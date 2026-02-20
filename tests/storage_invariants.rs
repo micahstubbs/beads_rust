@@ -4,27 +4,26 @@ use beads_rust::model::{DependencyType, Issue, IssueType, Priority, Status};
 use beads_rust::storage::{ListFilters, ReadyFilters, ReadySortPolicy};
 use chrono::{Duration, Utc};
 use common::{fixtures, test_db, test_db_with_dir};
-use rusqlite::Connection;
+use fsqlite::Connection;
+use fsqlite_types::SqliteValue;
 use std::collections::HashSet;
 
 fn table_names(conn: &Connection) -> HashSet<String> {
-    let mut stmt = conn
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
-        .expect("prepare table list");
-    stmt.query_map([], |row| row.get(0))
-        .expect("query table list")
-        .collect::<std::result::Result<HashSet<String>, _>>()
-        .expect("collect table list")
+    let rows = conn
+        .query("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .expect("query table list");
+    rows.iter()
+        .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from))
+        .collect()
 }
 
 fn column_names(conn: &Connection, table: &str) -> HashSet<String> {
-    let mut stmt = conn
-        .prepare("SELECT name FROM pragma_table_info(?)")
-        .expect("prepare table info");
-    stmt.query_map([table], |row| row.get(0))
-        .expect("query table info")
-        .collect::<std::result::Result<HashSet<String>, _>>()
-        .expect("collect table info")
+    let rows = conn
+        .query(&format!("PRAGMA table_info({table})"))
+        .expect("query table info");
+    rows.iter()
+        .filter_map(|row| row.get(1).and_then(SqliteValue::as_text).map(String::from))
+        .collect()
 }
 
 fn issue_ids(issues: &[Issue]) -> HashSet<String> {
@@ -37,7 +36,7 @@ fn schema_tables_and_columns_exist() {
     let db_path = dir.path().join(".beads").join("beads.db");
 
     drop(storage);
-    let conn = Connection::open(db_path).expect("open db");
+    let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open db");
 
     let tables = table_names(&conn);
     for table in [

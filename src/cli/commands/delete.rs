@@ -589,13 +589,13 @@ mod tests {
         // Add dependencies
         storage
             .mutate("test_add_deps", "tester", |tx, _ctx| {
-                tx.execute(
+                tx.execute_with_params(
                     "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES (?, ?, ?, ?)",
-                    ["bd-b", "bd-a", "blocks", &Utc::now().to_rfc3339()],
+                    &[fsqlite_types::SqliteValue::from("bd-b"), fsqlite_types::SqliteValue::from("bd-a"), fsqlite_types::SqliteValue::from("blocks"), fsqlite_types::SqliteValue::from(chrono::Utc::now().to_rfc3339().as_str())],
                 )?;
-                tx.execute(
+                tx.execute_with_params(
                     "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES (?, ?, ?, ?)",
-                    ["bd-c", "bd-b", "blocks", &Utc::now().to_rfc3339()],
+                    &[fsqlite_types::SqliteValue::from("bd-c"), fsqlite_types::SqliteValue::from("bd-b"), fsqlite_types::SqliteValue::from("blocks"), fsqlite_types::SqliteValue::from(chrono::Utc::now().to_rfc3339().as_str())],
                 )?;
                 Ok(())
             })

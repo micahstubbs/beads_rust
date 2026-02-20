@@ -374,10 +374,7 @@ pub fn get_events(conn: &Connection, issue_id: &str, limit: usize) -> Result<Vec
             ORDER BY created_at DESC, id DESC
             LIMIT ?2
             ",
-            &[
-                SqliteValue::from(issue_id),
-                SqliteValue::from(limit as i64),
-            ],
+            &[SqliteValue::from(issue_id), SqliteValue::from(limit as i64)],
         )?
     } else {
         conn.query_with_params(
@@ -396,9 +393,17 @@ pub fn get_events(conn: &Connection, issue_id: &str, limit: usize) -> Result<Vec
 
 fn event_from_row(row: &Row) -> Event {
     let id = row.get(0).and_then(|v| v.as_integer()).unwrap_or(0);
-    let issue_id = row.get(1).and_then(|v| v.as_text()).unwrap_or("").to_string();
+    let issue_id = row
+        .get(1)
+        .and_then(|v| v.as_text())
+        .unwrap_or("")
+        .to_string();
     let event_type_str = row.get(2).and_then(|v| v.as_text()).unwrap_or("");
-    let actor = row.get(3).and_then(|v| v.as_text()).unwrap_or("").to_string();
+    let actor = row
+        .get(3)
+        .and_then(|v| v.as_text())
+        .unwrap_or("")
+        .to_string();
     let old_value = row.get(4).and_then(|v| v.as_text()).map(String::from);
     let new_value = row.get(5).and_then(|v| v.as_text()).map(String::from);
     let comment = row.get(6).and_then(|v| v.as_text()).map(String::from);
@@ -537,10 +542,8 @@ mod tests {
         init_events_table(&conn).expect("Failed to create events table");
 
         // Insert a test issue
-        conn.execute(
-            "INSERT INTO issues (id, title) VALUES ('test-001', 'Test Issue')",
-        )
-        .expect("Failed to insert test issue");
+        conn.execute("INSERT INTO issues (id, title) VALUES ('test-001', 'Test Issue')")
+            .expect("Failed to insert test issue");
 
         conn
     }
@@ -612,10 +615,8 @@ mod tests {
         let conn = setup_test_db();
 
         // Add second issue for dependency
-        conn.execute(
-            "INSERT INTO issues (id, title) VALUES ('test-002', 'Blocking Issue')",
-        )
-        .expect("Failed to insert second issue");
+        conn.execute("INSERT INTO issues (id, title) VALUES ('test-002', 'Blocking Issue')")
+            .expect("Failed to insert second issue");
 
         conn.execute("BEGIN").expect("Failed to start tx");
         insert_dependency_added_event(&conn, "test-001", "eve", "blocks", "test-002")
@@ -750,10 +751,8 @@ mod tests {
         let conn = setup_test_db();
 
         // Add second issue
-        conn.execute(
-            "INSERT INTO issues (id, title) VALUES ('test-002', 'Second Issue')",
-        )
-        .expect("Failed to insert second issue");
+        conn.execute("INSERT INTO issues (id, title) VALUES ('test-002', 'Second Issue')")
+            .expect("Failed to insert second issue");
 
         // Insert events for both issues
         conn.execute("BEGIN").expect("Failed to start tx");

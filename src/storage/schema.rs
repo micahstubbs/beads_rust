@@ -418,9 +418,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         .unwrap_or(false);
 
     if has_compaction_level {
-        conn.execute(
-            "UPDATE issues SET compaction_level = 0 WHERE compaction_level IS NULL",
-        )?;
+        conn.execute("UPDATE issues SET compaction_level = 0 WHERE compaction_level IS NULL")?;
     }
 
     // Migration: ensure source_repo column exists (bd compatibility)
@@ -430,16 +428,12 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         .unwrap_or(false);
 
     if !has_source_repo {
-        conn.execute(
-            "ALTER TABLE issues ADD COLUMN source_repo TEXT NOT NULL DEFAULT '.'",
-        )?;
+        conn.execute("ALTER TABLE issues ADD COLUMN source_repo TEXT NOT NULL DEFAULT '.'")?;
     }
 
     // Migration: ensure is_template column exists (needed for idx_issues_ready)
     if !column_exists(conn, "issues", "is_template") {
-        conn.execute(
-            "ALTER TABLE issues ADD COLUMN is_template INTEGER DEFAULT 0",
-        )?;
+        conn.execute("ALTER TABLE issues ADD COLUMN is_template INTEGER DEFAULT 0")?;
     }
 
     // Migration: Add missing indexes for bd parity
@@ -515,9 +509,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     }
 
     if table_exists(conn, "comments") {
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_comments_issue ON comments(issue_id)",
-        )?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_comments_issue ON comments(issue_id)")?;
     }
 
     if table_exists(conn, "events") {
@@ -560,7 +552,11 @@ mod tests {
 
         // Verify pragmas
         let row = conn.query_row("PRAGMA journal_mode").unwrap();
-        let journal_mode = row.get(0).and_then(|v| v.as_text()).unwrap_or("").to_string();
+        let journal_mode = row
+            .get(0)
+            .and_then(|v| v.as_text())
+            .unwrap_or("")
+            .to_string();
         // In-memory DBs use MEMORY journaling, regardless of what we set
         assert!(journal_mode.to_uppercase() == "WAL" || journal_mode.to_uppercase() == "MEMORY");
 
@@ -585,8 +581,14 @@ mod tests {
             .iter()
             .map(|row| {
                 (
-                    row.get(1).and_then(|v| v.as_text()).unwrap_or("").to_string(),
-                    row.get(2).and_then(|v| v.as_text()).unwrap_or("").to_string(),
+                    row.get(1)
+                        .and_then(|v| v.as_text())
+                        .unwrap_or("")
+                        .to_string(),
+                    row.get(2)
+                        .and_then(|v| v.as_text())
+                        .unwrap_or("")
+                        .to_string(),
                     row.get(3).and_then(|v| v.as_integer()).unwrap_or(0) as i32,
                     row.get(4).and_then(|v| v.as_text()).map(String::from),
                 )
@@ -712,7 +714,10 @@ mod tests {
             .iter()
             .map(|row| {
                 (
-                    row.get(1).and_then(|v| v.as_text()).unwrap_or("").to_string(),
+                    row.get(1)
+                        .and_then(|v| v.as_text())
+                        .unwrap_or("")
+                        .to_string(),
                     row.get(4).and_then(|v| v.as_text()).map(String::from),
                 )
             })
@@ -808,10 +813,8 @@ mod tests {
 
         // === TEST CLOSED-AT CONSTRAINT ===
         // Insert an issue with defaults (will get status='open', closed_at=NULL)
-        conn.execute(
-            "INSERT INTO issues (id, title) VALUES ('test-1', 'Test Issue')",
-        )
-        .expect("Should allow open issue without closed_at");
+        conn.execute("INSERT INTO issues (id, title) VALUES ('test-1', 'Test Issue')")
+            .expect("Should allow open issue without closed_at");
 
         // Try to insert closed issue without closed_at - should fail
         let result = conn.execute(

@@ -82,25 +82,21 @@ fn concurrent_exports_no_corruption() {
     let temp = TempDir::new().unwrap();
     let beads_dir = setup_beads_dir(&temp);
 
-    let results: Vec<_> = (0..4)
+    // Export all concurrently using threads - create storage inside each thread
+    // since fsqlite Connection is not Send (uses Rc internally)
+    let handles: Vec<_> = (0..4)
         .map(|i| {
             let path = beads_dir.join(format!("issues_{i}.jsonl"));
-            let mut storage = SqliteStorage::open_memory().unwrap();
-            for j in 0..5 {
-                let issue =
-                    create_test_issue(&format!("t{i}-{j:03}"), &format!("Thread {i} Issue {j}"));
-                storage.create_issue(&issue, "tester").unwrap();
-            }
-            (storage, path)
-        })
-        .collect();
-
-    // Export all concurrently using threads
-    let handles: Vec<_> = results
-        .into_iter()
-        .map(|(storage, path)| {
             let bd = beads_dir.clone();
             std::thread::spawn(move || {
+                let mut storage = SqliteStorage::open_memory().unwrap();
+                for j in 0..5 {
+                    let issue = create_test_issue(
+                        &format!("t{i}-{j:03}"),
+                        &format!("Thread {i} Issue {j}"),
+                    );
+                    storage.create_issue(&issue, "tester").unwrap();
+                }
                 let config = ExportConfig {
                     beads_dir: Some(bd),
                     ..Default::default()
