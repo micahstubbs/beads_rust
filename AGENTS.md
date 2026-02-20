@@ -59,7 +59,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | Crate | Purpose |
 |-------|---------|
 | `clap` | CLI parsing with derive macros + shell completions |
-| `rusqlite` | SQLite storage (bundled, modern_sqlite features) |
+| `fsqlite` + `fsqlite-types` + `fsqlite-error` | SQLite engine facade plus shared storage types/errors (path dependencies) |
 | `serde` + `serde_json` | Issue serialization and JSONL export |
 | `schemars` | JSON Schema generation for robot output |
 | `chrono` | Timestamp parsing and RFC3339 formatting |
@@ -214,7 +214,7 @@ CLI (clap derive)
     ├── Commands ────── 35+ subcommands (create, list, show, close, dep, sync, ...)
     │                       │
     │                       ▼
-    ├── Storage ─────── SQLite (rusqlite, bundled)
+    ├── Storage ─────── SQLite (fsqlite stack)
     │                       │
     │                       ├── Schema (migrations, JSONL ↔ SQLite sync)
     │                       ├── Events (append-only audit log)

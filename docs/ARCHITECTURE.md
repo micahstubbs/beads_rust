@@ -198,7 +198,8 @@ br sync --flush-only
 
 ### SqliteStorage
 
-The primary storage implementation using rusqlite.
+The primary storage implementation using the fsqlite stack (`fsqlite`,
+`fsqlite-types`, and `fsqlite-error`).
 
 ```rust
 pub struct SqliteStorage {
@@ -656,14 +657,15 @@ impl IssueValidator {
 | Crate | Purpose |
 |-------|---------|
 | `clap` | CLI parsing with derive macros |
-| `rusqlite` | SQLite storage (bundled) |
+| `fsqlite` + `fsqlite-types` + `fsqlite-error` | SQLite engine facade plus shared storage types/errors |
 | `serde` + `serde_json` | Serialization |
 | `chrono` | Timestamps |
 | `sha2` | Content hashing |
-| `thiserror` | Error types |
-| `anyhow` | Error context |
+| `thiserror` + `anyhow` | Error types and context |
 | `tracing` | Structured logging |
-| `rayon` | Parallel processing |
+| `rich_rust` | Rich terminal UI components |
+| `toon_rust` | TOON format support |
+| `self_update` (optional) | Release-based self-update support |
 
 ---
 
