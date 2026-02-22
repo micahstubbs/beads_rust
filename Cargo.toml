@@ -20,21 +20,21 @@ clap_complete = { version = "4.5.66", features = ["unstable-dynamic"] }
 
 # Database (pure-Rust SQLite with concurrent writer support)
 # NOTE: transitive fsqlite workspace deps listed explicitly so rch syncs them
-fsqlite = { path = "/dp/frankensqlite/crates/fsqlite" }
-fsqlite-types = { path = "/dp/frankensqlite/crates/fsqlite-types" }
-fsqlite-error = { path = "/dp/frankensqlite/crates/fsqlite-error" }
-fsqlite-core = { path = "/dp/frankensqlite/crates/fsqlite-core" }
-fsqlite-func = { path = "/dp/frankensqlite/crates/fsqlite-func" }
-fsqlite-vdbe = { path = "/dp/frankensqlite/crates/fsqlite-vdbe" }
-fsqlite-vfs = { path = "/dp/frankensqlite/crates/fsqlite-vfs" }
-fsqlite-pager = { path = "/dp/frankensqlite/crates/fsqlite-pager" }
-fsqlite-parser = { path = "/dp/frankensqlite/crates/fsqlite-parser" }
-fsqlite-planner = { path = "/dp/frankensqlite/crates/fsqlite-planner" }
-fsqlite-wal = { path = "/dp/frankensqlite/crates/fsqlite-wal" }
-fsqlite-btree = { path = "/dp/frankensqlite/crates/fsqlite-btree" }
-fsqlite-ast = { path = "/dp/frankensqlite/crates/fsqlite-ast" }
-fsqlite-mvcc = { path = "/dp/frankensqlite/crates/fsqlite-mvcc" }
-fsqlite-observability = { path = "/dp/frankensqlite/crates/fsqlite-observability" }
+fsqlite = "0.1.0"
+fsqlite-types = "0.1.0"
+fsqlite-error = "0.1.0"
+fsqlite-core = "0.1.0"
+fsqlite-func = "0.1.0"
+fsqlite-vdbe = "0.1.0"
+fsqlite-vfs = "0.1.0"
+fsqlite-pager = "0.1.0"
+fsqlite-parser = "0.1.0"
+fsqlite-planner = "0.1.0"
+fsqlite-wal = "0.1.0"
+fsqlite-btree = "0.1.0"
+fsqlite-ast = "0.1.0"
+fsqlite-mvcc = "0.1.0"
+fsqlite-observability = "0.1.0"
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
