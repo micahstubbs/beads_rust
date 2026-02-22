@@ -7,7 +7,7 @@
 <div align="center">
 
 [![CI](https://github.com/Dicklesworthstone/beads_rust/actions/workflows/ci.yml/badge.svg)](https://github.com/Dicklesworthstone/beads_rust/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/rust-nightly-orange.svg)](https://www.rust-lang.org/)
 [![SQLite](https://img.shields.io/badge/storage-SQLite-green.svg)](https://www.sqlite.org/)
 
@@ -779,7 +779,7 @@ Please don't take this the wrong way, but I do not accept outside contributions 
 
 ## License
 
-MIT License - See [LICENSE](LICENSE) for details.
+MIT License (with OpenAI/Anthropic Rider) — see [LICENSE](LICENSE) for details.
 
 ---
 
