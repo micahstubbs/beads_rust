@@ -298,6 +298,7 @@ jobs:
           | Platform | Architecture | File |
           |----------|--------------|------|
           | Linux | x86_64 (gnu) | `br-${{ github.ref_name }}-linux_amd64.tar.gz` |
+          | Linux | ARM64 (gnu) | `br-${{ github.ref_name }}-linux_arm64.tar.gz` |
           | macOS | x86_64 (Intel) | `br-${{ github.ref_name }}-darwin_amd64.tar.gz` |
           | macOS | ARM64 (Apple Silicon) | `br-${{ github.ref_name }}-darwin_arm64.tar.gz` |
           | Windows | x86_64 | `br-${{ github.ref_name }}-windows_amd64.zip` |
