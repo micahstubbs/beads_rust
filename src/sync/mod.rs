@@ -303,6 +303,8 @@ pub struct ImportResult {
     pub tombstone_skipped: usize,
     /// Conflict markers detected (if any).
     pub conflict_markers: Vec<ConflictMarker>,
+    /// Number of orphaned DB entries removed during --rebuild.
+    pub orphans_removed: usize,
 }
 
 // ============================================================================

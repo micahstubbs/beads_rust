@@ -706,6 +706,74 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Manage AGENTS.md workflow instructions
+    Agents(AgentsArgs),
+
+    /// Record and label agent interactions (append-only JSONL)
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommands,
+    },
+
+    /// List blocked issues
+    Blocked(BlockedArgs),
+
+    /// Generate changelog from closed issues
+    Changelog(ChangelogArgs),
+
+    /// Close an issue
+    Close(CloseArgs),
+
+    /// Manage comments
+    #[command(alias = "comment")]
+    Comments(CommentsArgs),
+
+    /// Generate shell completions
+    #[command(alias = "completion")]
+    Completions(CompletionsArgs),
+
+    /// Configuration management
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
+
+    /// Count issues with optional grouping
+    Count(CountArgs),
+
+    /// Create a new issue
+    Create(CreateArgs),
+
+    /// Defer issues (schedule for later)
+    Defer(DeferArgs),
+
+    /// Delete an issue (creates tombstone)
+    Delete(DeleteArgs),
+
+    /// Manage dependencies
+    Dep {
+        #[command(subcommand)]
+        command: DepCommands,
+    },
+
+    /// Run read-only diagnostics
+    Doctor,
+
+    /// Epic management commands
+    Epic {
+        #[command(subcommand)]
+        command: EpicCommands,
+    },
+
+    /// Visualize dependency graph
+    Graph(GraphArgs),
+
+    /// Manage local history backups
+    History(HistoryArgs),
+
+    /// Show diagnostic metadata about the workspace
+    Info(InfoArgs),
+
     /// Initialize a beads workspace
     Init {
         /// Issue ID prefix (e.g., "bd")
@@ -721,87 +789,53 @@ pub enum Commands {
         backend: Option<String>,
     },
 
-    /// Create a new issue
-    Create(CreateArgs),
-
-    /// Quick capture (create issue, print ID only)
-    Q(QuickArgs),
-
-    /// List issues
-    List(ListArgs),
-
-    /// Show issue details
-    Show(ShowArgs),
-
-    /// Update an issue
-    Update(UpdateArgs),
-
-    /// Close an issue
-    Close(CloseArgs),
-
-    /// Reopen an issue
-    Reopen(ReopenArgs),
-
-    /// Delete an issue (creates tombstone)
-    Delete(DeleteArgs),
-
-    /// List ready issues (unblocked, not deferred)
-    Ready(ReadyArgs),
-
-    /// List blocked issues
-    Blocked(BlockedArgs),
-
-    /// Search issues
-    Search(SearchArgs),
-
-    /// Manage dependencies
-    Dep {
-        #[command(subcommand)]
-        command: DepCommands,
-    },
-
     /// Manage labels
     Label {
         #[command(subcommand)]
         command: LabelCommands,
     },
 
-    /// Epic management commands
-    Epic {
+    /// Check issues for missing template sections
+    Lint(LintArgs),
+
+    /// List issues
+    List(ListArgs),
+
+    /// List orphan issues (referenced in commits but open)
+    Orphans(OrphansArgs),
+
+    /// Quick capture (create issue, print ID only)
+    Q(QuickArgs),
+
+    /// Manage saved queries
+    Query {
         #[command(subcommand)]
-        command: EpicCommands,
+        command: QueryCommands,
     },
 
-    /// Manage comments
-    #[command(alias = "comment")]
-    Comments(CommentsArgs),
+    /// List ready issues (unblocked, not deferred)
+    Ready(ReadyArgs),
+
+    /// Reopen an issue
+    Reopen(ReopenArgs),
+
+    /// Emit JSON Schemas for br output types (for agent/tooling integration)
+    Schema(SchemaArgs),
+
+    /// Search issues
+    Search(SearchArgs),
+
+    /// Show issue details
+    Show(ShowArgs),
+
+    /// List stale issues
+    Stale(StaleArgs),
 
     /// Show project statistics
     Stats(StatsArgs),
 
     /// Alias for stats
     Status(StatsArgs),
-
-    /// Count issues with optional grouping
-    Count(CountArgs),
-
-    /// List stale issues
-    Stale(StaleArgs),
-
-    /// Check issues for missing template sections
-    Lint(LintArgs),
-
-    /// Defer issues (schedule for later)
-    Defer(DeferArgs),
-
-    /// Undefer issues (make ready again)
-    Undefer(UndeferArgs),
-
-    /// Configuration management
-    Config {
-        #[command(subcommand)]
-        command: ConfigCommands,
-    },
 
     /// Sync database with JSONL file (export or import)
     ///
@@ -838,56 +872,25 @@ EXAMPLES:
   br sync --flush-only           Export database to .beads/issues.jsonl
   br sync --flush-only -v        Export with safety logging
   br sync --import-only          Import from JSONL (validates first)
+  br sync --rebuild              Import + remove DB entries not in JSONL
   br sync --status               Show current sync status")]
     Sync(SyncArgs),
 
-    /// Run read-only diagnostics
-    Doctor,
+    /// Undefer issues (make ready again)
+    Undefer(UndeferArgs),
 
-    /// Show diagnostic metadata about the workspace
-    Info(InfoArgs),
-
-    /// Emit JSON Schemas for br output types (for agent/tooling integration)
-    Schema(SchemaArgs),
-
-    /// Show the active .beads directory
-    Where,
-
-    /// Show version information
-    Version(VersionArgs),
+    /// Update an issue
+    Update(UpdateArgs),
 
     /// Upgrade br to the latest version
     #[cfg(feature = "self_update")]
     Upgrade(UpgradeArgs),
 
-    /// Generate shell completions
-    #[command(alias = "completion")]
-    Completions(CompletionsArgs),
+    /// Show version information
+    Version(VersionArgs),
 
-    /// Record and label agent interactions (append-only JSONL)
-    Audit {
-        #[command(subcommand)]
-        command: AuditCommands,
-    },
-
-    /// Manage local history backups
-    History(HistoryArgs),
-    /// List orphan issues (referenced in commits but open)
-    Orphans(OrphansArgs),
-    /// Generate changelog from closed issues
-    Changelog(ChangelogArgs),
-
-    /// Manage saved queries
-    Query {
-        #[command(subcommand)]
-        command: QueryCommands,
-    },
-
-    /// Visualize dependency graph
-    Graph(GraphArgs),
-
-    /// Manage AGENTS.md workflow instructions
-    Agents(AgentsArgs),
+    /// Show the active .beads directory
+    Where,
 }
 
 /// Arguments for the completions command.
@@ -2098,6 +2101,14 @@ pub struct SyncArgs {
     /// Rename issues with wrong prefix to expected prefix during import
     #[arg(long)]
     pub rename_prefix: bool,
+
+    /// Rebuild the database from JSONL (removes orphaned DB entries)
+    ///
+    /// After importing, deletes any issues in the database that are not
+    /// present in the JSONL file. This ensures the DB exactly matches
+    /// the JSONL source of truth.
+    #[arg(long)]
+    pub rebuild: bool,
 
     /// Machine-readable output (alias for --json)
     #[arg(long)]

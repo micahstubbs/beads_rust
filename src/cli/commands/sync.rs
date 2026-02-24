@@ -47,6 +47,7 @@ pub struct ImportResultOutput {
     pub updated: usize,
     pub skipped: usize,
     pub tombstone_skipped: usize,
+    pub orphans_removed: usize,
     pub blocked_cache_rebuilt: bool,
 }
 
@@ -116,6 +117,15 @@ pub fn execute(
         return Err(BeadsError::Validation {
             field: "mode".to_string(),
             reason: "Must specify exactly one of --flush-only, --import-only, or --merge"
+                .to_string(),
+        });
+    }
+
+    // --rebuild only makes sense with import (the default or --import-only)
+    if args.rebuild && (args.flush_only || args.merge) {
+        return Err(BeadsError::Validation {
+            field: "rebuild".to_string(),
+            reason: "--rebuild can only be used with import mode (not --flush-only or --merge)"
                 .to_string(),
         });
     }
@@ -865,6 +875,7 @@ fn execute_import(
                 updated: 0,
                 skipped: 0,
                 tombstone_skipped: 0,
+                orphans_removed: 0,
                 blocked_cache_rebuilt: false,
             };
             ctx.json_pretty(&result);
@@ -874,8 +885,8 @@ fn execute_import(
         return Ok(());
     }
 
-    // Check staleness (unless --force)
-    if !args.force {
+    // Check staleness (unless --force or --rebuild)
+    if !args.force && !args.rebuild {
         let last_import_time = storage.get_metadata(METADATA_LAST_IMPORT_TIME)?;
         let stored_hash = storage.get_metadata(METADATA_JSONL_CONTENT_HASH)?;
 
@@ -895,6 +906,7 @@ fn execute_import(
                         updated: 0,
                         skipped: 0,
                         tombstone_skipped: 0,
+                        orphans_removed: 0,
                         blocked_cache_rebuilt: false,
                     };
                     ctx.json_pretty(&result);
@@ -954,7 +966,7 @@ fn execute_import(
 
     // Execute import
     info!(path = %jsonl_path.display(), "Importing from JSONL");
-    let import_result = import_from_jsonl(storage, jsonl_path, &import_config, Some(&prefix))?;
+    let mut import_result = import_from_jsonl(storage, jsonl_path, &import_config, Some(&prefix))?;
 
     info!(
         created_or_updated = import_result.imported_count,
@@ -962,6 +974,31 @@ fn execute_import(
         tombstone_skipped = import_result.tombstone_skipped,
         "Import complete"
     );
+
+    // --rebuild: remove DB entries not present in JSONL
+    if args.rebuild {
+        let jsonl_ids = get_issue_ids_from_jsonl(jsonl_path)?;
+        let db_ids: HashSet<String> = storage.get_all_ids()?.into_iter().collect();
+        let orphan_ids: Vec<String> = db_ids.difference(&jsonl_ids).cloned().collect();
+
+        if !orphan_ids.is_empty() {
+            info!(
+                count = orphan_ids.len(),
+                "Removing orphaned DB entries not present in JSONL"
+            );
+            for id in &orphan_ids {
+                debug!(id = %id, "Removing orphaned issue");
+                storage.delete_issue(id, "br-rebuild", "rebuild: not in JSONL", None)?;
+            }
+            import_result.orphans_removed = orphan_ids.len();
+            // Rebuild blocked cache again after removals
+            storage.rebuild_blocked_cache(true)?;
+            info!(
+                removed = orphan_ids.len(),
+                "Rebuild orphan cleanup complete"
+            );
+        }
+    }
 
     // Update content hash
     let content_hash = compute_jsonl_hash(jsonl_path)?;
@@ -973,6 +1010,7 @@ fn execute_import(
         updated: 0,
         skipped: import_result.skipped_count,
         tombstone_skipped: import_result.tombstone_skipped,
+        orphans_removed: import_result.orphans_removed,
         blocked_cache_rebuilt: true,
     };
 
@@ -988,6 +1026,9 @@ fn execute_import(
         }
         if result.tombstone_skipped > 0 {
             println!("  Tombstone protected: {} issues", result.tombstone_skipped);
+        }
+        if result.orphans_removed > 0 {
+            println!("  Orphans removed: {} issues (not in JSONL)", result.orphans_removed);
         }
         println!("  Rebuilt blocked cache");
     }
@@ -1030,6 +1071,14 @@ fn render_import_result_rich(result: &ImportResultOutput, ctx: &OutputContext) {
     if result.tombstone_skipped > 0 {
         text.append_styled("Tombstone protected ", theme.dimmed.clone());
         text.append(&result.tombstone_skipped.to_string());
+        text.append("\n");
+    }
+
+    // Orphans removed
+    if result.orphans_removed > 0 {
+        text.append_styled("Orphans removed    ", theme.dimmed.clone());
+        text.append_styled(&result.orphans_removed.to_string(), theme.warning.clone());
+        text.append_styled(" (not in JSONL)", theme.muted.clone());
         text.append("\n");
     }
 

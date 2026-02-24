@@ -165,8 +165,9 @@ impl<'a> IssuePanel<'a> {
             }
         }
 
-        // Build and print panel
-        let panel_width = if wrap { ctx.width() } else { 80 };
+        // Build and print panel — always use terminal width so descriptions
+        // are never silently truncated (issue #91).
+        let panel_width = ctx.width();
         let content = if wrap {
             wrap_rich_text(&content, panel_width)
         } else {
