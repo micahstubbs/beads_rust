@@ -272,7 +272,7 @@ const ISSUE_COLUMNS: &[(&str, &str)] = &[
     ("acceptance_criteria", "TEXT NOT NULL DEFAULT ''"),
     ("notes", "TEXT NOT NULL DEFAULT ''"),
     ("status", "TEXT NOT NULL DEFAULT 'open'"),
-    ("priority", "INTEGER NOT NULL DEFAULT 2"),
+    ("priority", "INTEGER NOT NULL DEFAULT 2 CHECK(priority >= 0 AND priority <= 4)"),
     ("issue_type", "TEXT NOT NULL DEFAULT 'task'"),
     ("assignee", "TEXT"),
     ("owner", "TEXT DEFAULT ''"),
@@ -432,12 +432,28 @@ fn rebuild_issues_table(conn: &Connection) -> Result<()> {
         return Ok(()); // Table is empty or doesn't exist
     }
 
+    // Wrap the entire rebuild in a transaction so a crash between DROP TABLE
+    // and RENAME cannot lose data.
+    conn.execute("BEGIN EXCLUSIVE")?;
+
+    if let Err(e) = rebuild_issues_table_inner(conn, &existing_columns) {
+        let _ = conn.execute("ROLLBACK");
+        return Err(e);
+    }
+
+    conn.execute("COMMIT")?;
+    Ok(())
+}
+
+/// Inner helper for [`rebuild_issues_table`] that performs the actual work
+/// inside an already-open transaction.
+fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) -> Result<()> {
     // Drop all indexes on the issues table first (they'll be recreated by SCHEMA_SQL)
     let index_rows =
         conn.query("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='issues' AND sql IS NOT NULL")?;
     for row in &index_rows {
         if let Some(name) = row.get(0).and_then(SqliteValue::as_text) {
-            conn.execute(&format!("DROP INDEX IF EXISTS {name}"))?;
+            conn.execute(&format!("DROP INDEX IF EXISTS \"{name}\""))?;
         }
     }
 
@@ -453,8 +469,13 @@ fn rebuild_issues_table(conn: &Connection) -> Result<()> {
 
     // Build CREATE TABLE for the new table with only columns that exist in the old table
     // plus any missing columns with defaults
+    // Build the canonical column list: id, content_hash, title, then the
+    // rest of ISSUE_COLUMNS (skipping content_hash which is already placed).
+    // This order must match EXPECTED_ISSUE_COLUMN_ORDER and SCHEMA_SQL.
     let all_expected: Vec<(&str, &str)> = std::iter::once(("id", "TEXT PRIMARY KEY"))
-        .chain(ISSUE_COLUMNS.iter().copied())
+        .chain(std::iter::once(("content_hash", "TEXT")))
+        .chain(std::iter::once(("title", "TEXT NOT NULL CHECK(length(title) <= 500)")))
+        .chain(ISSUE_COLUMNS.iter().copied().filter(|(name, _)| *name != "content_hash"))
         .collect();
 
     let mut create_cols = Vec::new();
