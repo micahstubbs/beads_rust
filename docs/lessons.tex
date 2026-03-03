@@ -159,7 +159,14 @@
 \textbf{Problem}: \colorbox{codebg}{\texttt{br sync --rebuild --force}} on a project with 2,257 issues (2.3MB JSONL) caused "Database error: out of memory" and WAL corruption despite the system having 62GB RAM and 80GB swap. The OOM was not a system-level OOM but an internal fsqlite error.
 
 
-\textbf{Root Cause}: fsqlite (frankensqlite) has a \colorbox{codebg}{\texttt{PageBufPool}} with a hard limit of 1024 page buffers. This pool is \textbf{shared} between the ARC page cache and transaction write-sets (\colorbox{codebg}{\texttt{pager.rs:354: let pool = inner.cache.pool().clone()}}). As the B-tree grows during bulk inserts, dirty pages accumulate in the write-set. The \colorbox{codebg}{\texttt{write\_page}} codepath (\colorbox{codebg}{\texttt{pager.rs:983}}) does \colorbox{codebg}{\texttt{self.pool.acquire()?}} with NO fallback on OOM — unlike \colorbox{codebg}{\texttt{fetch\_page}} which can fall back to reading directly from disk. Once the combined cache + write-set exceeds 1024 slots, every subsequent write fails with \colorbox{codebg}{\texttt{FrankenError::OutOfMemory}}.
+\textbf{Root Cause}: fsqlite (frankensqlite) has a \colorbox{codebg}{\texttt{PageBufPool}} with a hard limit of 1024 page buffers. This pool is \textbf{shared} between the ARC page cache and transaction write-sets:
+
+\begin{lstlisting}
+// pager.rs:354
+let pool = inner.cache.pool().clone();
+\end{lstlisting}
+
+As the B-tree grows during bulk inserts, dirty pages accumulate in the write-set. The \colorbox{codebg}{\texttt{write\_page}} codepath (\colorbox{codebg}{\texttt{pager.rs:983}}) does \colorbox{codebg}{\texttt{self.pool.acquire()?}} with NO fallback on OOM --- unlike \colorbox{codebg}{\texttt{fetch\_page}} which falls back to reading from disk. Once the combined cache + write-set exceeds 1024 slots, every subsequent write fails with \colorbox{codebg}{\texttt{FrankenError::OutOfMemory}}.
 
 
 \textbf{Lesson}: When a library reports "out of memory" but the system has plenty of RAM, the OOM is likely an internal resource pool exhaustion, not a system memory issue. Investigate the library's internal memory management before trying system-level fixes. Shared resource pools between cache and write paths are a common source of this — the cache grows to fill the pool, leaving no room for writes.
