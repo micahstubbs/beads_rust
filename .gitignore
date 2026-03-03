@@ -76,3 +76,12 @@ result-*
 
 # Private keys and certificates
 *.pem
+
+# LaTeX build artifacts (from m2p PDF generation)
+*.aux
+*.log
+*.out
+*-pages/
+
+# Guard: nested docs/ (created by running pdflatex from wrong cwd)
+docs/docs/
