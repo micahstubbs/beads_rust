@@ -1962,19 +1962,19 @@ impl SqliteStorage {
         dep_type: &str,
         actor: &str,
     ) -> Result<bool> {
-        // Check for cycles if this is a blocking dependency
-        if let Ok(dt) = dep_type.parse::<DependencyType>()
-            && dt.is_blocking()
-            && self.would_create_cycle(issue_id, depends_on_id, true)?
-        {
-            return Err(BeadsError::DependencyCycle {
-                path: format!(
-                    "Adding dependency {issue_id} -> {depends_on_id} would create a cycle"
-                ),
-            });
-        }
-
         self.mutate("add_dependency", actor, |conn, ctx| {
+            // Check for cycles inside the transaction to prevent TOCTOU races
+            if let Ok(dt) = dep_type.parse::<DependencyType>()
+                && dt.is_blocking()
+                && Self::check_cycle(conn, issue_id, depends_on_id, true)?
+            {
+                return Err(BeadsError::DependencyCycle {
+                    path: format!(
+                        "Adding dependency {issue_id} -> {depends_on_id} would create a cycle"
+                    ),
+                });
+            }
+
             let row = conn.query_row_with_params(
                 "SELECT count(*) FROM dependencies WHERE issue_id = ? AND depends_on_id = ?",
                 &[
