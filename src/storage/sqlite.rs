@@ -2964,15 +2964,29 @@ impl SqliteStorage {
     pub fn set_config(&mut self, key: &str, value: &str) -> Result<()> {
         // Explicit DELETE + INSERT instead of ON CONFLICT because
         // fsqlite does not enforce UNIQUE constraints on non-rowid columns.
-        self.conn.execute_with_params(
-            "DELETE FROM config WHERE key = ?",
-            &[SqliteValue::from(key)],
-        )?;
-        self.conn.execute_with_params(
-            "INSERT INTO config (key, value) VALUES (?, ?)",
-            &[SqliteValue::from(key), SqliteValue::from(value)],
-        )?;
-        Ok(())
+        // Wrapped in a transaction so a failed INSERT cannot leave the key deleted.
+        self.conn.execute("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<()> {
+            self.conn.execute_with_params(
+                "DELETE FROM config WHERE key = ?",
+                &[SqliteValue::from(key)],
+            )?;
+            self.conn.execute_with_params(
+                "INSERT INTO config (key, value) VALUES (?, ?)",
+                &[SqliteValue::from(key), SqliteValue::from(value)],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// Delete a config value.
@@ -3230,19 +3244,33 @@ impl SqliteStorage {
     pub fn set_export_hash(&mut self, issue_id: &str, content_hash: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         // DELETE + INSERT instead of INSERT OR REPLACE (fsqlite UNIQUE limitation)
-        self.conn.execute_with_params(
-            "DELETE FROM export_hashes WHERE issue_id = ?",
-            &[SqliteValue::from(issue_id)],
-        )?;
-        self.conn.execute_with_params(
-            "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
-            &[
-                SqliteValue::from(issue_id),
-                SqliteValue::from(content_hash),
-                SqliteValue::from(now),
-            ],
-        )?;
-        Ok(())
+        // Wrapped in a transaction so a failed INSERT cannot leave the hash deleted.
+        self.conn.execute("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<()> {
+            self.conn.execute_with_params(
+                "DELETE FROM export_hashes WHERE issue_id = ?",
+                &[SqliteValue::from(issue_id)],
+            )?;
+            self.conn.execute_with_params(
+                "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
+                &[
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(content_hash),
+                    SqliteValue::from(now),
+                ],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// Batch set export hashes for multiple issues after successful export.
@@ -3257,24 +3285,38 @@ impl SqliteStorage {
             return Ok(0);
         }
         let now = Utc::now().to_rfc3339();
-        let mut count = 0;
-        for (issue_id, content_hash) in exports {
-            // DELETE + INSERT instead of INSERT OR REPLACE (fsqlite UNIQUE limitation)
-            self.conn.execute_with_params(
-                "DELETE FROM export_hashes WHERE issue_id = ?",
-                &[SqliteValue::from(issue_id.as_str())],
-            )?;
-            self.conn.execute_with_params(
-                "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
-                &[
-                    SqliteValue::from(issue_id.as_str()),
-                    SqliteValue::from(content_hash.as_str()),
-                    SqliteValue::from(now.as_str()),
-                ],
-            )?;
-            count += 1;
+        // Wrap the entire batch in a transaction for atomicity.
+        self.conn.execute("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<usize> {
+            let mut count = 0;
+            for (issue_id, content_hash) in exports {
+                // DELETE + INSERT instead of INSERT OR REPLACE (fsqlite UNIQUE limitation)
+                self.conn.execute_with_params(
+                    "DELETE FROM export_hashes WHERE issue_id = ?",
+                    &[SqliteValue::from(issue_id.as_str())],
+                )?;
+                self.conn.execute_with_params(
+                    "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
+                    &[
+                        SqliteValue::from(issue_id.as_str()),
+                        SqliteValue::from(content_hash.as_str()),
+                        SqliteValue::from(now.as_str()),
+                    ],
+                )?;
+                count += 1;
+            }
+            Ok(count)
+        })();
+        match result {
+            Ok(count) => {
+                self.conn.execute("COMMIT")?;
+                Ok(count)
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK");
+                Err(e)
+            }
         }
-        Ok(count)
     }
 
     /// Clear all export hashes.
@@ -3358,15 +3400,29 @@ impl SqliteStorage {
     pub fn set_metadata(&mut self, key: &str, value: &str) -> Result<()> {
         // Explicit DELETE + INSERT instead of INSERT OR REPLACE because
         // fsqlite does not enforce UNIQUE constraints on non-rowid columns.
-        self.conn.execute_with_params(
-            "DELETE FROM metadata WHERE key = ?",
-            &[SqliteValue::from(key)],
-        )?;
-        self.conn.execute_with_params(
-            "INSERT INTO metadata (key, value) VALUES (?, ?)",
-            &[SqliteValue::from(key), SqliteValue::from(value)],
-        )?;
-        Ok(())
+        // Wrapped in a transaction so a failed INSERT cannot leave the key deleted.
+        self.conn.execute("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<()> {
+            self.conn.execute_with_params(
+                "DELETE FROM metadata WHERE key = ?",
+                &[SqliteValue::from(key)],
+            )?;
+            self.conn.execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[SqliteValue::from(key), SqliteValue::from(value)],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// Delete a metadata key.
