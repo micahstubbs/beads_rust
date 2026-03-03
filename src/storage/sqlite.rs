@@ -445,7 +445,7 @@ impl SqliteStorage {
     ) -> Result<bool> {
         // Construct filter clause
         let type_filter = if blocking_only {
-            "AND type IN ('blocks', 'parent-child', 'conditional-blocks')"
+            "AND type IN ('blocks', 'parent-child', 'conditional-blocks', 'waits-for')"
         } else {
             "" // No filter, follow all edges
         };

@@ -1121,15 +1121,16 @@ mod tests {
         storage
             .add_dependency("bd-2", "bd-1", "waits-for", "test")
             .unwrap();
-        // B blocks A (cycle)
-        storage
-            .add_dependency("bd-1", "bd-2", "waits-for", "test")
-            .unwrap();
+        // B blocks A (cycle) — should be rejected by cycle detection
+        let cycle_result = storage.add_dependency("bd-1", "bd-2", "waits-for", "test");
+        assert!(
+            cycle_result.is_err(),
+            "waits-for cycle should be detected and rejected"
+        );
 
         let ctx = OutputContext::from_flags(true, false, true); // JSON mode
 
-        // This should not hang even with root feeding into cycle
-        // If it hangs, the test runner will timeout
+        // graph_all should work fine with the acyclic graph
         let result = graph_all(&storage, false, &ctx);
         assert!(result.is_ok());
     }
