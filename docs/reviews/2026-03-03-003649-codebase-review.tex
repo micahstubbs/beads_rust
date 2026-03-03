@@ -112,7 +112,7 @@
 \fancyhf{}
 \renewcommand{\headrulewidth}{0.3pt}
 \renewcommand{\headrule}{\hbox to\headwidth{\color{rulegray}\leaders\hrule height \headrulewidth\hfill}}
-\fancyhead[L]{\footnotesize\color{headergray}\textit{Codebase Review: beads\textbackslash{}\_rust}}
+\fancyhead[L]{\footnotesize\color{headergray}\textit{Codebase Review: beads\_rust}}
 \renewcommand{\footrulewidth}{0.3pt}
 \renewcommand{\footrule}{\hbox to\headwidth{\color{rulegray}\leaders\hrule height \footrulewidth\hfill}}
 % Brand mark footer: CaseMirror wordmark left, page number right (both burgundy)
@@ -134,7 +134,7 @@
 \renewcommand{\columnseprulecolor}{\color{rulegray}}
 
 % -- Title --
-\title{\vspace{-1.8em}\LARGE\bfseries\color{titlebg} Codebase Review: beads\textbackslash{}\_rust\vspace{-0.3em}}
+\title{\vspace{-1.8em}\LARGE\bfseries\color{titlebg} Codebase Review: beads\_rust\vspace{-0.3em}}
 \author{CaseMirror Research \\ \small\itshape\href{https://casemirror.ai}{\textcolor{headergray}{casemirror.ai}}}
 \date{{\small\color{headergray} \today}}
 
@@ -149,7 +149,7 @@
 
 \textbf{Scope:} Full codebase (src/)
 
-\textbf{Reviewer:} Claude Opus 4.6 (automated)
+\textbf{Reviewer:} CaseMirror Research \& Claude Opus 4.6
 
 
 \subsection{Summary}
@@ -222,7 +222,7 @@ let type_filter = if blocking_only {
 "AND type IN ('blocks', 'parent-child', 'conditional-blocks', 'waits-for')"
 \end{lstlisting}
 
-\subsubsection{BUG-2: add\textbackslash{}\_dependency cycle check is outside the transaction (TOCTOU)}
+\subsubsection{BUG-2: add\_dependency cycle check is outside the transaction (TOCTOU)}
 
 \begin{itemize}
 \setlength{\itemsep}{0pt}
@@ -261,7 +261,7 @@ In a concurrent multi-agent environment (the stated use case), two agents can si
 
 \subsection{IMPORTANT}
 
-\subsubsection{BUG-3: set\textbackslash{}\_config/set\textbackslash{}\_metadata non-atomic DELETE+INSERT}
+\subsubsection{BUG-3: set\_config/set\_metadata non-atomic DELETE+INSERT}
 
 \begin{itemize}
 \setlength{\itemsep}{0pt}
@@ -296,7 +296,7 @@ Note: \texttt{set\_metadata\_in\_tx} (line 3520) exists as a transactional versi
 \textbf{Fix:} Wrap in an explicit transaction or route through \texttt{self.mutate(...)}.
 
 
-\subsubsection{BUG-4: rebuild\textbackslash{}\_blocked\textbackslash{}\_cache uses plain BEGIN instead of BEGIN IMMEDIATE}
+\subsubsection{BUG-4: rebuild\_blocked\_cache uses plain BEGIN instead of BEGIN IMMEDIATE}
 
 \begin{itemize}
 \setlength{\itemsep}{0pt}
@@ -322,7 +322,7 @@ pub fn rebuild_blocked_cache(&mut self, force_rebuild: bool) -> Result<usize> {
 \textbf{Fix:} Use \texttt{self.mutate(...)} or \texttt{BEGIN IMMEDIATE} with retry logic.
 
 
-\subsubsection{PERF-1: O(n\^{}2) visited-set check in collect\textbackslash{}\_descendant\textbackslash{}\_ids}
+\subsubsection{PERF-1: O(n\^{}2) visited-set check in collect\_descendant\_ids}
 
 \begin{itemize}
 \setlength{\itemsep}{0pt}
