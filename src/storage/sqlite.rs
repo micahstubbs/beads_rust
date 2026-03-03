@@ -1463,7 +1463,7 @@ impl SqliteStorage {
         if !force_rebuild {
             return Ok(0);
         }
-        self.conn.execute("BEGIN")?;
+        self.conn.execute("BEGIN IMMEDIATE")?;
         match Self::rebuild_blocked_cache_impl(&self.conn) {
             Ok(count) => {
                 self.conn.execute("COMMIT")?;
