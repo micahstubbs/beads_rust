@@ -205,3 +205,12 @@ tests/artifacts/perf/
 tests/artifacts/perf/**/perf.data
 tests/artifacts/perf/**/*.beads/
 *.perf.data
+
+# LaTeX build artifacts (from m2p PDF generation)
+*.aux
+*.log
+*.out
+*-pages/
+
+# Guard: nested docs/ (created by running pdflatex from wrong cwd)
+docs/docs/
