@@ -21,6 +21,10 @@ pub struct SqliteStorage {
     conn: Connection,
     /// Track mutations to trigger periodic WAL checkpoints.
     mutation_count: u32,
+    /// Database file path (None for in-memory databases).
+    /// Used by `reopen()` to close and reopen the connection, which is the
+    /// only way to fully release fsqlite's shared page buffer pool.
+    db_path: Option<std::path::PathBuf>,
 }
 
 /// Context for a mutation operation, tracking side effects.
@@ -123,6 +127,7 @@ impl SqliteStorage {
         Ok(Self {
             conn,
             mutation_count: 0,
+            db_path: Some(path.to_path_buf()),
         })
     }
 
@@ -137,6 +142,7 @@ impl SqliteStorage {
         Ok(Self {
             conn,
             mutation_count: 0,
+            db_path: None,
         })
     }
 
@@ -147,6 +153,79 @@ impl SqliteStorage {
         if let Err(e) = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
             tracing::debug!(error = %e, "WAL checkpoint failed (non-fatal, will retry later)");
         }
+    }
+
+    /// Begin a bulk import batch transaction.
+    ///
+    /// Sets aggressive PRAGMAs for bulk import performance:
+    /// - 64MB page cache (vs default 8MB)
+    /// - Disables WAL auto-checkpoint (caller must checkpoint manually)
+    ///
+    /// Call `commit_import_batch()` to commit and optionally checkpoint.
+    /// Call `rollback_import_batch()` on error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction cannot be started.
+    pub fn begin_import_batch(&mut self) -> Result<()> {
+        self.conn.execute("PRAGMA wal_autocheckpoint = 0")?;
+        self.conn.execute("BEGIN IMMEDIATE")?;
+        Ok(())
+    }
+
+    /// Commit a bulk import batch, checkpoint WAL, and reopen the connection.
+    ///
+    /// fsqlite's page buffer pool (1024 slots) is shared between the page cache
+    /// and transaction write-sets. After importing ~1400 issues, cached B-tree
+    /// pages exhaust the pool and new writes fail with OOM. The only way to
+    /// fully release the pool is to drop and reopen the connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the commit or reopen fails.
+    pub fn commit_import_batch(&mut self, reopen: bool) -> Result<()> {
+        self.conn.execute("COMMIT")?;
+        self.try_wal_checkpoint();
+        if reopen {
+            self.reopen()?;
+        }
+        Ok(())
+    }
+
+    /// Close and reopen the database connection.
+    ///
+    /// This is the only way to fully release fsqlite's shared page buffer pool,
+    /// which accumulates cached pages across transactions. Required for bulk
+    /// imports exceeding ~1000 issues.
+    ///
+    /// No-op for in-memory databases.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the new connection cannot be established.
+    pub fn reopen(&mut self) -> Result<()> {
+        if let Some(ref path) = self.db_path {
+            let new_conn = Connection::open(path.to_string_lossy().into_owned())?;
+            self.conn = new_conn;
+            self.mutation_count = 0;
+        }
+        Ok(())
+    }
+
+    /// Rollback a bulk import batch on error.
+    pub fn rollback_import_batch(&mut self) {
+        let _ = self.conn.execute("ROLLBACK");
+    }
+
+    /// Restore normal PRAGMAs after bulk import.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if PRAGMAs cannot be set.
+    pub fn end_bulk_import(&mut self) -> Result<()> {
+        self.conn.execute("PRAGMA wal_autocheckpoint = 1000")?;
+        self.try_wal_checkpoint();
+        Ok(())
     }
 
     /// Get audit events for a specific issue.
@@ -3272,6 +3351,38 @@ impl SqliteStorage {
                 Err(e)
             }
         }
+    }
+
+    /// Batch set export hashes without managing a transaction.
+    ///
+    /// Use this inside an existing transaction (e.g., during bulk import).
+    /// The caller is responsible for BEGIN/COMMIT/ROLLBACK.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub fn set_export_hashes_raw(&mut self, exports: &[(String, String)]) -> Result<usize> {
+        if exports.is_empty() {
+            return Ok(0);
+        }
+        let now = Utc::now().to_rfc3339();
+        let mut count = 0;
+        for (issue_id, content_hash) in exports {
+            self.conn.execute_with_params(
+                "DELETE FROM export_hashes WHERE issue_id = ?",
+                &[SqliteValue::from(issue_id.as_str())],
+            )?;
+            self.conn.execute_with_params(
+                "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
+                &[
+                    SqliteValue::from(issue_id.as_str()),
+                    SqliteValue::from(content_hash.as_str()),
+                    SqliteValue::from(now.as_str()),
+                ],
+            )?;
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// Batch set export hashes for multiple issues after successful export.

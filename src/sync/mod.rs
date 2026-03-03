@@ -2301,6 +2301,12 @@ pub fn import_from_jsonl(
     let mut import_ops = Vec::new();
     let mut new_export_hashes = Vec::new();
 
+    // Fast path: when the DB is empty (e.g., --rebuild after deleting beads.db),
+    // skip all collision detection queries. Every issue is new, so we can directly
+    // produce Insert actions. This avoids 3 SELECT queries per issue that would
+    // otherwise overwhelm fsqlite's internal memory on large imports (2000+ issues).
+    let db_is_empty = storage.count_issues()? == 0;
+
     let progress =
         create_progress_bar(issues.len() as u64, "Scanning issues", config.show_progress);
 
@@ -2334,26 +2340,30 @@ pub fn import_from_jsonl(
         // Compute content hash for collision detection
         let computed_hash = content_hash(&effective_issue);
 
-        // Detect collision
-        let collision = detect_collision(&effective_issue, storage, &computed_hash)?;
+        if db_is_empty {
+            // Fast path: no existing issues, everything is an insert
+            let target_id = effective_issue.id.clone();
+            new_export_hashes.push((target_id, computed_hash));
+            import_ops.push((effective_issue, CollisionAction::Insert));
+        } else {
+            // Normal path: detect collisions against existing DB
+            let collision = detect_collision(&effective_issue, storage, &computed_hash)?;
+            let action =
+                determine_action(&collision, &effective_issue, storage, config.force_upsert)?;
 
-        // Determine action
-        let action = determine_action(&collision, &effective_issue, storage, config.force_upsert)?;
+            // Determine target ID and record mapping
+            let target_id = match &collision {
+                CollisionResult::Match { existing_id, .. } => existing_id.clone(),
+                CollisionResult::NewIssue => effective_issue.id.clone(),
+            };
 
-        // Determine target ID and record mapping
-        let target_id = match &collision {
-            CollisionResult::Match { existing_id, .. } => existing_id.clone(),
-            CollisionResult::NewIssue => effective_issue.id.clone(),
-        };
+            if target_id != effective_issue.id {
+                renames.insert(effective_issue.id.clone(), target_id.clone());
+            }
 
-        if target_id != effective_issue.id {
-            renames.insert(effective_issue.id.clone(), target_id.clone());
+            new_export_hashes.push((target_id, computed_hash));
+            import_ops.push((effective_issue, action));
         }
-
-        // Collect hash for export_hashes table
-        new_export_hashes.push((target_id, computed_hash));
-
-        import_ops.push((effective_issue, action));
         progress.inc(1);
     }
     progress.finish_with_message("Scan complete");
@@ -2385,31 +2395,67 @@ pub fn import_from_jsonl(
         }
     }
 
-    // Phase 3: Execute Actions
+    // Phase 3: Execute Actions in batched transactions
+    // Without batching, each SQL statement runs in autocommit mode, causing
+    // unbounded WAL growth (one WAL frame per statement × ~5 statements per issue).
+    // Batching into groups of 500 reduces WAL frames by ~2500× and allows periodic
+    // checkpointing to keep WAL size bounded.
+    const IMPORT_BATCH_SIZE: usize = 25;
+
     let progress = create_progress_bar(
         import_ops.len() as u64,
         "Importing issues",
         config.show_progress,
     );
 
-    for (issue, action) in import_ops {
-        process_import_action(storage, &action, &issue, &mut result)?;
+    storage.begin_import_batch()?;
+    let mut batch_count = 0;
+
+    for (issue, action) in &import_ops {
+        if let Err(e) = process_import_action(storage, action, issue, &mut result) {
+            storage.rollback_import_batch();
+            storage.end_bulk_import()?;
+            return Err(e);
+        }
+        batch_count += 1;
         progress.inc(1);
+
+        // Commit, checkpoint WAL, and reopen connection every IMPORT_BATCH_SIZE issues.
+        // Reopening is required because fsqlite's page buffer pool (1024 slots) is
+        // shared between the page cache and transaction write-sets. As the B-tree
+        // grows, cached pages exhaust the pool, leaving no room for writes.
+        // Reopening drops all cached pages and resets the pool.
+        if batch_count >= IMPORT_BATCH_SIZE {
+            storage.commit_import_batch(true)?;
+            storage.begin_import_batch()?;
+            batch_count = 0;
+        }
     }
+
+    // Commit final partial batch (includes export hashes and metadata below)
+    // Restore export hashes inside the final batch transaction
+    if !new_export_hashes.is_empty() {
+        if let Err(e) = storage.set_export_hashes_raw(&new_export_hashes) {
+            storage.rollback_import_batch();
+            storage.end_bulk_import()?;
+            return Err(e);
+        }
+    }
+
+    storage.commit_import_batch(true)?;
     progress.finish_with_message("Import complete");
 
-    // Restore export hashes for imported issues
-    if !new_export_hashes.is_empty() {
-        storage.set_export_hashes(&new_export_hashes)?;
-    }
-
-    // Step 10: Refresh blocked cache
+    // Step 10: Refresh blocked cache (outside batch — uses its own transaction)
     storage.rebuild_blocked_cache(true)?;
 
     // Step 11: Update metadata
     storage.set_metadata(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
     let jsonl_hash = compute_jsonl_hash(input_path)?;
     storage.set_metadata(METADATA_JSONL_CONTENT_HASH, &jsonl_hash)?;
+
+    // Restore normal PRAGMAs and do final WAL compaction
+    storage.end_bulk_import()?;
+
     Ok(result)
 }
 
