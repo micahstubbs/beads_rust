@@ -2703,6 +2703,7 @@ impl SqliteStorage {
     /// Returns an error if a database query fails.
     fn collect_descendant_ids(&self, parent_id: &str) -> Result<Vec<String>> {
         let mut result = Vec::new();
+        let mut visited = HashSet::new();
         let mut queue = std::collections::VecDeque::new();
         queue.push_back(parent_id.to_string());
         while let Some(pid) = queue.pop_front() {
@@ -2713,7 +2714,7 @@ impl SqliteStorage {
             for row in &rows {
                 if let Some(id) = row.get(0).and_then(SqliteValue::as_text) {
                     let id = id.to_string();
-                    if !result.contains(&id) {
+                    if visited.insert(id.clone()) {
                         queue.push_back(id.clone());
                         result.push(id);
                     }
