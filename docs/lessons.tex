@@ -1,0 +1,229 @@
+\documentclass[twocolumn,10pt,letterpaper]{article}
+
+% -- Page geometry --
+\usepackage[
+  top=0.85in,
+  bottom=0.75in,
+  left=0.65in,
+  right=0.65in,
+  columnsep=0.25in
+]{geometry}
+
+% -- Beautiful typography: Century Schoolbook --
+\usepackage[T1]{fontenc}
+\usepackage{tgschola}              % TeX Gyre Schola (Century Schoolbook)
+\usepackage[scaled=0.82]{beramono} % Bera Mono for code
+\usepackage{microtype}             % Microtypographic refinements
+\usepackage{setspace}              % Line spacing control
+\setstretch{1.08}                  % Slightly open leading for readability
+
+% -- Packages --
+\usepackage{xurl}        % Allow URL breaks at any character (load before hyperref)
+\makeatletter
+\g@addto@macro\UrlBreaks{\UrlOrds}
+\makeatother
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{booktabs}    % Professional tables
+\usepackage{tabularx}    % Width-constrained tables
+\usepackage{enumitem}    % List customization
+\usepackage{fancyhdr}
+\usepackage{xcolor}
+\usepackage{balance}
+\usepackage{stfloats}    % Enable [h] placement for table* in two-column layout
+\usepackage{titlesec}    % Section heading customization
+\usepackage{listings}    % Code blocks with line wrapping
+
+% -- Paragraph spacing (no indent, modest skip) --
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.4em plus 0.1em minus 0.05em}
+\setlength{\emergencystretch}{3em}  % Extra stretch to avoid overfull hboxes in narrow columns
+
+% -- Code listings with line wrapping --
+\lstset{
+  basicstyle=\footnotesize\ttfamily,
+  breaklines=true,
+  breakatwhitespace=false,
+  breakautoindent=true,
+  postbreak=\mbox{\textcolor{accentrule}{$\hookrightarrow$}\space},
+  columns=fullflexible,
+  keepspaces=true,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{codebg},
+  framesep=3pt,
+  aboveskip=0.5em,
+  belowskip=0.5em,
+  xleftmargin=4pt,
+  xrightmargin=0pt,
+}
+
+% -- Colors --
+\definecolor{linkblue}{HTML}{1D4ED8}
+\definecolor{headergray}{HTML}{1F2937}
+\definecolor{rulegray}{HTML}{D1D5DB}
+\definecolor{titlebg}{HTML}{111827}
+\definecolor{accentrule}{HTML}{6B7280}
+\definecolor{brandred}{HTML}{8B2635}
+\definecolor{codebg}{HTML}{F3F4F6}    % Very light gray for code backgrounds
+
+% -- Hyperlinks --
+\hypersetup{
+    colorlinks=true,
+    linkcolor=linkblue,
+    urlcolor=linkblue,
+    citecolor=linkblue,
+    pdfstartview=FitH
+}
+
+% -- Section numbering: Roman > Alph > Arabic > alph, no decimals --
+\renewcommand{\thesection}{\Roman{section}}
+\renewcommand{\thesubsection}{\Alph{subsection}}
+\renewcommand{\thesubsubsection}{\arabic{subsubsection}}
+\renewcommand{\theparagraph}{\alph{paragraph}}
+\makeatletter
+\@addtoreset{subsection}{section}
+\@addtoreset{subsubsection}{subsection}
+\@addtoreset{paragraph}{subsubsection}
+\makeatother
+
+% -- Section headings --
+\titleformat{\section}
+  {\large\bfseries\color{titlebg}}
+  {\thesection.}{0.5em}{}
+  [\vspace{-0.3em}{\color{accentrule}\rule{\columnwidth}{0.5pt}}]
+\titleformat{\subsection}
+  {\normalsize\bfseries\color{headergray}}
+  {\thesubsection.}{0.4em}{}
+\titleformat{\subsubsection}
+  {\small\bfseries\itshape\color{headergray}}
+  {\thesubsubsection.}{0.4em}{}
+\titleformat{\paragraph}[runin]
+  {\small\bfseries\color{headergray}}
+  {\theparagraph)}{0.4em}{}[.\hspace{0.4em}]
+\titlespacing*{\section}{0pt}{1.0em}{0.35em}
+\titlespacing*{\subsection}{0pt}{0.75em}{0.2em}
+\titlespacing*{\subsubsection}{0pt}{0.55em}{0.15em}
+\titlespacing*{\paragraph}{0pt}{0.4em}{0em}
+
+% -- Lists: compact, elegant --
+\setlist{nosep, leftmargin=1.1em, topsep=0.2em, itemsep=0.05em}
+\setlist[itemize]{label={\small\textcolor{accentrule}{\textbullet}}}
+\setlist[enumerate]{label={\small\textcolor{headergray}{\arabic*.}}}
+
+% -- Tables: tighter, small text --
+\renewcommand{\arraystretch}{1.15}
+
+% -- Header/footer (pages 2+) --
+\pagestyle{fancy}
+\fancyhf{}
+\renewcommand{\headrulewidth}{0.3pt}
+\renewcommand{\headrule}{\hbox to\headwidth{\color{rulegray}\leaders\hrule height \headrulewidth\hfill}}
+\fancyhead[L]{\footnotesize\color{headergray}\textit{Lessons Learned}}
+\renewcommand{\footrulewidth}{0.3pt}
+\renewcommand{\footrule}{\hbox to\headwidth{\color{rulegray}\leaders\hrule height \footrulewidth\hfill}}
+% Brand mark footer: CaseMirror wordmark left, page number right (both burgundy)
+\fancyfoot[L]{\footnotesize\textbf{\color{headergray}CaseMirror}}
+\fancyfoot[R]{\footnotesize\color{headergray}\thepage}
+
+% -- Page 1 style: footer only, no header rule --
+\fancypagestyle{firstpage}{%
+  \fancyhf{}%
+  \renewcommand{\headrulewidth}{0pt}%
+  \renewcommand{\footrulewidth}{0.3pt}%
+  \renewcommand{\footrule}{\hbox to\headwidth{\color{rulegray}\leaders\hrule height 0.3pt\hfill}}%
+  \fancyfoot[L]{\footnotesize\textbf{\color{headergray}CaseMirror}}%
+  \fancyfoot[R]{\footnotesize\color{headergray}\thepage}%
+}
+
+% -- Column rule --
+\setlength{\columnseprule}{0.15pt}
+\renewcommand{\columnseprulecolor}{\color{rulegray}}
+
+% -- Title --
+\title{\vspace{-1.8em}\LARGE\bfseries\color{titlebg} Lessons Learned\vspace{-0.3em}}
+\author{CaseMirror Research \\ \small\itshape\href{https://casemirror.ai}{\textcolor{headergray}{casemirror.ai}}}
+\date{{\small\color{headergray} \today}}
+
+\begin{document}
+\raggedbottom
+\sloppy
+
+\maketitle
+\thispagestyle{firstpage}
+\vspace{-0.5em}
+
+
+\subsection{2026-03-03T09:48 - fsqlite Shared PageBufPool Causes Hard OOM on Bulk Inserts}
+
+\textbf{Problem}: \colorbox{codebg}{\texttt{br sync --rebuild --force}} on a project with 2,257 issues (2.3MB JSONL) caused "Database error: out of memory" and WAL corruption despite the system having 62GB RAM and 80GB swap. The OOM was not a system-level OOM but an internal fsqlite error.
+
+
+\textbf{Root Cause}: fsqlite (frankensqlite) has a \colorbox{codebg}{\texttt{PageBufPool}} with a hard limit of 1024 page buffers. This pool is \textbf{shared} between the ARC page cache and transaction write-sets (\colorbox{codebg}{\texttt{pager.rs:354: let pool = inner.cache.pool().clone()}}). As the B-tree grows during bulk inserts, dirty pages accumulate in the write-set. The \colorbox{codebg}{\texttt{write\_page}} codepath (\colorbox{codebg}{\texttt{pager.rs:983}}) does \colorbox{codebg}{\texttt{self.pool.acquire()?}} with NO fallback on OOM — unlike \colorbox{codebg}{\texttt{fetch\_page}} which can fall back to reading directly from disk. Once the combined cache + write-set exceeds 1024 slots, every subsequent write fails with \colorbox{codebg}{\texttt{FrankenError::OutOfMemory}}.
+
+
+\textbf{Lesson}: When a library reports "out of memory" but the system has plenty of RAM, the OOM is likely an internal resource pool exhaustion, not a system memory issue. Investigate the library's internal memory management before trying system-level fixes. Shared resource pools between cache and write paths are a common source of this — the cache grows to fill the pool, leaving no room for writes.
+
+
+\textbf{Code Issue}:
+
+\begin{lstlisting}
+// Before (broken): Single giant transaction for all inserts
+storage.begin_import_batch()?;
+for (issue, action) in &import_ops {
+    process_import_action(storage, action, issue, &mut result)?;
+    // B-tree pages accumulate in write-set, eventually exhausting pool
+}
+storage.commit_import_batch(false)?;
+
+// After (fixed): Small batches with connection reopen
+const IMPORT_BATCH_SIZE: usize = 25;
+storage.begin_import_batch()?;
+let mut batch_count = 0;
+for (issue, action) in &import_ops {
+    process_import_action(storage, action, issue, &mut result)?;
+    batch_count += 1;
+    if batch_count >= IMPORT_BATCH_SIZE {
+        storage.commit_import_batch(true)?;  // true = reopen connection
+        storage.begin_import_batch()?;
+        batch_count = 0;
+    }
+}
+storage.commit_import_batch(true)?;
+\end{lstlisting}
+
+\textbf{Solution}: Three-part fix:
+
+\begin{enumerate}
+\setlength{\itemsep}{0pt}
+\setlength{\parskip}{0pt}
+  \item \textbf{Empty-DB fast path} — skip 3 collision-detection SELECTs per issue when rebuilding into an empty DB
+  \item \textbf{Batch inserts (25)} — commit every 25 inserts with WAL checkpointing to limit write-set size
+  \item \textbf{Connection reopen} — drop and reopen the fsqlite Connection between batches to fully release the shared PageBufPool (the only way to reclaim pool slots held by the ARC cache)
+\end{enumerate}
+
+\textbf{Prevention}:
+
+\begin{itemize}
+\setlength{\itemsep}{0pt}
+\setlength{\parskip}{0pt}
+  \item When using fsqlite for bulk operations, always batch writes with connection reopen
+  \item \colorbox{codebg}{\texttt{PRAGMA cache\_size}} and \colorbox{codebg}{\texttt{PRAGMA shrink\_memory}} do NOT help — they control different layers than the PageBufPool
+  \item The failure point is deterministic (same issue count regardless of cache settings), which is a strong signal of a fixed internal limit rather than a system resource issue
+  \item Add debug tracing (eprintln!) early in investigation to narrow the failure to a specific phase/loop iteration before diving into library source code
+\end{itemize}
+
+\subsection{Meta-Lessons}
+
+\begin{itemize}
+\setlength{\itemsep}{0pt}
+\setlength{\parskip}{0pt}
+  \item \textbf{Library OOM != System OOM}: Always check if the "out of memory" error is from an internal resource pool before assuming system memory exhaustion
+  \item \textbf{Shared resource pools are dangerous}: When a pool serves both cache and active operations, the cache can starve the operations. The only safe fix is periodic pool release (connection reopen)
+  \item \textbf{Debug tracing narrows scope fast}: Adding eprintln! to phase boundaries and loop iterations pinpointed the failure from "somewhere in import" to "Phase 3 at issue \textasciitilde{}1479" in one run, saving hours of guesswork
+  \item \textbf{Batch size bisection}: When a batch size works or fails deterministically, binary search for the threshold (500→100→50→25) is the fastest path to a working configuration
+\end{itemize}
+
+
+\balance
+\end{document}
