@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 /// Number of mutations between WAL checkpoint attempts.
 const WAL_CHECKPOINT_INTERVAL: u32 = 50;
+const DEFAULT_BUSY_TIMEOUT_MS: u64 = 30_000;
 
 /// SQLite-based storage backend.
 #[derive(Debug)]
@@ -94,7 +95,7 @@ impl SqliteStorage {
     ///
     /// Returns an error if the connection cannot be established or schema application fails.
     pub fn open(path: &Path) -> Result<Self> {
-        Self::open_with_timeout(path, None)
+        Self::open_with_timeout(path, Some(DEFAULT_BUSY_TIMEOUT_MS))
     }
 
     /// Open a new connection with an optional busy timeout (ms).
@@ -133,6 +134,7 @@ impl SqliteStorage {
     /// Returns an error if the connection cannot be established.
     pub fn open_memory() -> Result<Self> {
         let conn = Connection::open(":memory:")?;
+        conn.execute(&format!("PRAGMA busy_timeout={DEFAULT_BUSY_TIMEOUT_MS}"))?;
         apply_schema(&conn)?;
         Ok(Self {
             conn,
@@ -157,10 +159,7 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub(crate) fn execute_raw_query(
-        &self,
-        sql: &str,
-    ) -> Result<Vec<Vec<SqliteValue>>> {
+    pub(crate) fn execute_raw_query(&self, sql: &str) -> Result<Vec<Vec<SqliteValue>>> {
         let rows = self.conn.query(sql)?;
         Ok(rows.iter().map(|r| r.values().to_vec()).collect())
     }
@@ -494,9 +493,8 @@ impl SqliteStorage {
             ""
         };
 
-        let query = format!(
-            "SELECT depends_on_id FROM dependencies WHERE issue_id = ? {type_filter}"
-        );
+        let query =
+            format!("SELECT depends_on_id FROM dependencies WHERE issue_id = ? {type_filter}");
 
         let mut visited: HashSet<String> = HashSet::new();
         let mut frontier: Vec<String> = vec![depends_on_id.to_string()];
@@ -509,10 +507,7 @@ impl SqliteStorage {
                 continue; // already visited
             }
 
-            let rows = conn.query_with_params(
-                &query,
-                &[SqliteValue::from(current.as_str())],
-            )?;
+            let rows = conn.query_with_params(&query, &[SqliteValue::from(current.as_str())])?;
             for row in &rows {
                 if let Some(next_id) = row.get(0).and_then(SqliteValue::as_text) {
                     if !visited.contains(next_id) {
@@ -4226,8 +4221,8 @@ impl SqliteStorage {
                 issue.content_hash.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
                 SqliteValue::from(issue.title.as_str()),
                 issue.description.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                issue.design.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                issue.acceptance_criteria.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                SqliteValue::from(issue.design.as_deref().unwrap_or("")),
+                SqliteValue::from(issue.acceptance_criteria.as_deref().unwrap_or("")),
                 issue.notes.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
                 SqliteValue::from(status_str),
                 SqliteValue::from(i64::from(issue.priority.0)),
@@ -5215,6 +5210,50 @@ mod tests {
         );
 
         lock_conn.execute("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn test_open_uses_default_busy_timeout() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("lock_read_open_default.db");
+
+        let _ = SqliteStorage::open(&db_path).unwrap();
+
+        let lock_conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        lock_conn.execute("BEGIN IMMEDIATE").unwrap();
+
+        let opened = SqliteStorage::open(&db_path);
+        assert!(
+            opened.is_ok(),
+            "default open() should use the standard busy timeout under a concurrent write lock"
+        );
+
+        lock_conn.execute("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn test_upsert_issue_for_import_coalesces_optional_text_fields_to_empty_strings() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = Issue {
+            id: "bd-import-null-optional-text".to_string(),
+            title: "Import null optional text".to_string(),
+            ..Issue::default()
+        };
+
+        storage.upsert_issue_for_import(&issue).unwrap();
+
+        let row = storage
+            .conn
+            .query_row_with_params(
+                "SELECT typeof(design), typeof(acceptance_criteria), design, acceptance_criteria FROM issues WHERE id = ?",
+                &[SqliteValue::from(issue.id.as_str())],
+            )
+            .unwrap();
+
+        assert_eq!(row.get(0).and_then(SqliteValue::as_text), Some("text"));
+        assert_eq!(row.get(1).and_then(SqliteValue::as_text), Some("text"));
+        assert_eq!(row.get(2).and_then(SqliteValue::as_text), Some(""));
+        assert_eq!(row.get(3).and_then(SqliteValue::as_text), Some(""));
     }
 
     #[test]

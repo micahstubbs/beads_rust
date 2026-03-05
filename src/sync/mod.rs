@@ -2422,15 +2422,16 @@ pub fn import_from_jsonl(
     ];
     let mut orphans_cleaned = 0usize;
     for (table, col) in orphan_tables {
-        let sql = format!(
-            "DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues)"
-        );
+        let sql = format!("DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues)");
         if let Ok(n) = storage.execute_raw_count(&sql) {
             orphans_cleaned += n;
         }
     }
     if orphans_cleaned > 0 {
-        tracing::info!(count = orphans_cleaned, "Cleaned orphaned FK rows after import");
+        tracing::info!(
+            count = orphans_cleaned,
+            "Cleaned orphaned FK rows after import"
+        );
         result.orphan_cleaned_count = orphans_cleaned;
     }
 

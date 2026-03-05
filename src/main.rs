@@ -241,8 +241,7 @@ fn run_auto_import(overrides: &config::CliOverrides, allow_stale: bool) -> Resul
 
     // Resolve startup config once for both no_db and no_auto_import checks
     let (skip_db, no_auto_import) = {
-        let startup_layer =
-            config::load_startup_config(&beads_dir).unwrap_or_default();
+        let startup_layer = config::load_startup_config(&beads_dir).unwrap_or_default();
         let merged_layer =
             config::ConfigLayer::merge_layers(&[startup_layer, overrides.as_layer()]);
         (

@@ -141,6 +141,31 @@ fn import_sets_closed_at_when_missing() {
 }
 
 #[test]
+fn export_import_roundtrip_keeps_optional_text_fields_integrity_safe() {
+    let mut storage = SqliteStorage::open_memory().unwrap();
+    let issue = issue_with_id("test-optional-text", "Optional text fields");
+    storage.create_issue(&issue, "tester").unwrap();
+
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("issues.jsonl");
+    export_to_jsonl(&storage, &path, &ExportConfig::default()).unwrap();
+
+    let db_path = temp.path().join("import.db");
+    let mut imported = SqliteStorage::open(&db_path).unwrap();
+    import_from_jsonl(
+        &mut imported,
+        &path,
+        &ImportConfig::default(),
+        Some("test-"),
+    )
+    .unwrap();
+
+    let imported_issue = imported.get_issue(&issue.id).unwrap().unwrap();
+    assert_eq!(imported_issue.design, None);
+    assert_eq!(imported_issue.acceptance_criteria, None);
+}
+
+#[test]
 fn import_rejects_conflict_markers() {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("issues.jsonl");

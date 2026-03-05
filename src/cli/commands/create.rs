@@ -132,7 +132,7 @@ pub fn create_issue_impl(
     // instead of a random hash-based ID
     let id = if let Some(parent_id) = &args.parent {
         // Verify parent exists
-        if !storage.id_exists(parent_id).unwrap_or(false) {
+        if !storage.id_exists(parent_id)? {
             return Err(BeadsError::IssueNotFound {
                 id: parent_id.clone(),
             });
@@ -143,16 +143,16 @@ pub fn create_issue_impl(
         let candidate = child_id(parent_id, next_num);
 
         // Double-check the ID doesn't exist (race condition safety)
-        if storage.id_exists(&candidate).unwrap_or(false) {
+        if storage.id_exists(&candidate)? {
             // Extremely unlikely, but handle by incrementing
             let mut num = next_num + 1;
             loop {
                 let alt = child_id(parent_id, num);
-                if !storage.id_exists(&alt).unwrap_or(false) {
+                if !storage.id_exists(&alt)? {
                     break alt;
                 }
                 num += 1;
-                if num > next_num + 100 {
+                if num > next_num.saturating_add(100) {
                     return Err(BeadsError::validation(
                         "parent",
                         "could not find available child ID",
@@ -703,6 +703,32 @@ mod tests {
         let err = create_issue_impl(&mut storage, &args, &config).unwrap_err();
         assert!(matches!(err, BeadsError::Validation { field, .. } if field == "title"));
         info!("test_create_issue_validation_empty_title: assertions passed");
+    }
+
+    #[test]
+    fn test_create_issue_with_parent_propagates_storage_error() {
+        init_test_logging();
+        info!("test_create_issue_with_parent_propagates_storage_error: starting");
+        let mut storage = setup_memory_storage();
+        let mut parent = default_args();
+        parent.title = Some("Parent".to_string());
+        let config = default_config();
+        let created_parent =
+            create_issue_impl(&mut storage, &parent, &config).expect("create parent");
+
+        storage
+            .execute_raw("DROP TABLE issues")
+            .expect("drop issues");
+
+        let mut child = default_args();
+        child.parent = Some(created_parent.id);
+
+        let err = create_issue_impl(&mut storage, &child, &config).unwrap_err();
+        assert!(
+            matches!(err, BeadsError::Database(_)),
+            "expected database error, got: {err:?}"
+        );
+        info!("test_create_issue_with_parent_propagates_storage_error: assertions passed");
     }
 
     #[test]
