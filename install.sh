@@ -351,7 +351,7 @@ usage() {
         echo ""
 
         gum style --foreground 214 --bold "PLATFORMS"
-        echo "  $(gum style --foreground 82 '✓ Linux x86_64') $(gum style --foreground 245 --faint '(glibc and musl)')"
+        echo "  $(gum style --foreground 82 '✓ Linux x86_64')"
         gum style --foreground 82 "  ✓ Linux ARM64"
         gum style --foreground 82 "  ✓ macOS Intel"
         gum style --foreground 82 "  ✓ macOS Apple Silicon"
@@ -390,7 +390,7 @@ Environment Variables:
   VERSION            Override version to install
 
 Platforms:
-  ✓ Linux x86_64 (glibc and musl)
+  ✓ Linux x86_64
   ✓ Linux ARM64
   ✓ macOS Intel
   ✓ macOS Apple Silicon
@@ -1311,16 +1311,6 @@ main() {
 
         if [ -n "$VERSION" ]; then
             local downloaded=0
-            # On Linux x86_64, prefer the musl (statically linked) binary
-            # for maximum compatibility across glibc versions
-            if [ "$platform" = "linux_amd64" ] && [ -z "$ARTIFACT_URL" ]; then
-                log_step "Trying statically-linked musl binary for maximum compatibility..."
-                if download_release "linux_musl_amd64"; then
-                    downloaded=1
-                else
-                    log_warn "musl binary not available, trying gnu binary..."
-                fi
-            fi
             if [ "$downloaded" -eq 0 ]; then
                 if download_release "$platform"; then
                     downloaded=1
