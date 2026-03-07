@@ -974,6 +974,50 @@ install_binary_atomic() {
     fi
 }
 
+is_windows_binary() {
+    case "$1" in
+        *.exe) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_installable_binary() {
+    local path="$1"
+    if [ ! -f "$path" ]; then
+        return 1
+    fi
+
+    if [ -x "$path" ] || is_windows_binary "$path"; then
+        return 0
+    fi
+
+    return 1
+}
+
+find_binary_candidate() {
+    local search_root="$1"
+    local binary_name="$2"
+    local bin="$search_root/$binary_name"
+
+    if is_installable_binary "$bin"; then
+        printf '%s\n' "$bin"
+        return 0
+    fi
+
+    if is_windows_binary "$binary_name"; then
+        bin=$(find "$search_root" -name "$binary_name" -type f 2>/dev/null | head -1)
+    else
+        bin=$(find "$search_root" -name "$binary_name" -type f -perm -111 2>/dev/null | head -1)
+    fi
+
+    if [ -n "$bin" ] && is_installable_binary "$bin"; then
+        printf '%s\n' "$bin"
+        return 0
+    fi
+
+    return 1
+}
+
 # ============================================================================
 # Build from source
 # ============================================================================
@@ -1009,12 +1053,8 @@ build_from_source() {
     fi
 
     # Find the binary
-    local bin="$target_dir/release/$BINARY_NAME"
-    if [ ! -x "$bin" ]; then
-        bin=$(find "$target_dir" -name "$BINARY_NAME" -type f -perm -111 2>/dev/null | head -1)
-    fi
-
-    if [ ! -x "$bin" ]; then
+    local bin
+    if ! bin=$(find_binary_candidate "$target_dir" "$BINARY_NAME"); then
         die "Binary not found after build"
     fi
 
@@ -1131,12 +1171,8 @@ PY
     esac
 
     # Find binary
-    local bin="$TMP/$BINARY_NAME"
-    if [ ! -x "$bin" ]; then
-        bin=$(find "$TMP" -name "$BINARY_NAME" -type f -perm -111 2>/dev/null | head -1)
-    fi
-
-    if [ ! -x "$bin" ]; then
+    local bin
+    if ! bin=$(find_binary_candidate "$TMP" "$BINARY_NAME"); then
         return 1
     fi
 
