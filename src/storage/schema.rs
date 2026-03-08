@@ -204,16 +204,131 @@ pub const SCHEMA_SQL: &str = r"
     );
 ";
 
+/// Split a SQL script into individual statements, respecting string literals,
+/// quoted identifiers, and comments.
+///
+/// A naive `split(';')` breaks when SQL string literals contain semicolons
+/// (e.g., `INSERT INTO t(v) VALUES('a;b')`). This function uses a small state
+/// machine to track whether the current position is inside:
+/// - A single-quoted string literal (`'...'`, with `''` as escape)
+/// - A double-quoted identifier (`"..."`, with `""` as escape)
+/// - A line comment (`-- ...`)
+/// - A block comment (`/* ... */`)
+///
+/// Only semicolons at the top level (outside all of the above) are treated as
+/// statement terminators.
+fn split_sql_statements(sql: &str) -> Vec<&str> {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut stmts = Vec::new();
+    let mut start = 0; // byte offset where the current statement begins
+    let mut i = 0;
+
+    // State flags — at most one is true at a time.
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+
+    while i < len {
+        let b = bytes[i];
+
+        // --- Line comment state ---
+        if in_line_comment {
+            if b == b'\n' {
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        // --- Block comment state ---
+        if in_block_comment {
+            if b == b'*' && i + 1 < len && bytes[i + 1] == b'/' {
+                in_block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        // --- Single-quoted string state ---
+        if in_single_quote {
+            if b == b'\'' {
+                // '' is an escaped quote inside a string literal
+                if i + 1 < len && bytes[i + 1] == b'\'' {
+                    i += 2;
+                } else {
+                    in_single_quote = false;
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        // --- Double-quoted identifier state ---
+        if in_double_quote {
+            if b == b'"' {
+                if i + 1 < len && bytes[i + 1] == b'"' {
+                    i += 2;
+                } else {
+                    in_double_quote = false;
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        // --- Top-level parsing ---
+        if b == b'\'' {
+            in_single_quote = true;
+            i += 1;
+        } else if b == b'"' {
+            in_double_quote = true;
+            i += 1;
+        } else if b == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
+            in_line_comment = true;
+            i += 2;
+        } else if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            in_block_comment = true;
+            i += 2;
+        } else if b == b';' {
+            // Statement terminator at top level.
+            let stmt = &sql[start..i];
+            if !stmt.trim().is_empty() {
+                stmts.push(stmt.trim());
+            }
+            start = i + 1;
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Trailing statement without a final semicolon.
+    if start < len {
+        let stmt = &sql[start..len];
+        if !stmt.trim().is_empty() {
+            stmts.push(stmt.trim());
+        }
+    }
+
+    stmts
+}
+
 /// Execute multiple SQL statements separated by semicolons.
 ///
-/// fsqlite does not support `execute_batch`, so we split on `;` and
-/// execute each non-empty statement individually.
+/// fsqlite does not support `execute_batch`, so we split the SQL script
+/// into individual statements (respecting string literals and comments)
+/// and execute each one individually.
 pub(crate) fn execute_batch(conn: &Connection, sql: &str) -> Result<()> {
-    for stmt in sql.split(';') {
-        let trimmed = stmt.trim();
-        if !trimmed.is_empty() {
-            conn.execute(trimmed)?;
-        }
+    for stmt in split_sql_statements(sql) {
+        conn.execute(stmt)?;
     }
     Ok(())
 }
@@ -1566,5 +1681,95 @@ mod tests {
             !runtime_schema_compatible(&conn),
             "legacy config/metadata primary keys should force the full repair path"
         );
+    }
+
+    // ---- split_sql_statements tests ----
+
+    #[test]
+    fn test_split_normal_multi_statement() {
+        let sql = "CREATE TABLE a (id INT); CREATE TABLE b (id INT); INSERT INTO a VALUES (1)";
+        let stmts = split_sql_statements(sql);
+        assert_eq!(stmts.len(), 3);
+        assert_eq!(stmts[0], "CREATE TABLE a (id INT)");
+        assert_eq!(stmts[1], "CREATE TABLE b (id INT)");
+        assert_eq!(stmts[2], "INSERT INTO a VALUES (1)");
+    }
+
+    #[test]
+    fn test_split_semicolon_inside_single_quoted_string() {
+        let sql = "INSERT INTO t(v) VALUES('a;b'); SELECT 1";
+        let stmts = split_sql_statements(sql);
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0], "INSERT INTO t(v) VALUES('a;b')");
+        assert_eq!(stmts[1], "SELECT 1");
+    }
+
+    #[test]
+    fn test_split_semicolon_inside_double_quoted_identifier() {
+        let sql = r#"CREATE TABLE "weird;name" (id INT); SELECT 1"#;
+        let stmts = split_sql_statements(sql);
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0], r#"CREATE TABLE "weird;name" (id INT)"#);
+        assert_eq!(stmts[1], "SELECT 1");
+    }
+
+    #[test]
+    fn test_split_escaped_quotes_in_string() {
+        // SQL escapes single quotes by doubling them: 'it''s'
+        let sql = "INSERT INTO t(v) VALUES('it''s;here'); SELECT 2";
+        let stmts = split_sql_statements(sql);
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0], "INSERT INTO t(v) VALUES('it''s;here')");
+        assert_eq!(stmts[1], "SELECT 2");
+    }
+
+    #[test]
+    fn test_split_empty_statements() {
+        let sql = "SELECT 1;; ; SELECT 2";
+        let stmts = split_sql_statements(sql);
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0], "SELECT 1");
+        assert_eq!(stmts[1], "SELECT 2");
+    }
+
+    #[test]
+    fn test_split_trailing_semicolon() {
+        let sql = "SELECT 1; SELECT 2;";
+        let stmts = split_sql_statements(sql);
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0], "SELECT 1");
+        assert_eq!(stmts[1], "SELECT 2");
+    }
+
+    #[test]
+    fn test_split_line_comment_with_semicolon() {
+        let sql = "SELECT 1; -- this is a comment; not a split\nSELECT 2";
+        let stmts = split_sql_statements(sql);
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0], "SELECT 1");
+        assert_eq!(stmts[1], "-- this is a comment; not a split\nSELECT 2");
+    }
+
+    #[test]
+    fn test_split_block_comment_with_semicolon() {
+        let sql = "SELECT 1; /* comment; with; semicolons */ SELECT 2";
+        let stmts = split_sql_statements(sql);
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0], "SELECT 1");
+        assert_eq!(stmts[1], "/* comment; with; semicolons */ SELECT 2");
+    }
+
+    #[test]
+    fn test_split_empty_input() {
+        assert!(split_sql_statements("").is_empty());
+        assert!(split_sql_statements("   ").is_empty());
+        assert!(split_sql_statements("  ;  ;  ").is_empty());
+    }
+
+    #[test]
+    fn test_split_single_statement_no_semicolon() {
+        let stmts = split_sql_statements("SELECT 42");
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "SELECT 42");
     }
 }
