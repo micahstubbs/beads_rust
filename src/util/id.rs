@@ -152,10 +152,18 @@ impl IdGenerator {
 
                     nonce += 1;
 
-                    // Safety break (unlikely to hit unless DB is full of collisions or checking is broken)
+                    // Safety break: if we hit 1000 collisions even with 12-char hashes,
+                    // append the nonce to force uniqueness.
                     if nonce > 1000 {
-                        // Desperate fallback: append large number to guarantee uniqueness
-                        return format!("{}-{}{}", self.config.prefix, hash_str, nonce);
+                        let desperate_id = format!("{}-{hash_str}{nonce}", self.config.prefix);
+                        if !exists(&desperate_id) {
+                            return desperate_id;
+                        }
+                    }
+
+                    // Hard stop at 2000 to prevent infinite loop if exists() is broken
+                    if nonce > 2000 {
+                        return format!("{}-{hash_str}{nonce}-FINAL", self.config.prefix);
                     }
                 }
             }
@@ -237,44 +245,8 @@ pub fn child_id(parent_id: &str, child_number: u32) -> String {
     format!("{parent_id}.{child_number}")
 }
 
-fn is_numeric_segment(segment: &str) -> bool {
-    !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit())
-}
-
-fn is_likely_hash_segment(segment: &str) -> bool {
-    if segment.len() < 3 {
-        return false;
-    }
-
-    // 3-char hashes accept all base36; 4+ must include a digit to avoid word collisions.
-    let mut has_digit = segment.len() == 3;
-    for c in segment.chars() {
-        if c.is_ascii_digit() {
-            has_digit = true;
-            continue;
-        }
-        if !(c.is_ascii_lowercase() || c.is_ascii_uppercase()) {
-            return false;
-        }
-    }
-
-    has_digit
-}
-
 fn issue_id_separator(id: &str) -> Option<usize> {
-    let last_dash = id.rfind('-')?;
-    let suffix = &id[last_dash + 1..];
-    let base = suffix.split('.').next().unwrap_or("");
-
-    // If the suffix looks like a valid hash/number, return this position.
-    // Otherwise, still return the last dash as a fallback to handle edge cases
-    // where the hash doesn't contain digits (e.g., "my-proj-abcd").
-    if is_numeric_segment(base) || is_likely_hash_segment(base) {
-        return Some(last_dash);
-    }
-
-    // Fallback: return last dash position for edge cases like word-like hashes
-    Some(last_dash)
+    id.rfind('-')
 }
 
 pub(crate) fn split_prefix_remainder(id: &str) -> Option<(&str, &str)> {
