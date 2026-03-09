@@ -1835,11 +1835,16 @@ fn yaml_scalar_to_string(value: &serde_yml::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Issue, IssueType, Priority};
+    use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use chrono::Utc;
     use std::process::Command;
     use tempfile::TempDir;
+
+    fn write_issue_jsonl(path: &Path, issue: &Issue) {
+        let json = serde_json::to_string(&issue).expect("serialize issue");
+        fs::write(path, format!("{json}\n")).expect("write jsonl");
+    }
 
     fn write_single_issue_jsonl(path: &Path, id: &str, title: &str) {
         let now = Utc::now();
@@ -1850,8 +1855,7 @@ mod tests {
             updated_at: now,
             ..Issue::default()
         };
-        let json = serde_json::to_string(&issue).expect("serialize issue");
-        fs::write(path, format!("{json}\n")).expect("write jsonl");
+        write_issue_jsonl(path, &issue);
     }
 
     fn create_malformed_blocked_cache_db(db_path: &Path) {
@@ -3220,6 +3224,54 @@ routing:
             }),
             "malformed original database should be preserved in the recovery directory"
         );
+    }
+
+    #[test]
+    fn open_storage_with_cli_recovers_malformed_schema_db_with_in_progress_issue() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        create_malformed_blocked_cache_db(&db_path);
+        let issue = Issue {
+            id: "beads_rust-3h0h".to_string(),
+            title: "Auto-recover malformed blocked_issues_cache schema from JSONL".to_string(),
+            status: Status::InProgress,
+            priority: Priority::CRITICAL,
+            issue_type: IssueType::Bug,
+            created_at: chrono::DateTime::parse_from_rfc3339("2026-03-08T22:47:27.836536089Z")
+                .expect("parse created_at")
+                .with_timezone(&Utc),
+            updated_at: chrono::DateTime::parse_from_rfc3339("2026-03-08T22:47:30.925913142Z")
+                .expect("parse updated_at")
+                .with_timezone(&Utc),
+            created_by: Some("ubuntu".to_string()),
+            source_repo: Some(".".to_string()),
+            compaction_level: Some(0),
+            original_size: Some(0),
+            ..Issue::default()
+        };
+        write_issue_jsonl(&jsonl_path, &issue);
+
+        let storage_ctx =
+            open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
+        let recovered_issue = storage_ctx
+            .storage
+            .get_issue("beads_rust-3h0h")
+            .expect("query issue")
+            .expect("issue should exist after malformed-schema recovery");
+
+        assert_eq!(
+            recovered_issue.title,
+            "Auto-recover malformed blocked_issues_cache schema from JSONL"
+        );
+        assert_eq!(recovered_issue.status, Status::InProgress);
+        assert_eq!(recovered_issue.priority, Priority::CRITICAL);
+        assert_eq!(recovered_issue.issue_type, IssueType::Bug);
+        assert_eq!(recovered_issue.created_by.as_deref(), Some("ubuntu"));
+        assert_eq!(recovered_issue.source_repo.as_deref(), Some("."));
     }
 
     #[test]
