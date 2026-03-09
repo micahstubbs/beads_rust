@@ -62,15 +62,17 @@ impl BackupFileGuard {
 
 impl Drop for BackupFileGuard {
     fn drop(&mut self) {
-        if !self.persist
-            && self.path.exists()
-            && let Err(cleanup_err) = fs::remove_file(&self.path)
-        {
-            tracing::warn!(
-                backup = %self.path.display(),
-                cleanup_error = %cleanup_err,
-                "Failed to remove partially written history backup"
-            );
+        if !self.persist {
+            // Use remove_file directly and ignore NotFound to be TOCTOU-safe.
+            if let Err(cleanup_err) = fs::remove_file(&self.path) {
+                if cleanup_err.kind() != io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        backup = %self.path.display(),
+                        error = %cleanup_err,
+                        "Failed to remove partially written history backup"
+                    );
+                }
+            }
         }
     }
 }
@@ -210,10 +212,10 @@ fn remove_history_artifact_if_present(path: &Path, label: &str) -> Result<()> {
         Ok(metadata) => {
             let file_type = metadata.file_type();
             if file_type.is_symlink() || file_type.is_file() {
-                if let Err(err) = fs::remove_file(path) {
-                    if err.kind() != io::ErrorKind::NotFound {
-                        return Err(BeadsError::Io(err));
-                    }
+                if let Err(err) = fs::remove_file(path)
+                    && err.kind() != io::ErrorKind::NotFound
+                {
+                    return Err(BeadsError::Io(err));
                 }
                 return Ok(());
             }

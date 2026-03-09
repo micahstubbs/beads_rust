@@ -20,6 +20,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::Issue;
 use crate::storage::SqliteStorage;
 use crate::sync::history::HistoryConfig;
+use crate::util::id::parse_id;
 use crate::util::progress::{create_progress_bar, create_spinner};
 use crate::validation::IssueValidator;
 use chrono::Utc;
@@ -1004,7 +1005,7 @@ pub fn preflight_import(
                         if is_tombstone {
                             continue;
                         }
-                        if !partial.id.starts_with(prefix) {
+                        if !id_matches_expected_prefix(&partial.id, prefix) {
                             mismatched_ids.push(partial.id);
                         }
                     }
@@ -1275,7 +1276,7 @@ pub fn export_to_jsonl_with_policy(
         } else {
             output_path.to_path_buf()
         };
-        
+
         history::backup_before_export(beads_dir, &config.history, &output_abs)?;
     }
 
@@ -1908,7 +1909,7 @@ pub fn finalize_export(
         // Update metadata
         storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, &result.content_hash)?;
         storage.set_metadata_in_tx(METADATA_LAST_EXPORT_TIME, &Utc::now().to_rfc3339())?;
-        
+
         // Clear force-flush flag if it was set
         storage.execute_raw("DELETE FROM metadata WHERE key = 'needs_flush'")?;
 
@@ -1972,7 +1973,11 @@ pub fn auto_flush(
         return Ok(AutoFlushResult::default());
     }
 
-    tracing::debug!(dirty_count, needs_flush, "Auto-flush: exporting dirty issues");
+    tracing::debug!(
+        dirty_count,
+        needs_flush,
+        "Auto-flush: exporting dirty issues"
+    );
 
     // Configure export with defaults, including beads_dir for path validation
     let export_config = ExportConfig {
@@ -2259,6 +2264,7 @@ pub fn import_from_jsonl(
     let file = File::open(input_path)?;
     let reader = BufReader::with_capacity(2 * 1024 * 1024, file);
     let mut issues = Vec::new();
+    let mut seen_ids_in_file = HashSet::new();
 
     for (line_num, line) in reader.lines().enumerate() {
         let line = line?;
@@ -2268,6 +2274,17 @@ pub fn import_from_jsonl(
         let issue: Issue = serde_json::from_str(&line).map_err(|e| {
             BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num + 1, e))
         })?;
+
+        // Detect duplicate IDs within the same file (protect against corrupted syncs)
+        if !seen_ids_in_file.insert(issue.id.clone()) {
+            tracing::warn!(
+                line = line_num + 1,
+                id = %issue.id,
+                "Duplicate issue ID in JSONL; using the last occurrence"
+            );
+            // Remove previous occurrence to keep order stable-ish while updating
+            issues.retain(|i: &Issue| i.id != issue.id);
+        }
         issues.push(issue);
     }
     spinner.finish_with_message("Read JSONL");
@@ -2301,7 +2318,7 @@ pub fn import_from_jsonl(
         let mut mismatches = Vec::new();
         for issue in &issues {
             // Check if ID starts with expected prefix
-            if !issue.id.starts_with(prefix) {
+            if !id_matches_expected_prefix(&issue.id, prefix) {
                 // Skip tombstones with wrong prefix (silently drop)
                 if issue.status == crate::model::Status::Tombstone {
                     continue;
@@ -2396,7 +2413,7 @@ pub fn import_from_jsonl(
         // If we are here and rename_on_import is false, then all remaining mismatches MUST be tombstones
         // (otherwise we would have errored above). We drop them now.
         if !config.rename_on_import {
-            issues.retain(|issue| issue.id.starts_with(prefix));
+            issues.retain(|issue| id_matches_expected_prefix(&issue.id, prefix));
         }
     }
 
@@ -2520,6 +2537,7 @@ pub fn import_from_jsonl(
             // (e.g., dependencies referencing issues not in the JSONL)
             let orphan_tables = &[
                 ("dependencies", "issue_id"),
+                ("dependencies", "depends_on_id"),
                 ("labels", "issue_id"),
                 ("comments", "issue_id"),
                 ("events", "issue_id"),
@@ -2597,6 +2615,10 @@ pub fn import_from_jsonl(
             })
         }
     }
+}
+
+fn id_matches_expected_prefix(id: &str, expected_prefix: &str) -> bool {
+    parse_id(id).is_ok_and(|parsed| parsed.prefix == expected_prefix)
 }
 
 /// Process a single import action.
@@ -3926,6 +3948,30 @@ mod tests {
     }
 
     #[test]
+    fn test_import_keeps_distinct_ids_with_identical_content() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+
+        let issue1 = make_test_issue("test-001", "Same content");
+        let issue2 = make_test_issue("test-002", "Same content");
+        let content = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&issue1).unwrap(),
+            serde_json::to_string(&issue2).unwrap()
+        );
+        fs::write(&path, content).unwrap();
+
+        let result =
+            import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("test-"))
+                .unwrap();
+        assert_eq!(result.imported_count, 2);
+        assert_eq!(result.skipped_count, 0);
+        assert!(storage.get_issue("test-001").unwrap().is_some());
+        assert!(storage.get_issue("test-002").unwrap().is_some());
+    }
+
+    #[test]
     fn test_import_restores_foreign_keys_after_relation_sync_failure() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let temp_dir = TempDir::new().unwrap();
@@ -4173,6 +4219,22 @@ mod tests {
         let config = ImportConfig::default();
         let err = import_from_jsonl(&mut storage, &path, &config, Some("bd")).unwrap_err();
         assert!(err.to_string().contains("Prefix mismatch"));
+    }
+
+    #[test]
+    fn test_import_prefix_mismatch_error_for_shared_prefix_superset() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+
+        let issue = make_issue_at("bdx-001", "Looks similar but wrong prefix", fixed_time(100));
+        let json = serde_json::to_string(&issue).unwrap();
+        fs::write(&path, format!("{json}\n")).unwrap();
+
+        let err = import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd"))
+            .unwrap_err();
+        assert!(err.to_string().contains("Prefix mismatch"));
+        assert!(err.to_string().contains("bdx-001"));
     }
 
     #[test]
@@ -4683,6 +4745,33 @@ mod tests {
         assert!(msg.contains("xx-001"), "Should list mismatched ID: {msg}");
         assert!(msg.contains("xx-002"), "Should list mismatched ID: {msg}");
         assert!(msg.contains("2 mismatched"), "Should show count: {msg}");
+    }
+
+    #[test]
+    fn test_preflight_import_rejects_shared_prefix_superset() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        let issue = make_test_issue("bdx-001", "Wrong shared prefix");
+        let json = serde_json::to_string(&issue).unwrap();
+        std::fs::write(&jsonl_path, format!("{json}\n")).unwrap();
+
+        let config = ImportConfig {
+            beads_dir: Some(beads_dir),
+            ..Default::default()
+        };
+
+        let result = preflight_import(&jsonl_path, &config, Some("bd")).unwrap();
+        assert_eq!(result.overall_status, PreflightCheckStatus::Fail);
+        let failures = result.failures();
+        let prefix_check = failures.iter().find(|c| c.name == "prefix_match");
+        assert!(prefix_check.is_some(), "Expected prefix_match failure");
+        assert!(
+            prefix_check.unwrap().message.contains("bdx-001"),
+            "Should report the mismatched ID"
+        );
     }
 
     #[test]

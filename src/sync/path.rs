@@ -20,6 +20,7 @@
 //! | `.beads/*.db-journal` | `SQLite` rollback journals |
 //! | `.beads/*.jsonl` | `JSONL` export files |
 //! | `.beads/*.jsonl.tmp` | Temp files for atomic writes |
+//! | `.beads/*.jsonl.<pid>.tmp` | PID-scoped temp files for atomic writes |
 //! | `.beads/.manifest.json` | Export manifest |
 //! | `.beads/metadata.json` | Workspace metadata |
 //!
@@ -52,7 +53,7 @@ pub const ALLOWED_EXTENSIONS: &[&str] = &[
     "db-shm",     // SQLite shared memory
     "db-journal", // SQLite rollback journal
     "jsonl",      // JSONL export
-    "jsonl.tmp",  // Atomic write temp files
+    "jsonl.tmp",  // Atomic write temp files (plus pid-scoped .jsonl.<pid>.tmp)
 ];
 
 /// Files explicitly allowed by exact name within `.beads/`.
@@ -97,7 +98,7 @@ impl PathValidation {
                 beads_dir.display()
             )),
             Self::DisallowedExtension { path, extension } => Some(format!(
-                "Path '{}' has disallowed extension '{}' (allowed: {:?})",
+                "Path '{}' has disallowed extension '{}' (allowed: {:?}, plus pid-scoped '*.jsonl.<pid>.tmp')",
                 path.display(),
                 extension,
                 ALLOWED_EXTENSIONS
@@ -397,6 +398,10 @@ fn validate_extension_and_name(path: &Path) -> PathValidation {
         return PathValidation::Allowed;
     }
 
+    if is_allowed_jsonl_temp_name(&file_name) {
+        return PathValidation::Allowed;
+    }
+
     // Check extension matches
     // Handle compound extensions like .jsonl.tmp
     for allowed_ext in ALLOWED_EXTENSIONS {
@@ -414,6 +419,21 @@ fn validate_extension_and_name(path: &Path) -> PathValidation {
         path: path.to_path_buf(),
         extension,
     }
+}
+
+fn is_allowed_jsonl_temp_name(file_name: &str) -> bool {
+    if file_name.ends_with(".jsonl.tmp") {
+        return true;
+    }
+
+    let Some(prefix) = file_name.strip_suffix(".tmp") else {
+        return false;
+    };
+    let Some((base, pid)) = prefix.rsplit_once(".jsonl.") else {
+        return false;
+    };
+
+    !base.is_empty() && !pid.is_empty() && pid.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Validates a path and returns an error if it's not allowed.
@@ -518,7 +538,7 @@ fn validate_external_jsonl_path(path: &Path) -> Result<()> {
 
     // Case-sensitive check is intentional: JSONL files should use lowercase .jsonl extension
     #[allow(clippy::case_sensitive_file_extension_comparisons)]
-    if !file_name.ends_with(".jsonl") && !file_name.ends_with(".jsonl.tmp") {
+    if !file_name.ends_with(".jsonl") && !is_allowed_jsonl_temp_name(&file_name) {
         return Err(BeadsError::Config(format!(
             "External path '{}' must be a .jsonl file",
             path.display()
@@ -758,6 +778,19 @@ mod tests {
 
         let result = validate_sync_path(&path, &beads_dir);
         assert!(result.is_allowed(), "Temp JSONL files should be allowed");
+    }
+
+    #[test]
+    fn test_allowed_pid_scoped_temp_file() {
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let path = beads_dir.join("issues.jsonl.12345.tmp");
+        std::fs::write(&path, "").expect("write");
+
+        let result = validate_sync_path(&path, &beads_dir);
+        assert!(
+            result.is_allowed(),
+            "PID-scoped temp JSONL files should be allowed"
+        );
     }
 
     #[test]
@@ -1059,6 +1092,19 @@ mod tests {
         assert!(
             result.is_ok(),
             "Temp file in same directory with .tmp extension should be valid"
+        );
+    }
+
+    #[test]
+    fn test_temp_file_valid_same_directory_with_pid_scoped_name() {
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let target = beads_dir.join("issues.jsonl");
+        let temp = beads_dir.join("issues.jsonl.12345.tmp");
+
+        let result = validate_temp_file_path(&temp, &target, &beads_dir, false);
+        assert!(
+            result.is_ok(),
+            "PID-scoped temp file in same directory should be valid"
         );
     }
 
