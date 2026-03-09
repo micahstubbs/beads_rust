@@ -2069,63 +2069,66 @@ pub enum CollisionAction {
     Skip { reason: String },
 }
 
-/// Detect collision for an incoming issue using the 4-phase algorithm.
-///
-/// Phases:
-/// 1. External reference match
-/// 2. Content hash match
-/// 3. ID match
-/// 4. No match (new issue)
+/// Detect collision for an incoming issue using the 4-phase algorithm with preloaded metadata maps.
 fn detect_collision(
     incoming: &Issue,
-    storage: &SqliteStorage,
+    id_by_ext_ref: &std::collections::HashMap<String, String>,
+    id_by_hash: &std::collections::HashMap<String, String>,
+    meta_by_id: &std::collections::HashMap<String, crate::storage::sqlite::IssueMetadata>,
     computed_hash: &str,
-) -> Result<CollisionResult> {
+) -> CollisionResult {
     // Phase 1: External reference match
     if let Some(ref external_ref) = incoming.external_ref
-        && let Some(existing) = storage.find_by_external_ref(external_ref)?
+        && let Some(existing_id) = id_by_ext_ref.get(external_ref)
     {
-        return Ok(CollisionResult::Match {
-            existing_id: existing.id,
+        return CollisionResult::Match {
+            existing_id: existing_id.clone(),
             match_type: MatchType::ExternalRef,
             phase: 1,
-        });
+        };
     }
 
     // Phase 2: Content hash match
-    if let Some(existing) = storage.find_by_content_hash(computed_hash)? {
-        return Ok(CollisionResult::Match {
-            existing_id: existing.id,
+    if let Some(existing_id) = id_by_hash.get(computed_hash) {
+        return CollisionResult::Match {
+            existing_id: existing_id.clone(),
             match_type: MatchType::ContentHash,
             phase: 2,
-        });
+        };
     }
 
     // Phase 3: ID match
-    if storage.id_exists(&incoming.id)? {
-        return Ok(CollisionResult::Match {
+    if meta_by_id.contains_key(&incoming.id) {
+        return CollisionResult::Match {
             existing_id: incoming.id.clone(),
             match_type: MatchType::Id,
             phase: 3,
-        });
+        };
     }
 
     // Phase 4: No match
-    Ok(CollisionResult::NewIssue)
+    CollisionResult::NewIssue
 }
 
 /// Determine the action to take based on collision result.
 fn determine_action(
     collision: &CollisionResult,
     incoming: &Issue,
-    storage: &SqliteStorage,
+    meta_by_id: &std::collections::HashMap<String, crate::storage::sqlite::IssueMetadata>,
     force_upsert: bool,
 ) -> Result<CollisionAction> {
     match collision {
         CollisionResult::NewIssue => Ok(CollisionAction::Insert),
         CollisionResult::Match { existing_id, .. } => {
+            let existing_meta =
+                meta_by_id
+                    .get(existing_id)
+                    .ok_or_else(|| BeadsError::IssueNotFound {
+                        id: existing_id.clone(),
+                    })?;
+
             // Check for tombstone protection (even force doesn't override this)
-            if storage.is_tombstone(existing_id)? {
+            if existing_meta.status == crate::model::Status::Tombstone {
                 return Ok(CollisionAction::Skip {
                     reason: format!("Tombstone protection: {existing_id}"),
                 });
@@ -2138,16 +2141,8 @@ fn determine_action(
                 });
             }
 
-            // Get existing issue for timestamp comparison
-            let existing =
-                storage
-                    .get_issue(existing_id)?
-                    .ok_or_else(|| BeadsError::IssueNotFound {
-                        id: existing_id.clone(),
-                    })?;
-
             // Last-write-wins: compare updated_at
-            match incoming.updated_at.cmp(&existing.updated_at) {
+            match incoming.updated_at.cmp(&existing_meta.updated_at) {
                 std::cmp::Ordering::Greater => Ok(CollisionAction::Update {
                     existing_id: existing_id.clone(),
                 }),
@@ -2321,26 +2316,34 @@ pub fn import_from_jsonl(
 
         // 2. Validate (Step 3.5)
         if let Err(errors) = IssueValidator::validate(&issue) {
-            let details = errors.join(", ");
+            let details = errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err(BeadsError::Config(format!(
                 "Validation failed for issue {} at line {}: {}",
-                issue.id, line_num + 1, details
+                issue.id,
+                line_num + 1,
+                details
             )));
         }
 
         // 3. Prefix Check (Step 4)
-        if !config.skip_prefix_validation && let Some(prefix) = expected_prefix {
-            if !id_matches_expected_prefix(&issue.id, prefix) {
-                if issue.status != crate::model::Status::Tombstone {
-                    if !config.rename_on_import {
-                        return Err(BeadsError::Config(format!(
-                            "Prefix mismatch at line {}: expected '{}', found issue '{}'",
-                            line_num + 1, prefix, issue.id
-                        )));
-                    }
-                    mismatches.push(issue.id.clone());
-                }
+        if !config.skip_prefix_validation
+            && let Some(prefix) = expected_prefix
+            && !id_matches_expected_prefix(&issue.id, prefix)
+            && issue.status != crate::model::Status::Tombstone
+        {
+            if !config.rename_on_import {
+                return Err(BeadsError::Config(format!(
+                    "Prefix mismatch at line {}: expected '{}', found issue '{}'",
+                    line_num + 1,
+                    prefix,
+                    issue.id
+                )));
             }
+            mismatches.push(issue.id.clone());
         }
 
         // 4. Deduplicate
@@ -2361,94 +2364,109 @@ pub fn import_from_jsonl(
     let mut result = ImportResult::default();
 
     // Step 5: Handle renames if requested
-    if config.rename_on_import {
-            use crate::util::id::{IdConfig, IdGenerator};
+    if config.rename_on_import
+        && !mismatches.is_empty()
+        && let Some(prefix) = expected_prefix
+    {
+        use crate::util::id::{IdConfig, IdGenerator};
 
-            let mismatch_set: std::collections::HashSet<String> =
-                mismatches.iter().cloned().collect();
+        let mismatch_set: std::collections::HashSet<String> = mismatches.iter().cloned().collect();
 
-            // Collect details to avoid borrowing issues during generation
-            let to_rename: Vec<_> = issues
-                .iter()
-                .filter(|i| mismatch_set.contains(&i.id))
-                .map(|i| {
-                    (
-                        i.id.clone(),
-                        i.title.clone(),
-                        i.description.clone(),
-                        i.created_by.clone(),
-                        i.created_at,
-                    )
-                })
-                .collect();
+        // Collect details to avoid borrowing issues during generation
+        let to_rename: Vec<_> = issues
+            .iter()
+            .filter(|i| mismatch_set.contains(&i.id))
+            .map(|i| {
+                (
+                    i.id.clone(),
+                    i.title.clone(),
+                    i.description.clone(),
+                    i.created_by.clone(),
+                    i.created_at,
+                )
+            })
+            .collect();
 
-            let generator = IdGenerator::new(IdConfig::with_prefix(prefix));
-            let mut renames = std::collections::HashMap::new();
-            let existing_ids: std::collections::HashSet<String> =
-                storage.get_all_ids()?.into_iter().collect();
+        let generator = IdGenerator::new(IdConfig::with_prefix(prefix));
+        let mut renames = std::collections::HashMap::new();
+        let existing_ids: std::collections::HashSet<String> =
+            storage.get_all_ids()?.into_iter().collect();
 
-            // Collect all IDs that will NOT be renamed to avoid collisions
-            let mut occupied_ids: std::collections::HashSet<String> = issues
-                .iter()
-                .filter(|i| !mismatch_set.contains(&i.id))
-                .map(|i| i.id.clone())
-                .collect();
+        // Collect all IDs that will NOT be renamed to avoid collisions
+        let mut occupied_ids: std::collections::HashSet<String> = issues
+            .iter()
+            .filter(|i| !mismatch_set.contains(&i.id))
+            .map(|i| i.id.clone())
+            .collect();
 
-            // Add existing IDs from storage to occupied set
-            occupied_ids.extend(existing_ids);
+        // Add existing IDs from storage to occupied set
+        occupied_ids.extend(existing_ids);
 
-            let mut generated_ids = std::collections::HashSet::new();
+        let mut generated_ids = std::collections::HashSet::new();
 
-            for (old_id, title, desc, creator, created_at) in to_rename {
-                let new_id = generator.generate(
-                    &title,
-                    desc.as_deref(),
-                    creator.as_deref(),
-                    created_at,
-                    issues.len(),
-                    |candidate| {
-                        occupied_ids.contains(candidate) || generated_ids.contains(candidate)
-                    },
-                );
-                generated_ids.insert(new_id.clone());
-                renames.insert(old_id, new_id);
+        for (old_id, title, desc, creator, created_at) in to_rename {
+            let new_id = generator.generate(
+                &title,
+                desc.as_deref(),
+                creator.as_deref(),
+                created_at,
+                issues.len(),
+                |candidate| occupied_ids.contains(candidate) || generated_ids.contains(candidate),
+            );
+            generated_ids.insert(new_id.clone());
+            renames.insert(old_id, new_id);
+        }
+
+        // Apply renames
+        for issue in &mut issues {
+            if let Some(new_id) = renames.get(&issue.id) {
+                // Preserve old ID in external_ref if empty
+                if issue.external_ref.is_none() {
+                    issue.external_ref = Some(issue.id.clone());
+                }
+                issue.id = new_id.clone();
+                // Recompute content hash since ID/external_ref changed
+                issue.content_hash = Some(content_hash(issue));
             }
-
-            // Apply renames
-            for issue in &mut issues {
-                if let Some(new_id) = renames.get(&issue.id) {
-                    // Preserve old ID in external_ref if empty
-                    if issue.external_ref.is_none() {
-                        issue.external_ref = Some(issue.id.clone());
-                    }
-                    issue.id = new_id.clone();
-                    // Recompute content hash since ID/external_ref changed
-                    issue.content_hash = Some(content_hash(issue));
+            // Update dependencies
+            for dep in &mut issue.dependencies {
+                if let Some(new_target) = renames.get(&dep.depends_on_id) {
+                    dep.depends_on_id = new_target.clone();
                 }
-                // Update dependencies
-                for dep in &mut issue.dependencies {
-                    if let Some(new_target) = renames.get(&dep.depends_on_id) {
-                        dep.depends_on_id = new_target.clone();
-                    }
-                    if let Some(new_source) = renames.get(&dep.issue_id) {
-                        dep.issue_id = new_source.clone();
-                    }
+                if let Some(new_source) = renames.get(&dep.issue_id) {
+                    dep.issue_id = new_source.clone();
                 }
-                // Update comments
-                for comment in &mut issue.comments {
-                    if let Some(new_source) = renames.get(&comment.issue_id) {
-                        comment.issue_id = new_source.clone();
-                    }
+            }
+            // Update comments
+            for comment in &mut issue.comments {
+                if let Some(new_source) = renames.get(&comment.issue_id) {
+                    comment.issue_id = new_source.clone();
                 }
             }
         }
+    }
 
-        // Fix: Filter out tombstones with wrong prefix that were "silently dropped" above.
-        // If we are here and rename_on_import is false, then all remaining mismatches MUST be tombstones
-        // (otherwise we would have errored above). We drop them now.
-        if !config.rename_on_import {
-            issues.retain(|issue| id_matches_expected_prefix(&issue.id, prefix));
+    // Preload all metadata for O(1) collision detection (avoiding N+1 queries)
+    let all_meta = storage.get_all_issues_metadata()?;
+    let mut meta_by_id = std::collections::HashMap::new();
+    let mut id_by_ext_ref = std::collections::HashMap::new();
+    let mut id_by_hash = std::collections::HashMap::new();
+
+    for m in all_meta {
+        let issue_id = m.id.clone();
+        if let Some(ext) = m.external_ref.as_ref() {
+            id_by_ext_ref
+                .entry(ext.clone())
+                .or_insert_with(|| issue_id.clone());
         }
+        if let Some(hash) = m.content_hash.as_ref() {
+            // Preserve the first matching issue to mirror the old query_row
+            // collision path when multiple issues share the same content hash.
+            id_by_hash
+                .entry(hash.clone())
+                .or_insert_with(|| issue_id.clone());
+        }
+        meta_by_id.insert(issue_id, m);
     }
 
     // Phase 1: Scan and Resolve IDs
@@ -2491,10 +2509,21 @@ pub fn import_from_jsonl(
         let computed_hash = content_hash(&effective_issue);
 
         // Detect collision
-        let collision = detect_collision(&effective_issue, storage, &computed_hash)?;
+        let collision = detect_collision(
+            &effective_issue,
+            &id_by_ext_ref,
+            &id_by_hash,
+            &meta_by_id,
+            &computed_hash,
+        );
 
         // Determine action
-        let action = determine_action(&collision, &effective_issue, storage, config.force_upsert)?;
+        let action = determine_action(
+            &collision,
+            &effective_issue,
+            &meta_by_id,
+            config.force_upsert,
+        )?;
 
         // Determine target ID and record mapping
         let target_id = match &collision {
@@ -3323,6 +3352,36 @@ mod tests {
         chrono::DateTime::from_timestamp(secs, 0).expect("timestamp")
     }
 
+    fn build_collision_maps(
+        storage: &SqliteStorage,
+    ) -> (
+        HashMap<String, String>,
+        HashMap<String, String>,
+        HashMap<String, crate::storage::sqlite::IssueMetadata>,
+    ) {
+        let all_meta = storage.get_all_issues_metadata().unwrap();
+        let mut meta_by_id = HashMap::new();
+        let mut id_by_ext_ref = HashMap::new();
+        let mut id_by_hash = HashMap::new();
+
+        for meta in all_meta {
+            let issue_id = meta.id.clone();
+            if let Some(ext) = meta.external_ref.as_ref() {
+                id_by_ext_ref
+                    .entry(ext.clone())
+                    .or_insert_with(|| issue_id.clone());
+            }
+            if let Some(hash) = meta.content_hash.as_ref() {
+                id_by_hash
+                    .entry(hash.clone())
+                    .or_insert_with(|| issue_id.clone());
+            }
+            meta_by_id.insert(issue_id, meta);
+        }
+
+        (id_by_ext_ref, id_by_hash, meta_by_id)
+    }
+
     struct LineFailWriter {
         buffer: Vec<u8>,
         current: Vec<u8>,
@@ -3831,7 +3890,14 @@ mod tests {
         incoming.external_ref = Some("JIRA-1".to_string());
         let computed_hash = crate::util::content_hash(&incoming);
 
-        let collision = detect_collision(&incoming, &storage, &computed_hash).unwrap();
+        let (id_by_ext_ref, id_by_hash, meta_by_id) = build_collision_maps(&storage);
+        let collision = detect_collision(
+            &incoming,
+            &id_by_ext_ref,
+            &id_by_hash,
+            &meta_by_id,
+            &computed_hash,
+        );
         assert!(
             matches!(collision, CollisionResult::Match { .. }),
             "expected match"
@@ -4107,7 +4173,14 @@ mod tests {
         incoming.external_ref = Some("JIRA-1".to_string());
         let computed_hash = crate::util::content_hash(&incoming);
 
-        let collision = detect_collision(&incoming, &storage, &computed_hash).unwrap();
+        let (id_by_ext_ref, id_by_hash, meta_by_id) = build_collision_maps(&storage);
+        let collision = detect_collision(
+            &incoming,
+            &id_by_ext_ref,
+            &id_by_hash,
+            &meta_by_id,
+            &computed_hash,
+        );
         assert!(
             matches!(collision, CollisionResult::Match { .. }),
             "expected match"
@@ -4139,7 +4212,14 @@ mod tests {
         let incoming = make_issue_at("bd-same", "Same Content", fixed_time(200));
         let computed_hash = crate::util::content_hash(&incoming);
 
-        let collision = detect_collision(&incoming, &storage, &computed_hash).unwrap();
+        let (id_by_ext_ref, id_by_hash, meta_by_id) = build_collision_maps(&storage);
+        let collision = detect_collision(
+            &incoming,
+            &id_by_ext_ref,
+            &id_by_hash,
+            &meta_by_id,
+            &computed_hash,
+        );
         assert!(
             matches!(collision, CollisionResult::Match { .. }),
             "expected match"
@@ -4157,6 +4237,46 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_collision_duplicate_content_hash_keeps_first_match() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let mut first = make_issue_at("bd-first", "Same Content", fixed_time(100));
+        set_content_hash(&mut first);
+        storage.upsert_issue_for_import(&first).unwrap();
+
+        let mut second = make_issue_at("bd-second", "Same Content", fixed_time(200));
+        set_content_hash(&mut second);
+        storage.upsert_issue_for_import(&second).unwrap();
+
+        let incoming = make_issue_at("bd-new", "Same Content", fixed_time(300));
+        let computed_hash = crate::util::content_hash(&incoming);
+
+        let (id_by_ext_ref, id_by_hash, meta_by_id) = build_collision_maps(&storage);
+        let collision = detect_collision(
+            &incoming,
+            &id_by_ext_ref,
+            &id_by_hash,
+            &meta_by_id,
+            &computed_hash,
+        );
+
+        assert!(
+            matches!(collision, CollisionResult::Match { .. }),
+            "expected match"
+        );
+        if let CollisionResult::Match {
+            existing_id,
+            match_type,
+            phase,
+        } = collision
+        {
+            assert_eq!(existing_id, "bd-first");
+            assert_eq!(match_type, MatchType::ContentHash);
+            assert_eq!(phase, 2);
+        }
+    }
+
+    #[test]
     fn test_detect_collision_id_match() {
         let mut storage = SqliteStorage::open_memory().unwrap();
 
@@ -4166,7 +4286,14 @@ mod tests {
         let incoming = make_issue_at("bd-1", "Incoming", fixed_time(200));
 
         let computed_hash = crate::util::content_hash(&incoming);
-        let collision = detect_collision(&incoming, &storage, &computed_hash).unwrap();
+        let (id_by_ext_ref, id_by_hash, meta_by_id) = build_collision_maps(&storage);
+        let collision = detect_collision(
+            &incoming,
+            &id_by_ext_ref,
+            &id_by_hash,
+            &meta_by_id,
+            &computed_hash,
+        );
 
         assert!(
             matches!(collision, CollisionResult::Match { .. }),
@@ -4197,7 +4324,8 @@ mod tests {
             match_type: MatchType::Id,
             phase: 3,
         };
-        let action = determine_action(&collision, &incoming, &storage, false).unwrap();
+        let (_, _, meta_by_id) = build_collision_maps(&storage);
+        let action = determine_action(&collision, &incoming, &meta_by_id, false).unwrap();
         assert!(
             matches!(action, CollisionAction::Skip { .. }),
             "expected tombstone skip"
@@ -4218,16 +4346,17 @@ mod tests {
             match_type: MatchType::Id,
             phase: 3,
         };
+        let (_, _, meta_by_id) = build_collision_maps(&storage);
 
         let newer = make_issue_at("bd-1", "Incoming", fixed_time(200));
-        let action = determine_action(&collision, &newer, &storage, false).unwrap();
+        let action = determine_action(&collision, &newer, &meta_by_id, false).unwrap();
         assert!(
             matches!(action, CollisionAction::Update { .. }),
             "expected update action"
         );
 
         let equal = make_issue_at("bd-1", "Incoming", fixed_time(100));
-        let action = determine_action(&collision, &equal, &storage, false).unwrap();
+        let action = determine_action(&collision, &equal, &meta_by_id, false).unwrap();
         assert!(
             matches!(action, CollisionAction::Skip { .. }),
             "expected equal timestamp skip"
@@ -4237,7 +4366,7 @@ mod tests {
         }
 
         let older = make_issue_at("bd-1", "Incoming", fixed_time(50));
-        let action = determine_action(&collision, &older, &storage, false).unwrap();
+        let action = determine_action(&collision, &older, &meta_by_id, false).unwrap();
         assert!(
             matches!(action, CollisionAction::Skip { .. }),
             "expected older timestamp skip"

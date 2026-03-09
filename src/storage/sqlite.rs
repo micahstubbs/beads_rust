@@ -20,6 +20,11 @@ use std::time::Duration;
 /// Number of mutations between WAL checkpoint attempts.
 const WAL_CHECKPOINT_INTERVAL: u32 = 50;
 const DEFAULT_BUSY_TIMEOUT_MS: u64 = 30_000;
+const EXPORT_HASH_CHUNK_SIZE: usize = 900;
+const DIRTY_ISSUE_CHUNK_SIZE: usize = 900;
+const IMPORT_LABEL_CHUNK_SIZE: usize = 400;
+const IMPORT_DEPENDENCY_CHUNK_SIZE: usize = 140;
+const IMPORT_COMMENT_CHUNK_SIZE: usize = 199;
 
 /// SQLite-based storage backend.
 #[derive(Debug)]
@@ -259,11 +264,10 @@ impl SqliteStorage {
             return Ok(0);
         }
 
-        const CHUNK_SIZE: usize = 900;
         let now = Utc::now().to_rfc3339();
         let mut count = 0;
 
-        for chunk in exports.chunks(CHUNK_SIZE) {
+        for chunk in exports.chunks(EXPORT_HASH_CHUNK_SIZE) {
             // Bulk delete existing hashes for this chunk
             let placeholders: Vec<String> = chunk.iter().map(|_| "?".to_string()).collect();
             let sql = format!(
@@ -332,6 +336,7 @@ impl SqliteStorage {
     ///
     /// Returns an error if any step fails (e.g. database error, logic error).
     /// The transaction is rolled back on error.
+    #[allow(clippy::too_many_lines)]
     pub fn mutate<F, R>(&mut self, op: &str, actor: &str, mut f: F) -> Result<R>
     where
         F: FnMut(&Connection, &mut MutationContext) -> Result<R>,
@@ -382,10 +387,9 @@ impl SqliteStorage {
                         // REPLACE because fsqlite lacks UNIQUE enforcement.
                         if !ctx.dirty_ids.is_empty() {
                             let now_str = Utc::now().to_rfc3339();
-                            const CHUNK_SIZE: usize = 900;
                             let dirty_vec: Vec<String> = ctx.dirty_ids.iter().cloned().collect();
 
-                            for chunk in dirty_vec.chunks(CHUNK_SIZE) {
+                            for chunk in dirty_vec.chunks(DIRTY_ISSUE_CHUNK_SIZE) {
                                 // Bulk delete existing dirty flags for this chunk
                                 let placeholders: Vec<String> =
                                     chunk.iter().map(|_| "?".to_string()).collect();
@@ -1128,6 +1132,47 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn get_issue(&self, id: &str) -> Result<Option<Issue>> {
         Self::get_issue_from_conn(&self.conn, id)
+    }
+
+    /// Get metadata for all issues to optimize import collision detection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_all_issues_metadata(&self) -> Result<Vec<IssueMetadata>> {
+        let sql = "SELECT id, external_ref, content_hash, updated_at, status FROM issues";
+        let rows = self.conn.query(sql)?;
+        let mut metas = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let id = row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or_default()
+                .to_string();
+            let external_ref = row
+                .get(1)
+                .and_then(SqliteValue::as_text)
+                .map(str::to_string);
+            let content_hash = row
+                .get(2)
+                .and_then(SqliteValue::as_text)
+                .map(str::to_string);
+            let updated_at = parse_datetime(
+                row.get(3)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or_default(),
+            )?;
+            let status = parse_status(row.get(4).and_then(SqliteValue::as_text));
+
+            metas.push(IssueMetadata {
+                id,
+                external_ref,
+                content_hash,
+                updated_at,
+                status,
+            });
+        }
+        Ok(metas)
     }
 
     fn get_issue_from_conn(conn: &Connection, id: &str) -> Result<Option<Issue>> {
@@ -4185,6 +4230,16 @@ pub struct ReadyFilters {
     pub recursive: bool,
 }
 
+/// Minimal metadata needed for fast collision detection during sync.
+#[derive(Debug, Clone)]
+pub struct IssueMetadata {
+    pub id: String,
+    pub external_ref: Option<String>,
+    pub content_hash: Option<String>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub status: crate::model::Status,
+}
+
 /// Sort policy for ready issues.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum ReadySortPolicy {
@@ -4829,19 +4884,37 @@ impl SqliteStorage {
             &[SqliteValue::from(issue_id)],
         )?;
 
+        if labels.is_empty() {
+            return Ok(());
+        }
+
         // Add new labels
         let mut seen_labels = HashSet::new();
+        let mut unique_labels = Vec::new();
         for label in labels {
-            if !seen_labels.insert(label.as_str()) {
-                continue;
+            if seen_labels.insert(label.as_str()) {
+                unique_labels.push(label);
             }
-            self.conn.execute_with_params(
-                "INSERT INTO labels (issue_id, label) VALUES (?, ?)",
-                &[
-                    SqliteValue::from(issue_id),
-                    SqliteValue::from(label.as_str()),
-                ],
-            )?;
+        }
+
+        if unique_labels.is_empty() {
+            return Ok(());
+        }
+
+        for chunk in unique_labels.chunks(IMPORT_LABEL_CHUNK_SIZE) {
+            let placeholders: Vec<String> = chunk.iter().map(|_| "(?, ?)".to_string()).collect();
+            let sql = format!(
+                "INSERT INTO labels (issue_id, label) VALUES {}",
+                placeholders.join(", ")
+            );
+
+            let mut params = Vec::with_capacity(chunk.len() * 2);
+            for label in chunk {
+                params.push(SqliteValue::from(issue_id));
+                params.push(SqliteValue::from(label.as_str()));
+            }
+
+            self.conn.execute_with_params(&sql, &params)?;
         }
 
         Ok(())
@@ -4863,27 +4936,49 @@ impl SqliteStorage {
             &[SqliteValue::from(issue_id)],
         )?;
 
+        if dependencies.is_empty() {
+            return Ok(());
+        }
+
         // Add new dependencies
         let mut seen_deps = HashSet::new();
+        let mut unique_deps = Vec::new();
         for dep in dependencies {
             // Deduplicate by (target, type) to allow multiple relationship types
             // between the same issues while preventing identical duplicates.
-            if !seen_deps.insert((dep.depends_on_id.as_str(), dep.dep_type.as_str())) {
-                continue;
+            if seen_deps.insert((dep.depends_on_id.as_str(), dep.dep_type.as_str())) {
+                unique_deps.push(dep);
             }
-            self.conn.execute_with_params(
-                "INSERT OR IGNORE INTO dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-                &[
-                    SqliteValue::from(issue_id),
-                    SqliteValue::from(dep.depends_on_id.as_str()),
-                    SqliteValue::from(dep.dep_type.as_str()),
-                    SqliteValue::from(dep.created_at.to_rfc3339().as_str()),
-                    SqliteValue::from(dep.created_by.as_deref().unwrap_or("import")),
-                    SqliteValue::from(dep.metadata.as_deref().unwrap_or("{}")),
-                    SqliteValue::from(dep.thread_id.as_deref().unwrap_or("")),
-                ],
-            )?;
+        }
+
+        if unique_deps.is_empty() {
+            return Ok(());
+        }
+
+        for chunk in unique_deps.chunks(IMPORT_DEPENDENCY_CHUNK_SIZE) {
+            let placeholders: Vec<String> = chunk
+                .iter()
+                .map(|_| "(?, ?, ?, ?, ?, ?, ?)".to_string())
+                .collect();
+            let sql = format!(
+                "INSERT OR IGNORE INTO dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id) VALUES {}",
+                placeholders.join(", ")
+            );
+
+            let mut params = Vec::with_capacity(chunk.len() * 7);
+            for dep in chunk {
+                params.push(SqliteValue::from(issue_id));
+                params.push(SqliteValue::from(dep.depends_on_id.as_str()));
+                params.push(SqliteValue::from(dep.dep_type.as_str()));
+                params.push(SqliteValue::from(dep.created_at.to_rfc3339().as_str()));
+                params.push(SqliteValue::from(
+                    dep.created_by.as_deref().unwrap_or("import"),
+                ));
+                params.push(SqliteValue::from(dep.metadata.as_deref().unwrap_or("{}")));
+                params.push(SqliteValue::from(dep.thread_id.as_deref().unwrap_or("")));
+            }
+
+            self.conn.execute_with_params(&sql, &params)?;
         }
 
         Ok(())
@@ -4905,18 +5000,30 @@ impl SqliteStorage {
             &[SqliteValue::from(issue_id)],
         )?;
 
-        // Add new comments
-        for comment in comments {
-            self.conn.execute_with_params(
-                "INSERT OR REPLACE INTO comments (id, issue_id, author, text, created_at) VALUES (?, ?, ?, ?, ?)",
-                &[
-                    SqliteValue::from(comment.id),
-                    SqliteValue::from(issue_id),
-                    SqliteValue::from(comment.author.as_str()),
-                    SqliteValue::from(comment.body.as_str()),
-                    SqliteValue::from(comment.created_at.to_rfc3339().as_str()),
-                ],
-            )?;
+        if comments.is_empty() {
+            return Ok(());
+        }
+
+        for chunk in comments.chunks(IMPORT_COMMENT_CHUNK_SIZE) {
+            let placeholders: Vec<String> = chunk
+                .iter()
+                .map(|_| "(?, ?, ?, ?, ?)".to_string())
+                .collect();
+            let sql = format!(
+                "INSERT OR REPLACE INTO comments (id, issue_id, author, text, created_at) VALUES {}",
+                placeholders.join(", ")
+            );
+
+            let mut params = Vec::with_capacity(chunk.len() * 5);
+            for comment in chunk {
+                params.push(SqliteValue::from(comment.id));
+                params.push(SqliteValue::from(issue_id));
+                params.push(SqliteValue::from(comment.author.as_str()));
+                params.push(SqliteValue::from(comment.body.as_str()));
+                params.push(SqliteValue::from(comment.created_at.to_rfc3339().as_str()));
+            }
+
+            self.conn.execute_with_params(&sql, &params)?;
         }
 
         Ok(())
@@ -5204,6 +5311,66 @@ mod tests {
             .and_then(SqliteValue::as_integer)
             .unwrap_or(0);
         assert_eq!(dirty_count, 1);
+    }
+
+    #[test]
+    fn test_get_all_issues_metadata_preserves_custom_status() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = make_issue(
+            "bd-custom",
+            "Custom status",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .execute_test_sql("UPDATE issues SET status = 'mystery-state' WHERE id = 'bd-custom'")
+            .unwrap();
+
+        let metadata = storage.get_all_issues_metadata().unwrap();
+        let issue_meta = metadata
+            .iter()
+            .find(|meta| meta.id == "bd-custom")
+            .expect("metadata for bd-custom");
+
+        assert_eq!(
+            issue_meta.status,
+            Status::Custom("mystery-state".to_string())
+        );
+    }
+
+    #[test]
+    fn test_get_all_issues_metadata_errors_on_invalid_updated_at() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = make_issue(
+            "bd-bad-time",
+            "Bad timestamp",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .execute_test_sql(
+                "UPDATE issues SET updated_at = 'not-a-timestamp' WHERE id = 'bd-bad-time'",
+            )
+            .unwrap();
+
+        let err = storage.get_all_issues_metadata().unwrap_err();
+        match err {
+            BeadsError::Config(message) => {
+                assert!(
+                    message.contains("unparseable datetime"),
+                    "unexpected error: {message}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]
