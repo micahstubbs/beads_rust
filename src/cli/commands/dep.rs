@@ -1520,9 +1520,7 @@ mod tests {
         assert_eq!(title, "[missing issue: bd-missing]");
         assert_eq!(priority, 2);
         assert_eq!(status, "deleted");
-        info!(
-            "test_resolve_dep_tree_node_metadata_missing_internal_issue: assertions passed"
-        );
+        info!("test_resolve_dep_tree_node_metadata_missing_internal_issue: assertions passed");
     }
 
     #[test]

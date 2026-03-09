@@ -440,6 +440,16 @@ fn e2e_where_basic() {
         "where should output .beads path: {}",
         whr.stdout
     );
+    assert!(
+        whr.stdout.contains("database:"),
+        "where should report the resolved database path: {}",
+        whr.stdout
+    );
+    assert!(
+        whr.stdout.contains("jsonl:"),
+        "where should report the resolved JSONL path: {}",
+        whr.stdout
+    );
 }
 
 #[test]
@@ -449,12 +459,17 @@ fn e2e_where_uninitialized() {
 
     // Run where without init
     let whr = run_br(&workspace, ["where"], "where_no_init");
-    // Should fail or output nothing useful
+    assert!(!whr.status.success(), "where should fail without init");
+
+    let error_payload = extract_json_payload(&whr.stderr);
+    let error_json: Value = serde_json::from_str(&error_payload)
+        .expect("where without init should emit structured json to stderr");
+    assert_eq!(error_json["error"]["code"], "NOT_INITIALIZED");
     assert!(
-        !whr.status.success() || whr.stdout.trim().is_empty() || whr.stderr.contains("not found"),
-        "where should fail or be empty without init: stdout='{}', stderr='{}'",
-        whr.stdout,
-        whr.stderr
+        error_json["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("br init")),
+        "structured error should tell the user how to initialize the workspace"
     );
 }
 
@@ -466,14 +481,12 @@ fn e2e_where_json_output() {
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
-    // Where with --json (if supported)
+    // Where with explicit JSON output
     let whr = run_br(&workspace, ["where", "--json"], "where_json");
-    if whr.status.success() {
-        let payload = extract_json_payload(&whr.stdout);
-        let _json: Value =
-            serde_json::from_str(&payload).expect("where --json should output valid JSON");
-    }
-    // --json may not be supported for where, which is fine
+    assert!(whr.status.success(), "where --json failed: {}", whr.stderr);
+    let payload = extract_json_payload(&whr.stdout);
+    let _json: Value =
+        serde_json::from_str(&payload).expect("where --json should output valid JSON");
 }
 
 // ============================================================================

@@ -62,7 +62,7 @@ pub fn execute(
 
     let issues = storage.search_issues(query, &filters)?;
     let mut issues = if client_filters {
-        apply_client_filters(storage, issues, &args.filters)?
+        apply_client_filters(issues, &args.filters)?
     } else {
         issues
     };
@@ -166,14 +166,15 @@ fn attach_counts(
     }
 
     let issue_ids: Vec<String> = issues.iter().map(|issue| issue.id.clone()).collect();
-    let dep_counts = storage.count_dependencies_for_issues(&issue_ids)?;
-    let dependent_counts = storage.count_dependents_for_issues(&issue_ids)?;
+    let labels_map = storage.get_labels_for_issues(&issue_ids)?;
+    let (dep_counts, dependent_counts) = storage.count_relation_counts_for_issues(&issue_ids)?;
 
     Ok(issues
         .into_iter()
-        .map(|issue| {
+        .map(|mut issue| {
             let dependency_count = *dep_counts.get(&issue.id).unwrap_or(&0);
             let dependent_count = *dependent_counts.get(&issue.id).unwrap_or(&0);
+            issue.labels = labels_map.get(&issue.id).cloned().unwrap_or_default();
             IssueWithCounts {
                 issue,
                 dependency_count,
@@ -333,8 +334,6 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
 
 fn needs_client_filters(args: &ListArgs) -> bool {
     !args.id.is_empty()
-        || !args.label.is_empty()
-        || !args.label_any.is_empty()
         || args.priority_min.is_some()
         || args.priority_max.is_some()
         || args.desc_contains.is_some()
@@ -344,7 +343,6 @@ fn needs_client_filters(args: &ListArgs) -> bool {
 }
 
 fn apply_client_filters(
-    storage: &SqliteStorage,
     issues: Vec<crate::model::Issue>,
     args: &ListArgs,
 ) -> Result<Vec<crate::model::Issue>> {
@@ -352,16 +350,6 @@ fn apply_client_filters(
         None
     } else {
         Some(args.id.iter().map(String::as_str).collect())
-    };
-
-    let label_filters = !args.label.is_empty() || !args.label_any.is_empty();
-
-    // Pre-fetch labels if needed to avoid N+1 query
-    let labels_map = if label_filters {
-        let issue_ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
-        storage.get_labels_for_issues(&issue_ids)?
-    } else {
-        std::collections::HashMap::new()
     };
 
     let mut filtered = Vec::new();
@@ -432,19 +420,6 @@ fn apply_client_filters(
             }
         }
 
-        if label_filters {
-            let empty_labels = Vec::new();
-            let labels = labels_map.get(&issue.id).unwrap_or(&empty_labels);
-            if !args.label.is_empty() && !args.label.iter().all(|label| labels.contains(label)) {
-                continue;
-            }
-            if !args.label_any.is_empty()
-                && !args.label_any.iter().any(|label| labels.contains(label))
-            {
-                continue;
-            }
-        }
-
         filtered.push(issue);
     }
 
@@ -480,6 +455,7 @@ fn apply_sort_by_issue<T>(
     Ok(())
 }
 
+#[cfg(test)]
 fn apply_sort(issues: &mut [IssueWithCounts], sort: Option<&str>) -> Result<()> {
     apply_sort_by_issue(issues, sort, |issue| &issue.issue)
 }
@@ -568,6 +544,26 @@ mod tests {
         let results = storage.search_issues("xyz", &filters).expect("search");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "bd-xyz");
+    }
+
+    #[test]
+    fn test_label_filters_do_not_require_client_filtering() {
+        let args = ListArgs {
+            label: vec!["backend".to_string()],
+            ..ListArgs::default()
+        };
+
+        assert!(!needs_client_filters(&args));
+    }
+
+    #[test]
+    fn test_label_any_filters_do_not_require_client_filtering() {
+        let args = ListArgs {
+            label_any: vec!["backend".to_string(), "ops".to_string()],
+            ..ListArgs::default()
+        };
+
+        assert!(!needs_client_filters(&args));
     }
 
     #[test]
@@ -710,5 +706,32 @@ mod tests {
 
         apply_sort(&mut items, Some("created_at")).expect("sort");
         assert_eq!(items[0].issue.id, "bd-new");
+    }
+
+    #[test]
+    fn test_attach_counts_backfills_labels() {
+        let mut storage = SqliteStorage::open_memory().expect("db");
+        let issue = Issue {
+            id: "bd-labeled".to_string(),
+            title: "Labeled issue".to_string(),
+            ..Issue::default()
+        };
+        storage.create_issue(&issue, "tester").expect("create");
+        storage
+            .add_label("bd-labeled", "backend", "tester")
+            .expect("label");
+
+        let stored_issue = storage
+            .get_issue("bd-labeled")
+            .expect("get")
+            .expect("issue exists");
+        assert!(
+            stored_issue.labels.is_empty(),
+            "labels are loaded separately"
+        );
+
+        let hydrated = attach_counts(&storage, vec![stored_issue]).expect("attach counts");
+        assert_eq!(hydrated.len(), 1);
+        assert_eq!(hydrated[0].issue.labels, vec!["backend".to_string()]);
     }
 }

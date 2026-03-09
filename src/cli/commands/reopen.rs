@@ -1,6 +1,7 @@
 //! Reopen command implementation.
 
 use crate::cli::ReopenArgs;
+use crate::cli::commands::preserve_blocked_cache_on_error;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::Status;
@@ -47,7 +48,7 @@ pub fn execute(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let use_json = json || args.robot;
+    let use_json = json || ctx.is_json() || args.robot;
 
     tracing::info!("Executing reopen command");
 
@@ -83,13 +84,16 @@ pub fn execute(
 
     let mut reopened_issues: Vec<ReopenedIssue> = Vec::new();
     let mut skipped_issues: Vec<SkippedIssue> = Vec::new();
+    let mut cache_dirty = false;
 
     for resolved in &resolved_ids {
         let id = &resolved.id;
         tracing::info!(id = %id, "Reopening issue");
 
         // Get current issue
-        let Some(issue) = storage.get_issue(id)? else {
+        let Some(issue) =
+            preserve_blocked_cache_on_error(storage, cache_dirty, "reopen", storage.get_issue(id))?
+        else {
             skipped_issues.push(SkippedIssue {
                 id: id.clone(),
                 reason: "issue not found".to_string(),
@@ -97,9 +101,19 @@ pub fn execute(
             continue;
         };
 
-        // Check if already open
-        if !issue.status.is_terminal() {
-            tracing::debug!(id = %id, status = ?issue.status, "Issue already open");
+        // Tombstones are deletion markers and must not be resurrected through reopen.
+        if issue.status == Status::Tombstone {
+            tracing::debug!(id = %id, "Issue is tombstoned and cannot be reopened");
+            skipped_issues.push(SkippedIssue {
+                id: id.clone(),
+                reason: "cannot reopen tombstone issue".to_string(),
+            });
+            continue;
+        }
+
+        // Only closed issues can be reopened.
+        if issue.status != Status::Closed {
+            tracing::debug!(id = %id, status = ?issue.status, "Issue is not closed");
             skipped_issues.push(SkippedIssue {
                 id: id.clone(),
                 reason: format!("already {}", issue.status.as_str()),
@@ -109,12 +123,13 @@ pub fn execute(
 
         tracing::debug!(previous_status = ?issue.status, "Issue was previously {:?}", issue.status);
 
-        // Build update: set status=open, clear closed_at, clear tombstone fields
+        // Build update: set status=open and clear close/defer metadata.
         let update = IssueUpdate {
             status: Some(Status::Open),
             closed_at: Some(None),         // Clear closed_at
             close_reason: Some(None),      // Clear close_reason
             closed_by_session: Some(None), // Clear closed_by_session
+            defer_until: Some(None),       // Reopened issues should not stay deferred
             deleted_at: Some(None),        // Clear deleted_at
             deleted_by: Some(None),        // Clear deleted_by
             delete_reason: Some(None),     // Clear delete_reason
@@ -123,14 +138,17 @@ pub fn execute(
         };
 
         // Apply update
-        storage.update_issue(id, &update, &actor)?;
+        let update_result = storage.update_issue(id, &update, &actor);
+        preserve_blocked_cache_on_error(storage, cache_dirty, "reopen", update_result)?;
+        cache_dirty = true;
         tracing::info!(id = %id, reason = ?args.reason, "Issue reopened");
 
         // Add comment if reason provided
         if let Some(ref reason) = args.reason {
             let comment_text = format!("Reopened: {reason}");
             tracing::debug!(id = %id, "Adding reopen comment");
-            storage.add_comment(id, &actor, &comment_text)?;
+            let comment_result = storage.add_comment(id, &actor, &comment_text);
+            preserve_blocked_cache_on_error(storage, cache_dirty, "reopen", comment_result)?;
         }
 
         // Update last touched
@@ -144,8 +162,11 @@ pub fn execute(
         });
     }
 
-    if !reopened_issues.is_empty() {
-        tracing::info!("Rebuilding blocked cache after reopening {} issues", reopened_issues.len());
+    if cache_dirty {
+        tracing::info!(
+            "Rebuilding blocked cache after reopening {} issues",
+            reopened_issues.len()
+        );
         storage.rebuild_blocked_cache(true)?;
     }
 
@@ -243,4 +264,143 @@ fn render_reopen_rich(
         .box_style(theme.box_style);
 
     console.print_renderable(&panel);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::commands;
+    use crate::config::CliOverrides;
+    use crate::model::{Issue, IssueType, Priority, Status};
+    use crate::output::OutputContext;
+    use crate::storage::SqliteStorage;
+    use chrono::{Duration, Utc};
+    use std::env;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    static TEST_DIR_LOCK: Mutex<()> = Mutex::new(());
+
+    struct DirGuard {
+        previous: PathBuf,
+    }
+
+    impl DirGuard {
+        fn new(target: &std::path::Path) -> Self {
+            let previous = env::current_dir().expect("current dir");
+            env::set_current_dir(target).expect("set current dir");
+            Self { previous }
+        }
+    }
+
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = env::set_current_dir(&self.previous);
+        }
+    }
+
+    fn make_closed_deferred_issue(id: &str, title: &str) -> Issue {
+        let now = Utc::now();
+        Issue {
+            id: id.to_string(),
+            title: title.to_string(),
+            status: Status::Closed,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            created_at: now,
+            updated_at: now,
+            closed_at: Some(now),
+            defer_until: Some(now + Duration::days(7)),
+            ..Issue::default()
+        }
+    }
+
+    #[test]
+    fn execute_clears_defer_until_when_reopening_closed_deferred_issue() {
+        let _lock = TEST_DIR_LOCK.lock().expect("dir lock");
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        storage
+            .create_issue(
+                &make_closed_deferred_issue("bd-reopen-deferred", "Closed deferred issue"),
+                "tester",
+            )
+            .expect("create issue");
+        drop(storage);
+
+        let _guard = DirGuard::new(temp.path());
+        let args = ReopenArgs {
+            ids: vec!["bd-reopen-deferred".to_string()],
+            reason: None,
+            robot: false,
+        };
+        execute(&args, false, &CliOverrides::default(), &ctx).expect("reopen");
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        let issue = storage
+            .get_issue("bd-reopen-deferred")
+            .expect("get issue")
+            .expect("issue exists");
+
+        assert_eq!(issue.status, Status::Open);
+        assert!(issue.defer_until.is_none());
+        assert!(issue.closed_at.is_none());
+    }
+
+    #[test]
+    fn execute_reopen_tombstone_skips_without_resurrecting_it() {
+        let _lock = TEST_DIR_LOCK.lock().expect("dir lock");
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        let issue = Issue {
+            id: "bd-reopen-tombstone".to_string(),
+            title: "Deleted issue".to_string(),
+            status: Status::Open,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            ..Issue::default()
+        };
+        storage
+            .create_issue(&issue, "tester")
+            .expect("create issue");
+        storage
+            .delete_issue(
+                "bd-reopen-tombstone",
+                "tester",
+                "delete for reopen test",
+                None,
+            )
+            .expect("delete issue");
+        drop(storage);
+
+        let _guard = DirGuard::new(temp.path());
+        let args = ReopenArgs {
+            ids: vec!["bd-reopen-tombstone".to_string()],
+            reason: None,
+            robot: false,
+        };
+        execute(&args, false, &CliOverrides::default(), &ctx).expect("reopen");
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        let issue = storage
+            .get_issue("bd-reopen-tombstone")
+            .expect("get issue")
+            .expect("issue exists");
+
+        assert_eq!(issue.status, Status::Tombstone);
+        assert!(issue.deleted_at.is_some());
+    }
 }

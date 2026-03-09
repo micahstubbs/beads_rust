@@ -612,6 +612,123 @@ fn e2e_reopen_command() {
     assert_eq!(reopened[0]["status"], "open");
 }
 
+#[test]
+fn e2e_reopen_honors_env_json_mode() {
+    let _log = common::test_log("e2e_reopen_honors_env_json_mode");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "reopen_env_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Issue to reopen via env", "--json"],
+        "reopen_env_create",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let created: Value = serde_json::from_str(&extract_json_payload(&create.stdout))
+        .expect("create should emit json");
+    let issue_id = created["id"].as_str().expect("issue id");
+
+    let close = run_br(&workspace, ["close", issue_id], "reopen_env_close");
+    assert!(close.status.success(), "close failed: {}", close.stderr);
+
+    let reopen = run_br_with_env(
+        &workspace,
+        ["reopen", issue_id],
+        [("BR_OUTPUT_FORMAT", "json")],
+        "reopen_env_json",
+    );
+    assert!(
+        reopen.status.success(),
+        "reopen with env json failed: {}",
+        reopen.stderr
+    );
+
+    let payload = extract_json_payload(&reopen.stdout);
+    let parsed: Value = serde_json::from_str(&payload).expect("reopen env json parse");
+    let reopened = parsed["reopened"].as_array().expect("reopened array");
+    assert_eq!(reopened.len(), 1);
+    assert_eq!(reopened[0]["id"], issue_id);
+    assert_eq!(reopened[0]["status"], "open");
+}
+
+#[test]
+fn e2e_reopen_tombstone_skips_without_resurrection() {
+    let _log = common::test_log("e2e_reopen_tombstone_skips_without_resurrection");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "reopen_tombstone_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Issue to tombstone", "--json"],
+        "reopen_tombstone_create",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let created: Value =
+        serde_json::from_str(&extract_json_payload(&create.stdout)).expect("create json");
+    let issue_id = created["id"].as_str().expect("issue id");
+
+    let delete = run_br(
+        &workspace,
+        [
+            "delete",
+            issue_id,
+            "--force",
+            "--reason",
+            "Testing reopen tombstone",
+        ],
+        "reopen_tombstone_delete",
+    );
+    assert!(delete.status.success(), "delete failed: {}", delete.stderr);
+
+    let reopen = run_br(
+        &workspace,
+        ["reopen", issue_id, "--json"],
+        "reopen_tombstone_reopen",
+    );
+    assert!(
+        reopen.status.success(),
+        "reopen tombstone failed: {}",
+        reopen.stderr
+    );
+
+    let payload = extract_json_payload(&reopen.stdout);
+    let parsed: Value = serde_json::from_str(&payload).expect("reopen tombstone json");
+    let reopened = parsed["reopened"].as_array().cloned().unwrap_or_default();
+    let skipped = parsed["skipped"].as_array().cloned().unwrap_or_default();
+
+    assert!(
+        reopened.is_empty(),
+        "tombstone should not be reported as reopened"
+    );
+    assert_eq!(skipped.len(), 1, "tombstone should be reported as skipped");
+    assert_eq!(skipped[0]["id"], issue_id);
+    assert!(
+        skipped[0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("tombstone")),
+        "skip reason should explain that tombstones cannot be reopened"
+    );
+
+    let show = run_br(
+        &workspace,
+        ["show", issue_id, "--json"],
+        "reopen_tombstone_show",
+    );
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    let show_payload = extract_json_payload(&show.stdout);
+    let show_json: Value = serde_json::from_str(&show_payload).expect("show json");
+
+    if show_json.is_array() {
+        assert_eq!(show_json[0]["status"], "tombstone");
+    } else {
+        assert_eq!(show_json["status"], "tombstone");
+    }
+}
+
 /// E2E tests for saved queries: query save/run/list/delete.
 #[test]
 #[allow(clippy::too_many_lines)]

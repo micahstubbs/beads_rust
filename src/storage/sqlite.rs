@@ -3213,6 +3213,79 @@ impl SqliteStorage {
         Ok(map)
     }
 
+    /// Count dependencies and dependents for multiple issues with one round-trip per chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn count_relation_counts_for_issues(
+        &self,
+        issue_ids: &[String],
+    ) -> Result<(HashMap<String, usize>, HashMap<String, usize>)> {
+        const SQLITE_VAR_LIMIT: usize = 900;
+
+        if issue_ids.is_empty() {
+            return Ok((HashMap::new(), HashMap::new()));
+        }
+
+        let mut dependency_counts: HashMap<String, usize> = HashMap::new();
+        let mut dependent_counts: HashMap<String, usize> = HashMap::new();
+
+        for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
+            let value_rows: Vec<&str> = chunk.iter().map(|_| "(?)").collect();
+            let sql = format!(
+                r"WITH target_ids(id) AS (VALUES {}),
+                  counts AS (
+                      SELECT issue_id AS id, COUNT(*) AS dependency_count, 0 AS dependent_count
+                      FROM dependencies
+                      WHERE issue_id IN (SELECT id FROM target_ids)
+                      GROUP BY issue_id
+                      UNION ALL
+                      SELECT depends_on_id AS id, 0 AS dependency_count, COUNT(*) AS dependent_count
+                      FROM dependencies
+                      WHERE depends_on_id IN (SELECT id FROM target_ids)
+                      GROUP BY depends_on_id
+                  )
+                  SELECT target_ids.id,
+                         COALESCE(SUM(counts.dependency_count), 0),
+                         COALESCE(SUM(counts.dependent_count), 0)
+                  FROM target_ids
+                  LEFT JOIN counts ON counts.id = target_ids.id
+                  GROUP BY target_ids.id",
+                value_rows.join(",")
+            );
+
+            let params: Vec<SqliteValue> = chunk
+                .iter()
+                .map(|issue_id| SqliteValue::from(issue_id.as_str()))
+                .collect();
+
+            let rows = self.conn.query_with_params(&sql, &params)?;
+            for row in &rows {
+                let issue_id = row
+                    .get(0)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or("")
+                    .to_string();
+                let dependency_count = row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0);
+                let dependent_count = row.get(2).and_then(SqliteValue::as_integer).unwrap_or(0);
+
+                if dependency_count > 0 {
+                    dependency_counts.insert(
+                        issue_id.clone(),
+                        usize::try_from(dependency_count).unwrap_or(0),
+                    );
+                }
+                if dependent_count > 0 {
+                    dependent_counts
+                        .insert(issue_id, usize::try_from(dependent_count).unwrap_or(0));
+                }
+            }
+        }
+
+        Ok((dependency_counts, dependent_counts))
+    }
+
     /// Count dependents for multiple issues efficiently.
     ///
     /// # Errors

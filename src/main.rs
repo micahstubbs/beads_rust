@@ -41,9 +41,13 @@ fn main() {
     };
 
     // Phase 2: Open Storage (One-time)
-    let should_preopen_storage = ctx.is_initialized()
-        && !ctx.no_db()
-        && (needs_bootstrap_context || (is_mutating && !ctx.no_auto_flush()));
+    let storage_enabled = ctx.is_initialized() && !ctx.no_db();
+    let should_auto_flush_now = is_mutating && !ctx.no_auto_flush();
+    let should_preopen_storage = should_preopen_storage(
+        storage_enabled,
+        needs_bootstrap_context,
+        should_auto_flush_now,
+    );
     let mut storage_result = if should_preopen_storage {
         match open_storage_from_ctx(&ctx) {
             Ok(res) => Some(res),
@@ -61,7 +65,6 @@ fn main() {
     // Phase 3: Auto-Import
     if let (Some(res), Some(paths)) = (storage_result.as_mut(), ctx.paths.as_ref())
         && should_auto_import(&cli.command)
-        && !ctx.no_auto_import()
     {
         let expected_prefix = match res.storage.get_config("issue_prefix") {
             Ok(p) => p,
@@ -75,7 +78,7 @@ fn main() {
             &paths.jsonl_path,
             expected_prefix.as_deref(),
             cli.allow_stale,
-            false, // ctx.no_auto_import already checked above
+            ctx.no_auto_import(),
         );
         if let Err(e) = outcome {
             handle_error(&e, json_error_mode);
@@ -259,6 +262,14 @@ fn open_storage_from_ctx(ctx: &StartupContext) -> Result<OpenStorageContext> {
     )?;
 
     Ok(OpenStorageContext { storage })
+}
+
+const fn should_preopen_storage(
+    storage_enabled: bool,
+    needs_bootstrap_context: bool,
+    should_auto_flush_now: bool,
+) -> bool {
+    storage_enabled && (needs_bootstrap_context || should_auto_flush_now)
 }
 
 /// Determine if a command potentially mutates data.
@@ -595,5 +606,20 @@ mod tests {
     fn should_not_render_errors_as_json_without_json_request() {
         let cli = Cli::parse_from(["br", "history", "list"]);
         assert!(!should_render_errors_as_json_with_env(&cli, None));
+    }
+
+    #[test]
+    fn preopen_storage_skips_commands_without_bootstrap_or_flush_work() {
+        assert!(!should_preopen_storage(true, false, false));
+    }
+
+    #[test]
+    fn preopen_storage_keeps_mutating_auto_flush_path() {
+        assert!(should_preopen_storage(true, false, true));
+    }
+
+    #[test]
+    fn preopen_storage_keeps_bootstrap_path_for_staleness_checks() {
+        assert!(should_preopen_storage(true, true, false));
     }
 }

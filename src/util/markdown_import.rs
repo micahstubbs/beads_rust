@@ -263,13 +263,13 @@ fn split_list_content(content: &str) -> Vec<String> {
             result.extend(
                 line.split(',')
                     .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
+                    .filter(|s| !s.is_empty()),
             );
         } else {
             result.extend(
                 line.split_whitespace()
                     .map(str::to_string)
-                    .filter(|s| !s.is_empty())
+                    .filter(|s| !s.is_empty()),
             );
         }
     }

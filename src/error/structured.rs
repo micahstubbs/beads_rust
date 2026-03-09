@@ -268,7 +268,7 @@ impl StructuredError {
     #[must_use]
     pub fn from_error(err: &BeadsError) -> Self {
         let (code, context) = Self::extract_code_and_context(err);
-        let hint = Self::generate_hint(err, context.as_ref());
+        let hint = Self::generate_hint(Self::hint_source(err), context.as_ref());
 
         Self {
             code,
@@ -276,6 +276,34 @@ impl StructuredError {
             hint,
             retryable: code.is_retryable(),
             context,
+        }
+    }
+
+    fn hint_source(err: &BeadsError) -> &BeadsError {
+        match err {
+            BeadsError::WithContext { source, .. } => source
+                .downcast_ref::<BeadsError>()
+                .map_or(err, Self::hint_source),
+            _ => err,
+        }
+    }
+
+    fn add_wrapper_context(wrapper_context: &str, inner_context: Option<Value>) -> Value {
+        match inner_context {
+            Some(Value::Object(mut object)) => {
+                object.insert(
+                    "wrapper_context".to_string(),
+                    Value::String(wrapper_context.to_string()),
+                );
+                Value::Object(object)
+            }
+            Some(other) => json!({
+                "wrapper_context": wrapper_context,
+                "source_context": other,
+            }),
+            None => json!({
+                "wrapper_context": wrapper_context,
+            }),
         }
     }
 
@@ -607,8 +635,34 @@ impl StructuredError {
             BeadsError::Io(_) => (ErrorCode::IoError, None),
             BeadsError::Json(_) => (ErrorCode::JsonError, None),
             BeadsError::Yaml(_) => (ErrorCode::YamlError, None),
-            BeadsError::WithContext { context, .. } => {
-                (ErrorCode::InternalError, Some(json!({"context": context})))
+            BeadsError::WithContext { context, source } => {
+                if let Some(source_err) = source.downcast_ref::<BeadsError>() {
+                    let (code, inner_context) = Self::extract_code_and_context(source_err);
+                    (
+                        code,
+                        Some(Self::add_wrapper_context(context, inner_context)),
+                    )
+                } else if source.downcast_ref::<std::io::Error>().is_some() {
+                    (
+                        ErrorCode::IoError,
+                        Some(Self::add_wrapper_context(context, None)),
+                    )
+                } else if source.downcast_ref::<serde_json::Error>().is_some() {
+                    (
+                        ErrorCode::JsonError,
+                        Some(Self::add_wrapper_context(context, None)),
+                    )
+                } else if source.downcast_ref::<serde_yml::Error>().is_some() {
+                    (
+                        ErrorCode::YamlError,
+                        Some(Self::add_wrapper_context(context, None)),
+                    )
+                } else {
+                    (
+                        ErrorCode::InternalError,
+                        Some(Self::add_wrapper_context(context, None)),
+                    )
+                }
             }
             BeadsError::Other(_) => (ErrorCode::InternalError, None),
         }
@@ -926,6 +980,7 @@ pub fn find_similar_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
 
     #[test]
     fn test_error_code_as_str() {
@@ -1052,6 +1107,43 @@ mod tests {
         assert_eq!(err.code, ErrorCode::AmbiguousId);
         assert!(err.retryable);
         assert!(err.context.as_ref().unwrap()["matches"].is_array());
+    }
+
+    #[test]
+    fn test_structured_error_preserves_wrapped_beads_error_code() {
+        let err = BeadsError::WithContext {
+            context: "failed to preserve blocked cache after partial close mutation".to_string(),
+            source: Box::new(BeadsError::validation("ids", "boom")),
+        };
+
+        let structured = StructuredError::from_error(&err);
+        let context = structured.context.expect("context");
+
+        assert_eq!(structured.code, ErrorCode::ValidationFailed);
+        assert!(structured.retryable);
+        assert_eq!(context["field"], "ids");
+        assert_eq!(context["reason"], "boom");
+        assert_eq!(
+            context["wrapper_context"],
+            "failed to preserve blocked cache after partial close mutation"
+        );
+    }
+
+    #[test]
+    fn test_structured_error_preserves_wrapped_io_error_code() {
+        let err = BeadsError::WithContext {
+            context: "failed to rename recovered database".to_string(),
+            source: Box::new(io::Error::other("disk full")),
+        };
+
+        let structured = StructuredError::from_error(&err);
+        let context = structured.context.expect("context");
+
+        assert_eq!(structured.code, ErrorCode::IoError);
+        assert_eq!(
+            context["wrapper_context"],
+            "failed to rename recovered database"
+        );
     }
 
     #[test]

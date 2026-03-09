@@ -72,3 +72,47 @@ fn test_soft_defer_behavior() {
         issue.get("defer_until")
     );
 }
+
+#[test]
+fn test_soft_defer_preserves_in_progress_status() {
+    let workspace = BrWorkspace::new();
+    run_br(&workspace, ["init"], "init");
+
+    let create = run_br(
+        &workspace,
+        ["create", "Soft Defer In Progress", "--json"],
+        "create",
+    );
+    assert!(create.status.success());
+    let created: serde_json::Value = serde_json::from_str(&create.stdout).expect("parse json");
+    let id = created["id"].as_str().expect("issue id");
+
+    let update = run_br(
+        &workspace,
+        ["update", id, "--status", "in_progress", "--defer", "+1d"],
+        "update_soft_defer_in_progress",
+    );
+    assert!(update.status.success(), "update failed: {}", update.stderr);
+
+    let undefer = run_br(&workspace, ["undefer", id, "--json"], "undefer");
+    assert!(
+        undefer.status.success(),
+        "undefer failed: {}",
+        undefer.stderr
+    );
+
+    let show_json = run_br(&workspace, ["show", id, "--json"], "show_json");
+    let json: serde_json::Value = serde_json::from_str(&show_json.stdout).expect("parse json");
+    let issue = if json.is_array() { &json[0] } else { &json };
+
+    assert_eq!(
+        issue["status"].as_str(),
+        Some("in_progress"),
+        "soft-deferred in-progress issue should stay in progress"
+    );
+    assert!(
+        issue.get("defer_until").is_none() || issue["defer_until"].is_null(),
+        "defer_until should be cleared, got: {:?}",
+        issue.get("defer_until")
+    );
+}

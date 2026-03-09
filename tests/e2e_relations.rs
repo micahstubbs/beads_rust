@@ -530,16 +530,32 @@ fn e2e_close_blocked_requires_force() {
         "close_blocked_skip",
     );
     assert!(
-        close_skip.status.success(),
-        "close blocked failed: {}",
-        close_skip.stderr
+        !close_skip.status.success(),
+        "close blocked should fail with nothing-to-do: {}",
+        close_skip.stdout
     );
     let payload = extract_json_payload(&close_skip.stdout);
     let close_json: Value = serde_json::from_str(&payload).expect("close json");
-    let closed = close_json.as_array().cloned().unwrap_or_default();
+    let closed = close_json["closed"].as_array().cloned().unwrap_or_default();
+    let skipped = close_json["skipped"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert!(
         closed.is_empty(),
         "blocked issue should not close without --force"
+    );
+    assert_eq!(
+        skipped.len(),
+        1,
+        "blocked close should report one skipped issue"
+    );
+    assert_eq!(skipped[0]["id"], blocked_id);
+    assert!(
+        skipped[0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("blocked by:")),
+        "blocked close should explain the dependency blocker"
     );
 
     let show = run_br(
@@ -569,4 +585,132 @@ fn e2e_close_blocked_requires_force() {
         "blocked issue not closed with --force"
     );
     info!("e2e_close_blocked_requires_force: assertions passed");
+}
+
+#[test]
+fn e2e_close_json_reports_closed_and_skipped_in_partial_batch() {
+    common::init_test_logging();
+    info!("e2e_close_json_reports_closed_and_skipped_in_partial_batch: starting");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let blocker = run_br(&workspace, ["create", "Blocker issue"], "create_blocker");
+    assert!(
+        blocker.status.success(),
+        "blocker create failed: {}",
+        blocker.stderr
+    );
+    let blocker_id = parse_created_id(&blocker.stdout);
+
+    let blocked = run_br(&workspace, ["create", "Blocked issue"], "create_blocked");
+    assert!(
+        blocked.status.success(),
+        "blocked create failed: {}",
+        blocked.stderr
+    );
+    let blocked_id = parse_created_id(&blocked.stdout);
+
+    let independent = run_br(
+        &workspace,
+        ["create", "Independent issue"],
+        "create_independent",
+    );
+    assert!(
+        independent.status.success(),
+        "independent create failed: {}",
+        independent.stderr
+    );
+    let independent_id = parse_created_id(&independent.stdout);
+
+    let dep_add = run_br(
+        &workspace,
+        ["dep", "add", &blocked_id, &blocker_id],
+        "dep_add",
+    );
+    assert!(
+        dep_add.status.success(),
+        "dep add failed: {}",
+        dep_add.stderr
+    );
+
+    let close = run_br(
+        &workspace,
+        ["close", &blocked_id, &independent_id, "--json"],
+        "close_partial_batch",
+    );
+    assert!(
+        close.status.success(),
+        "partial close should succeed: {}",
+        close.stderr
+    );
+
+    let payload = extract_json_payload(&close.stdout);
+    let close_json: Value = serde_json::from_str(&payload).expect("close json");
+    let closed = close_json["closed"].as_array().cloned().unwrap_or_default();
+    let skipped = close_json["skipped"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+
+    assert_eq!(
+        closed.len(),
+        1,
+        "partial close should report one closed issue"
+    );
+    assert_eq!(closed[0]["id"], independent_id);
+    assert_eq!(
+        skipped.len(),
+        1,
+        "partial close should report one skipped issue"
+    );
+    assert_eq!(skipped[0]["id"], blocked_id);
+    assert!(
+        skipped[0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("blocked by:")),
+        "partial close should preserve skipped blocker details"
+    );
+    info!("e2e_close_json_reports_closed_and_skipped_in_partial_batch: assertions passed");
+}
+
+#[test]
+fn e2e_close_honors_env_json_mode() {
+    common::init_test_logging();
+    info!("e2e_close_honors_env_json_mode: starting");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Close via env json", "--json"],
+        "create_env_json_close",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let created: Value =
+        serde_json::from_str(&extract_json_payload(&create.stdout)).expect("create json");
+    let issue_id = created["id"].as_str().expect("issue id");
+
+    let close = common::cli::run_br_with_env(
+        &workspace,
+        ["close", issue_id],
+        [("BR_OUTPUT_FORMAT", "json")],
+        "close_env_json",
+    );
+    assert!(
+        close.status.success(),
+        "close with env json failed: {}",
+        close.stderr
+    );
+
+    let payload = extract_json_payload(&close.stdout);
+    let close_json: Value = serde_json::from_str(&payload).expect("close json");
+    let closed = close_json.as_array().cloned().unwrap_or_default();
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0]["id"], issue_id);
+    assert_eq!(closed[0]["status"], "closed");
+    info!("e2e_close_honors_env_json_mode: assertions passed");
 }

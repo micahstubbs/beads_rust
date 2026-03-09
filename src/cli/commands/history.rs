@@ -80,8 +80,7 @@ pub fn execute(args: HistoryArgs, cli: &config::CliOverrides, ctx: &OutputContex
 
     match args.command {
         Some(HistoryCommands::Diff { file }) => {
-            let active_jsonl_path =
-                config::ConfigPaths::resolve(&beads_dir, cli.db.as_ref())?.jsonl_path;
+            let active_jsonl_path = config::resolve_paths(&beads_dir, cli.db.as_ref())?.jsonl_path;
             diff_backup(
                 &beads_dir,
                 &history_dir,
@@ -91,8 +90,7 @@ pub fn execute(args: HistoryArgs, cli: &config::CliOverrides, ctx: &OutputContex
             )
         }
         Some(HistoryCommands::Restore { file, force }) => {
-            let active_jsonl_path =
-                config::ConfigPaths::resolve(&beads_dir, cli.db.as_ref())?.jsonl_path;
+            let active_jsonl_path = config::resolve_paths(&beads_dir, cli.db.as_ref())?.jsonl_path;
             restore_backup(
                 &beads_dir,
                 &history_dir,

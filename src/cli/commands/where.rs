@@ -2,6 +2,7 @@
 
 use crate::config;
 use crate::config::routing::follow_redirects;
+use crate::error::BeadsError;
 use crate::error::Result;
 use crate::output::OutputContext;
 use crate::util::parse_id;
@@ -31,7 +32,7 @@ struct WhereOutput {
 /// Returns an error if redirect resolution fails.
 pub fn execute(cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     let Some(output) = resolve_where_output(cli)? else {
-        return handle_missing_beads(ctx);
+        return Err(BeadsError::NotInitialized);
     };
 
     if ctx.is_json() {
@@ -57,7 +58,7 @@ fn resolve_where_output(cli: &config::CliOverrides) -> Result<Option<WhereOutput
         Some(canonicalize_lossy(&beads_dir).display().to_string())
     };
 
-    let paths = config::ConfigPaths::resolve(&final_dir, cli.db.as_ref())?;
+    let paths = config::resolve_paths(&final_dir, cli.db.as_ref())?;
     let database_path = canonicalize_lossy(&paths.db_path).display().to_string();
     let jsonl_path = canonicalize_lossy(&paths.jsonl_path).display().to_string();
     let prefix = detect_prefix(&final_dir, &paths.jsonl_path, cli);
@@ -134,27 +135,9 @@ fn print_human(output: &WhereOutput) {
     if let Some(db_path) = &output.database_path {
         println!("  database: {db_path}");
     }
-}
-
-fn handle_missing_beads(ctx: &OutputContext) -> Result<()> {
-    if ctx.is_json() {
-        let payload = serde_json::json!({ "error": "no beads directory found" });
-        ctx.json_pretty(&payload);
-    } else if ctx.is_rich() {
-        let console = Console::default();
-        let theme = ctx.theme();
-        let mut text = Text::new("");
-        text.append_styled("\u{2717} ", theme.error.clone());
-        text.append_styled("No beads directory found.\n", theme.error.clone());
-        text.append_styled("  Run ", theme.muted.clone());
-        text.append_styled("br init", theme.accent.clone());
-        text.append_styled(" to create one.", theme.muted.clone());
-        console.print_renderable(&text);
-    } else {
-        eprintln!("No beads directory found.");
-        eprintln!("Run `br init` to create one.");
+    if let Some(jsonl_path) = &output.jsonl_path {
+        println!("  jsonl: {jsonl_path}");
     }
-    std::process::exit(1);
 }
 
 /// Render location info as a rich panel.

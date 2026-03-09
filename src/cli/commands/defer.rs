@@ -1,9 +1,9 @@
 //! Defer and Undefer command implementations.
 
+use crate::cli::commands::preserve_blocked_cache_on_error;
 use crate::cli::{DeferArgs, UndeferArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::format::ReadyIssue;
 use crate::model::{Issue, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::IssueUpdate;
@@ -13,20 +13,43 @@ use rich_rust::prelude::*;
 use serde::Serialize;
 
 /// Result of deferring a single issue (for text output).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DeferredIssue {
     pub id: String,
     pub title: String,
+    pub previous_status: String,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub defer_until: Option<String>,
 }
 
 /// Issue that was skipped during defer.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SkippedIssue {
     pub id: String,
     pub reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DeferResult {
+    pub deferred: Vec<DeferredIssue>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SkippedIssue>,
+}
+
+#[derive(Debug, Serialize)]
+struct UndeferResult {
+    pub undeferred: Vec<DeferredIssue>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SkippedIssue>,
+}
+
+fn restored_status_after_undefer(issue: &Issue) -> Status {
+    if issue.status == Status::Deferred {
+        Status::Open
+    } else {
+        issue.status.clone()
+    }
 }
 
 /// Execute the defer command.
@@ -36,7 +59,7 @@ pub struct SkippedIssue {
 /// Returns an error if database operations fail or IDs cannot be resolved.
 pub fn execute_defer(
     args: &DeferArgs,
-    _json: bool,
+    json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
@@ -74,15 +97,17 @@ pub fn execute_defer(
     )?;
 
     let mut deferred_issues: Vec<DeferredIssue> = Vec::new();
-    let mut deferred_full: Vec<Issue> = Vec::new();
     let mut skipped_issues: Vec<SkippedIssue> = Vec::new();
+    let mut cache_dirty = false;
 
     for resolved in &resolved_ids {
         let id = &resolved.id;
         tracing::info!(id = %id, until = ?defer_until, "Deferring issue");
 
         // Get current issue
-        let Some(issue) = storage.get_issue(id)? else {
+        let Some(issue) =
+            preserve_blocked_cache_on_error(storage, cache_dirty, "defer", storage.get_issue(id))?
+        else {
             skipped_issues.push(SkippedIssue {
                 id: id.clone(),
                 reason: "issue not found".to_string(),
@@ -119,27 +144,25 @@ pub fn execute_defer(
         };
 
         // Apply update
-        storage.update_issue(id, &update, &actor)?;
+        let update_result = storage.update_issue(id, &update, &actor);
+        preserve_blocked_cache_on_error(storage, cache_dirty, "defer", update_result)?;
+        cache_dirty = true;
         tracing::info!(id = %id, defer_until = ?defer_until, "Issue deferred");
 
         // Update last touched
         crate::util::set_last_touched_id(&beads_dir, id);
 
-        // Get updated issue for JSON output
-        if let Some(updated) = storage.get_issue(id)? {
-            deferred_full.push(updated);
-        }
-
         deferred_issues.push(DeferredIssue {
             id: id.clone(),
             title: issue.title.clone(),
+            previous_status: issue.status.as_str().to_string(),
             status: "deferred".to_string(),
             defer_until: defer_until.map(|dt| dt.to_rfc3339()),
         });
     }
 
     // Rebuild blocked cache since deferred issues may unblock dependents (or change their blocked reason)
-    if !deferred_issues.is_empty() {
+    if cache_dirty {
         tracing::info!(
             "Rebuilding blocked cache after deferring {} issues",
             deferred_issues.len()
@@ -147,7 +170,7 @@ pub fn execute_defer(
         storage.rebuild_blocked_cache(true)?;
     }
 
-    render_defer_output(&deferred_issues, &deferred_full, &skipped_issues, args, ctx)?;
+    render_defer_output(&deferred_issues, &skipped_issues, args, json, ctx)?;
 
     storage_ctx.flush_no_db_if_dirty()?;
     Ok(())
@@ -155,15 +178,22 @@ pub fn execute_defer(
 
 fn render_defer_output(
     deferred_issues: &[DeferredIssue],
-    deferred_full: &[Issue],
     skipped_issues: &[SkippedIssue],
     args: &DeferArgs,
+    json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let use_json = ctx.is_json() || args.robot;
+    let use_json = json || ctx.is_json() || args.robot;
     if use_json {
-        let json_output: Vec<ReadyIssue> = deferred_full.iter().map(ReadyIssue::from).collect();
-        let json = serde_json::to_string_pretty(&json_output)?;
+        let json = if skipped_issues.is_empty() {
+            serde_json::to_string_pretty(deferred_issues)?
+        } else {
+            let result = DeferResult {
+                deferred: deferred_issues.to_vec(),
+                skipped: skipped_issues.to_vec(),
+            };
+            serde_json::to_string_pretty(&result)?
+        };
         println!("{json}");
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_defer_rich(deferred_issues, skipped_issues, ctx);
@@ -194,7 +224,7 @@ fn render_defer_output(
 /// Returns an error if database operations fail or IDs cannot be resolved.
 pub fn execute_undefer(
     args: &UndeferArgs,
-    _json: bool,
+    json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
@@ -225,15 +255,21 @@ pub fn execute_undefer(
     )?;
 
     let mut undeferred_issues: Vec<DeferredIssue> = Vec::new();
-    let mut undeferred_full: Vec<Issue> = Vec::new();
     let mut skipped_issues: Vec<SkippedIssue> = Vec::new();
+    let mut cache_dirty = false;
 
     for resolved in &resolved_ids {
         let id = &resolved.id;
         tracing::info!(id = %id, "Undeferring issue");
 
         // Get current issue
-        let Some(issue) = storage.get_issue(id)? else {
+        let Some(issue) = preserve_blocked_cache_on_error(
+            storage,
+            cache_dirty,
+            "undefer",
+            storage.get_issue(id),
+        )?
+        else {
             skipped_issues.push(SkippedIssue {
                 id: id.clone(),
                 reason: "issue not found".to_string(),
@@ -251,36 +287,41 @@ pub fn execute_undefer(
             continue;
         }
 
-        // Build update: set status=open, clear defer_until
+        let restored_status = restored_status_after_undefer(&issue);
+        let status_update = if issue.status == Status::Deferred {
+            Some(Status::Open)
+        } else {
+            None
+        };
+
+        // Build update: clear defer_until and only reopen explicitly deferred issues.
         let update = IssueUpdate {
-            status: Some(Status::Open),
+            status: status_update,
             defer_until: Some(None), // Clear defer_until
             skip_cache_rebuild: true,
             ..Default::default()
         };
 
         // Apply update
-        storage.update_issue(id, &update, &actor)?;
+        let update_result = storage.update_issue(id, &update, &actor);
+        preserve_blocked_cache_on_error(storage, cache_dirty, "undefer", update_result)?;
+        cache_dirty = true;
         tracing::info!(id = %id, "Issue undeferred");
 
         // Update last touched
         crate::util::set_last_touched_id(&beads_dir, id);
 
-        // Get updated issue for JSON output
-        if let Some(updated) = storage.get_issue(id)? {
-            undeferred_full.push(updated);
-        }
-
         undeferred_issues.push(DeferredIssue {
             id: id.clone(),
             title: issue.title.clone(),
-            status: "open".to_string(),
+            previous_status: issue.status.as_str().to_string(),
+            status: restored_status.as_str().to_string(),
             defer_until: None,
         });
     }
 
     // Rebuild blocked cache since undeferred issues may become blockers
-    if !undeferred_issues.is_empty() {
+    if cache_dirty {
         tracing::info!(
             "Rebuilding blocked cache after undeferring {} issues",
             undeferred_issues.len()
@@ -288,23 +329,41 @@ pub fn execute_undefer(
         storage.rebuild_blocked_cache(true)?;
     }
 
-    // Output
-    let use_json = ctx.is_json() || args.robot;
+    render_undefer_output(&undeferred_issues, &skipped_issues, json, args, ctx)?;
+
+    storage_ctx.flush_no_db_if_dirty()?;
+    Ok(())
+}
+
+fn render_undefer_output(
+    undeferred_issues: &[DeferredIssue],
+    skipped_issues: &[SkippedIssue],
+    json: bool,
+    args: &UndeferArgs,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let use_json = json || ctx.is_json() || args.robot;
     if use_json {
-        // bd outputs a bare array of updated issues
-        let json_output: Vec<ReadyIssue> = undeferred_full.iter().map(ReadyIssue::from).collect();
-        let json = serde_json::to_string_pretty(&json_output)?;
+        let json = if skipped_issues.is_empty() {
+            serde_json::to_string_pretty(undeferred_issues)?
+        } else {
+            let result = UndeferResult {
+                undeferred: undeferred_issues.to_vec(),
+                skipped: skipped_issues.to_vec(),
+            };
+            serde_json::to_string_pretty(&result)?
+        };
         println!("{json}");
     } else if matches!(ctx.mode(), OutputMode::Rich) {
-        render_undefer_rich(&undeferred_issues, &skipped_issues, ctx);
+        render_undefer_rich(undeferred_issues, skipped_issues, ctx);
     } else {
-        for undeferred in &undeferred_issues {
+        for undeferred in undeferred_issues {
             println!(
-                "\u{2713} Undeferred {}: {} (now open)",
-                undeferred.id, undeferred.title
+                "\u{2713} Undeferred {}: {} (now {})",
+                undeferred.id, undeferred.title, undeferred.status
             );
         }
-        for skipped in &skipped_issues {
+        for skipped in skipped_issues {
             println!("\u{2298} Skipped {}: {}", skipped.id, skipped.reason);
         }
         if undeferred_issues.is_empty() && skipped_issues.is_empty() {
@@ -312,7 +371,6 @@ pub fn execute_undefer(
         }
     }
 
-    storage_ctx.flush_no_db_if_dirty()?;
     Ok(())
 }
 
@@ -339,7 +397,7 @@ fn render_defer_rich(deferred: &[DeferredIssue], skipped: &[SkippedIssue], ctx: 
             content.append(&item.title);
             content.append("\n");
             content.append_styled("  Status: ", theme.dimmed.clone());
-            content.append_styled("open", theme.success.clone());
+            content.append_styled(&item.previous_status, theme.success.clone());
             content.append(" \u{2192} ");
             content.append_styled("deferred", theme.warning.clone());
             content.append("\n");
@@ -398,9 +456,13 @@ fn render_undefer_rich(
             content.append(&item.title);
             content.append("\n");
             content.append_styled("  Status: ", theme.dimmed.clone());
-            content.append_styled("deferred", theme.warning.clone());
-            content.append(" \u{2192} ");
-            content.append_styled("open", theme.success.clone());
+            content.append_styled(&item.previous_status, theme.warning.clone());
+            if item.previous_status == item.status {
+                content.append_styled(" (unchanged)", theme.dimmed.clone());
+            } else {
+                content.append(" \u{2192} ");
+                content.append_styled(&item.status, theme.success.clone());
+            }
             content.append("\n");
         }
 
@@ -679,6 +741,32 @@ mod tests {
 
         let updated = storage.get_issue("bd-defer-3").expect("get").unwrap();
         assert_eq!(updated.status, Status::Open);
+        assert!(updated.defer_until.is_none());
+    }
+
+    #[test]
+    fn execute_undefer_preserves_non_deferred_status_for_soft_defer() {
+        let _lock = TEST_DIR_LOCK.lock().expect("dir lock");
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        let mut storage = SqliteStorage::open(&beads_dir.join("beads.db")).expect("storage");
+        let mut issue = make_issue("bd-soft-defer-1", "Soft defer in progress");
+        issue.status = Status::InProgress;
+        issue.defer_until = Some(Utc::now() + Duration::days(1));
+        storage.create_issue(&issue, "tester").expect("create");
+
+        let _guard = DirGuard::new(temp.path());
+        let undefer_args = UndeferArgs {
+            ids: vec!["bd-soft-defer-1".to_string()],
+            robot: true,
+        };
+        execute_undefer(&undefer_args, true, &CliOverrides::default(), &ctx).expect("undefer");
+
+        let updated = storage.get_issue("bd-soft-defer-1").expect("get").unwrap();
+        assert_eq!(updated.status, Status::InProgress);
         assert!(updated.defer_until.is_none());
     }
 }

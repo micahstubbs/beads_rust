@@ -1,6 +1,7 @@
 //! Close command implementation.
 
 use crate::cli::CloseArgs as CliCloseArgs;
+use crate::cli::commands::preserve_blocked_cache_on_error;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::Status;
@@ -9,6 +10,7 @@ use crate::storage::IssueUpdate;
 use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 /// Internal arguments for the close command.
 #[derive(Debug, Clone, Default)]
@@ -93,6 +95,86 @@ pub struct SkippedIssue {
     pub reason: String,
 }
 
+fn build_close_json_payload(
+    args: &CloseArgs,
+    closed_issues: Vec<ClosedIssue>,
+    skipped_issues: Vec<SkippedIssue>,
+    unblocked_issues: Vec<UnblockedIssue>,
+) -> Result<String> {
+    let json = if args.suggest_next {
+        // suggest_next is br-only, so always use the wrapped machine format.
+        let result = CloseWithSuggestResult {
+            closed: closed_issues,
+            skipped: skipped_issues,
+            unblocked: unblocked_issues,
+        };
+        serde_json::to_string_pretty(&result)?
+    } else if skipped_issues.is_empty() {
+        // Preserve bd-compatible array output for pure-success closes.
+        serde_json::to_string_pretty(&closed_issues)?
+    } else {
+        // Once skips are present, a bare array loses machine-readable reasons.
+        let result = CloseResult {
+            closed: closed_issues,
+            skipped: skipped_issues,
+        };
+        serde_json::to_string_pretty(&result)?
+    };
+
+    Ok(json)
+}
+
+fn render_close_json(
+    args: &CloseArgs,
+    closed_issues: Vec<ClosedIssue>,
+    skipped_issues: Vec<SkippedIssue>,
+    unblocked_issues: Vec<UnblockedIssue>,
+) -> Result<()> {
+    let json = build_close_json_payload(args, closed_issues, skipped_issues, unblocked_issues)?;
+    println!("{json}");
+    Ok(())
+}
+
+fn compute_batch_closable_ids(
+    active_issue_ids: &HashSet<String>,
+    internal_blockers_by_id: &HashMap<String, Vec<String>>,
+    external_blockers_by_id: &HashMap<String, Vec<String>>,
+) -> HashSet<String> {
+    let mut closable: HashSet<String> = active_issue_ids
+        .iter()
+        .filter(|id| {
+            external_blockers_by_id
+                .get(*id)
+                .is_none_or(std::vec::Vec::is_empty)
+        })
+        .cloned()
+        .collect();
+
+    loop {
+        let to_remove: Vec<String> = closable
+            .iter()
+            .filter(|id| {
+                internal_blockers_by_id
+                    .get(*id)
+                    .into_iter()
+                    .flatten()
+                    .any(|blocker_id| !closable.contains(blocker_id))
+            })
+            .cloned()
+            .collect();
+
+        if to_remove.is_empty() {
+            break;
+        }
+
+        for id in to_remove {
+            closable.remove(&id);
+        }
+    }
+
+    closable
+}
+
 /// Execute the close command.
 ///
 /// # Errors
@@ -128,6 +210,7 @@ pub fn execute_with_args(
     ctx: &OutputContext,
 ) -> Result<()> {
     tracing::info!("Executing close command");
+    let use_json = use_json || ctx.is_json();
 
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
@@ -178,15 +261,25 @@ pub fn execute_with_args(
         Vec::new()
     };
 
+    let requested_ids: HashSet<String> = resolved_ids
+        .iter()
+        .map(|resolved| resolved.id.clone())
+        .collect();
+    let mut open_issues: HashMap<String, crate::model::Issue> = HashMap::new();
+    let mut internal_blockers_by_id: HashMap<String, Vec<String>> = HashMap::new();
+    let mut external_blockers_by_id: HashMap<String, Vec<String>> = HashMap::new();
     let mut closed_issues: Vec<ClosedIssue> = Vec::new();
     let mut skipped_issues: Vec<SkippedIssue> = Vec::new();
+    let mut cache_dirty = false;
 
     for resolved in &resolved_ids {
         let id = &resolved.id;
         tracing::info!(id = %id, "Closing issue");
 
         // Get current issue
-        let Some(issue) = storage.get_issue(id)? else {
+        let Some(issue) =
+            preserve_blocked_cache_on_error(storage, cache_dirty, "close", storage.get_issue(id))?
+        else {
             skipped_issues.push(SkippedIssue {
                 id: id.clone(),
                 reason: "issue not found".to_string(),
@@ -203,14 +296,76 @@ pub fn execute_with_args(
             continue;
         }
 
-        // Check if blocked (unless --force)
-        if !args.force && storage.is_blocked(id)? {
-            let mut blocker_ids = storage.get_blockers(id)?;
-            if blocker_ids.is_empty() {
+        if args.force {
+            open_issues.insert(id.clone(), issue);
+            continue;
+        }
+
+        let mut blocker_ids = if preserve_blocked_cache_on_error(
+            storage,
+            cache_dirty,
+            "close",
+            storage.is_blocked(id),
+        )? {
+            let mut blockers = preserve_blocked_cache_on_error(
+                storage,
+                cache_dirty,
+                "close",
+                storage.get_blockers(id),
+            )?;
+            if blockers.is_empty() {
                 // Fallback in case of cache inconsistency or implicit blocking
-                blocker_ids = storage.get_dependencies(id)?;
+                blockers = preserve_blocked_cache_on_error(
+                    storage,
+                    cache_dirty,
+                    "close",
+                    storage.get_dependencies(id),
+                )?;
             }
-            tracing::debug!(blocked_by = ?blocker_ids, "Issue is blocked");
+            blockers
+        } else {
+            Vec::new()
+        };
+        blocker_ids.sort();
+        blocker_ids.dedup();
+        let (internal_blockers, external_blockers): (Vec<String>, Vec<String>) = blocker_ids
+            .into_iter()
+            .partition(|blocker_id| requested_ids.contains(blocker_id));
+        internal_blockers_by_id.insert(id.clone(), internal_blockers);
+        external_blockers_by_id.insert(id.clone(), external_blockers);
+        open_issues.insert(id.clone(), issue);
+    }
+
+    let active_issue_ids: HashSet<String> = open_issues.keys().cloned().collect();
+    let batch_closable_ids = if args.force {
+        active_issue_ids
+    } else {
+        compute_batch_closable_ids(
+            &active_issue_ids,
+            &internal_blockers_by_id,
+            &external_blockers_by_id,
+        )
+    };
+
+    for resolved in &resolved_ids {
+        let id = &resolved.id;
+        let Some(issue) = open_issues.get(id) else {
+            continue;
+        };
+
+        if !args.force && !batch_closable_ids.contains(id) {
+            let mut blocker_ids = external_blockers_by_id.get(id).cloned().unwrap_or_default();
+            if let Some(internal_blockers) = internal_blockers_by_id.get(id) {
+                blocker_ids.extend(
+                    internal_blockers
+                        .iter()
+                        .filter(|blocker_id| !batch_closable_ids.contains(*blocker_id))
+                        .cloned(),
+                );
+            }
+            blocker_ids.sort();
+            blocker_ids.dedup();
+            tracing::debug!(blocked_by = ?blocker_ids, "Issue remains blocked in batch close");
             let reason = if blocker_ids.is_empty() {
                 "blocked by dependencies".to_string()
             } else {
@@ -223,7 +378,6 @@ pub fn execute_with_args(
             continue;
         }
 
-        // Build update
         let now = Utc::now();
         let close_reason = args.reason.clone().unwrap_or_else(|| "done".to_string());
         let update = IssueUpdate {
@@ -236,7 +390,9 @@ pub fn execute_with_args(
         };
 
         // Apply update
-        storage.update_issue(id, &update, &actor)?;
+        let update_result = storage.update_issue(id, &update, &actor);
+        preserve_blocked_cache_on_error(storage, cache_dirty, "close", update_result)?;
+        cache_dirty = true;
         tracing::info!(id = %id, reason = ?args.reason, "Issue closed");
 
         // Update last touched
@@ -251,8 +407,11 @@ pub fn execute_with_args(
         });
     }
 
-    if !closed_issues.is_empty() {
-        tracing::info!("Rebuilding blocked cache after closing {} issues", closed_issues.len());
+    if cache_dirty {
+        tracing::info!(
+            "Rebuilding blocked cache after closing {} issues",
+            closed_issues.len()
+        );
         storage.rebuild_blocked_cache(true)?;
     }
 
@@ -263,11 +422,15 @@ pub fn execute_with_args(
         // We just need to fetch the new state.
 
         // Find issues that were blocked before but aren't now
-        let blocked_after: Vec<String> = storage
-            .get_blocked_issues()?
-            .into_iter()
-            .map(|(i, _)| i.id)
-            .collect();
+        let blocked_after: Vec<String> = preserve_blocked_cache_on_error(
+            storage,
+            cache_dirty,
+            "close",
+            storage.get_blocked_issues(),
+        )?
+        .into_iter()
+        .map(|(i, _)| i.id)
+        .collect();
 
         let newly_unblocked: Vec<String> = blocked_before
             .into_iter()
@@ -278,8 +441,12 @@ pub fn execute_with_args(
 
         let mut unblocked = Vec::new();
         for uid in newly_unblocked {
-            if let Some(issue) = storage.get_issue(&uid)?
-                && issue.status.is_active()
+            if let Some(issue) = preserve_blocked_cache_on_error(
+                storage,
+                cache_dirty,
+                "close",
+                storage.get_issue(&uid),
+            )? && issue.status.is_active()
             {
                 unblocked.push(UnblockedIssue {
                     id: issue.id,
@@ -299,47 +466,31 @@ pub fn execute_with_args(
 
     // Output
     if use_json {
-        if args.suggest_next {
-            // suggest_next is br-only, use wrapped format
-            let result = CloseWithSuggestResult {
-                closed: closed_issues,
-                skipped: skipped_issues,
-                unblocked: unblocked_issues,
-            };
-            let json = serde_json::to_string_pretty(&result)?;
-            println!("{json}");
-        } else {
-            // bd conformance: output bare array of closed issues
-            let json = serde_json::to_string_pretty(&closed_issues)?;
-            println!("{json}");
-        }
+        render_close_json(args, closed_issues, skipped_issues, unblocked_issues)?;
+    } else if closed_issues.is_empty() && skipped_issues.is_empty() {
+        ctx.info("No issues to close.");
     } else {
-        if closed_issues.is_empty() && skipped_issues.is_empty() {
-            ctx.info("No issues to close.");
-        } else {
-            for closed in &closed_issues {
-                let mut msg = format!("Closed {}: {}", closed.id, closed.title);
-                if let Some(reason) = &closed.close_reason {
-                    msg.push_str(&format!(" ({reason})"));
-                }
-                ctx.success(&msg);
+        for closed in &closed_issues {
+            let mut msg = format!("Closed {}: {}", closed.id, closed.title);
+            if let Some(reason) = &closed.close_reason {
+                msg.push_str(&format!(" ({reason})"));
             }
-            for skipped in &skipped_issues {
-                ctx.warning(&format!("Skipped {}: {}", skipped.id, skipped.reason));
-            }
-            if !unblocked_issues.is_empty() {
-                ctx.newline();
-                ctx.info(&format!("Unblocked {} issue(s):", unblocked_issues.len()));
-                for issue in &unblocked_issues {
-                    ctx.print(&format!("  {}: {}", issue.id, issue.title));
-                }
+            ctx.success(&msg);
+        }
+        for skipped in &skipped_issues {
+            ctx.warning(&format!("Skipped {}: {}", skipped.id, skipped.reason));
+        }
+        if !unblocked_issues.is_empty() {
+            ctx.newline();
+            ctx.info(&format!("Unblocked {} issue(s):", unblocked_issues.len()));
+            for issue in &unblocked_issues {
+                ctx.print(&format!("  {}: {}", issue.id, issue.title));
             }
         }
     }
 
     storage_ctx.flush_no_db_if_dirty()?;
 
-    // Return non-zero exit code if all issues were skipped (none actually closed)
     if closed_count == 0 && skipped_count > 0 {
         return Err(BeadsError::NothingToDo {
             reason: format!("all {skipped_count} issue(s) skipped"),
@@ -352,6 +503,50 @@ pub fn execute_with_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::commands;
+    use crate::config::CliOverrides;
+    use crate::model::{DependencyType, Issue, IssueType, Priority, Status};
+    use crate::output::OutputContext;
+    use crate::storage::SqliteStorage;
+    use chrono::Utc;
+    use std::env;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    static TEST_DIR_LOCK: Mutex<()> = Mutex::new(());
+
+    struct DirGuard {
+        previous: PathBuf,
+    }
+
+    impl DirGuard {
+        fn new(target: &std::path::Path) -> Self {
+            let previous = env::current_dir().expect("current dir");
+            env::set_current_dir(target).expect("set current dir");
+            Self { previous }
+        }
+    }
+
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = env::set_current_dir(&self.previous);
+        }
+    }
+
+    fn make_issue(id: &str, title: &str) -> Issue {
+        let now = Utc::now();
+        Issue {
+            id: id.to_string(),
+            title: title.to_string(),
+            status: Status::Open,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            created_at: now,
+            updated_at: now,
+            ..Issue::default()
+        }
+    }
 
     // =========================================================================
     // CloseArgs tests
@@ -655,6 +850,49 @@ mod tests {
     }
 
     #[test]
+    fn test_render_close_json_preserves_bare_array_for_pure_success() {
+        let json = build_close_json_payload(
+            &CloseArgs::default(),
+            vec![ClosedIssue {
+                id: "bd-1".to_string(),
+                title: "Task 1".to_string(),
+                status: "closed".to_string(),
+                closed_at: "2026-01-01T00:00:00Z".to_string(),
+                close_reason: Some("done".to_string()),
+            }],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.is_array());
+    }
+
+    #[test]
+    fn test_close_result_shape_with_skipped_is_wrapped() {
+        let json = build_close_json_payload(
+            &CloseArgs::default(),
+            vec![ClosedIssue {
+                id: "bd-1".to_string(),
+                title: "Task 1".to_string(),
+                status: "closed".to_string(),
+                closed_at: "2026-01-01T00:00:00Z".to_string(),
+                close_reason: Some("done".to_string()),
+            }],
+            vec![SkippedIssue {
+                id: "bd-2".to_string(),
+                reason: "blocked by: bd-3".to_string(),
+            }],
+            vec![],
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.is_object());
+        assert_eq!(parsed["closed"][0]["id"], "bd-1");
+        assert_eq!(parsed["skipped"][0]["id"], "bd-2");
+    }
+
+    #[test]
     fn test_close_args_clone() {
         let args = CloseArgs {
             ids: vec!["bd-clone".to_string()],
@@ -678,5 +916,81 @@ mod tests {
         assert!(debug_str.contains("CloseArgs"));
         assert!(debug_str.contains("ids"));
         assert!(debug_str.contains("reason"));
+    }
+
+    #[test]
+    fn execute_with_args_closes_requested_blocker_chain_in_one_batch() {
+        let _lock = TEST_DIR_LOCK.lock().expect("dir lock");
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        storage
+            .create_issue(&make_issue("bd-blocker", "Batch blocker"), "tester")
+            .expect("create blocker");
+        storage
+            .create_issue(&make_issue("bd-blocked", "Batch blocked"), "tester")
+            .expect("create blocked");
+        storage
+            .add_dependency(
+                "bd-blocked",
+                "bd-blocker",
+                DependencyType::Blocks.as_str(),
+                "tester",
+            )
+            .expect("add dependency");
+        storage.rebuild_blocked_cache(true).expect("rebuild cache");
+        drop(storage);
+
+        let _guard = DirGuard::new(temp.path());
+        let args = CloseArgs {
+            ids: vec!["bd-blocked".to_string(), "bd-blocker".to_string()],
+            ..CloseArgs::default()
+        };
+        execute_with_args(&args, false, &CliOverrides::default(), &ctx).expect("close batch");
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        let blocker = storage
+            .get_issue("bd-blocker")
+            .expect("get blocker")
+            .expect("blocker exists");
+        let blocked_issue = storage
+            .get_issue("bd-blocked")
+            .expect("get blocked")
+            .expect("blocked exists");
+
+        assert_eq!(blocker.status, Status::Closed);
+        assert_eq!(blocked_issue.status, Status::Closed);
+    }
+
+    #[test]
+    fn execute_with_args_returns_nothing_to_do_when_all_requested_issues_are_skipped() {
+        let _lock = TEST_DIR_LOCK.lock().expect("dir lock");
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        let mut issue = make_issue("bd-closed", "Already closed");
+        issue.status = Status::Closed;
+        issue.closed_at = Some(Utc::now());
+        storage
+            .create_issue(&issue, "tester")
+            .expect("create closed issue");
+
+        let _guard = DirGuard::new(temp.path());
+        let args = CloseArgs {
+            ids: vec!["bd-closed".to_string()],
+            ..CloseArgs::default()
+        };
+
+        let err = execute_with_args(&args, true, &CliOverrides::default(), &ctx)
+            .expect_err("all-skipped close should fail");
+        assert!(matches!(err, BeadsError::NothingToDo { .. }));
     }
 }

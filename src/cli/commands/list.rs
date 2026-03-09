@@ -125,8 +125,8 @@ pub fn execute(
             let mut labels_map = storage.get_labels_for_issues(&issue_ids)?;
 
             // Use batch counting
-            let dependency_counts = storage.count_dependencies_for_issues(&issue_ids)?;
-            let dependent_counts = storage.count_dependents_for_issues(&issue_ids)?;
+            let (dependency_counts, dependent_counts) =
+                storage.count_relation_counts_for_issues(&issue_ids)?;
 
             // Convert to IssueWithCounts
             let issues_with_counts: Vec<IssueWithCounts> = issues

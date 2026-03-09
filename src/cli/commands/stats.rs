@@ -76,12 +76,10 @@ pub fn execute(
         breakdowns.push(compute_label_breakdown(storage, &all_issues)?);
     }
 
-    // Compute recent activity by default (matches bd behavior).
-    // Use --no-activity to skip this (for performance).
-    let recent_activity = if args.no_activity {
-        None
-    } else {
+    let recent_activity = if should_include_activity(args) {
         compute_recent_activity(&jsonl_path, args.activity_hours)
+    } else {
+        None
     };
 
     let output = Statistics {
@@ -112,6 +110,10 @@ pub fn execute(
     }
 
     Ok(())
+}
+
+const fn should_include_activity(args: &StatsArgs) -> bool {
+    !args.no_activity
 }
 
 /// Compute summary statistics.
@@ -977,6 +979,20 @@ mod tests {
             compute_recent_activity(&jsonl_path, 24).expect("activity for committed custom jsonl");
         assert_eq!(activity.commit_count, 1);
         assert_eq!(activity.hours_tracked, 24);
+    }
+
+    #[test]
+    fn test_should_include_activity_defaults_on() {
+        assert!(should_include_activity(&StatsArgs::default()));
+        assert!(should_include_activity(&StatsArgs {
+            activity: true,
+            ..StatsArgs::default()
+        }));
+        assert!(!should_include_activity(&StatsArgs {
+            activity: true,
+            no_activity: true,
+            ..StatsArgs::default()
+        }));
     }
 
     #[test]

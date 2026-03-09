@@ -2268,7 +2268,7 @@ pub struct StatsArgs {
     #[arg(long)]
     pub by_label: bool,
 
-    /// Include recent activity stats (requires git). Now shown by default.
+    /// Include recent activity stats explicitly (default unless `--no-activity`)
     #[arg(long)]
     pub activity: bool,
 

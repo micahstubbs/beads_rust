@@ -203,6 +203,11 @@ fn defer_json_output() {
         "deferred item should have status"
     );
     assert_eq!(first["status"].as_str().unwrap(), "deferred");
+    assert_eq!(first["previous_status"].as_str(), Some("open"));
+    assert!(
+        first["defer_until"].as_str().is_some(),
+        "defer json output should preserve defer_until"
+    );
     info!("defer_json_output: assertions passed");
 }
 
@@ -482,6 +487,7 @@ fn undefer_json_output() {
     assert!(first.get("title").is_some());
     assert!(first.get("status").is_some());
     assert_eq!(first["status"].as_str().unwrap(), "open");
+    assert_eq!(first["previous_status"].as_str(), Some("deferred"));
     info!("undefer_json_output: assertions passed");
 }
 
@@ -535,12 +541,25 @@ fn undefer_already_open_skips() {
 
     let payload = extract_json_payload(&undefer.stdout);
     let result: Value = serde_json::from_str(&payload).expect("valid json");
-    assert!(result.is_array());
+    let undeferred = result["undeferred"].as_array().cloned().unwrap_or_default();
+    let skipped = result["skipped"].as_array().cloned().unwrap_or_default();
 
-    // update command returns issues that were processed.
-    // If no changes, it might still return it depending on implementation details of update command.
-    // If it returns empty array, it means nothing happened.
-    // Let's verify status is open regardless.
+    assert!(
+        undeferred.is_empty(),
+        "already-open issue should not be reported as undeferred"
+    );
+    assert_eq!(
+        skipped.len(),
+        1,
+        "already-open issue should be reported as skipped"
+    );
+    assert_eq!(skipped[0]["id"], id);
+    assert!(
+        skipped[0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("not deferred")),
+        "skip reason should explain that the issue was not deferred"
+    );
 
     let show = run_br(&workspace, ["show", &id, "--json"], "show");
     let show_payload = extract_json_payload(&show.stdout);
@@ -550,26 +569,40 @@ fn undefer_already_open_skips() {
 }
 
 #[test]
-fn defer_closed_issue_error() {
+fn defer_closed_issue_skips() {
     common::init_test_logging();
-    info!("defer_closed_issue_error: starting");
+    info!("defer_closed_issue_skips: starting");
     let (workspace, id) = setup_workspace_with_issue();
 
     let close = run_br(&workspace, ["close", &id], "close_first");
     assert!(close.status.success());
 
-    // Deferring a closed issue should update status to deferred
+    // Closed issues should be reported as skipped instead of being deferred.
     let defer = run_br(&workspace, ["defer", &id, "--json"], "defer_closed");
     assert!(defer.status.success());
 
     let payload = extract_json_payload(&defer.stdout);
     let result: Value = serde_json::from_str(&payload).expect("valid json");
+    let deferred = result["deferred"].as_array().cloned().unwrap_or_default();
+    let skipped = result["skipped"].as_array().cloned().unwrap_or_default();
 
-    let updated = result.as_array().unwrap();
-    if !updated.is_empty() {
-        assert_eq!(updated[0]["status"], "deferred");
-    }
-    info!("defer_closed_issue_error: assertions passed");
+    assert!(
+        deferred.is_empty(),
+        "closed issue should not be deferred successfully"
+    );
+    assert_eq!(
+        skipped.len(),
+        1,
+        "closed issue should be reported as skipped"
+    );
+    assert_eq!(skipped[0]["id"], id);
+    assert!(
+        skipped[0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("cannot defer closed issue")),
+        "skip reason should explain that closed issues cannot be deferred"
+    );
+    info!("defer_closed_issue_skips: assertions passed");
 }
 
 #[test]
