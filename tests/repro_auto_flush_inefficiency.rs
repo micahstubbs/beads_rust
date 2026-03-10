@@ -63,14 +63,13 @@ fn test_auto_flush_optimizes_no_content_change() {
     let dirty_ids = storage.get_dirty_issue_ids().unwrap();
     assert_eq!(dirty_ids.len(), 1, "Issue should be dirty after updates");
 
-    // 4. Second auto-flush (should SKIP export because content hash hasn't changed)
-    // CURRENTLY THIS FAILS (it flushes) - Update: We ACCEPT this inefficiency for correctness (label sync)
+    // 4. Second auto-flush should now skip the rewrite because the exported JSONL
+    // would be byte-identical.
     let result = auto_flush(&mut storage, &beads_dir, &jsonl_path).unwrap();
 
-    // Inefficiency documentation: We flush even if content hash is unchanged
     assert!(
-        result.flushed,
-        "Inefficiency: We flush even if content hash matches (to be safe for relations)"
+        !result.flushed,
+        "Auto-flush should skip a no-op rewrite when the JSONL would be unchanged"
     );
 
     // And dirty flags should be cleared
@@ -126,4 +125,54 @@ fn test_auto_flush_uses_resolved_jsonl_path() {
     assert!(result.flushed);
     assert!(custom_jsonl_path.exists());
     assert!(!beads_dir.join("issues.jsonl").exists());
+}
+
+#[test]
+fn test_auto_flush_preserves_unrelated_existing_jsonl_lines() {
+    let temp_dir = TempDir::new().unwrap();
+    let beads_dir = temp_dir.path().join(".beads");
+    fs::create_dir(&beads_dir).unwrap();
+    let db_path = beads_dir.join("beads.db");
+    let jsonl_path = beads_dir.join("issues.jsonl");
+
+    let mut storage = SqliteStorage::open(&db_path).unwrap();
+    storage.create_issue(&make_issue("bd-1"), "tester").unwrap();
+    auto_flush(&mut storage, &beads_dir, &jsonl_path).unwrap();
+
+    let extra_issue = make_issue("bd-extra");
+    let mut contents = fs::read_to_string(&jsonl_path).unwrap();
+    contents.push_str(&format!(
+        "{}\n",
+        serde_json::to_string(&extra_issue).unwrap()
+    ));
+    fs::write(&jsonl_path, contents).unwrap();
+
+    storage
+        .update_issue(
+            "bd-1",
+            &beads_rust::storage::IssueUpdate {
+                title: Some("Updated".to_string()),
+                ..Default::default()
+            },
+            "tester",
+        )
+        .unwrap();
+
+    let result = auto_flush(&mut storage, &beads_dir, &jsonl_path).unwrap();
+    assert!(result.flushed);
+
+    let issues = beads_rust::sync::read_issues_from_jsonl(&jsonl_path).unwrap();
+    let ids = issues
+        .iter()
+        .map(|issue| issue.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["bd-1", "bd-extra"]);
+    assert_eq!(
+        issues
+            .iter()
+            .find(|issue| issue.id == "bd-1")
+            .unwrap()
+            .title,
+        "Updated"
+    );
 }

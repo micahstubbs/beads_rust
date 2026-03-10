@@ -26,7 +26,7 @@ use crate::validation::IssueValidator;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashSet, hash_map::RandomState};
+use std::collections::{BTreeMap, HashSet, hash_map::RandomState};
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -1215,6 +1215,45 @@ pub fn get_issue_ids_from_jsonl(path: &Path) -> Result<HashSet<String>> {
     Ok(analyze_jsonl(path)?.1)
 }
 
+fn read_jsonl_lines_by_id(path: &Path) -> Result<BTreeMap<String, String>> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut lines_by_id = BTreeMap::new();
+    let mut line_buf = String::new();
+    let mut line_num = 0;
+
+    loop {
+        line_buf.clear();
+        let bytes = reader.read_line(&mut line_buf)?;
+        if bytes == 0 {
+            break;
+        }
+
+        line_num += 1;
+        let trimmed = line_buf.trim_end_matches(['\n', '\r']);
+        if trimmed.trim().is_empty() {
+            continue;
+        }
+
+        let partial: PartialId = serde_json::from_str(trimmed)
+            .map_err(|e| BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num, e)))?;
+
+        if lines_by_id
+            .insert(partial.id.clone(), trimmed.to_string())
+            .is_some()
+        {
+            return Err(BeadsError::Config(format!(
+                "Duplicate issue id '{}' in {} at line {}",
+                partial.id,
+                path.display(),
+                line_num
+            )));
+        }
+    }
+
+    Ok(lines_by_id)
+}
+
 /// Export issues from `SQLite` to JSONL format.
 ///
 /// This implements the classic beads export semantics:
@@ -1926,6 +1965,239 @@ pub fn finalize_export(
     }
 }
 
+fn normalize_issue_for_export(issue: &mut Issue) {
+    if !issue.labels.is_empty() {
+        issue.labels.sort();
+        issue.labels.dedup();
+    }
+}
+
+fn is_issue_exportable(issue: &Issue, retention_days: Option<u64>) -> bool {
+    !issue.ephemeral && !issue.id.contains("-wisp-") && !issue.is_expired_tombstone(retention_days)
+}
+
+fn finalize_incremental_auto_flush(
+    storage: &mut SqliteStorage,
+    clear_dirty_ids: &[String],
+    removed_hash_ids: &[String],
+    issue_hashes: &[(String, String)],
+    content_hash: Option<&str>,
+) -> Result<()> {
+    use chrono::Utc;
+
+    storage.execute_raw("BEGIN IMMEDIATE")?;
+    match (|| -> Result<()> {
+        if !clear_dirty_ids.is_empty() {
+            storage.clear_dirty_issues(clear_dirty_ids)?;
+        }
+        if !removed_hash_ids.is_empty() {
+            storage.clear_export_hashes_in_tx(removed_hash_ids)?;
+        }
+        if !issue_hashes.is_empty() {
+            storage.set_export_hashes_in_tx(issue_hashes)?;
+        }
+        if let Some(content_hash) = content_hash {
+            storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, content_hash)?;
+            storage.set_metadata_in_tx(METADATA_LAST_EXPORT_TIME, &Utc::now().to_rfc3339())?;
+        }
+        storage.execute_raw("DELETE FROM metadata WHERE key = 'needs_flush'")?;
+        Ok(())
+    })() {
+        Ok(()) => {
+            storage.execute_raw("COMMIT")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = storage.execute_raw("ROLLBACK");
+            Err(err)
+        }
+    }
+}
+
+fn write_jsonl_lines_atomically(
+    lines_by_id: &BTreeMap<String, String>,
+    output_path: &Path,
+    config: &ExportConfig,
+) -> Result<String> {
+    if let Some(ref beads_dir) = config.beads_dir {
+        validate_sync_path_with_external(output_path, beads_dir, config.allow_external_jsonl)?;
+
+        let output_abs = if output_path.is_absolute() {
+            output_path.to_path_buf()
+        } else if let Ok(cwd) = std::env::current_dir() {
+            cwd.join(output_path)
+        } else {
+            output_path.to_path_buf()
+        };
+
+        history::backup_before_export(beads_dir, &config.history, &output_abs)?;
+    }
+
+    let parent_dir = output_path.parent().ok_or_else(|| {
+        BeadsError::Config(format!("Invalid output path: {}", output_path.display()))
+    })?;
+    fs::create_dir_all(parent_dir)?;
+
+    let temp_path = export_temp_path(output_path);
+    if let Some(ref beads_dir) = config.beads_dir {
+        validate_temp_file_path(
+            &temp_path,
+            output_path,
+            beads_dir,
+            config.allow_external_jsonl,
+        )?;
+    }
+
+    let temp_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                BeadsError::Config(format!(
+                    "Temporary export file already exists: {}",
+                    temp_path.display()
+                ))
+            } else {
+                err.into()
+            }
+        })?;
+    let mut temp_guard = TempFileGuard::new(temp_path.clone());
+    let mut writer = BufWriter::new(temp_file);
+    let mut hasher = Sha256::new();
+
+    for line in lines_by_id.values() {
+        writeln!(writer, "{line}")?;
+        hasher.update(line.as_bytes());
+        hasher.update(b"\n");
+    }
+
+    writer.flush()?;
+    writer
+        .into_inner()
+        .map_err(|e| BeadsError::Io(e.into_error()))?
+        .sync_all()?;
+
+    let actual_count = count_issues_in_jsonl(&temp_path)?;
+    if actual_count != lines_by_id.len() {
+        return Err(BeadsError::Config(format!(
+            "Export verification failed: expected {} issues, JSONL has {} lines",
+            lines_by_id.len(),
+            actual_count
+        )));
+    }
+
+    if let Some(ref beads_dir) = config.beads_dir {
+        require_safe_sync_overwrite_path(
+            &temp_path,
+            beads_dir,
+            config.allow_external_jsonl,
+            "rename temp file",
+        )?;
+        require_safe_sync_overwrite_path(
+            output_path,
+            beads_dir,
+            config.allow_external_jsonl,
+            "overwrite JSONL output",
+        )?;
+    }
+
+    fs::rename(&temp_path, output_path)?;
+    temp_guard.persist();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        let _ = fs::set_permissions(output_path, perms);
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn try_incremental_auto_flush(
+    storage: &mut SqliteStorage,
+    beads_dir: &Path,
+    jsonl_path: &Path,
+) -> Result<Option<AutoFlushResult>> {
+    if !jsonl_path.exists() {
+        return Ok(None);
+    }
+
+    let mut lines_by_id = read_jsonl_lines_by_id(jsonl_path)?;
+    let dirty_ids = storage.get_dirty_issue_ids()?;
+    if dirty_ids.is_empty() {
+        return Ok(Some(AutoFlushResult::default()));
+    }
+
+    let mut removed_hash_ids = Vec::new();
+    let mut issue_hashes = Vec::new();
+    let mut changed = false;
+
+    for issue_id in &dirty_ids {
+        let maybe_issue = storage.get_issue_for_export(issue_id)?;
+        match maybe_issue {
+            Some(mut issue) if is_issue_exportable(&issue, None) => {
+                normalize_issue_for_export(&mut issue);
+                let json = serde_json::to_string(&issue).map_err(|err| {
+                    BeadsError::Config(format!(
+                        "Failed to serialize issue '{}' during auto-flush: {err}",
+                        issue.id
+                    ))
+                })?;
+
+                if lines_by_id.get(issue_id) != Some(&json) {
+                    lines_by_id.insert(issue_id.clone(), json);
+                    changed = true;
+                }
+
+                issue_hashes.push((
+                    issue_id.clone(),
+                    issue
+                        .content_hash
+                        .clone()
+                        .unwrap_or_else(|| issue.compute_content_hash()),
+                ));
+            }
+            Some(_) | None => {
+                removed_hash_ids.push(issue_id.clone());
+                changed |= lines_by_id.remove(issue_id).is_some();
+            }
+        }
+    }
+
+    if !changed {
+        finalize_incremental_auto_flush(
+            storage,
+            &dirty_ids,
+            &removed_hash_ids,
+            &issue_hashes,
+            None,
+        )?;
+        return Ok(Some(AutoFlushResult::default()));
+    }
+
+    let export_config = ExportConfig {
+        force: false,
+        beads_dir: Some(beads_dir.to_path_buf()),
+        ..Default::default()
+    };
+    let content_hash = write_jsonl_lines_atomically(&lines_by_id, jsonl_path, &export_config)?;
+    finalize_incremental_auto_flush(
+        storage,
+        &dirty_ids,
+        &removed_hash_ids,
+        &issue_hashes,
+        Some(&content_hash),
+    )?;
+
+    Ok(Some(AutoFlushResult {
+        flushed: true,
+        exported_count: lines_by_id.len(),
+        content_hash,
+    }))
+}
+
 /// Result of an auto-flush operation.
 #[derive(Debug, Default)]
 pub struct AutoFlushResult {
@@ -1978,6 +2250,26 @@ pub fn auto_flush(
         needs_flush,
         "Auto-flush: exporting dirty issues"
     );
+
+    if !needs_flush {
+        match try_incremental_auto_flush(storage, beads_dir, jsonl_path) {
+            Ok(Some(result)) => {
+                tracing::info!(
+                    flushed = result.flushed,
+                    exported = result.exported_count,
+                    "Auto-flush complete"
+                );
+                return Ok(result);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::debug!(
+                    ?err,
+                    "Incremental auto-flush unavailable; falling back to full export"
+                );
+            }
+        }
+    }
 
     // Configure export with defaults, including beads_dir for path validation
     let export_config = ExportConfig {

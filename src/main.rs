@@ -104,7 +104,20 @@ fn main() {
         Commands::Search(args) => {
             commands::search::execute(&args, cli.json, &overrides, &output_ctx)
         }
-        Commands::Show(args) => commands::show::execute(&args, cli.json, &overrides, &output_ctx),
+        Commands::Show(args) => {
+            if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
+            {
+                commands::show::execute_with_storage(
+                    &args,
+                    &overrides,
+                    &output_ctx,
+                    beads_dir,
+                    &res.storage,
+                )
+            } else {
+                commands::show::execute(&args, cli.json, &overrides, &output_ctx)
+            }
+        }
         Commands::Close(args) => {
             commands::close::execute_cli(&args, cli.json || args.robot, &overrides, &output_ctx)
         }

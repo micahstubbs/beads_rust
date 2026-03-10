@@ -297,6 +297,33 @@ impl SqliteStorage {
         Ok(count)
     }
 
+    /// Clear export hashes using the caller's active transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub(crate) fn clear_export_hashes_in_tx(&self, issue_ids: &[String]) -> Result<usize> {
+        if issue_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut total_deleted = 0;
+        for chunk in issue_ids.chunks(EXPORT_HASH_CHUNK_SIZE) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "DELETE FROM export_hashes WHERE issue_id IN ({})",
+                placeholders.join(",")
+            );
+            let params: Vec<SqliteValue> = chunk
+                .iter()
+                .map(|issue_id| SqliteValue::from(issue_id.as_str()))
+                .collect();
+            total_deleted += self.conn.execute_with_params(&sql, &params)?;
+        }
+
+        Ok(total_deleted)
+    }
+
     /// Attempt a WAL checkpoint (TRUNCATE mode) to flush WAL back to the main
     /// database file. Errors are logged but do not propagate — checkpoint
     /// failure is non-fatal and will be retried on the next interval.

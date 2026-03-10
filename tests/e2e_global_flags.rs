@@ -395,6 +395,83 @@ fn e2e_no_db_flag_show() {
 }
 
 #[test]
+fn e2e_no_db_show_bypasses_corrupt_db_and_preserves_relations() {
+    let _log = common::test_log("e2e_no_db_show_bypasses_corrupt_db_and_preserves_relations");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let parent = run_br(&workspace, ["create", "Parent issue"], "create_parent");
+    assert!(parent.status.success(), "create parent failed: {}", parent.stderr);
+    let parent_id = parent
+        .stdout
+        .lines()
+        .next()
+        .unwrap_or("")
+        .strip_prefix("✓ Created ")
+        .and_then(|s| s.split(':').next())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    let child = run_br(&workspace, ["create", "Child issue"], "create_child");
+    assert!(child.status.success(), "create child failed: {}", child.stderr);
+    let child_id = child
+        .stdout
+        .lines()
+        .next()
+        .unwrap_or("")
+        .strip_prefix("✓ Created ")
+        .and_then(|s| s.split(':').next())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    let dep = run_br(
+        &workspace,
+        ["dep", "add", &child_id, &parent_id, "--type", "parent-child"],
+        "dep_add_parent_child",
+    );
+    assert!(dep.status.success(), "dep add failed: {}", dep.stderr);
+
+    let sync = run_br(&workspace, ["sync", "--flush-only"], "sync_flush");
+    assert!(sync.status.success(), "sync flush failed: {}", sync.stderr);
+
+    fs::write(workspace.root.join(".beads").join("beads.db"), b"not a sqlite db")
+        .expect("corrupt db for no-db regression");
+
+    let show_child = run_br(
+        &workspace,
+        ["--no-db", "show", &child_id, "--json"],
+        "show_no_db_corrupt_child",
+    );
+    assert!(
+        show_child.status.success(),
+        "show --no-db on corrupt db failed: {}",
+        show_child.stderr
+    );
+    let child_payload = extract_json_payload(&show_child.stdout);
+    let child_json: Vec<Value> = serde_json::from_str(&child_payload).expect("valid child JSON");
+    assert_eq!(child_json[0]["parent"], parent_id);
+
+    let show_parent = run_br(
+        &workspace,
+        ["--no-db", "show", &parent_id, "--json"],
+        "show_no_db_corrupt_parent",
+    );
+    assert!(
+        show_parent.status.success(),
+        "parent show --no-db on corrupt db failed: {}",
+        show_parent.stderr
+    );
+    let parent_payload = extract_json_payload(&show_parent.stdout);
+    let parent_json: Vec<Value> = serde_json::from_str(&parent_payload).expect("valid parent JSON");
+    assert_eq!(parent_json[0]["dependents"][0]["id"], child_id);
+    assert_eq!(parent_json[0]["dependents"][0]["dependency_type"], "parent-child");
+}
+
+#[test]
 fn e2e_no_db_flag_ready() {
     let _log = common::test_log("e2e_no_db_flag_ready");
     let workspace = BrWorkspace::new();

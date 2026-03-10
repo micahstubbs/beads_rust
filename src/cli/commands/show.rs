@@ -6,10 +6,15 @@ use crate::error::{BeadsError, Result};
 use crate::format::{
     IssueDetails, IssueWithDependencyMetadata, format_priority_label, format_status_icon_colored,
 };
+use crate::model::{Dependency, Issue, Priority, Status};
 use crate::output::{IssuePanel, OutputContext, OutputMode};
+use crate::storage::SqliteStorage;
+use crate::sync::read_issues_from_jsonl;
 use crate::util::id::{IdResolver, ResolverConfig};
-use std::collections::HashMap;
+use chrono::{DateTime, Utc};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
+use std::path::{Path, PathBuf};
 
 /// Execute the show command.
 ///
@@ -23,12 +28,39 @@ pub fn execute(
     outer_ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    let storage = &storage_ctx.storage;
+    execute_inner(args, cli, outer_ctx, &beads_dir, None)
+}
+
+/// Execute show using storage that was already opened by the caller.
+///
+/// # Errors
+///
+/// Returns an error if issue resolution or rendering fails.
+pub fn execute_with_storage(
+    args: &ShowArgs,
+    cli: &config::CliOverrides,
+    outer_ctx: &OutputContext,
+    beads_dir: &Path,
+    storage: &SqliteStorage,
+) -> Result<()> {
+    execute_inner(args, cli, outer_ctx, beads_dir, Some(storage))
+}
+
+fn execute_inner(
+    args: &ShowArgs,
+    cli: &config::CliOverrides,
+    outer_ctx: &OutputContext,
+    beads_dir: &Path,
+    preloaded_storage: Option<&SqliteStorage>,
+) -> Result<()> {
+    let startup = config::load_startup_config_with_paths(beads_dir, cli.db.as_ref())?;
+    let mut bootstrap_config = startup.merged_config.clone();
+    bootstrap_config.merge_from(&cli.as_layer());
+    let no_db = config::no_db_from_layer(&bootstrap_config).unwrap_or(false);
 
     let mut target_ids = args.ids.clone();
     if target_ids.is_empty() {
-        let last_touched = crate::util::get_last_touched_id(&beads_dir);
+        let last_touched = crate::util::get_last_touched_id(beads_dir);
         if last_touched.is_empty() {
             return Err(BeadsError::validation(
                 "ids",
@@ -38,7 +70,14 @@ pub fn execute(
         target_ids.push(last_touched);
     }
 
-    let config_layer = config::load_config(&beads_dir, Some(storage), cli)?;
+    let owned_storage_ctx = if no_db || preloaded_storage.is_some() {
+        None
+    } else {
+        Some(config::open_storage_with_cli(beads_dir, cli)?)
+    };
+    let storage = preloaded_storage.or_else(|| owned_storage_ctx.as_ref().map(|ctx| &ctx.storage));
+
+    let config_layer = config::load_config(beads_dir, storage, cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     let use_color = config::should_use_color(&config_layer);
@@ -49,35 +88,23 @@ pub fn execute(
     );
     let quiet = cli.quiet.unwrap_or(false);
     let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
-    let external_db_paths = config::external_project_db_paths(&config_layer, &beads_dir);
-    let mut external_statuses: Option<HashMap<String, bool>> = None;
+    let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
 
-    let mut details_list = Vec::new();
-    for id_input in target_ids {
-        let resolution = resolver.resolve_fallible(
-            &id_input,
-            |id| storage.id_exists(id),
-            |hash| storage.find_ids_by_hash(hash),
-        )?;
-
-        // Fetch full details including comments and events
-        if let Some(mut details) = storage.get_issue_details(&resolution.id, true, false, 10)? {
-            if issue_details_have_external_dependencies(&details) {
-                if external_statuses.is_none() {
-                    external_statuses = Some(
-                        storage.resolve_external_dependency_statuses(&external_db_paths, false)?,
-                    );
-                }
-                if let Some(statuses) = external_statuses.as_ref() {
-                    apply_external_dependency_metadata(&mut details.dependencies, statuses);
-                    apply_external_dependency_metadata(&mut details.dependents, statuses);
-                }
-            }
-            details_list.push(details);
-        } else {
-            return Err(BeadsError::IssueNotFound { id: resolution.id });
-        }
-    }
+    let details_list = if no_db {
+        load_issue_details_from_jsonl(
+            &target_ids,
+            &resolver,
+            &startup.paths.jsonl_path,
+            &external_db_paths,
+        )?
+    } else {
+        load_issue_details_from_storage(
+            &target_ids,
+            &resolver,
+            storage.ok_or(BeadsError::NotInitialized)?,
+            &external_db_paths,
+        )?
+    };
 
     if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
@@ -105,6 +132,215 @@ pub fn execute(
     }
 
     Ok(())
+}
+
+fn load_issue_details_from_storage(
+    target_ids: &[String],
+    resolver: &IdResolver,
+    storage: &SqliteStorage,
+    external_db_paths: &HashMap<String, PathBuf>,
+) -> Result<Vec<IssueDetails>> {
+    let mut external_statuses: Option<HashMap<String, bool>> = None;
+    let mut details_list = Vec::with_capacity(target_ids.len());
+
+    for id_input in target_ids {
+        let resolution = resolver.resolve_fallible(
+            id_input,
+            |id| storage.id_exists(id),
+            |hash| storage.find_ids_by_hash(hash),
+        )?;
+
+        let Some(mut details) = storage.get_issue_details(&resolution.id, true, false, 10)? else {
+            return Err(BeadsError::IssueNotFound { id: resolution.id });
+        };
+
+        if issue_details_have_external_dependencies(&details) {
+            if external_statuses.is_none() {
+                external_statuses =
+                    Some(storage.resolve_external_dependency_statuses(external_db_paths, false)?);
+            }
+            if let Some(statuses) = external_statuses.as_ref() {
+                apply_external_dependency_metadata(&mut details.dependencies, statuses);
+                apply_external_dependency_metadata(&mut details.dependents, statuses);
+            }
+        }
+
+        details_list.push(details);
+    }
+
+    Ok(details_list)
+}
+
+fn load_issue_details_from_jsonl(
+    target_ids: &[String],
+    resolver: &IdResolver,
+    jsonl_path: &Path,
+    external_db_paths: &HashMap<String, PathBuf>,
+) -> Result<Vec<IssueDetails>> {
+    let issues = read_issues_from_jsonl(jsonl_path)?;
+    let mut issues_by_id = HashMap::with_capacity(issues.len());
+    for issue in issues {
+        issues_by_id.insert(issue.id.clone(), issue);
+    }
+
+    let mut details_list = Vec::with_capacity(target_ids.len());
+    for id_input in target_ids {
+        let resolution = resolver.resolve_fallible(
+            id_input,
+            |id| Ok(issues_by_id.contains_key(id)),
+            |hash| Ok(find_ids_by_hash_in_memory(&issues_by_id, hash)),
+        )?;
+        let issue = issues_by_id
+            .get(&resolution.id)
+            .ok_or_else(|| BeadsError::IssueNotFound {
+                id: resolution.id.clone(),
+            })?;
+        details_list.push(build_issue_details_from_jsonl(issue, &issues_by_id)?);
+    }
+
+    let external_ids = collect_external_dependency_ids(&details_list);
+    if !external_ids.is_empty() {
+        let statuses =
+            SqliteStorage::resolve_external_dependency_statuses_for_ids(&external_ids, external_db_paths);
+        for details in &mut details_list {
+            apply_external_dependency_metadata(&mut details.dependencies, &statuses);
+            apply_external_dependency_metadata(&mut details.dependents, &statuses);
+        }
+    }
+
+    Ok(details_list)
+}
+
+fn build_issue_details_from_jsonl(
+    issue: &Issue,
+    issues_by_id: &HashMap<String, Issue>,
+) -> Result<IssueDetails> {
+    let mut dependencies = issue
+        .dependencies
+        .iter()
+        .map(|dep| dependency_metadata_from_jsonl(dep, issues_by_id, true))
+        .collect::<Result<Vec<_>>>()?;
+    dependencies.sort_by(|left, right| {
+        left.1
+            .cmp(&right.1)
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.0.id.cmp(&right.0.id))
+    });
+
+    let mut dependents = issues_by_id
+        .values()
+        .flat_map(|candidate| {
+            candidate
+                .dependencies
+                .iter()
+                .filter(move |dep| dep.depends_on_id == issue.id)
+                .map(move |dep| (candidate, dep))
+        })
+        .map(|(candidate, dep)| {
+            Ok((
+                IssueWithDependencyMetadata {
+                    id: candidate.id.clone(),
+                    title: candidate.title.clone(),
+                    status: candidate.status.clone(),
+                    priority: candidate.priority,
+                    dep_type: dep.dep_type.as_str().to_string(),
+                },
+                candidate.priority,
+                candidate.created_at,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    dependents.sort_by(|left, right| {
+        left.1
+            .cmp(&right.1)
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.0.id.cmp(&right.0.id))
+    });
+
+    let mut issue_without_relations = issue.clone();
+    let labels = issue_without_relations.labels.clone();
+    let comments = issue_without_relations.comments.clone();
+    issue_without_relations.labels.clear();
+    issue_without_relations.dependencies.clear();
+    issue_without_relations.comments.clear();
+
+    Ok(IssueDetails {
+        issue: issue_without_relations,
+        labels,
+        dependencies: dependencies.into_iter().map(|(item, _, _)| item).collect(),
+        dependents: dependents.into_iter().map(|(item, _, _)| item).collect(),
+        comments,
+        events: Vec::new(),
+        parent: issue
+            .dependencies
+            .iter()
+            .rev()
+            .find(|dep| dep.dep_type.as_str() == "parent-child")
+            .map(|dep| dep.depends_on_id.clone()),
+    })
+}
+
+fn dependency_metadata_from_jsonl(
+    dep: &Dependency,
+    issues_by_id: &HashMap<String, Issue>,
+    allow_external_placeholder: bool,
+) -> Result<(IssueWithDependencyMetadata, Priority, DateTime<Utc>)> {
+    if let Some(target) = issues_by_id.get(&dep.depends_on_id) {
+        return Ok((
+            IssueWithDependencyMetadata {
+                id: target.id.clone(),
+                title: target.title.clone(),
+                status: target.status.clone(),
+                priority: target.priority,
+                dep_type: dep.dep_type.as_str().to_string(),
+            },
+            target.priority,
+            target.created_at,
+        ));
+    }
+
+    if allow_external_placeholder && dep.depends_on_id.starts_with("external:") {
+        return Ok((
+            IssueWithDependencyMetadata {
+                id: dep.depends_on_id.clone(),
+                title: dep
+                    .depends_on_id
+                    .strip_prefix("external:")
+                    .unwrap_or(&dep.depends_on_id)
+                    .to_string(),
+                status: Status::Blocked,
+                priority: Priority::MEDIUM,
+                dep_type: dep.dep_type.as_str().to_string(),
+            },
+            Priority::MEDIUM,
+            dep.created_at,
+        ));
+    }
+
+    Err(BeadsError::Config(format!(
+        "dependency row references missing issue {}",
+        dep.depends_on_id
+    )))
+}
+
+fn find_ids_by_hash_in_memory(issues_by_id: &HashMap<String, Issue>, hash_suffix: &str) -> Vec<String> {
+    issues_by_id
+        .keys()
+        .filter(|id| {
+            id.split_once('-')
+                .is_some_and(|(_, suffix)| suffix.contains(hash_suffix))
+        })
+        .cloned()
+        .collect()
+}
+
+fn collect_external_dependency_ids(details_list: &[IssueDetails]) -> HashSet<String> {
+    details_list
+        .iter()
+        .flat_map(|details| details.dependencies.iter().chain(details.dependents.iter()))
+        .filter(|item| item.id.starts_with("external:"))
+        .map(|item| item.id.clone())
+        .collect()
 }
 
 fn issue_details_have_external_dependencies(details: &IssueDetails) -> bool {
@@ -310,9 +546,11 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_external_dependency_metadata, format_issue_details};
+    use super::{
+        apply_external_dependency_metadata, build_issue_details_from_jsonl, format_issue_details,
+    };
     use crate::format::{IssueDetails, IssueWithDependencyMetadata};
-    use crate::model::{Comment, Issue, IssueType, Priority, Status};
+    use crate::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use crate::util::id::{IdResolver, ResolverConfig};
     use chrono::{TimeZone, Utc};
@@ -587,5 +825,52 @@ mod tests {
         info!(
             "test_apply_external_dependency_metadata_updates_generated_placeholder: assertions passed"
         );
+    }
+
+    #[test]
+    fn test_build_issue_details_from_jsonl_derives_parent_and_dependents() {
+        init_logging();
+        info!("test_build_issue_details_from_jsonl_derives_parent_and_dependents: starting");
+
+        let mut parent = make_test_issue("bd-parent", "Parent");
+        parent.priority = Priority::HIGH;
+
+        let mut child = make_test_issue("bd-child", "Child");
+        child.labels = vec!["backend".to_string()];
+        child.comments = vec![Comment {
+            id: 7,
+            issue_id: "bd-child".to_string(),
+            author: "alice".to_string(),
+            body: "Investigating".to_string(),
+            created_at: Utc.with_ymd_and_hms(2025, 1, 2, 3, 4, 0).unwrap(),
+        }];
+        child.dependencies = vec![Dependency {
+            issue_id: "bd-child".to_string(),
+            depends_on_id: "bd-parent".to_string(),
+            dep_type: DependencyType::ParentChild,
+            created_at: Utc.with_ymd_and_hms(2025, 1, 1, 1, 0, 0).unwrap(),
+            created_by: Some("tester".to_string()),
+            metadata: None,
+            thread_id: None,
+        }];
+
+        let issues_by_id = HashMap::from([
+            (parent.id.clone(), parent.clone()),
+            (child.id.clone(), child.clone()),
+        ]);
+
+        let child_details = build_issue_details_from_jsonl(&child, &issues_by_id).unwrap();
+        assert_eq!(child_details.parent.as_deref(), Some("bd-parent"));
+        assert_eq!(child_details.labels, vec!["backend".to_string()]);
+        assert_eq!(child_details.comments.len(), 1);
+        assert!(child_details.issue.labels.is_empty());
+        assert!(child_details.issue.dependencies.is_empty());
+        assert!(child_details.issue.comments.is_empty());
+
+        let parent_details = build_issue_details_from_jsonl(&parent, &issues_by_id).unwrap();
+        assert_eq!(parent_details.dependents.len(), 1);
+        assert_eq!(parent_details.dependents[0].id, "bd-child");
+        assert_eq!(parent_details.dependents[0].dep_type, "parent-child");
+        info!("test_build_issue_details_from_jsonl_derives_parent_and_dependents: assertions passed");
     }
 }
