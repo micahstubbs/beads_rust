@@ -448,10 +448,22 @@ fn set_config_value(
     // Set the value
     let parts: Vec<&str> = key.split('.').collect();
     let old_value = get_yaml_value(&config, &parts);
+    let parsed_value = if let Ok(b) = value.parse::<bool>() {
+        serde_yml::Value::Bool(b)
+    } else if let Ok(i) = value.parse::<i64>() {
+        serde_yml::Value::Number(i.into())
+    } else if let Ok(f) = value.parse::<f64>() {
+        serde_yml::Value::Number(f.into())
+    } else if value == "null" {
+        serde_yml::Value::Null
+    } else {
+        serde_yml::Value::String(value.to_string())
+    };
+    
     set_yaml_value(
         &mut config,
         &parts,
-        serde_yml::Value::String(value.to_string()),
+        parsed_value,
     );
 
     // Write back
