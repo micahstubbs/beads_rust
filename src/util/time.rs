@@ -83,6 +83,17 @@ pub fn parse_flexible_timestamp(s: &str, field_name: &str) -> Result<DateTime<Ut
     // Try keywords
     let now = Local::now();
     match s.to_lowercase().as_str() {
+        "today" => {
+            let time = NaiveTime::from_hms_opt(17, 0, 0).unwrap();
+            let naive_dt = now.date_naive().and_time(time);
+            Ok(local_to_utc(&naive_dt, field_name)?)
+        }
+        "yesterday" => {
+            let yesterday = now.date_naive() - Duration::days(1);
+            let time = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+            let naive_dt = yesterday.and_time(time);
+            Ok(local_to_utc(&naive_dt, field_name)?)
+        }
         "tomorrow" => {
             let tomorrow = now.date_naive() + Duration::days(1);
             let time = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
@@ -140,7 +151,7 @@ pub fn parse_flexible_timestamp(s: &str, field_name: &str) -> Result<DateTime<Ut
 ///
 /// Supports:
 /// - Relative duration: `+1h`, `+2d`, `+1w`, `+30m`, `-7d`
-/// - Keywords: `tomorrow`, `next-week`
+/// - Keywords: `today`, `yesterday`, `tomorrow`, `next-week`
 ///
 /// Returns `None` if the input cannot be parsed as a relative time.
 #[must_use]
@@ -169,6 +180,17 @@ pub fn parse_relative_time(s: &str) -> Option<DateTime<Utc>> {
     // Try keywords
     let now = Local::now();
     match s.to_lowercase().as_str() {
+        "today" => {
+            let time = NaiveTime::from_hms_opt(17, 0, 0)?;
+            let naive_dt = now.date_naive().and_time(time);
+            local_to_utc_opt(&naive_dt)
+        }
+        "yesterday" => {
+            let yesterday = now.date_naive() - Duration::days(1);
+            let time = NaiveTime::from_hms_opt(9, 0, 0)?;
+            let naive_dt = yesterday.and_time(time);
+            local_to_utc_opt(&naive_dt)
+        }
         "tomorrow" => {
             let tomorrow = now.date_naive() + Duration::days(1);
             let time = NaiveTime::from_hms_opt(9, 0, 0)?;
@@ -262,5 +284,41 @@ mod tests {
     fn test_parse_relative_time_invalid() {
         assert!(parse_relative_time("invalid").is_none());
         assert!(parse_relative_time("2025-01-15").is_none());
+    }
+}
+
+fn local_to_utc(naive_dt: &chrono::NaiveDateTime, field_name: &str) -> Result<DateTime<Utc>> {
+    use chrono::LocalResult;
+    match Local.from_local_datetime(naive_dt) {
+        LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => Ok(dt.with_timezone(&Utc)),
+        LocalResult::None => {
+            // Time doesn't exist (DST gap), push forward by 1 hour
+            let shifted = *naive_dt + Duration::hours(1);
+            match Local.from_local_datetime(&shifted) {
+                LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => {
+                    Ok(dt.with_timezone(&Utc))
+                }
+                LocalResult::None => Err(BeadsError::validation(
+                    field_name,
+                    "invalid local time around DST transition",
+                )),
+            }
+        }
+    }
+}
+
+fn local_to_utc_opt(naive_dt: &chrono::NaiveDateTime) -> Option<DateTime<Utc>> {
+    use chrono::LocalResult;
+    match Local.from_local_datetime(naive_dt) {
+        LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => Some(dt.with_timezone(&Utc)),
+        LocalResult::None => {
+            let shifted = *naive_dt + Duration::hours(1);
+            match Local.from_local_datetime(&shifted) {
+                LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => {
+                    Some(dt.with_timezone(&Utc))
+                }
+                LocalResult::None => None,
+            }
+        }
     }
 }

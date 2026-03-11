@@ -183,16 +183,9 @@ pub fn parse_markdown_content(content: &str) -> Result<Vec<ParsedIssue>> {
 
         // Collect content for current section
         if current_issue.is_some() {
-            // Handle the quirk: before H3, only capture first non-empty line as description
-            if current_section == Section::BeforeH3 {
-                if !captured_implicit_desc && !line.trim().is_empty() {
-                    section_lines.push(line.to_string());
-                    captured_implicit_desc = true;
-                }
-                // Ignore subsequent lines before H3
-            } else {
-                section_lines.push(line.to_string());
-            }
+            // Before the first H3, everything is part of the implicit description.
+            // We preserve all lines to allow multiline lead-ins.
+            section_lines.push(line.to_string());
         }
     }
 
