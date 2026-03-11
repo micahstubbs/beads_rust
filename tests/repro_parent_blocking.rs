@@ -3,9 +3,20 @@ use beads_rust::storage::{ReadyFilters, ReadySortPolicy, SqliteStorage};
 use chrono::Utc;
 
 #[test]
-fn test_parent_blocks_child_ready() {
+fn test_blocked_parent_blocks_child_ready() {
     let mut storage = SqliteStorage::open_memory().unwrap();
     let now = Utc::now();
+
+    let blocker = Issue {
+        id: "bd-blocker".to_string(),
+        title: "Root blocker".to_string(),
+        issue_type: IssueType::Bug,
+        created_at: now,
+        updated_at: now,
+        created_by: Some("tester".to_string()),
+        ..Issue::default()
+    };
+    storage.create_issue(&blocker, "tester").unwrap();
 
     // Create a parent issue
     let parent = Issue {
@@ -31,7 +42,16 @@ fn test_parent_blocks_child_ready() {
     };
     storage.create_issue(&child, "tester").unwrap();
 
-    // Parent-child relationships are modeled as dependencies.
+    storage
+        .add_dependency(
+            "bd-parent",
+            "bd-blocker",
+            DependencyType::Blocks.as_str(),
+            "tester",
+        )
+        .unwrap();
+
+    // Parent-child relationships should propagate a blocked parent to its child.
     storage
         .add_dependency(
             "bd-child",
@@ -44,14 +64,19 @@ fn test_parent_blocks_child_ready() {
     // Manually trigger cache rebuild
     storage.rebuild_blocked_cache(true).unwrap();
 
-    // Check if child is blocked
+    assert!(storage.is_blocked("bd-parent").unwrap());
+
+    // Check if child is blocked transitively through the parent.
     let is_blocked = storage.is_blocked("bd-child").unwrap();
-    assert!(is_blocked, "Child should be blocked by open parent");
+    assert!(is_blocked, "Child should be blocked by blocked parent");
 
     // Check if child is in ready issues
     let ready = storage
         .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::default())
         .unwrap();
     let is_ready = ready.iter().any(|i| i.id == "bd-child");
-    assert!(!is_ready, "Child should not be ready when parent is open");
+    assert!(
+        !is_ready,
+        "Child should not be ready when its parent is blocked"
+    );
 }

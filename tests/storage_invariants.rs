@@ -1168,7 +1168,7 @@ fn list_issues_with_counts_accurate_dependencies() {
 
 #[test]
 fn find_by_content_hash_roundtrip() {
-    let mut storage = test_db();
+    let storage = test_db();
     let mut issue = fixtures::issue("hash-lookup");
     issue.content_hash = Some("hash-abc123".to_string());
 

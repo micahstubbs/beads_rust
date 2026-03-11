@@ -582,26 +582,68 @@ impl Issue {
     /// labels, dependencies, comments, and user-visible timestamps like `due_at`.
     #[must_use]
     pub fn sync_equals(&self, other: &Self) -> bool {
-        self.sync_compare_value() == other.sync_compare_value()
-    }
+        if self.id != other.id
+            || self.title != other.title
+            || self.description != other.description
+            || self.design != other.design
+            || self.acceptance_criteria != other.acceptance_criteria
+            || self.notes != other.notes
+            || self.status != other.status
+            || self.priority != other.priority
+            || self.issue_type != other.issue_type
+            || self.assignee != other.assignee
+            || self.owner != other.owner
+            || self.estimated_minutes != other.estimated_minutes
+            || self.created_by != other.created_by
+            || self.closed_at != other.closed_at
+            || self.close_reason != other.close_reason
+            || self.closed_by_session != other.closed_by_session
+            || self.due_at != other.due_at
+            || self.defer_until != other.defer_until
+            || self.external_ref != other.external_ref
+            || self.source_system != other.source_system
+            || self.source_repo != other.source_repo
+            || self.deleted_at != other.deleted_at
+            || self.deleted_by != other.deleted_by
+            || self.delete_reason != other.delete_reason
+            || self.original_type != other.original_type
+            || self.compacted_at != other.compacted_at
+            || self.compacted_at_commit != other.compacted_at_commit
+            || self.original_size != other.original_size
+            || self.sender != other.sender
+            || self.ephemeral != other.ephemeral
+            || self.pinned != other.pinned
+            || self.is_template != other.is_template
+        {
+            return false;
+        }
 
-    fn sync_compare_value(&self) -> serde_json::Value {
-        let mut normalized = self.clone();
-        normalized.normalize_for_sync_compare();
-        serde_json::to_value(&normalized).expect("Issue serialization should be infallible")
-    }
+        // Handle compaction_level serialization quirk where None == 0
+        if self.compaction_level.unwrap_or(0) != other.compaction_level.unwrap_or(0) {
+            return false;
+        }
 
-    fn normalize_for_sync_compare(&mut self) {
-        let epoch = DateTime::from_timestamp(0, 0).expect("unix epoch should be valid");
+        // Fast path for relations: if lengths differ, they can't be equal
+        if self.dependencies.len() != other.dependencies.len()
+            || self.comments.len() != other.comments.len()
+        {
+            return false;
+        }
 
-        self.content_hash = None;
-        self.created_at = epoch;
-        self.updated_at = epoch;
+        // Compare labels (order independent)
+        let mut self_labels = self.labels.clone();
+        self_labels.sort_unstable();
+        self_labels.dedup();
+        let mut other_labels = other.labels.clone();
+        other_labels.sort_unstable();
+        other_labels.dedup();
+        if self_labels != other_labels {
+            return false;
+        }
 
-        self.labels.sort_unstable();
-        self.labels.dedup();
-
-        self.dependencies.sort_by(|left, right| {
+        // Compare dependencies (order independent)
+        let mut self_deps = self.dependencies.clone();
+        self_deps.sort_by(|left, right| {
             left.issue_id
                 .cmp(&right.issue_id)
                 .then_with(|| left.depends_on_id.cmp(&right.depends_on_id))
@@ -611,8 +653,24 @@ impl Issue {
                 .then_with(|| left.metadata.cmp(&right.metadata))
                 .then_with(|| left.thread_id.cmp(&right.thread_id))
         });
+        let mut other_deps = other.dependencies.clone();
+        other_deps.sort_by(|left, right| {
+            left.issue_id
+                .cmp(&right.issue_id)
+                .then_with(|| left.depends_on_id.cmp(&right.depends_on_id))
+                .then_with(|| left.dep_type.as_str().cmp(right.dep_type.as_str()))
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.created_by.cmp(&right.created_by))
+                .then_with(|| left.metadata.cmp(&right.metadata))
+                .then_with(|| left.thread_id.cmp(&right.thread_id))
+        });
+        if self_deps != other_deps {
+            return false;
+        }
 
-        self.comments.sort_by(|left, right| {
+        // Compare comments (order independent)
+        let mut self_comments = self.comments.clone();
+        self_comments.sort_by(|left, right| {
             left.issue_id
                 .cmp(&right.issue_id)
                 .then_with(|| left.created_at.cmp(&right.created_at))
@@ -620,6 +678,20 @@ impl Issue {
                 .then_with(|| left.body.cmp(&right.body))
                 .then_with(|| left.id.cmp(&right.id))
         });
+        let mut other_comments = other.comments.clone();
+        other_comments.sort_by(|left, right| {
+            left.issue_id
+                .cmp(&right.issue_id)
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.author.cmp(&right.author))
+                .then_with(|| left.body.cmp(&right.body))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        if self_comments != other_comments {
+            return false;
+        }
+
+        true
     }
 
     /// Check if this issue is a tombstone that has exceeded its TTL.
@@ -1407,6 +1479,22 @@ mod tests {
         issue2.due_at = Some(Utc.timestamp_opt(1_800_000_000, 0).unwrap());
 
         assert!(!issue1.sync_equals(&issue2));
+    }
+
+    #[test]
+    fn test_issue_sync_equals_treats_duplicate_labels_as_equivalent() {
+        let mut issue1 = create_test_issue();
+        issue1.labels = vec![
+            "backend".to_string(),
+            "backend".to_string(),
+            "urgent".to_string(),
+        ];
+
+        let mut issue2 = create_test_issue();
+        issue2.labels = vec!["urgent".to_string(), "backend".to_string()];
+
+        assert!(issue1.sync_equals(&issue2));
+        assert!(issue2.sync_equals(&issue1));
     }
 
     // ========================================================================

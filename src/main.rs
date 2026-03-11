@@ -107,7 +107,11 @@ fn main() {
             commands::comments::execute(&args, cli.json, &overrides, &output_ctx)
         }
         Commands::Search(args) => {
-            commands::search::execute(&args, cli.json, &overrides, &output_ctx)
+            if let Some(res) = storage_result.as_ref() {
+                commands::search::execute_with_storage_ctx(&args, &overrides, &output_ctx, res)
+            } else {
+                commands::search::execute(&args, cli.json, &overrides, &output_ctx)
+            }
         }
         Commands::Show(args) => {
             if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
@@ -146,7 +150,10 @@ fn main() {
                 commands::count::execute(&args, cli.json, &overrides, &output_ctx)
             }
         }
-        Commands::Stale(args) => commands::stale::execute(&args, &overrides, &output_ctx),
+        Commands::Stale(args) => storage_result.as_ref().map_or_else(
+            || commands::stale::execute(&args, &overrides, &output_ctx),
+            |res| commands::stale::execute_with_storage(&args, &output_ctx, &res.storage),
+        ),
         Commands::Lint(args) => commands::lint::execute(&args, cli.json, &overrides, &output_ctx),
         Commands::Ready(args) => {
             if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
@@ -228,10 +235,24 @@ fn main() {
             }
         }
         Commands::Changelog(args) => {
-            commands::changelog::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
+            if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
+            {
+                commands::changelog::execute_with_storage_ctx(
+                    &args,
+                    cli.json || args.robot,
+                    &output_ctx,
+                    beads_dir,
+                    res,
+                )
+            } else {
+                commands::changelog::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
+            }
         }
         Commands::Query { command } => commands::query::execute(&command, &overrides, &output_ctx),
-        Commands::Graph(args) => commands::graph::execute(&args, &overrides, &output_ctx),
+        Commands::Graph(args) => storage_result.as_ref().map_or_else(
+            || commands::graph::execute(&args, &overrides, &output_ctx),
+            |res| commands::graph::execute_with_storage_ctx(&args, &overrides, &output_ctx, res),
+        ),
         Commands::Agents(args) => {
             let agents_args = commands::agents::AgentsArgs {
                 add: args.add,
@@ -475,9 +496,7 @@ fn handle_error(err: &BeadsError, json_mode: bool) -> ! {
     let structured = StructuredError::from_error(err);
     let exit_code = structured.code.exit_code();
 
-    let use_json = json_mode || !io::stdout().is_terminal();
-
-    if use_json {
+    if json_mode {
         let json = structured.to_json();
         eprintln!(
             "{}",

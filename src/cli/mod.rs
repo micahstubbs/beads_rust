@@ -1981,12 +1981,13 @@ pub struct ReadyArgs {
         long,
         num_args = 0..=1,
         default_missing_value = "",
+        conflicts_with = "unassigned",
         add = ArgValueCompleter::new(assignee_completer)
     )]
     pub assignee: Option<String>,
 
     /// Show only unassigned issues
-    #[arg(long)]
+    #[arg(long, conflicts_with = "assignee")]
     pub unassigned: bool,
 
     /// Filter by label (AND logic, can be repeated)
@@ -2544,6 +2545,13 @@ mod tests {
             Commands::Ready(args) => assert_eq!(args.assignee.as_deref(), Some("")),
             _ => panic!("expected ready command"),
         }
+    }
+
+    #[test]
+    fn test_ready_assignee_conflicts_with_unassigned() {
+        let err = Cli::try_parse_from(["br", "ready", "--assignee", "alice", "--unassigned"])
+            .expect_err("ready filters should conflict");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]

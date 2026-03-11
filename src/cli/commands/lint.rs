@@ -269,17 +269,23 @@ fn resolve_issues(
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
 
-    let mut issues = Vec::new();
+    let mut resolved_ids = Vec::new();
     for id_input in &args.ids {
         let resolution = resolver.resolve_fallible(
             id_input,
             |id| storage.id_exists(id),
             |hash| storage.find_ids_by_hash(hash),
         )?;
+        resolved_ids.push(resolution.id);
+    }
 
-        match storage.get_issue(&resolution.id)? {
-            Some(issue) => issues.push(issue),
-            None => eprintln!("Issue not found: {}", resolution.id),
+    let issues = storage.get_issues_by_ids(&resolved_ids)?;
+    let found_ids: std::collections::HashSet<String> =
+        issues.iter().map(|i| i.id.clone()).collect();
+
+    for id in &resolved_ids {
+        if !found_ids.contains(id) {
+            eprintln!("Issue not found: {}", id);
         }
     }
 

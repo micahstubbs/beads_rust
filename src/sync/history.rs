@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 /// Configuration for history backups.
 #[derive(Debug, Clone)]
@@ -136,13 +137,17 @@ fn parse_backup_timestamp(ts_str: &str) -> Option<DateTime<Utc>> {
     None
 }
 
+static BACKUP_FILENAME_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?P<stem>.+?)\.(?P<ts>\d{8}_\d{6}(?:_\d{6})?)(\.\d+)?$")
+        .expect("static regex compilation must not fail")
+});
+
 pub(crate) fn parse_backup_filename(filename: &str) -> Option<(String, DateTime<Utc>)> {
     let without_ext = filename.strip_suffix(".jsonl")?;
 
     // Pattern: <stem>.<timestamp>[.<collision_index>]
     // Timestamp formats: YYYYMMDD_HHMMSS or YYYYMMDD_HHMMSS_ffffff
-    let re = Regex::new(r"^(?P<stem>.+?)\.(?P<ts>\d{8}_\d{6}(?:_\d{6})?)(\.\d+)?$").ok()?;
-    let caps = re.captures(without_ext)?;
+    let caps = BACKUP_FILENAME_REGEX.captures(without_ext)?;
 
     let stem = caps.name("stem")?.as_str().to_string();
     let timestamp_str = caps.name("ts")?.as_str();

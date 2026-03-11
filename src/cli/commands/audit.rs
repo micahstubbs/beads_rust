@@ -474,6 +474,11 @@ fn ensure_interactions_file(beads_dir: &Path) -> Result<PathBuf> {
 }
 
 fn audit_entry_exists(beads_dir: &Path, entry_id: &str) -> Result<bool> {
+    #[derive(Deserialize)]
+    struct PartialId {
+        id: Option<String>,
+    }
+
     let entry_id = entry_id.trim();
     if entry_id.is_empty() {
         return Err(BeadsError::validation("entry_id", "required"));
@@ -489,22 +494,28 @@ fn audit_entry_exists(beads_dir: &Path, entry_id: &str) -> Result<bool> {
     };
 
     let reader = BufReader::new(file);
+
+    let id_pattern = format!("\"{}\"", entry_id);
+
     for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str::<AuditEntry>(&line) {
+        // Fast path string check before paying JSON parse cost
+        if !line.contains(&id_pattern) {
+            continue;
+        }
+        match serde_json::from_str::<PartialId>(&line) {
             Ok(entry) => {
                 if entry.id.as_deref() == Some(entry_id) {
                     return Ok(true);
                 }
             }
-            Err(err) => {
-                tracing::warn!(
-                    entry_id = ?entry_id,
-                    error = %err,
-                    "Failed to parse audit interaction entry; skipping"
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "Skipping malformed audit entry during existence check"
                 );
             }
         }

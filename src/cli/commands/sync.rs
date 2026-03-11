@@ -536,6 +536,40 @@ fn execute_flush(
             )));
         }
 
+        let jsonl_ids = get_issue_ids_from_jsonl(jsonl_path)?;
+        if !jsonl_ids.is_empty() {
+            let db_ids: HashSet<String> = storage.get_all_ids()?.into_iter().collect();
+            let mut missing_list = jsonl_ids.difference(&db_ids).cloned().collect::<Vec<_>>();
+
+            if !missing_list.is_empty() {
+                missing_list.sort();
+                let display_count = missing_list.len().min(10);
+                let preview = missing_list
+                    .iter()
+                    .take(display_count)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let more = if missing_list.len() > 10 {
+                    format!(" ... and {} more", missing_list.len() - 10)
+                } else {
+                    String::new()
+                };
+
+                return Err(BeadsError::Config(format!(
+                    "Refusing to export stale database that would lose issues.\n\
+                     Database has {} issues, JSONL has {} unique issues.\n\
+                     Export would lose {} issue(s): {}{}\n\
+                     Hint: Run import first, or use --force to override.",
+                    db_ids.len(),
+                    jsonl_ids.len(),
+                    missing_list.len(),
+                    preview,
+                    more
+                )));
+            }
+        }
+
         if use_json {
             let result = FlushResult {
                 exported_issues: 0,
@@ -586,7 +620,12 @@ fn execute_flush(
     );
 
     // Finalize export (clear dirty flags, update metadata)
-    finalize_export(storage, &export_result, Some(&export_result.issue_hashes))?;
+    finalize_export(
+        storage,
+        &export_result,
+        Some(&export_result.issue_hashes),
+        jsonl_path,
+    )?;
     info!("Export complete, cleared dirty flags");
 
     // Write manifest if requested
@@ -1229,8 +1268,12 @@ fn execute_merge(
     // Apply deletions. Base snapshots can lag behind historical ID migrations, so a
     // merge may legitimately request deletion of an issue that is already absent from
     // the live database. Treat that as a no-op instead of aborting the whole merge.
+    let existing_deleted_issues = storage.get_issues_by_ids(&report.deleted)?;
+    let existing_deleted_ids: std::collections::HashSet<String> =
+        existing_deleted_issues.into_iter().map(|i| i.id).collect();
+
     for id in &report.deleted {
-        if storage.get_issue(id)?.is_some() {
+        if existing_deleted_ids.contains(id) {
             storage.delete_issue(id, "system", "merge deletion", Some(chrono::Utc::now()))?;
         } else {
             tracing::debug!(
@@ -1286,7 +1329,12 @@ fn execute_merge(
     };
 
     let (export_result, _) = export_to_jsonl_with_policy(storage, jsonl_path, &export_config)?;
-    finalize_export(storage, &export_result, Some(&export_result.issue_hashes))?;
+    finalize_export(
+        storage,
+        &export_result,
+        Some(&export_result.issue_hashes),
+        jsonl_path,
+    )?;
 
     // Output success message
     if use_json {

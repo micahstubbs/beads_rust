@@ -78,6 +78,37 @@ fn e2e_beads_dir_invalid_path_fails() {
 }
 
 #[test]
+fn e2e_invalid_beads_dir_does_not_fall_back_to_cwd_workspace() {
+    let _log = common::test_log("e2e_invalid_beads_dir_does_not_fall_back_to_cwd_workspace");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Invalid env should not fall back"],
+        "create",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let env_vars = vec![("BEADS_DIR", "/nonexistent/path/to/beads")];
+    let list = run_br_with_env(&workspace, ["list", "--json"], env_vars, "list_invalid_dir");
+    assert!(
+        !list.status.success(),
+        "invalid BEADS_DIR should not fall back to the cwd workspace"
+    );
+
+    let combined = format!("{}{}", list.stdout, list.stderr);
+    assert!(
+        combined.contains("BEADS_DIR") || combined.contains("existing .beads directory"),
+        "error should mention the invalid BEADS_DIR override: stdout={}, stderr={}",
+        list.stdout,
+        list.stderr
+    );
+}
+
+#[test]
 fn e2e_beads_dir_takes_precedence_over_cwd() {
     let _log = common::test_log("e2e_beads_dir_takes_precedence_over_cwd");
 

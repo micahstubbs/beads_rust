@@ -8,7 +8,7 @@ use crate::error::{BeadsError, Result};
 use crate::format::{
     IssueWithCounts, TextFormatOptions, csv, format_issue_line_with, terminal_width,
 };
-use crate::model::{IssueType, Priority, Status};
+use crate::model::{Issue, IssueType, Priority, Status};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
 use chrono::Utc;
@@ -40,11 +40,54 @@ pub fn execute(
 
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    let storage = &storage_ctx.storage;
+    execute_with_storage_ctx(args, cli, outer_ctx, &storage_ctx)
+}
 
-    let mut filters = build_filters(&args.filters)?;
-    let client_filters = needs_client_filters(&args.filters);
-    let needs_post_query_ordering = requires_post_query_ordering(&args.filters, client_filters);
+/// Execute search using storage that was already opened by the caller.
+///
+/// # Errors
+///
+/// Returns an error if the query is empty or search execution fails.
+#[allow(clippy::too_many_lines)]
+pub fn execute_with_storage_ctx(
+    args: &SearchArgs,
+    cli: &config::CliOverrides,
+    outer_ctx: &OutputContext,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<()> {
+    let query = validate_query(args)?;
+    let storage = &storage_ctx.storage;
+    let issues = collect_search_results(storage, query, &args.filters)?;
+    render_search_results(
+        storage,
+        issues,
+        query,
+        &args.filters,
+        cli,
+        outer_ctx,
+        storage_ctx,
+    )
+}
+
+fn validate_query(args: &SearchArgs) -> Result<&str> {
+    let query = args.query.trim();
+    if query.is_empty() {
+        return Err(BeadsError::Validation {
+            field: "query".to_string(),
+            reason: "search query cannot be empty".to_string(),
+        });
+    }
+    Ok(query)
+}
+
+fn collect_search_results(
+    storage: &SqliteStorage,
+    query: &str,
+    list_args: &ListArgs,
+) -> Result<Vec<Issue>> {
+    let mut filters = build_filters(list_args)?;
+    let client_filters = needs_client_filters(list_args);
+    let needs_post_query_ordering = requires_post_query_ordering(list_args, client_filters);
     let limit = if needs_post_query_ordering {
         filters.limit.take()
     } else {
@@ -57,14 +100,14 @@ pub fn execute(
 
     let issues = storage.search_issues(query, &filters)?;
     let mut issues = if client_filters {
-        apply_client_filters(issues, &args.filters)?
+        apply_client_filters(issues, list_args)?
     } else {
         issues
     };
 
     if needs_post_query_ordering {
-        apply_issue_sort(&mut issues, args.filters.sort.as_deref())?;
-        if args.filters.reverse {
+        apply_issue_sort(&mut issues, list_args.sort.as_deref())?;
+        if list_args.reverse {
             issues.reverse();
         }
         if let Some(limit) = limit
@@ -75,8 +118,21 @@ pub fn execute(
         }
     }
 
+    Ok(issues)
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_search_results(
+    storage: &SqliteStorage,
+    issues: Vec<Issue>,
+    query: &str,
+    list_args: &ListArgs,
+    cli: &config::CliOverrides,
+    outer_ctx: &OutputContext,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<()> {
     let output_format = resolve_output_format_with_outer_mode(
-        args.filters.format,
+        list_args.format,
         outer_ctx.inherited_output_mode(),
         false,
     );
@@ -97,7 +153,7 @@ pub fn execute(
     let format_options = TextFormatOptions {
         use_color,
         max_width,
-        wrap: args.filters.wrap,
+        wrap: list_args.wrap,
     };
     let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
 
@@ -109,11 +165,11 @@ pub fn execute(
         }
         OutputFormat::Toon => {
             let issues_with_counts = attach_counts(storage, issues)?;
-            ctx.toon_with_stats(&issues_with_counts, args.filters.stats);
+            ctx.toon_with_stats(&issues_with_counts, list_args.stats);
             return Ok(());
         }
         OutputFormat::Csv => {
-            let fields = csv::parse_fields(args.filters.fields.as_deref());
+            let fields = csv::parse_fields(list_args.fields.as_deref());
             let csv_output = csv::format_csv(&issues, &fields);
             print!("{csv_output}");
             return Ok(());
@@ -143,8 +199,8 @@ pub fn execute(
                 if issues.len() == 1 { "" } else { "s" }
             ))
             .highlight_query(query)
-            .wrap(args.filters.wrap);
-        if args.filters.wrap {
+            .wrap(list_args.wrap);
+        if list_args.wrap {
             table = table.width(Some(ctx.width()));
         }
         if show_context {

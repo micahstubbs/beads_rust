@@ -234,6 +234,42 @@ task
 }
 
 #[test]
+fn test_markdown_import_rejects_external_ref_argument() {
+    let workspace = BrWorkspace::new();
+
+    let output = run_br(&workspace, ["init"], "init_external_ref_arg");
+    assert!(output.status.success(), "init failed");
+
+    let md_path = workspace.root.join("issues.md");
+    let content = r"## Imported issue
+### Type
+task
+";
+    fs::write(&md_path, content).expect("write md");
+
+    let output = run_br(
+        &workspace,
+        [
+            "create",
+            "--file",
+            "issues.md",
+            "--external-ref",
+            "JIRA-123",
+        ],
+        "create_external_ref_arg",
+    );
+    assert!(
+        !output.status.success(),
+        "--external-ref should fail with --file"
+    );
+    assert!(
+        output
+            .stderr
+            .contains("--external-ref is not supported with --file")
+    );
+}
+
+#[test]
 fn test_markdown_import_rejects_non_empty_file_without_issue_headers() {
     let workspace = BrWorkspace::new();
 

@@ -91,18 +91,12 @@ pub fn execute(
 
     // 4. Check for dependents (if not --force and not --cascade)
     let delete_set: HashSet<String> = ids.iter().cloned().collect();
-    let mut all_dependents: Vec<String> = Vec::new();
-
-    for id in &ids {
-        let dependents = storage.get_dependents(id)?;
-        for dep_id in dependents {
-            if !delete_set.contains(&dep_id) {
-                all_dependents.push(dep_id);
-            }
-        }
-    }
-    all_dependents.sort();
-    all_dependents.dedup();
+    let all_dependents = collect_direct_dependents(storage, &ids)?;
+    let cascade_dependents = if args.cascade {
+        Some(collect_sorted_cascade_dependents(storage, &ids)?)
+    } else {
+        None
+    };
 
     if !all_dependents.is_empty() && !args.force && !args.cascade {
         // Preview mode: show what would happen
@@ -124,14 +118,10 @@ pub fn execute(
 
     // 5. Dry-run mode
     if args.dry_run {
+        let cascade_ids = cascade_dependents.clone().unwrap_or_default();
         if ctx.is_rich() {
-            let cascade_ids: Vec<String> = if args.cascade {
-                all_dependents.clone()
-            } else {
-                vec![]
-            };
             let orphan_ids: Vec<String> = if args.force && !args.cascade {
-                all_dependents.clone()
+                all_dependents
             } else {
                 vec![]
             };
@@ -144,12 +134,12 @@ pub fn execute(
                     .ok_or_else(|| BeadsError::IssueNotFound { id: id.clone() })?;
                 println!("  - {}: {}", id, issue.title);
             }
-            if args.cascade && !all_dependents.is_empty() {
+            if !cascade_ids.is_empty() {
                 println!(
                     "Would also cascade delete {} dependent(s):",
-                    all_dependents.len()
+                    cascade_ids.len()
                 );
-                for dep in &all_dependents {
+                for dep in &cascade_ids {
                     println!("  - {dep}");
                 }
             }
@@ -165,10 +155,8 @@ pub fn execute(
 
     // 6. Build final delete set
     let mut final_delete_set: HashSet<String> = delete_set;
-    if args.cascade {
-        // Recursively collect all dependents
-        let cascade_ids = collect_cascade_dependents(storage, &ids)?;
-        final_delete_set.extend(cascade_ids);
+    if let Some(cascade_ids) = &cascade_dependents {
+        final_delete_set.extend(cascade_ids.iter().cloned());
     }
 
     // 7. Get actor
@@ -189,7 +177,8 @@ pub fn execute(
     }
 
     // Delete each issue (create tombstone, then purge if --hard)
-    let final_ids: Vec<String> = final_delete_set.into_iter().collect();
+    let mut final_ids: Vec<String> = final_delete_set.into_iter().collect();
+    final_ids.sort();
     for id in &final_ids {
         if args.hard {
             // Hard delete: physically remove from DB so it's pruned from JSONL
@@ -283,6 +272,38 @@ fn collect_cascade_dependents(
     Ok(all_ids)
 }
 
+fn collect_direct_dependents(
+    storage: &SqliteStorage,
+    initial_ids: &[String],
+) -> Result<Vec<String>> {
+    let delete_set: HashSet<String> = initial_ids.iter().cloned().collect();
+    let mut dependents = Vec::new();
+
+    for id in initial_ids {
+        let direct_dependents = storage.get_dependents(id)?;
+        for dep_id in direct_dependents {
+            if !delete_set.contains(&dep_id) {
+                dependents.push(dep_id);
+            }
+        }
+    }
+
+    dependents.sort();
+    dependents.dedup();
+    Ok(dependents)
+}
+
+fn collect_sorted_cascade_dependents(
+    storage: &SqliteStorage,
+    initial_ids: &[String],
+) -> Result<Vec<String>> {
+    let mut cascade_ids: Vec<String> = collect_cascade_dependents(storage, initial_ids)?
+        .into_iter()
+        .collect();
+    cascade_ids.sort();
+    Ok(cascade_ids)
+}
+
 /// Render the dependents warning panel in rich format.
 fn render_dependents_warning_rich(
     dependents: &[String],
@@ -292,6 +313,13 @@ fn render_dependents_warning_rich(
     let console = Console::default();
     let theme = ctx.theme();
     let width = ctx.width();
+
+    let mut issues_by_id = std::collections::HashMap::new();
+    if let Ok(issues) = storage.get_issues_by_ids(dependents) {
+        for issue in issues {
+            issues_by_id.insert(issue.id.clone(), issue);
+        }
+    }
 
     let mut content = Text::new("");
 
@@ -304,7 +332,7 @@ fn render_dependents_warning_rich(
         content.append_styled("  \u{2022} ", theme.dimmed.clone());
         content.append_styled(dep_id, theme.issue_id.clone());
         // Try to get title
-        if let Ok(Some(issue)) = storage.get_issue(dep_id) {
+        if let Some(issue) = issues_by_id.get(dep_id) {
             content.append_styled(": ", theme.dimmed.clone());
             content.append(&issue.title);
         }
@@ -340,6 +368,17 @@ fn render_dry_run_rich(
     let theme = ctx.theme();
     let width = ctx.width();
 
+    let mut all_ids = Vec::new();
+    all_ids.extend_from_slice(ids);
+    all_ids.extend_from_slice(cascade_ids);
+    all_ids.extend_from_slice(orphan_ids);
+    let mut issues_by_id = std::collections::HashMap::new();
+    if let Ok(issues) = storage.get_issues_by_ids(&all_ids) {
+        for issue in issues {
+            issues_by_id.insert(issue.id.clone(), issue);
+        }
+    }
+
     let mut content = Text::new("");
 
     // Main issues to delete
@@ -350,7 +389,7 @@ fn render_dry_run_rich(
     for id in ids {
         content.append_styled("  \u{2717} ", theme.error.clone());
         content.append_styled(id, theme.issue_id.clone());
-        if let Ok(Some(issue)) = storage.get_issue(id) {
+        if let Some(issue) = issues_by_id.get(id) {
             content.append_styled(": ", theme.dimmed.clone());
             content.append(&issue.title);
         }
@@ -367,7 +406,7 @@ fn render_dry_run_rich(
         for id in cascade_ids {
             content.append_styled("  \u{21b3} ", theme.warning.clone());
             content.append_styled(id, theme.issue_id.clone());
-            if let Ok(Some(issue)) = storage.get_issue(id) {
+            if let Some(issue) = issues_by_id.get(id) {
                 content.append_styled(": ", theme.dimmed.clone());
                 content.append(&issue.title);
             }
@@ -385,7 +424,7 @@ fn render_dry_run_rich(
         for id in orphan_ids {
             content.append_styled("  \u{26a0} ", theme.warning.clone());
             content.append_styled(id, theme.issue_id.clone());
-            if let Ok(Some(issue)) = storage.get_issue(id) {
+            if let Some(issue) = issues_by_id.get(id) {
                 content.append_styled(": ", theme.dimmed.clone());
                 content.append(&issue.title);
             }
@@ -409,6 +448,16 @@ fn render_delete_result_rich(result: &DeleteResult, storage: &SqliteStorage, ctx
     let theme = ctx.theme();
     let width = ctx.width();
 
+    let mut all_ids = Vec::new();
+    all_ids.extend_from_slice(&result.deleted);
+    all_ids.extend_from_slice(&result.orphaned_issues);
+    let mut issues_by_id = std::collections::HashMap::new();
+    if let Ok(issues) = storage.get_issues_by_ids(&all_ids) {
+        for issue in issues {
+            issues_by_id.insert(issue.id.clone(), issue);
+        }
+    }
+
     let mut content = Text::new("");
 
     // Deleted items
@@ -419,7 +468,7 @@ fn render_delete_result_rich(result: &DeleteResult, storage: &SqliteStorage, ctx
     for id in &result.deleted {
         content.append_styled("  \u{2713} ", theme.success.clone());
         content.append_styled(id, theme.issue_id.clone());
-        if let Ok(Some(issue)) = storage.get_issue(id) {
+        if let Some(issue) = issues_by_id.get(id) {
             content.append_styled(": ", theme.dimmed.clone());
             content.append(&issue.title);
         }
@@ -450,7 +499,7 @@ fn render_delete_result_rich(result: &DeleteResult, storage: &SqliteStorage, ctx
         for id in &result.orphaned_issues {
             content.append_styled("  \u{26a0} ", theme.warning.clone());
             content.append_styled(id, theme.issue_id.clone());
-            if let Ok(Some(issue)) = storage.get_issue(id) {
+            if let Some(issue) = issues_by_id.get(id) {
                 content.append_styled(": ", theme.dimmed.clone());
                 content.append(&issue.title);
             }
@@ -612,5 +661,71 @@ mod tests {
         assert!(cascade.contains("bd-c"));
         assert!(!cascade.contains("bd-a")); // Initial ID not included
         info!("test_cascade_dependents_collection: assertions passed");
+    }
+
+    #[test]
+    fn test_direct_dependents_collection_is_shallow() {
+        init_logging();
+        info!("test_direct_dependents_collection_is_shallow: starting");
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let a = create_test_issue("bd-a", "Issue A");
+        let b = create_test_issue("bd-b", "Issue B");
+        let c = create_test_issue("bd-c", "Issue C");
+
+        storage.create_issue(&a, "tester").unwrap();
+        storage.create_issue(&b, "tester").unwrap();
+        storage.create_issue(&c, "tester").unwrap();
+
+        storage
+            .mutate("test_add_direct_deps", "tester", |tx, _ctx| {
+                tx.execute_with_params(
+                    "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES (?, ?, ?, ?)",
+                    &[fsqlite_types::SqliteValue::from("bd-b"), fsqlite_types::SqliteValue::from("bd-a"), fsqlite_types::SqliteValue::from("blocks"), fsqlite_types::SqliteValue::from(chrono::Utc::now().to_rfc3339().as_str())],
+                )?;
+                tx.execute_with_params(
+                    "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES (?, ?, ?, ?)",
+                    &[fsqlite_types::SqliteValue::from("bd-c"), fsqlite_types::SqliteValue::from("bd-b"), fsqlite_types::SqliteValue::from("blocks"), fsqlite_types::SqliteValue::from(chrono::Utc::now().to_rfc3339().as_str())],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let direct = collect_direct_dependents(&storage, &["bd-a".to_string()]).unwrap();
+        assert_eq!(direct, vec!["bd-b".to_string()]);
+        info!("test_direct_dependents_collection_is_shallow: assertions passed");
+    }
+
+    #[test]
+    fn test_sorted_cascade_dependents_include_transitive_dependents() {
+        init_logging();
+        info!("test_sorted_cascade_dependents_include_transitive_dependents: starting");
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let a = create_test_issue("bd-a", "Issue A");
+        let b = create_test_issue("bd-b", "Issue B");
+        let c = create_test_issue("bd-c", "Issue C");
+
+        storage.create_issue(&a, "tester").unwrap();
+        storage.create_issue(&b, "tester").unwrap();
+        storage.create_issue(&c, "tester").unwrap();
+
+        storage
+            .mutate("test_add_transitive_deps", "tester", |tx, _ctx| {
+                tx.execute_with_params(
+                    "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES (?, ?, ?, ?)",
+                    &[fsqlite_types::SqliteValue::from("bd-b"), fsqlite_types::SqliteValue::from("bd-a"), fsqlite_types::SqliteValue::from("blocks"), fsqlite_types::SqliteValue::from(chrono::Utc::now().to_rfc3339().as_str())],
+                )?;
+                tx.execute_with_params(
+                    "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES (?, ?, ?, ?)",
+                    &[fsqlite_types::SqliteValue::from("bd-c"), fsqlite_types::SqliteValue::from("bd-b"), fsqlite_types::SqliteValue::from("blocks"), fsqlite_types::SqliteValue::from(chrono::Utc::now().to_rfc3339().as_str())],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let cascade = collect_sorted_cascade_dependents(&storage, &["bd-a".to_string()]).unwrap();
+        assert_eq!(cascade, vec!["bd-b".to_string(), "bd-c".to_string()]);
+        info!("test_sorted_cascade_dependents_include_transitive_dependents: assertions passed");
     }
 }

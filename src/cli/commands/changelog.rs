@@ -77,10 +77,29 @@ pub fn execute(
     ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let config::OpenStorageResult { storage, paths, .. } =
-        config::open_storage_with_cli(&beads_dir, cli)?;
-    let repo_root =
-        git_repo_root_for_path(&paths.jsonl_path).or_else(|| git_repo_root_for_path(&beads_dir));
+    let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    execute_with_storage_ctx(args, json, ctx, &beads_dir, &storage_ctx)
+}
+
+/// Execute changelog generation using storage that was already opened by the caller.
+///
+/// # Errors
+///
+/// Returns an error if git lookup or storage access fails.
+///
+/// # Panics
+///
+/// Panics if JSON serialization of the output fails (should never happen with valid data).
+pub fn execute_with_storage_ctx(
+    args: &ChangelogArgs,
+    json: bool,
+    ctx: &OutputContext,
+    beads_dir: &Path,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<()> {
+    let storage = &storage_ctx.storage;
+    let repo_root = git_repo_root_for_path(&storage_ctx.paths.jsonl_path)
+        .or_else(|| git_repo_root_for_path(beads_dir));
 
     let (since_dt, since_label) = resolve_since(args, repo_root.as_deref())?;
     let until = Utc::now();

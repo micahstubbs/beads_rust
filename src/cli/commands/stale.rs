@@ -4,7 +4,7 @@ use crate::error::{BeadsError, Result};
 use crate::format::StaleIssue;
 use crate::model::{Issue, Status};
 use crate::output::{OutputContext, OutputMode};
-use crate::storage::ListFilters;
+use crate::storage::{ListFilters, SqliteStorage};
 use chrono::{DateTime, Duration, Utc};
 
 /// Execute the stale command.
@@ -13,14 +13,39 @@ use chrono::{DateTime, Duration, Utc};
 ///
 /// Returns an error if filters are invalid or the database query fails.
 pub fn execute(args: &StaleArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
-    if args.days < 0 {
-        return Err(BeadsError::validation("days", "must be >= 0"));
+    if !(0..=36500).contains(&args.days) {
+        return Err(BeadsError::validation(
+            "days",
+            "must be between 0 and 36500",
+        ));
     }
 
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    let storage = &storage_ctx.storage;
+    execute_inner(args, ctx, &storage_ctx.storage)
+}
 
+/// Execute the stale command using storage that was already opened by the caller.
+///
+/// # Errors
+///
+/// Returns an error if filters are invalid or the database query fails.
+pub fn execute_with_storage(
+    args: &StaleArgs,
+    ctx: &OutputContext,
+    storage: &SqliteStorage,
+) -> Result<()> {
+    if !(0..=36500).contains(&args.days) {
+        return Err(BeadsError::validation(
+            "days",
+            "must be between 0 and 36500",
+        ));
+    }
+
+    execute_inner(args, ctx, storage)
+}
+
+fn execute_inner(args: &StaleArgs, ctx: &OutputContext, storage: &SqliteStorage) -> Result<()> {
     let statuses = if args.status.is_empty() {
         vec![Status::Open, Status::InProgress]
     } else {

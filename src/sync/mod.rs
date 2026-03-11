@@ -1445,11 +1445,8 @@ pub fn export_to_jsonl_with_policy(
             issue.labels = labels;
         }
 
-        // Normalize labels for consistent round-trip hashing (matches import behavior)
-        if !issue.labels.is_empty() {
-            issue.labels.sort();
-            issue.labels.dedup();
-        }
+        // Normalize for consistent round-trip hashing (matches import behavior)
+        normalize_issue_for_export(issue);
 
         // Comments
         if let Some(ref map) = all_comments {
@@ -1712,11 +1709,8 @@ pub fn export_to_writer_with_policy<W: Write>(
             issue.labels = labels;
         }
 
-        // Normalize labels for consistent round-trip hashing (matches import behavior)
-        if !issue.labels.is_empty() {
-            issue.labels.sort();
-            issue.labels.dedup();
-        }
+        // Normalize for consistent round-trip hashing (matches import behavior)
+        normalize_issue_for_export(issue);
 
         // Comments
         if let Some(ref map) = all_comments {
@@ -1792,6 +1786,8 @@ pub fn export_to_writer_with_policy<W: Write>(
 
 /// Metadata key for the JSONL content hash.
 pub const METADATA_JSONL_CONTENT_HASH: &str = "jsonl_content_hash";
+/// Metadata key for the exact observed JSONL mtime at the last successful sync.
+pub const METADATA_JSONL_MTIME: &str = "jsonl_mtime";
 /// Metadata key for the last export time.
 pub const METADATA_LAST_EXPORT_TIME: &str = "last_export_time";
 /// Metadata key for the last import time.
@@ -1816,13 +1812,27 @@ pub struct StalenessCheck {
 /// Returns an error if reading dirty state, metadata, JSONL mtime, or hashing fails.
 pub fn compute_staleness(storage: &SqliteStorage, jsonl_path: &Path) -> Result<StalenessCheck> {
     let dirty_count = storage.get_dirty_issue_count()?;
-    let last_import_time = storage.get_metadata(METADATA_LAST_IMPORT_TIME)?;
-    let last_export_time = storage.get_metadata(METADATA_LAST_EXPORT_TIME)?;
-    let jsonl_content_hash = storage.get_metadata(METADATA_JSONL_CONTENT_HASH)?;
     let jsonl_exists = jsonl_path.exists();
+    let db_newer = dirty_count > 0;
 
-    let (jsonl_mtime, jsonl_newer, db_newer) = if jsonl_exists {
-        let jsonl_mtime = fs::symlink_metadata(jsonl_path)?.modified()?;
+    let (jsonl_mtime, jsonl_newer) = if jsonl_exists {
+        let (jsonl_mtime, jsonl_mtime_witness) = observed_jsonl_mtime(jsonl_path)?;
+
+        if storage.get_metadata(METADATA_JSONL_MTIME)?.as_deref() == Some(&jsonl_mtime_witness) {
+            let current_hash = compute_jsonl_hash(jsonl_path)?;
+            let stored_hash = storage.get_metadata(METADATA_JSONL_CONTENT_HASH)?;
+            return Ok(StalenessCheck {
+                dirty_count,
+                jsonl_exists: true,
+                jsonl_mtime: Some(jsonl_mtime),
+                jsonl_newer: stored_hash.as_deref() != Some(current_hash.as_str()),
+                db_newer,
+            });
+        }
+
+        let last_import_time = storage.get_metadata(METADATA_LAST_IMPORT_TIME)?;
+        let last_export_time = storage.get_metadata(METADATA_LAST_EXPORT_TIME)?;
+        let jsonl_content_hash = storage.get_metadata(METADATA_JSONL_CONTENT_HASH)?;
 
         // Get the latest known sync time (either import or export)
         let mut latest_sync_ts: Option<chrono::DateTime<Utc>> = None;
@@ -1858,9 +1868,9 @@ pub fn compute_staleness(storage: &SqliteStorage, jsonl_path: &Path) -> Result<S
             false
         };
 
-        (Some(jsonl_mtime), jsonl_newer, dirty_count > 0)
+        (Some(jsonl_mtime), jsonl_newer)
     } else {
-        (None, false, dirty_count > 0)
+        (None, false)
     };
 
     Ok(StalenessCheck {
@@ -1870,6 +1880,17 @@ pub fn compute_staleness(storage: &SqliteStorage, jsonl_path: &Path) -> Result<S
         jsonl_newer,
         db_newer,
     })
+}
+
+fn observed_jsonl_mtime(jsonl_path: &Path) -> Result<(std::time::SystemTime, String)> {
+    let jsonl_mtime = fs::symlink_metadata(jsonl_path)?.modified()?;
+    let jsonl_mtime_witness = chrono::DateTime::<Utc>::from(jsonl_mtime).to_rfc3339();
+    Ok((jsonl_mtime, jsonl_mtime_witness))
+}
+
+fn record_jsonl_mtime_in_tx(storage: &SqliteStorage, jsonl_path: &Path) -> Result<()> {
+    let (_, jsonl_mtime_witness) = observed_jsonl_mtime(jsonl_path)?;
+    storage.set_metadata_in_tx(METADATA_JSONL_MTIME, &jsonl_mtime_witness)
 }
 
 /// Result of an auto-import attempt.
@@ -1919,7 +1940,7 @@ pub fn auto_import_if_stale(
             message: format!(
                 "JSONL is newer ({}), but the database also has {} unsaved change(s).\n\
                  A silent auto-import would risk overwriting local changes.\n\
-                 Hint: run `br sync` to perform a safe 3-way merge, or `br sync --export-only` to push your changes first.",
+                 Hint: run `br sync` to perform a safe 3-way merge, or `br sync --flush-only` to push your changes first.",
                 staleness.jsonl_mtime.map_or_else(
                     || "unknown".to_string(),
                     |t| chrono::DateTime::<Utc>::from(t).to_rfc3339(),
@@ -1971,39 +1992,34 @@ pub fn finalize_export(
     storage: &mut SqliteStorage,
     result: &ExportResult,
     issue_hashes: Option<&[(String, String)]>,
+    jsonl_path: &Path,
 ) -> Result<()> {
     use chrono::Utc;
+    let storage_ref: &SqliteStorage = storage;
 
-    storage.execute_raw("BEGIN IMMEDIATE")?;
-    match (|| -> Result<()> {
+    storage_ref.with_write_transaction(|| -> Result<()> {
         // Clear dirty flags for exported issues (safe version with timestamp validation)
         if !result.exported_marked_at.is_empty() {
-            storage.clear_dirty_issues(&result.exported_marked_at)?;
+            storage_ref.clear_dirty_issues(&result.exported_marked_at)?;
         }
 
         // Record export hashes for each exported issue (for incremental export detection)
         if let Some(hashes) = issue_hashes {
-            storage.set_export_hashes_in_tx(hashes)?;
+            storage_ref.set_export_hashes_in_tx(hashes)?;
         }
 
         // Update metadata
-        storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, &result.content_hash)?;
-        storage.set_metadata_in_tx(METADATA_LAST_EXPORT_TIME, &Utc::now().to_rfc3339())?;
+        storage_ref.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, &result.content_hash)?;
+        storage_ref.set_metadata_in_tx(METADATA_LAST_EXPORT_TIME, &Utc::now().to_rfc3339())?;
+        record_jsonl_mtime_in_tx(storage_ref, jsonl_path)?;
 
         // Clear force-flush flag if it was set
-        storage.execute_raw("DELETE FROM metadata WHERE key = 'needs_flush'")?;
+        storage_ref.execute_raw("DELETE FROM metadata WHERE key = 'needs_flush'")?;
 
         Ok(())
-    })() {
-        Ok(()) => {
-            storage.execute_raw("COMMIT")?;
-            Ok(())
-        }
-        Err(err) => {
-            let _ = storage.execute_raw("ROLLBACK");
-            Err(err)
-        }
-    }
+    })?;
+
+    Ok(())
 }
 
 fn normalize_issue_for_export(issue: &mut Issue) {
@@ -2018,41 +2034,41 @@ fn is_issue_exportable(issue: &Issue, retention_days: Option<u64>) -> bool {
 }
 
 fn finalize_incremental_auto_flush(
-    storage: &mut SqliteStorage,
+    storage: &SqliteStorage,
     clear_dirty_metadata: &[(String, String)],
     removed_hash_ids: &[String],
     issue_hashes: &[(String, String)],
     content_hash: Option<&str>,
+    jsonl_path: Option<&Path>,
 ) -> Result<()> {
     use chrono::Utc;
+    let storage_ref: &SqliteStorage = storage;
 
-    storage.execute_raw("BEGIN IMMEDIATE")?;
-    match (|| -> Result<()> {
+    storage_ref.with_write_transaction(|| -> Result<()> {
         if !clear_dirty_metadata.is_empty() {
-            storage.clear_dirty_issues(clear_dirty_metadata)?;
+            storage_ref.clear_dirty_issues(clear_dirty_metadata)?;
         }
         if !removed_hash_ids.is_empty() {
-            storage.clear_export_hashes_in_tx(removed_hash_ids)?;
+            storage_ref.clear_export_hashes_in_tx(removed_hash_ids)?;
         }
         if !issue_hashes.is_empty() {
-            storage.set_export_hashes_in_tx(issue_hashes)?;
+            storage_ref.set_export_hashes_in_tx(issue_hashes)?;
         }
         if let Some(content_hash) = content_hash {
-            storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, content_hash)?;
-            storage.set_metadata_in_tx(METADATA_LAST_EXPORT_TIME, &Utc::now().to_rfc3339())?;
+            storage_ref.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, content_hash)?;
+            storage_ref.set_metadata_in_tx(METADATA_LAST_EXPORT_TIME, &Utc::now().to_rfc3339())?;
+            let jsonl_path = jsonl_path.ok_or_else(|| {
+                BeadsError::Config(
+                    "incremental auto-flush metadata update requires a JSONL path".to_string(),
+                )
+            })?;
+            record_jsonl_mtime_in_tx(storage_ref, jsonl_path)?;
         }
-        storage.execute_raw("DELETE FROM metadata WHERE key = 'needs_flush'")?;
+        storage_ref.execute_raw("DELETE FROM metadata WHERE key = 'needs_flush'")?;
         Ok(())
-    })() {
-        Ok(()) => {
-            storage.execute_raw("COMMIT")?;
-            Ok(())
-        }
-        Err(err) => {
-            let _ = storage.execute_raw("ROLLBACK");
-            Err(err)
-        }
-    }
+    })?;
+
+    Ok(())
 }
 
 fn write_jsonl_lines_atomically(
@@ -2157,7 +2173,7 @@ fn write_jsonl_lines_atomically(
 }
 
 fn try_incremental_auto_flush(
-    storage: &mut SqliteStorage,
+    storage: &SqliteStorage,
     beads_dir: &Path,
     jsonl_path: &Path,
 ) -> Result<Option<AutoFlushResult>> {
@@ -2222,6 +2238,7 @@ fn try_incremental_auto_flush(
             &removed_hash_ids,
             &issue_hashes,
             None,
+            None,
         )?;
         return Ok(Some(AutoFlushResult::default()));
     }
@@ -2239,6 +2256,7 @@ fn try_incremental_auto_flush(
         &removed_hash_ids,
         &issue_hashes,
         Some(&content_hash),
+        Some(jsonl_path),
     )?;
 
     Ok(Some(AutoFlushResult {
@@ -2334,7 +2352,12 @@ pub fn auto_flush(
         export_to_jsonl_with_policy(storage, jsonl_path, &export_config)?;
 
     // Finalize export (clear dirty flags, update metadata)
-    finalize_export(storage, &export_result, Some(&export_result.issue_hashes))?;
+    finalize_export(
+        storage,
+        &export_result,
+        Some(&export_result.issue_hashes),
+        jsonl_path,
+    )?;
 
     tracing::info!(
         exported = export_result.exported_count,
@@ -2656,19 +2679,22 @@ pub fn import_from_jsonl(
     let file_size = file.metadata().map_or(0, |m| m.len());
     // Estimate ~500 bytes per issue to pre-allocate vector capacity
     let estimated_count = (file_size / 500) as usize;
-    let reader = BufReader::with_capacity(2 * 1024 * 1024, file);
+    let mut reader = BufReader::with_capacity(2 * 1024 * 1024, file);
     let mut issues = Vec::with_capacity(estimated_count);
     let mut id_to_index = std::collections::HashMap::with_capacity(estimated_count);
     let mut mismatches = Vec::new();
 
-    for (line_num, line) in reader.lines().enumerate() {
-        let line = line?;
-        if line.trim().is_empty() {
+    let mut line = String::new();
+    let mut line_num = 0;
+    while reader.read_line(&mut line)? > 0 {
+        line_num += 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            line.clear();
             continue;
         }
-        let mut issue: Issue = serde_json::from_str(&line).map_err(|e| {
-            BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num + 1, e))
-        })?;
+        let mut issue: Issue = serde_json::from_str(trimmed)
+            .map_err(|e| BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num, e)))?;
 
         // 1. Normalize (Step 3)
         normalize_issue(&mut issue);
@@ -2682,9 +2708,7 @@ pub fn import_from_jsonl(
                 .join(", ");
             return Err(BeadsError::Config(format!(
                 "Validation failed for issue {} at line {}: {}",
-                issue.id,
-                line_num + 1,
-                details
+                issue.id, line_num, details
             )));
         }
 
@@ -2697,9 +2721,7 @@ pub fn import_from_jsonl(
             if !config.rename_on_import {
                 return Err(BeadsError::Config(format!(
                     "Prefix mismatch at line {}: expected '{}', found issue '{}'",
-                    line_num + 1,
-                    prefix,
-                    issue.id
+                    line_num, prefix, issue.id
                 )));
             }
             mismatches.push(issue.id.clone());
@@ -2708,7 +2730,7 @@ pub fn import_from_jsonl(
         // 4. Deduplicate
         if let Some(&index) = id_to_index.get(&issue.id) {
             tracing::warn!(
-                line = line_num + 1,
+                line = line_num,
                 id = %issue.id,
                 "Duplicate issue ID in JSONL; using the last occurrence"
             );
@@ -2717,6 +2739,8 @@ pub fn import_from_jsonl(
             id_to_index.insert(issue.id.clone(), issues.len());
             issues.push(issue);
         }
+
+        line.clear();
     }
     spinner.finish_with_message("Parsed and validated issues");
 
@@ -2937,78 +2961,62 @@ pub fn import_from_jsonl(
         "Importing issues",
         config.show_progress,
     );
-    let apply_result = (|| -> Result<ImportResult> {
-        storage.execute_raw("BEGIN IMMEDIATE")?;
+    let storage_ref: &SqliteStorage = storage;
+    let apply_result = storage_ref.with_write_transaction(|| -> Result<ImportResult> {
+        let mut tx_result = result.clone();
+        // Keep export-hash state transactional so failed imports do not
+        // erase incremental export bookkeeping.
+        storage_ref.clear_all_export_hashes_in_tx()?;
 
-        let tx_result = (|| -> Result<ImportResult> {
-            // Keep export-hash state transactional so failed imports do not
-            // erase incremental export bookkeeping.
-            storage.clear_all_export_hashes_in_tx()?;
-
-            for (issue, action) in import_ops {
-                process_import_action(storage, &action, &issue, &mut result)?;
-                progress.inc(1);
-            }
-
-            // Clean up any orphaned rows left by FK-deferred import
-            // (e.g., dependencies referencing issues not in the JSONL)
-            let orphan_tables = &[
-                ("dependencies", "issue_id"),
-                ("dependencies", "depends_on_id"),
-                ("labels", "issue_id"),
-                ("comments", "issue_id"),
-                ("events", "issue_id"),
-                ("dirty_issues", "issue_id"),
-                ("blocked_issues_cache", "issue_id"),
-                ("child_counters", "parent_id"),
-            ];
-            let mut orphans_cleaned = 0usize;
-            for (table, col) in orphan_tables {
-                let sql = if *table == "dependencies" && *col == "depends_on_id" {
-                    format!(
-                        "DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues) AND {col} NOT LIKE 'external:%'"
-                    )
-                } else {
-                    format!("DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues)")
-                };
-                orphans_cleaned += storage.execute_raw_count(&sql)?;
-            }
-            if orphans_cleaned > 0 {
-                tracing::info!(
-                    count = orphans_cleaned,
-                    "Cleaned orphaned FK rows after import"
-                );
-                result.orphan_cleaned_count = orphans_cleaned;
-            }
-
-            if !new_export_hashes.is_empty() {
-                storage.set_export_hashes_in_tx(&new_export_hashes)?;
-            }
-
-            storage.rebuild_blocked_cache_in_tx()?;
-            storage.rebuild_child_counters_in_tx()?;
-            storage
-                .set_metadata_in_tx(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
-            storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, &jsonl_hash)?;
-
-            Ok(result)
-        })();
-
-        match tx_result {
-            Ok(import_result) => {
-                if let Err(err) = storage.execute_raw("COMMIT") {
-                    let _ = storage.execute_raw("ROLLBACK");
-                    Err(err)
-                } else {
-                    Ok(import_result)
-                }
-            }
-            Err(err) => {
-                let _ = storage.execute_raw("ROLLBACK");
-                Err(err)
-            }
+        for (issue, action) in &import_ops {
+            process_import_action(storage_ref, action, issue, &mut tx_result)?;
+            progress.inc(1);
         }
-    })();
+
+        // Clean up any orphaned rows left by FK-deferred import
+        // (e.g., dependencies referencing issues not in the JSONL)
+        let orphan_tables = &[
+            ("dependencies", "issue_id"),
+            ("dependencies", "depends_on_id"),
+            ("labels", "issue_id"),
+            ("comments", "issue_id"),
+            ("events", "issue_id"),
+            ("dirty_issues", "issue_id"),
+            ("blocked_issues_cache", "issue_id"),
+            ("child_counters", "parent_id"),
+        ];
+        let mut orphans_cleaned = 0usize;
+        for (table, col) in orphan_tables {
+            let sql = if *table == "dependencies" && *col == "depends_on_id" {
+                format!(
+                    "DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues) AND {col} NOT LIKE 'external:%'"
+                )
+            } else {
+                format!("DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues)")
+            };
+            orphans_cleaned += storage_ref.execute_raw_count(&sql)?;
+        }
+        if orphans_cleaned > 0 {
+            tracing::info!(
+                count = orphans_cleaned,
+                "Cleaned orphaned FK rows after import"
+            );
+            tx_result.orphan_cleaned_count = orphans_cleaned;
+        }
+
+        if !new_export_hashes.is_empty() {
+            storage_ref.set_export_hashes_in_tx(&new_export_hashes)?;
+        }
+
+        storage_ref.rebuild_blocked_cache_in_tx()?;
+        storage_ref.rebuild_child_counters_in_tx()?;
+        storage_ref
+            .set_metadata_in_tx(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
+        storage_ref.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, &jsonl_hash)?;
+        record_jsonl_mtime_in_tx(storage_ref, input_path)?;
+
+        Ok(tx_result)
+    });
 
     let fk_restore_result = storage.execute_raw("PRAGMA foreign_keys = ON");
     match (apply_result, fk_restore_result) {
@@ -3047,7 +3055,7 @@ fn id_matches_expected_prefix(id: &str, expected_prefix: &str) -> bool {
 
 /// Process a single import action.
 fn process_import_action(
-    storage: &mut SqliteStorage,
+    storage: &SqliteStorage,
     action: &CollisionAction,
     issue: &Issue,
     result: &mut ImportResult,
@@ -3087,7 +3095,7 @@ fn process_import_action(
 }
 
 /// Sync labels, dependencies, and comments for an imported issue.
-fn sync_issue_relations(storage: &mut SqliteStorage, issue: &Issue) -> Result<()> {
+fn sync_issue_relations(storage: &SqliteStorage, issue: &Issue) -> Result<()> {
     // Sync labels
     storage.sync_labels_for_import(&issue.id, &issue.labels)?;
 
@@ -4171,6 +4179,75 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_staleness_uses_matching_jsonl_mtime_witness() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+
+        fs::write(&jsonl_path, "{\"id\":\"bd-1\"}\n").unwrap();
+        let (_, jsonl_mtime_witness) = observed_jsonl_mtime(&jsonl_path).unwrap();
+
+        storage
+            .set_metadata(METADATA_JSONL_CONTENT_HASH, "stale-hash")
+            .unwrap();
+        storage
+            .set_metadata(METADATA_JSONL_MTIME, &jsonl_mtime_witness)
+            .unwrap();
+
+        let staleness = compute_staleness(&storage, &jsonl_path).unwrap();
+        assert!(staleness.jsonl_exists);
+        assert!(!staleness.jsonl_newer);
+        assert!(staleness.jsonl_mtime.is_some());
+    }
+
+    #[test]
+    fn test_compute_staleness_does_not_trust_matching_mtime_without_hash_match() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+
+        fs::write(&jsonl_path, "{\"id\":\"bd-1\"}\n").unwrap();
+        let (_, jsonl_mtime_witness) = observed_jsonl_mtime(&jsonl_path).unwrap();
+
+        storage
+            .set_metadata(METADATA_JSONL_CONTENT_HASH, "stale-hash")
+            .unwrap();
+        storage
+            .set_metadata(METADATA_JSONL_MTIME, &jsonl_mtime_witness)
+            .unwrap();
+
+        let staleness = compute_staleness(&storage, &jsonl_path).unwrap();
+        assert!(staleness.jsonl_exists);
+        assert!(staleness.jsonl_newer);
+        assert!(staleness.jsonl_mtime.is_some());
+    }
+
+    #[test]
+    fn test_import_records_matching_jsonl_mtime_witness() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+
+        let issue = make_test_issue("bd-import", "Imported issue");
+        let json = serde_json::to_string(&issue).unwrap();
+        fs::write(&jsonl_path, format!("{json}\n")).unwrap();
+
+        import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .unwrap();
+
+        let (_, jsonl_mtime_witness) = observed_jsonl_mtime(&jsonl_path).unwrap();
+        assert_eq!(
+            storage.get_metadata(METADATA_JSONL_MTIME).unwrap(),
+            Some(jsonl_mtime_witness)
+        );
+    }
+
+    #[test]
     fn test_normalize_issue_wisp_detection() {
         let mut issue = make_test_issue("bd-wisp-123", "Wisp issue");
         assert!(!issue.ephemeral);
@@ -4276,7 +4353,7 @@ mod tests {
     #[test]
     fn test_import_collision_by_external_ref_same_id() {
         // Test collision detection by external_ref when IDs also match
-        let mut storage = SqliteStorage::open_memory().unwrap();
+        let storage = SqliteStorage::open_memory().unwrap();
 
         let mut ext_issue = make_issue_at("bd-ext", "External", fixed_time(100));
         ext_issue.external_ref = Some("JIRA-1".to_string());
@@ -4561,7 +4638,7 @@ mod tests {
 
     #[test]
     fn test_detect_collision_external_ref_priority() {
-        let mut storage = SqliteStorage::open_memory().unwrap();
+        let storage = SqliteStorage::open_memory().unwrap();
 
         let mut ext_issue = make_issue_at("bd-ext", "External", fixed_time(100));
         ext_issue.external_ref = Some("JIRA-1".to_string());
@@ -4604,7 +4681,7 @@ mod tests {
 
     #[test]
     fn test_detect_collision_content_hash_before_id() {
-        let mut storage = SqliteStorage::open_memory().unwrap();
+        let storage = SqliteStorage::open_memory().unwrap();
 
         let mut hash_issue = make_issue_at("bd-hash", "Same Content", fixed_time(100));
         set_content_hash(&mut hash_issue);
@@ -4643,7 +4720,7 @@ mod tests {
 
     #[test]
     fn test_detect_collision_duplicate_content_hash_keeps_first_match() {
-        let mut storage = SqliteStorage::open_memory().unwrap();
+        let storage = SqliteStorage::open_memory().unwrap();
 
         let mut first = make_issue_at("bd-first", "Same Content", fixed_time(100));
         set_content_hash(&mut first);
@@ -4904,7 +4981,13 @@ mod tests {
 
         let config = ExportConfig::default();
         let result = export_to_jsonl(&storage, &output_path, &config).unwrap();
-        finalize_export(&mut storage, &result, Some(&result.issue_hashes)).unwrap();
+        finalize_export(
+            &mut storage,
+            &result,
+            Some(&result.issue_hashes),
+            &output_path,
+        )
+        .unwrap();
 
         assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
         assert!(
@@ -4916,6 +4999,12 @@ mod tests {
         assert!(
             storage
                 .get_metadata(METADATA_LAST_EXPORT_TIME)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            storage
+                .get_metadata(METADATA_JSONL_MTIME)
                 .unwrap()
                 .is_some()
         );
@@ -4936,7 +5025,13 @@ mod tests {
 
         let invalid_issue_hashes = vec![("bd-missing".to_string(), "hash".to_string())];
 
-        let err = finalize_export(&mut storage, &result, Some(&invalid_issue_hashes)).unwrap_err();
+        let err = finalize_export(
+            &mut storage,
+            &result,
+            Some(&invalid_issue_hashes),
+            &output_path,
+        )
+        .unwrap_err();
         match err {
             BeadsError::Database(_) => {}
             other => panic!("unexpected error: {other:?}"),
@@ -4956,6 +5051,12 @@ mod tests {
         assert!(
             storage
                 .get_metadata(METADATA_LAST_EXPORT_TIME)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .get_metadata(METADATA_JSONL_MTIME)
                 .unwrap()
                 .is_none()
         );

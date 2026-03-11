@@ -1363,6 +1363,46 @@ fn e2e_delete_with_dependents_preview() {
 }
 
 #[test]
+fn e2e_delete_json_sorts_deleted_ids() {
+    let _log = common::test_log("e2e_delete_json_sorts_deleted_ids");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success());
+
+    let create_a = run_br(&workspace, ["create", "Delete A"], "create_delete_a");
+    assert!(create_a.status.success());
+    let id_a = parse_created_id(&create_a.stdout);
+
+    let create_b = run_br(&workspace, ["create", "Delete B"], "create_delete_b");
+    assert!(create_b.status.success());
+    let id_b = parse_created_id(&create_b.stdout);
+
+    let result = run_br(
+        &workspace,
+        ["delete", &id_b, &id_a, "--json"],
+        "delete_json_sorted_ids",
+    );
+    assert!(
+        result.status.success(),
+        "delete json failed: {}",
+        result.stderr
+    );
+
+    let json: Value = serde_json::from_str(&result.stdout).expect("should be valid JSON");
+    let deleted = json["deleted"].as_array().expect("deleted array");
+    let deleted_ids: Vec<&str> = deleted
+        .iter()
+        .map(|value| value.as_str().expect("deleted id"))
+        .collect();
+
+    let mut expected = vec![id_a.as_str(), id_b.as_str()];
+    expected.sort_unstable();
+    assert_eq!(deleted_ids, expected);
+    assert_eq!(json["deleted_count"], 2);
+}
+
+#[test]
 fn e2e_validation_error_empty_label() {
     let _log = common::test_log("e2e_validation_error_empty_label");
     let workspace = BrWorkspace::new();

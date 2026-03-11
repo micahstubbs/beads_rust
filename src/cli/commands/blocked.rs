@@ -151,9 +151,8 @@ fn execute_inner(
             }
         }
 
-        if !external_ids_to_fetch.is_empty()
-            && let Ok(fetched_issues) = storage.get_issues_by_ids(&external_ids_to_fetch)
-        {
+        if !external_ids_to_fetch.is_empty() {
+            let fetched_issues = storage.get_issues_by_ids(&external_ids_to_fetch)?;
             for issue in fetched_issues {
                 if issue.status.is_terminal() {
                     continue;

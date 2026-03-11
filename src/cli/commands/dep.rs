@@ -316,6 +316,27 @@ fn dependency_type_for_pair(
         .map(|dep| dep.dep_type.as_str().to_string()))
 }
 
+fn normalize_dep_type_filter(dep_type: &str) -> Result<String> {
+    let parsed: DependencyType = dep_type.parse().map_err(|_| BeadsError::Validation {
+        field: "type".to_string(),
+        reason: format!("Invalid dependency type: {dep_type}"),
+    })?;
+
+    if let DependencyType::Custom(_) = parsed {
+        return Err(BeadsError::Validation {
+            field: "type".to_string(),
+            reason: format!(
+                "Unknown dependency type: '{dep_type}'. \
+                 Allowed types: blocks, parent-child, conditional-blocks, waits-for, \
+                 related, discovered-from, replies-to, relates-to, duplicates, \
+                 supersedes, caused-by"
+            ),
+        });
+    }
+
+    Ok(parsed.as_str().to_string())
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn dep_list(
     args: &DepListArgs,
@@ -334,6 +355,11 @@ fn dep_list(
     );
     let ctx = OutputContext::from_output_format(output_format, quiet, no_color);
     let issue_id = resolve_issue_id(storage, resolver, all_ids, &args.issue)?;
+    let dep_type_filter = args
+        .dep_type
+        .as_deref()
+        .map(normalize_dep_type_filter)
+        .transpose()?;
 
     let mut items = Vec::new();
 
@@ -341,7 +367,7 @@ fn dep_list(
     if matches!(args.direction, DepDirection::Down | DepDirection::Both) {
         let deps = storage.get_dependencies_with_metadata(&issue_id)?;
         for dep in deps {
-            if let Some(ref filter_type) = args.dep_type
+            if let Some(ref filter_type) = dep_type_filter
                 && dep.dep_type != *filter_type
             {
                 continue;
@@ -361,7 +387,7 @@ fn dep_list(
     if matches!(args.direction, DepDirection::Up | DepDirection::Both) {
         let deps = storage.get_dependents_with_metadata(&issue_id)?;
         for dep in deps {
-            if let Some(ref filter_type) = args.dep_type
+            if let Some(ref filter_type) = dep_type_filter
                 && dep.dep_type != *filter_type
             {
                 continue;
@@ -718,11 +744,11 @@ fn dep_tree(
             false
         } else {
             dependencies = match args.direction {
-                DepDirection::Down => storage.get_blocker_ids(&item.id)?,
-                DepDirection::Up => storage.get_blocked_issue_ids(&item.id)?,
+                DepDirection::Down => storage.get_dependencies(&item.id)?,
+                DepDirection::Up => storage.get_dependents(&item.id)?,
                 DepDirection::Both => {
-                    let mut all = storage.get_blocker_ids(&item.id)?;
-                    let mut up = storage.get_blocked_issue_ids(&item.id)?;
+                    let mut all = storage.get_dependencies(&item.id)?;
+                    let mut up = storage.get_dependents(&item.id)?;
                     all.append(&mut up);
                     all.sort();
                     all.dedup();
@@ -1115,6 +1141,21 @@ mod tests {
         assert!(!DependencyType::Related.is_blocking());
         assert!(!DependencyType::Duplicates.is_blocking());
         info!("test_blocking_dependency_types: assertions passed");
+    }
+
+    #[test]
+    fn test_normalize_dep_type_filter_canonicalizes_standard_types() {
+        assert_eq!(
+            normalize_dep_type_filter("Parent-Child").unwrap(),
+            "parent-child"
+        );
+        assert_eq!(normalize_dep_type_filter("BLOCKS").unwrap(), "blocks");
+    }
+
+    #[test]
+    fn test_normalize_dep_type_filter_rejects_unknown_types() {
+        let err = normalize_dep_type_filter("parent_child").unwrap_err();
+        assert!(matches!(err, BeadsError::Validation { field, .. } if field == "type"));
     }
 
     #[test]

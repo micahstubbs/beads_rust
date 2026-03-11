@@ -55,6 +55,12 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 "--dry-run is not supported with --file",
             ));
         }
+        if args.external_ref.is_some() {
+            return Err(BeadsError::validation(
+                "external_ref",
+                "--external-ref is not supported with --file",
+            ));
+        }
         return execute_import(file_path, args, cli, ctx);
     }
 

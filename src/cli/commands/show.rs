@@ -28,82 +28,7 @@ pub fn execute(
     outer_ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let mut target_ids = args.ids.clone();
-    if target_ids.is_empty() {
-        let last_touched = crate::util::get_last_touched_id(&beads_dir);
-        if last_touched.is_empty() {
-            return Err(BeadsError::validation(
-                "ids",
-                "no issue IDs provided and no last-touched issue",
-            ));
-        }
-        target_ids.push(last_touched);
-    }
-
-    let routed_batches = config::routing::group_issue_inputs_by_route(&target_ids, &beads_dir)?;
-    if routed_batches.iter().any(|batch| batch.is_external) {
-        let output_format = resolve_output_format_basic_with_outer_mode(
-            args.format,
-            outer_ctx.inherited_output_mode(),
-            false,
-        );
-
-        if matches!(
-            output_format,
-            crate::cli::OutputFormat::Json | crate::cli::OutputFormat::Toon
-        ) {
-            let mut details_list = Vec::new();
-            for batch in routed_batches {
-                let mut batch_args = args.clone();
-                batch_args.ids = batch.issue_inputs;
-
-                let mut batch_cli = cli.clone();
-                batch_cli.db = Some(batch.beads_dir.join("beads.db"));
-
-                let (batch_details, _) = load_issue_details_for_route(
-                    &batch_args,
-                    &batch_cli,
-                    &batch.beads_dir,
-                    None,
-                    None,
-                )?;
-                details_list.extend(batch_details);
-            }
-
-            match output_format {
-                crate::cli::OutputFormat::Json => outer_ctx.json_pretty(&details_list),
-                crate::cli::OutputFormat::Toon => {
-                    outer_ctx.toon_with_stats(&details_list, args.stats);
-                }
-                crate::cli::OutputFormat::Text | crate::cli::OutputFormat::Csv => unreachable!(),
-            }
-            return Ok(());
-        }
-
-        for (index, batch) in routed_batches.into_iter().enumerate() {
-            if index > 0 {
-                println!();
-            }
-
-            let mut batch_args = args.clone();
-            batch_args.ids = batch.issue_inputs;
-
-            let mut batch_cli = cli.clone();
-            batch_cli.db = Some(batch.beads_dir.join("beads.db"));
-
-            execute_inner(
-                &batch_args,
-                &batch_cli,
-                outer_ctx,
-                &batch.beads_dir,
-                None,
-                None,
-            )?;
-        }
-        return Ok(());
-    }
-
-    execute_inner(args, cli, outer_ctx, &beads_dir, None, None)
+    execute_routed(args, cli, outer_ctx, &beads_dir, None, None)
 }
 
 /// Execute show using storage that was already opened by the caller.
@@ -118,7 +43,7 @@ pub fn execute_with_storage(
     beads_dir: &Path,
     storage: &SqliteStorage,
 ) -> Result<()> {
-    execute_inner(args, cli, outer_ctx, beads_dir, Some(storage), None)
+    execute_routed(args, cli, outer_ctx, beads_dir, Some(storage), None)
 }
 
 /// Execute show using the caller's preopened storage context.
@@ -133,7 +58,130 @@ pub fn execute_with_storage_ctx(
     beads_dir: &Path,
     storage_ctx: &config::OpenStorageResult,
 ) -> Result<()> {
-    execute_inner(args, cli, outer_ctx, beads_dir, None, Some(storage_ctx))
+    execute_routed(args, cli, outer_ctx, beads_dir, None, Some(storage_ctx))
+}
+
+fn execute_routed(
+    args: &ShowArgs,
+    cli: &config::CliOverrides,
+    outer_ctx: &OutputContext,
+    beads_dir: &Path,
+    preloaded_storage: Option<&SqliteStorage>,
+    preloaded_storage_ctx: Option<&config::OpenStorageResult>,
+) -> Result<()> {
+    let target_ids = requested_target_ids(args, beads_dir)?;
+    let routed_batches = config::routing::group_issue_inputs_by_route(&target_ids, beads_dir)?;
+    if !routed_batches.iter().any(|batch| batch.is_external) {
+        return execute_inner(
+            args,
+            cli,
+            outer_ctx,
+            beads_dir,
+            preloaded_storage,
+            preloaded_storage_ctx,
+        );
+    }
+
+    let output_format = resolve_output_format_basic_with_outer_mode(
+        args.format,
+        outer_ctx.inherited_output_mode(),
+        false,
+    );
+    let normalized_local_beads_dir =
+        dunce::canonicalize(beads_dir).unwrap_or_else(|_| beads_dir.to_path_buf());
+
+    if matches!(
+        output_format,
+        crate::cli::OutputFormat::Json | crate::cli::OutputFormat::Toon
+    ) {
+        let mut details_list = Vec::new();
+        for batch in routed_batches {
+            let mut batch_args = args.clone();
+            batch_args.ids = batch.issue_inputs;
+
+            let mut batch_cli = cli.clone();
+            batch_cli.db = None;
+
+            let batch_beads_dir = batch.beads_dir;
+            let normalized_batch_beads_dir =
+                dunce::canonicalize(&batch_beads_dir).unwrap_or_else(|_| batch_beads_dir.clone());
+            let use_preloaded = normalized_batch_beads_dir == normalized_local_beads_dir;
+            let (batch_details, _) = load_issue_details_for_route(
+                &batch_args,
+                &batch_cli,
+                &batch_beads_dir,
+                if use_preloaded {
+                    preloaded_storage
+                } else {
+                    None
+                },
+                if use_preloaded {
+                    preloaded_storage_ctx
+                } else {
+                    None
+                },
+            )?;
+            details_list.extend(batch_details);
+        }
+
+        match output_format {
+            crate::cli::OutputFormat::Json => outer_ctx.json_pretty(&details_list),
+            crate::cli::OutputFormat::Toon => {
+                outer_ctx.toon_with_stats(&details_list, args.stats);
+            }
+            crate::cli::OutputFormat::Text | crate::cli::OutputFormat::Csv => unreachable!(),
+        }
+        return Ok(());
+    }
+
+    for (index, batch) in routed_batches.into_iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+
+        let mut batch_args = args.clone();
+        batch_args.ids = batch.issue_inputs;
+
+        let mut batch_cli = cli.clone();
+        batch_cli.db = None;
+
+        let normalized_batch_beads_dir =
+            dunce::canonicalize(&batch.beads_dir).unwrap_or_else(|_| batch.beads_dir.clone());
+        let use_preloaded = normalized_batch_beads_dir == normalized_local_beads_dir;
+        execute_inner(
+            &batch_args,
+            &batch_cli,
+            outer_ctx,
+            &batch.beads_dir,
+            if use_preloaded {
+                preloaded_storage
+            } else {
+                None
+            },
+            if use_preloaded {
+                preloaded_storage_ctx
+            } else {
+                None
+            },
+        )?;
+    }
+
+    Ok(())
+}
+
+fn requested_target_ids(args: &ShowArgs, beads_dir: &Path) -> Result<Vec<String>> {
+    let mut target_ids = args.ids.clone();
+    if target_ids.is_empty() {
+        let last_touched = crate::util::get_last_touched_id(beads_dir);
+        if last_touched.is_empty() {
+            return Err(BeadsError::validation(
+                "ids",
+                "no issue IDs provided and no last-touched issue",
+            ));
+        }
+        target_ids.push(last_touched);
+    }
+    Ok(target_ids)
 }
 
 fn execute_inner(
@@ -194,17 +242,7 @@ fn load_issue_details_for_route(
     preloaded_storage: Option<&SqliteStorage>,
     preloaded_storage_ctx: Option<&config::OpenStorageResult>,
 ) -> Result<(Vec<IssueDetails>, bool)> {
-    let mut target_ids = args.ids.clone();
-    if target_ids.is_empty() {
-        let last_touched = crate::util::get_last_touched_id(beads_dir);
-        if last_touched.is_empty() {
-            return Err(BeadsError::validation(
-                "ids",
-                "no issue IDs provided and no last-touched issue",
-            ));
-        }
-        target_ids.push(last_touched);
-    }
+    let target_ids = requested_target_ids(args, beads_dir)?;
 
     if let Some(storage_ctx) = preloaded_storage_ctx {
         let config_layer = storage_ctx.load_config(cli)?;

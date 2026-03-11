@@ -645,7 +645,7 @@ fn failed_create_does_not_persist() {
 
 #[test]
 fn upsert_issue_for_import_creates_new() {
-    let mut storage = test_db();
+    let storage = test_db();
     let issue = fixtures::issue("upsert-new");
 
     storage.upsert_issue_for_import(&issue).unwrap();
@@ -674,7 +674,7 @@ fn upsert_issue_for_import_updates_existing() {
 
 #[test]
 fn upsert_issue_stores_all_fields() {
-    let mut storage = test_db();
+    let storage = test_db();
     let now = Utc::now();
 
     let issue = Issue {

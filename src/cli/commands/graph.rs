@@ -8,13 +8,14 @@
 use crate::cli::GraphArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::model::{DependencyType, Issue, Status};
+use crate::model::{DependencyType, Issue, Priority, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::str::FromStr;
 use tracing::debug;
 use unicode_width::UnicodeWidthStr;
 
@@ -60,6 +61,13 @@ struct SingleGraphTraversal {
     edges: Vec<(String, String)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HumanGraphRenderMode {
+    Rich,
+    Compact,
+    Plain,
+}
+
 /// Execute the graph command.
 ///
 /// # Errors
@@ -68,7 +76,20 @@ struct SingleGraphTraversal {
 pub fn execute(args: &GraphArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    execute_with_storage_ctx(args, cli, ctx, &storage_ctx)
+}
 
+/// Execute the graph command using storage that was already opened by the caller.
+///
+/// # Errors
+///
+/// Returns an error if database operations fail or if inputs are invalid.
+pub fn execute_with_storage_ctx(
+    args: &GraphArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<()> {
     let config_layer = storage_ctx.load_config(cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
@@ -111,7 +132,8 @@ fn graph_single(
         &traversal.edges,
         &root_nodes,
     );
-    let nodes = build_graph_nodes(&traversal.traversal_order, &traversal.issues_by_id, &depths);
+    let mut nodes = build_graph_nodes(&traversal.traversal_order, &traversal.issues_by_id, &depths);
+    sort_single_graph_nodes(&mut nodes, root_id);
 
     if ctx.is_json() {
         let output = SingleGraphOutput {
@@ -134,15 +156,19 @@ fn graph_single(
         return Ok(());
     }
 
-    if matches!(ctx.mode(), OutputMode::Rich) {
-        render_single_graph_rich(&nodes, &traversal.edges, &root_issue, ctx);
-    } else if compact {
-        println!(
-            "{}",
-            format_compact_dependency_edges(root_id, &traversal.edges)
-        );
-    } else {
-        render_single_graph_plain(&nodes, &traversal.edges, &root_issue);
+    match human_graph_render_mode(ctx.mode(), compact) {
+        HumanGraphRenderMode::Rich => {
+            render_single_graph_rich(&nodes, &traversal.edges, &root_issue, ctx);
+        }
+        HumanGraphRenderMode::Compact => {
+            println!(
+                "{}",
+                format_compact_dependency_edges(root_id, &traversal.edges)
+            );
+        }
+        HumanGraphRenderMode::Plain => {
+            render_single_graph_plain(&nodes, &traversal.edges, &root_issue);
+        }
     }
 
     Ok(())
@@ -308,56 +334,63 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
     }
 
     // Text output
-    if matches!(ctx.mode(), OutputMode::Rich) {
-        render_all_graph_rich(&components, total_nodes, ctx);
-    } else {
-        println!(
-            "Dependency graph: {} issues in {} component(s)",
-            total_nodes,
-            components.len()
-        );
-        println!();
+    match human_graph_render_mode(ctx.mode(), compact) {
+        HumanGraphRenderMode::Rich => render_all_graph_rich(&components, total_nodes, ctx),
+        HumanGraphRenderMode::Compact | HumanGraphRenderMode::Plain => {
+            let render_compact = matches!(
+                human_graph_render_mode(ctx.mode(), compact),
+                HumanGraphRenderMode::Compact
+            );
 
-        for (i, component) in components.iter().enumerate() {
-            if compact {
-                // Compact: one line per component
-                let ids: Vec<&str> = component.nodes.iter().map(|n| n.id.as_str()).collect();
-                println!("Component {}: {}", i + 1, ids.join(", "));
-            } else {
-                let roots = if component.roots.is_empty() {
-                    "none".to_string()
+            println!(
+                "Dependency graph: {} issues in {} component(s)",
+                total_nodes,
+                components.len()
+            );
+            println!();
+
+            for (i, component) in components.iter().enumerate() {
+                if render_compact {
+                    // Compact: one line per component
+                    let ids: Vec<&str> = component.nodes.iter().map(|n| n.id.as_str()).collect();
+                    println!("Component {}: {}", i + 1, ids.join(", "));
                 } else {
-                    component.roots.join(", ")
-                };
-                let parent_map = build_parent_map(&component.edges);
-                // Detailed view
-                println!(
-                    "Component {} ({} issues, roots: {}, by depth):",
-                    i + 1,
-                    component.nodes.len(),
-                    roots
-                );
-
-                for node in &component.nodes {
-                    let indent = "  ".repeat(node.depth + 1);
-                    let root_marker = if component.roots.contains(&node.id) {
-                        " (root)"
+                    let roots = if component.roots.is_empty() {
+                        "none".to_string()
                     } else {
-                        ""
+                        component.roots.join(", ")
                     };
-                    let parents = format_parent_list(parent_map.get(&node.id).map(Vec::as_slice));
+                    let parent_map = build_parent_map(&component.edges);
+                    // Detailed view
                     println!(
-                        "{}{}: {} [P{}] [{}]{}{}",
-                        indent,
-                        node.id,
-                        node.title,
-                        node.priority,
-                        node.status,
-                        root_marker,
-                        parents
+                        "Component {} ({} issues, roots: {}, by depth):",
+                        i + 1,
+                        component.nodes.len(),
+                        roots
                     );
+
+                    for node in &component.nodes {
+                        let indent = "  ".repeat(node.depth + 1);
+                        let root_marker = if component.roots.contains(&node.id) {
+                            " (root)"
+                        } else {
+                            ""
+                        };
+                        let parents =
+                            format_parent_list(parent_map.get(&node.id).map(Vec::as_slice));
+                        println!(
+                            "{}{}: {} [P{}] [{}]{}{}",
+                            indent,
+                            node.id,
+                            node.title,
+                            node.priority,
+                            node.status,
+                            root_marker,
+                            parents
+                        );
+                    }
+                    println!();
                 }
-                println!();
             }
         }
     }
@@ -424,6 +457,9 @@ fn collect_single_graph(
     let mut seen_edges: HashSet<(String, String)> = HashSet::new();
     let mut discovered_nodes: HashSet<String> = HashSet::new();
 
+    // Optimization: Prefetch active issue metadata to avoid N+1 queries during traversal
+    let metadata_cache = storage.get_active_issues_metadata()?;
+
     // Stack stores (current_id, path_to_this_node)
     let mut stack: Vec<(String, Vec<String>)> = vec![(root_id.to_string(), vec![])];
 
@@ -449,12 +485,24 @@ fn collect_single_graph(
             }
 
             if !discovered_nodes.contains(&dep.id) {
-                let issue = storage.get_issue(&dep.id)?.ok_or_else(|| {
-                    BeadsError::Config(format!(
-                        "dependency graph references missing issue {}",
-                        dep.id
-                    ))
-                })?;
+                // Use cache if available, otherwise fallback to DB
+                let issue = if let Some(meta) = metadata_cache.get(&dep.id) {
+                    Issue {
+                        id: dep.id.clone(),
+                        title: meta.0.clone(),
+                        priority: Priority(meta.1),
+                        status: Status::from_str(&meta.2).unwrap_or(Status::Open),
+                        ..Issue::default()
+                    }
+                } else {
+                    storage.get_issue(&dep.id)?.ok_or_else(|| {
+                        BeadsError::Config(format!(
+                            "dependency graph references missing issue {}",
+                            dep.id
+                        ))
+                    })?
+                };
+
                 traversal_order.push(dep.id.clone());
                 issues_by_id.insert(dep.id.clone(), issue);
                 discovered_nodes.insert(dep.id.clone());
@@ -496,6 +544,16 @@ fn build_graph_nodes(
             }
         })
         .collect()
+}
+
+fn sort_single_graph_nodes(nodes: &mut [GraphNode], root_id: &str) {
+    nodes.sort_by(|left, right| {
+        (left.id != root_id)
+            .cmp(&(right.id != root_id))
+            .then(left.depth.cmp(&right.depth))
+            .then(left.priority.cmp(&right.priority))
+            .then(left.id.cmp(&right.id))
+    });
 }
 
 fn calculate_depths_from_dependency_edges(
@@ -774,6 +832,16 @@ fn format_compact_dependency_edges(root_id: &str, edges: &[(String, String)]) ->
         parts.join("; ")
     } else {
         format!("{root_id}; {}", parts.join("; "))
+    }
+}
+
+const fn human_graph_render_mode(mode: OutputMode, compact: bool) -> HumanGraphRenderMode {
+    if compact {
+        HumanGraphRenderMode::Compact
+    } else if matches!(mode, OutputMode::Rich) {
+        HumanGraphRenderMode::Rich
+    } else {
+        HumanGraphRenderMode::Plain
     }
 }
 
@@ -1593,5 +1661,74 @@ mod tests {
 
         let compact = format_compact_dependency_edges("root", &edges);
         assert_eq!(compact, "root <- bd-a, bd-b; bd-a <- bd-c; bd-b <- bd-c");
+    }
+
+    #[test]
+    fn test_human_graph_render_mode_prefers_compact_over_rich() {
+        assert_eq!(
+            human_graph_render_mode(OutputMode::Rich, true),
+            HumanGraphRenderMode::Compact
+        );
+        assert_eq!(
+            human_graph_render_mode(OutputMode::Rich, false),
+            HumanGraphRenderMode::Rich
+        );
+        assert_eq!(
+            human_graph_render_mode(OutputMode::Plain, true),
+            HumanGraphRenderMode::Compact
+        );
+        assert_eq!(
+            human_graph_render_mode(OutputMode::Plain, false),
+            HumanGraphRenderMode::Plain
+        );
+    }
+
+    #[test]
+    fn test_sort_single_graph_nodes_keeps_root_first_then_depth() {
+        let mut nodes = vec![
+            GraphNode {
+                id: "leaf".to_string(),
+                title: "leaf".to_string(),
+                status: "open".to_string(),
+                priority: 3,
+                depth: 3,
+            },
+            GraphNode {
+                id: "branch-b".to_string(),
+                title: "branch-b".to_string(),
+                status: "open".to_string(),
+                priority: 2,
+                depth: 1,
+            },
+            GraphNode {
+                id: "root".to_string(),
+                title: "root".to_string(),
+                status: "open".to_string(),
+                priority: 4,
+                depth: 0,
+            },
+            GraphNode {
+                id: "branch-a".to_string(),
+                title: "branch-a".to_string(),
+                status: "open".to_string(),
+                priority: 1,
+                depth: 1,
+            },
+            GraphNode {
+                id: "middle".to_string(),
+                title: "middle".to_string(),
+                status: "open".to_string(),
+                priority: 0,
+                depth: 2,
+            },
+        ];
+
+        sort_single_graph_nodes(&mut nodes, "root");
+
+        let ordered_ids: Vec<&str> = nodes.iter().map(|node| node.id.as_str()).collect();
+        assert_eq!(
+            ordered_ids,
+            vec!["root", "branch-a", "branch-b", "middle", "leaf"]
+        );
     }
 }

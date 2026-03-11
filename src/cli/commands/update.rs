@@ -11,6 +11,7 @@ use crate::util::time::parse_flexible_timestamp;
 use crate::validation::LabelValidator;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use std::path::Path;
 
 /// JSON output structure for updated issues.
 #[derive(Serialize)]
@@ -62,12 +63,19 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
             batch_args.ids = batch.issue_inputs;
 
             let mut batch_cli = cli.clone();
-            batch_cli.db = Some(batch.beads_dir.join("beads.db"));
+            // Routed projects must resolve their own metadata-defined DB path
+            // instead of being forced back to the default beads.db filename.
+            batch_cli.db = None;
 
-            updated_issues.extend(execute_single_route(&batch_args, &batch_cli, ctx)?);
+            updated_issues.extend(execute_single_route(
+                &batch_args,
+                &batch_cli,
+                ctx,
+                &batch.beads_dir,
+            )?);
         }
     } else {
-        updated_issues.extend(execute_single_route(args, cli, ctx)?);
+        updated_issues.extend(execute_single_route(args, cli, ctx, &beads_dir)?);
     }
 
     if ctx.is_json() {
@@ -81,14 +89,14 @@ fn execute_single_route(
     args: &UpdateArgs,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
+    beads_dir: &Path,
 ) -> Result<Vec<UpdatedIssueOutput>> {
-    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
 
     let config_layer = storage_ctx.load_config(cli)?;
     let actor = config::resolve_actor(&config_layer);
     let resolver = build_resolver(&config_layer, &storage_ctx.storage);
-    let resolved_ids = resolve_target_ids(args, &beads_dir, &resolver, &storage_ctx.storage)?;
+    let resolved_ids = resolve_target_ids(args, beads_dir, &resolver, &storage_ctx.storage)?;
 
     let claim_exclusive = config::claim_exclusive_from_layer(&config_layer);
     let update = build_update(args, &actor, claim_exclusive)?;
@@ -170,7 +178,7 @@ fn execute_single_route(
         apply_parent_update(storage, id, args.parent.as_deref(), &resolver, &actor)?;
 
         // Update last touched
-        crate::util::set_last_touched_id(&beads_dir, id);
+        crate::util::set_last_touched_id(beads_dir, id);
 
         // Get issue after update for output
         let issue_after = storage.get_issue(id)?;

@@ -212,11 +212,11 @@ pub fn read_redirect(beads_dir: &Path) -> Result<Option<PathBuf>> {
 ///
 /// Returns an error if a redirect cannot be read or if a redirect loop is detected.
 pub fn follow_redirects(start: &Path, max_depth: usize) -> Result<PathBuf> {
-    let mut current = start.to_path_buf();
-    let mut visited = vec![start.to_path_buf()];
+    let mut current = canonicalize_redirect_path(start);
+    let mut visited = vec![current.clone()];
     let mut depth = 0usize;
 
-    while let Some(next) = read_redirect(&current)? {
+    while let Some(next_raw) = read_redirect(&current)? {
         if depth >= max_depth {
             return Err(BeadsError::Config(format!(
                 "Redirect chain exceeds max depth ({max_depth}): {}",
@@ -224,12 +224,17 @@ pub fn follow_redirects(start: &Path, max_depth: usize) -> Result<PathBuf> {
             )));
         }
 
+        let next = canonicalize_redirect_path(&next_raw);
+        if next == current {
+            break;
+        }
+
         // Check for loops
         if visited.iter().any(|p| p == &next) {
             return Err(BeadsError::Config(format!(
                 "Redirect loop detected: {} -> {}",
                 current.display(),
-                next.display()
+                next_raw.display()
             )));
         }
 
@@ -254,6 +259,10 @@ pub fn follow_redirects(start: &Path, max_depth: usize) -> Result<PathBuf> {
     }
 
     Ok(current)
+}
+
+fn canonicalize_redirect_path(path: &Path) -> PathBuf {
+    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Resolve the target beads directory for an issue ID.
@@ -364,14 +373,21 @@ fn resolve_route_entry(
 
     // Follow redirects
     let final_path = follow_redirects(&target_path, 10)?;
+    let normalized_final_path =
+        dunce::canonicalize(&final_path).unwrap_or_else(|_| final_path.clone());
+    let normalized_local_beads_dir =
+        dunce::canonicalize(local_beads_dir).unwrap_or_else(|_| local_beads_dir.to_path_buf());
 
     // Determine if external
-    let is_external = final_path != local_beads_dir;
+    let is_external = normalized_final_path != normalized_local_beads_dir;
 
     if is_external {
-        Ok(RoutingResult::external(final_path, route.path.clone()))
+        Ok(RoutingResult::external(
+            normalized_final_path,
+            route.path.clone(),
+        ))
     } else {
-        Ok(RoutingResult::local(final_path))
+        Ok(RoutingResult::local(normalized_final_path))
     }
 }
 
@@ -534,6 +550,37 @@ mod tests {
     }
 
     #[test]
+    fn follow_redirects_allows_dot_redirect_to_current_beads_dir() {
+        let dir = TempDir::new().unwrap();
+        let beads_dir = dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        fs::write(beads_dir.join("redirect"), ".").unwrap();
+
+        let resolved = follow_redirects(&beads_dir, 10).unwrap();
+        assert_eq!(resolved, dunce::canonicalize(&beads_dir).unwrap());
+    }
+
+    #[test]
+    fn follow_redirects_detects_loops_after_canonicalizing_targets() {
+        let dir = TempDir::new().unwrap();
+        let first = dir.path().join("first").join(".beads");
+        let second = dir.path().join("second").join(".beads");
+
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+
+        fs::write(first.join("redirect"), "../../second/.beads").unwrap();
+        fs::write(second.join("redirect"), "../../first/./.beads").unwrap();
+
+        let err = follow_redirects(&first, 10).unwrap_err();
+        match err {
+            BeadsError::Config(msg) => assert!(msg.contains("loop detected")),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn is_external_id_check() {
         assert!(is_external_id("fe-abc", "bd-"));
         assert!(!is_external_id("bd-abc", "bd-"));
@@ -624,6 +671,58 @@ mod tests {
         assert_eq!(
             batches[1].issue_inputs,
             vec!["ext-1".to_string(), "ext-2".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_route_self_path_is_not_external_after_normalization() {
+        let dir = TempDir::new().unwrap();
+        let local_beads = dir.path().join("current/.beads");
+        fs::create_dir_all(&local_beads).unwrap();
+        fs::write(
+            local_beads.join("routes.jsonl"),
+            r#"{"prefix":"self-","path":"../current"}"#,
+        )
+        .unwrap();
+
+        let result = resolve_route("self-abc", &local_beads).unwrap();
+        let local_canonical = dunce::canonicalize(&local_beads).unwrap();
+
+        assert_eq!(result.beads_dir, local_canonical);
+        assert!(!result.is_external);
+        assert_eq!(result.project_path, None);
+    }
+
+    #[test]
+    fn group_issue_inputs_by_route_merges_equivalent_external_paths() {
+        let dir = TempDir::new().unwrap();
+        let local_beads = dir.path().join("current/.beads");
+        let external_beads = dir.path().join("external/.beads");
+        fs::create_dir_all(&local_beads).unwrap();
+        fs::create_dir_all(&external_beads).unwrap();
+        fs::write(
+            local_beads.join("routes.jsonl"),
+            concat!(
+                r#"{"prefix":"ext-","path":"../external"}"#,
+                "\n",
+                r#"{"prefix":"alt-","path":"../current/../external"}"#
+            ),
+        )
+        .unwrap();
+
+        let batches =
+            group_issue_inputs_by_route(&["ext-1".to_string(), "alt-2".to_string()], &local_beads)
+                .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0].beads_dir,
+            dunce::canonicalize(&external_beads).unwrap()
+        );
+        assert!(batches[0].is_external);
+        assert_eq!(
+            batches[0].issue_inputs,
+            vec!["ext-1".to_string(), "alt-2".to_string()]
         );
     }
 

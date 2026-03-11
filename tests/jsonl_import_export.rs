@@ -78,6 +78,25 @@ fn export_import_roundtrip_preserves_relationships() {
 }
 
 #[test]
+fn import_reads_multiple_jsonl_lines_without_buffer_accumulation() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("issues.jsonl");
+    let issue_a = issue_with_id("test-a", "First");
+    let issue_b = issue_with_id("test-b", "Second");
+    let json_a = serde_json::to_string(&issue_a).unwrap();
+    let json_b = serde_json::to_string(&issue_b).unwrap();
+    fs::write(&path, format!("{json_a}\n{json_b}\n")).unwrap();
+
+    let mut storage = SqliteStorage::open_memory().unwrap();
+    let import =
+        import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("test-")).unwrap();
+
+    assert_eq!(import.imported_count, 2);
+    assert!(storage.get_issue("test-a").unwrap().is_some());
+    assert!(storage.get_issue("test-b").unwrap().is_some());
+}
+
+#[test]
 fn export_sorts_by_id() {
     let mut storage = SqliteStorage::open_memory().unwrap();
     let issue_b = issue_with_id("test-b", "B");
@@ -486,6 +505,7 @@ fn import_repopulates_export_hashes() {
         &mut storage,
         &export_result,
         Some(&export_result.issue_hashes),
+        &path,
     )
     .unwrap();
     let original_hash = export_result.issue_hashes[0].1.clone();

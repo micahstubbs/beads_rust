@@ -15,8 +15,8 @@ use crate::error::{BeadsError, Result, ResultExt};
 use crate::model::{IssueType, Priority};
 use crate::storage::SqliteStorage;
 use crate::sync::{
-    ExportConfig, ImportConfig, ImportResult, export_to_jsonl_with_policy, finalize_export,
-    import_from_jsonl, preflight_import,
+    ExportConfig, ImportConfig, ImportResult, compute_jsonl_hash, export_to_jsonl_with_policy,
+    finalize_export, import_from_jsonl, preflight_import,
 };
 use crate::util::id::IdConfig;
 use chrono::Utc;
@@ -317,7 +317,7 @@ fn derive_beads_dir_from_db_path(db_path: &Path) -> Result<PathBuf> {
 fn resolve_explicit_beads_dir(path: &Path, source: &str) -> Result<PathBuf> {
     if !path.is_dir() {
         return Err(BeadsError::Config(format!(
-            "{source} must point to an existing .beads directory: {}",
+            "{source} not found or not a .beads directory: {}",
             path.display()
         )));
     }
@@ -812,6 +812,7 @@ pub struct OpenStorageResult {
     pub paths: ConfigPaths,
     pub no_db: bool,
     startup_layers: Vec<ConfigLayer>,
+    loaded_jsonl_hash: Option<String>,
 }
 
 impl OpenStorageResult {
@@ -832,13 +833,13 @@ impl OpenStorageResult {
 
     /// Flush JSONL if no-db mode is enabled and there are dirty issues.
     ///
-    /// Before exporting, re-reads the on-disk JSONL to merge any changes made
-    /// by concurrent `--no-db` processes since this instance loaded its snapshot.
-    /// This prevents silently clobbering writes from other processes.
+    /// Refuses to export if the on-disk JSONL changed since this no-db session
+    /// loaded its snapshot. Re-importing into the same dirty in-memory storage
+    /// is not a safe merge and can overwrite local edits.
     ///
     /// # Errors
     ///
-    /// Returns an error if JSONL re-import or export fails.
+    /// Returns an error if concurrent JSONL changes are detected or export fails.
     pub fn flush_no_db_if_dirty(&mut self) -> Result<()> {
         if !self.no_db {
             return Ok(());
@@ -848,36 +849,23 @@ impl OpenStorageResult {
             return Ok(());
         }
 
-        // Re-read the on-disk JSONL to merge concurrent writes before exporting.
-        // Without this, our export would overwrite the entire file with only the
-        // snapshot loaded at startup + our modifications, silently dropping any
-        // issues written by other --no-db processes in the interim.
-        if self.paths.jsonl_path.is_file() {
-            let prefix = self.storage.get_config("issue_prefix")?.unwrap_or_default();
-            let import_config = ImportConfig {
-                beads_dir: Some(self.paths.beads_dir.clone()),
-                allow_external_jsonl: resolved_jsonl_path_is_external(
-                    &self.paths.beads_dir,
-                    &self.paths.jsonl_path,
+        let current_jsonl_hash = if self.paths.jsonl_path.is_file() {
+            Some(compute_jsonl_hash(&self.paths.jsonl_path)?)
+        } else {
+            None
+        };
+
+        if current_jsonl_hash != self.loaded_jsonl_hash {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "JSONL changed on disk since this --no-db session started: {}\n\
+                     Refusing to flush a stale in-memory snapshot because it could overwrite \
+                     concurrent changes.\n\
+                     Hint: rerun the command against the latest JSONL, or use `br sync` to \
+                     reconcile competing edits explicitly.",
+                    self.paths.jsonl_path.display()
                 ),
-                show_progress: false,
-                ..Default::default()
-            };
-            // Errors during re-import are logged but non-fatal: we still want to
-            // flush our own dirty changes even if the JSONL is transiently
-            // unreadable (e.g. mid-rename by another process).
-            if let Err(err) = import_from_jsonl(
-                &mut self.storage,
-                &self.paths.jsonl_path,
-                &import_config,
-                Some(&prefix),
-            ) {
-                tracing::warn!(
-                    path = %self.paths.jsonl_path.display(),
-                    error = %err,
-                    "Failed to re-read JSONL before flush; proceeding with stale snapshot"
-                );
-            }
+            });
         }
 
         let export_config = ExportConfig {
@@ -900,6 +888,7 @@ impl OpenStorageResult {
             Some(&export_result.issue_hashes),
             &self.paths.jsonl_path,
         )?;
+        self.loaded_jsonl_hash = Some(export_result.content_hash);
 
         Ok(())
     }
@@ -944,12 +933,18 @@ pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<Ope
                 Some(&prefix),
             )?;
         }
+        let loaded_jsonl_hash = if paths.jsonl_path.is_file() {
+            Some(compute_jsonl_hash(&paths.jsonl_path)?)
+        } else {
+            None
+        };
 
         Ok(OpenStorageResult {
             storage,
             paths,
             no_db,
             startup_layers,
+            loaded_jsonl_hash,
         })
     } else {
         let storage = open_sqlite_storage_with_recovery(
@@ -963,6 +958,7 @@ pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<Ope
             paths,
             no_db,
             startup_layers,
+            loaded_jsonl_hash: None,
         })
     }
 }
@@ -2438,7 +2434,8 @@ labels:
             .expect_err("invalid override should fail");
         assert!(matches!(err, BeadsError::Config(_)));
         assert!(
-            err.to_string().contains("existing .beads directory"),
+            err.to_string()
+                .contains("not found or not a .beads directory"),
             "unexpected error: {err}"
         );
     }
@@ -3523,6 +3520,53 @@ routing:
         assert!(
             exported.contains("\"id\":\"bd-ext-flush\""),
             "flush should export to the resolved external JSONL path"
+        );
+    }
+
+    #[test]
+    fn open_storage_with_cli_no_db_refuses_to_flush_stale_snapshot() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let external_dir = temp.path().join("external-store");
+        let db_path = external_dir.join("beads.db");
+        let jsonl_path = external_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::create_dir_all(&external_dir).expect("create external dir");
+
+        write_single_issue_jsonl(&jsonl_path, "bd-ext-import", "Imported from external JSONL");
+
+        let cli = CliOverrides {
+            db: Some(db_path),
+            no_db: Some(true),
+            ..CliOverrides::default()
+        };
+        let mut storage_ctx = open_storage_with_cli(&beads_dir, &cli).expect("storage");
+
+        let new_issue = Issue {
+            id: "bd-ext-flush".to_string(),
+            title: "Flushed to external JSONL".to_string(),
+            ..Issue::default()
+        };
+        storage_ctx
+            .storage
+            .create_issue(&new_issue, "tester")
+            .expect("create issue");
+
+        write_single_issue_jsonl(&jsonl_path, "bd-concurrent", "Concurrent rewrite");
+
+        let err = storage_ctx
+            .flush_no_db_if_dirty()
+            .expect_err("stale flush conflict");
+        assert!(matches!(err, BeadsError::SyncConflict { .. }));
+
+        let exported = fs::read_to_string(&jsonl_path).expect("read external jsonl");
+        assert!(
+            exported.contains("\"id\":\"bd-concurrent\""),
+            "concurrent JSONL content should be preserved"
+        );
+        assert!(
+            !exported.contains("\"id\":\"bd-ext-flush\""),
+            "stale in-memory edits should not overwrite concurrent JSONL changes"
         );
     }
 
