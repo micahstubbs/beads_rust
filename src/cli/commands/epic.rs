@@ -38,7 +38,7 @@ fn execute_status(
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     let storage = &storage_ctx.storage;
-    let config_layer = config::load_config(&beads_dir, Some(storage), cli)?;
+    let config_layer = storage_ctx.load_config(cli)?;
     let use_color = config::should_use_color(&config_layer);
 
     let mut epics = load_epic_statuses(storage)?;
@@ -85,7 +85,7 @@ fn execute_close_eligible(
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    let config_layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
+    let config_layer = storage_ctx.load_config(cli)?;
     let actor = config::resolve_actor(&config_layer);
 
     let storage = &mut storage_ctx.storage;

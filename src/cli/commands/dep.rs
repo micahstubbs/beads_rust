@@ -30,7 +30,7 @@ pub fn execute(
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
 
-    let config_layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
+    let config_layer = storage_ctx.load_config(cli)?;
     let use_color = config::should_use_color(&config_layer);
     let quiet = cli.quiet.unwrap_or(false);
     let id_config = config::id_config_from_layer(&config_layer);
@@ -678,6 +678,9 @@ fn dep_tree(
     let external_statuses =
         storage.resolve_external_dependency_statuses(external_db_paths, false)?;
 
+    // Optimization: Prefetch all active issue metadata to avoid N+1 queries during traversal
+    let metadata_cache = storage.get_active_issues_metadata()?;
+
     let mut nodes = Vec::new();
 
     let mut queue = vec![QueueItem {
@@ -698,13 +701,17 @@ fn dep_tree(
         let node_key = format!("n{next_node_key}");
         next_node_key += 1;
 
-        let (title, priority, status) = resolve_dep_tree_node_metadata(
-            storage,
-            &root_id,
-            &root_issue,
-            &item.id,
-            &external_statuses,
-        )?;
+        let (title, priority, status) = if let Some(meta) = metadata_cache.get(&item.id) {
+            meta.clone()
+        } else {
+            resolve_dep_tree_node_metadata(
+                storage,
+                &root_id,
+                &root_issue,
+                &item.id,
+                &external_statuses,
+            )?
+        };
 
         let mut dependencies = Vec::new();
         let truncated = if item.id.starts_with("external:") {
