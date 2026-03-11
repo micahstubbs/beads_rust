@@ -992,8 +992,8 @@ fn execute_import(
 
     // Output result
     let result = ImportResultOutput {
-        created: import_result.imported_count, // We don't distinguish created vs updated yet
-        updated: 0,
+        created: import_result.created_count,
+        updated: import_result.updated_count,
         skipped: import_result.skipped_count,
         tombstone_skipped: import_result.tombstone_skipped,
         orphans_removed: import_result.orphans_removed,
@@ -1006,7 +1006,8 @@ fn execute_import(
         render_import_result_rich(&result, ctx);
     } else {
         println!("Imported from JSONL:");
-        println!("  Processed: {} issues", result.created);
+        println!("  Created: {} issues", result.created);
+        println!("  Updated: {} issues", result.updated);
         if result.skipped > 0 {
             println!("  Skipped: {} issues (up-to-date)", result.skipped);
         }
@@ -1042,9 +1043,15 @@ fn render_import_result_rich(result: &ImportResultOutput, ctx: &OutputContext) {
     text.append_styled("JSONL → SQLite", theme.info.clone());
     text.append("\n");
 
-    // Processed count
-    text.append_styled("Processed          ", theme.dimmed.clone());
+    // Created count
+    text.append_styled("Created            ", theme.dimmed.clone());
     text.append_styled(&result.created.to_string(), theme.accent.clone());
+    text.append_styled(" issues", theme.dimmed.clone());
+    text.append("\n");
+
+    // Updated count
+    text.append_styled("Updated            ", theme.dimmed.clone());
+    text.append_styled(&result.updated.to_string(), theme.accent.clone());
     text.append_styled(" issues", theme.dimmed.clone());
     text.append("\n");
 

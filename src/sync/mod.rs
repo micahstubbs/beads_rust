@@ -329,6 +329,10 @@ pub enum OrphanMode {
 pub struct ImportResult {
     /// Number of issues imported (created or updated).
     pub imported_count: usize,
+    /// Number of issues created during import.
+    pub created_count: usize,
+    /// Number of issues updated during import.
+    pub updated_count: usize,
     /// Number of issues skipped.
     pub skipped_count: usize,
     /// Number of tombstones skipped.
@@ -3017,6 +3021,7 @@ fn process_import_action(
             storage.upsert_issue_for_import(issue)?;
             sync_issue_relations(storage, issue)?;
             result.imported_count += 1;
+            result.created_count += 1;
         }
         CollisionAction::Update { existing_id } => {
             // When updating by external_ref or content_hash, the incoming issue may have
@@ -3031,6 +3036,7 @@ fn process_import_action(
                 sync_issue_relations(storage, &updated_issue)?;
             }
             result.imported_count += 1;
+            result.updated_count += 1;
         }
         CollisionAction::Skip { reason } => {
             tracing::debug!(id = %issue.id, reason = %reason, "Skipping issue");
@@ -4155,6 +4161,8 @@ mod tests {
         let config = ImportConfig::default();
         let result = import_from_jsonl(&mut storage, &path, &config, Some("test-")).unwrap();
         assert_eq!(result.imported_count, 1);
+        assert_eq!(result.created_count, 0);
+        assert_eq!(result.updated_count, 1);
 
         // The existing issue should be updated
         let updated = storage.get_issue("test-001").unwrap().unwrap();
@@ -4275,6 +4283,8 @@ mod tests {
 
         // New issue should be imported
         assert_eq!(result.imported_count, 1);
+        assert_eq!(result.created_count, 1);
+        assert_eq!(result.updated_count, 0);
         assert_eq!(result.skipped_count, 0);
         assert!(storage.get_issue("test-new").unwrap().is_some());
     }

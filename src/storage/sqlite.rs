@@ -24,7 +24,6 @@ const EXPORT_HASH_CHUNK_SIZE: usize = 900;
 const DIRTY_ISSUE_CHUNK_SIZE: usize = 900;
 const IMPORT_LABEL_CHUNK_SIZE: usize = 400;
 const IMPORT_DEPENDENCY_CHUNK_SIZE: usize = 140;
-const IMPORT_COMMENT_CHUNK_SIZE: usize = 199;
 
 /// SQLite-based storage backend.
 #[derive(Debug)]
@@ -1650,7 +1649,7 @@ impl SqliteStorage {
     /// Get ready issues (unblocked, not deferred, not pinned, not ephemeral).
     ///
     /// Ready definition:
-    /// 1. Status is `open` OR `in_progress`
+    /// 1. Status is `open` by default, or `deferred` when `include_deferred` is set
     /// 2. NOT in `blocked_issues_cache`
     /// 3. `defer_until` is NULL or <= now (unless `include_deferred`)
     /// 4. `pinned = 0` (not pinned)
@@ -1680,11 +1679,12 @@ impl SqliteStorage {
 
         let mut params: Vec<SqliteValue> = Vec::new();
 
-        // Ready condition 1: status is `open` OR `in_progress`
+        // Ready condition 1: status is `open` by default; optionally include
+        // explicitly deferred issues when requested.
         if filters.include_deferred {
-            sql.push_str(" AND status IN ('open', 'in_progress', 'deferred')");
+            sql.push_str(" AND status IN ('open', 'deferred')");
         } else {
-            sql.push_str(" AND status IN ('open', 'in_progress')");
+            sql.push_str(" AND status = 'open'");
         }
 
         // Ready condition 2: NOT in blocked_issues_cache (NOT IN — frankensqlite
@@ -4619,7 +4619,7 @@ fn query_external_project_capabilities(
             let issue_sql = format!(
                 "SELECT id
                  FROM issues
-                 WHERE status IN ('closed', 'tombstone') AND id IN ({})",
+                 WHERE status = 'closed' AND id IN ({})",
                 issue_placeholders.join(",")
             );
             let issue_params: Vec<SqliteValue> = issue_chunk
@@ -5218,26 +5218,51 @@ impl SqliteStorage {
             return Ok(());
         }
 
-        for chunk in comments.chunks(IMPORT_COMMENT_CHUNK_SIZE) {
-            let placeholders: Vec<String> = chunk
-                .iter()
-                .map(|_| "(?, ?, ?, ?, ?)".to_string())
-                .collect();
-            let sql = format!(
-                "INSERT OR REPLACE INTO comments (id, issue_id, author, text, created_at) VALUES {}",
-                placeholders.join(", ")
-            );
+        for comment in comments {
+            let created_at = comment.created_at.to_rfc3339();
+            let colliding_issue_id = if comment.id > 0 {
+                self.conn
+                    .query_with_params(
+                        "SELECT issue_id FROM comments WHERE id = ? LIMIT 1",
+                        &[SqliteValue::from(comment.id)],
+                    )?
+                    .into_iter()
+                    .next()
+                    .and_then(|row| {
+                        row.get(0)
+                            .and_then(SqliteValue::as_text)
+                            .map(str::to_string)
+                    })
+            } else {
+                None
+            };
 
-            let mut params = Vec::with_capacity(chunk.len() * 5);
-            for comment in chunk {
-                params.push(SqliteValue::from(comment.id));
-                params.push(SqliteValue::from(issue_id));
-                params.push(SqliteValue::from(comment.author.as_str()));
-                params.push(SqliteValue::from(comment.body.as_str()));
-                params.push(SqliteValue::from(comment.created_at.to_rfc3339().as_str()));
+            if colliding_issue_id
+                .as_deref()
+                .is_some_and(|existing_issue_id| existing_issue_id != issue_id)
+                || comment.id <= 0
+            {
+                self.conn.execute_with_params(
+                    "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
+                    &[
+                        SqliteValue::from(issue_id),
+                        SqliteValue::from(comment.author.as_str()),
+                        SqliteValue::from(comment.body.as_str()),
+                        SqliteValue::from(created_at.as_str()),
+                    ],
+                )?;
+            } else {
+                self.conn.execute_with_params(
+                    "INSERT INTO comments (id, issue_id, author, text, created_at) VALUES (?, ?, ?, ?, ?)",
+                    &[
+                        SqliteValue::from(comment.id),
+                        SqliteValue::from(issue_id),
+                        SqliteValue::from(comment.author.as_str()),
+                        SqliteValue::from(comment.body.as_str()),
+                        SqliteValue::from(created_at.as_str()),
+                    ],
+                )?;
             }
-
-            self.conn.execute_with_params(&sql, &params)?;
         }
 
         Ok(())
@@ -6374,6 +6399,110 @@ mod tests {
     }
 
     #[test]
+    fn test_sync_comments_for_import_preserves_comments_on_other_issues() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+
+        let issue_a = make_issue(
+            "bd-c-import-a",
+            "Import target",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let issue_b = make_issue(
+            "bd-c-import-b",
+            "Existing comment owner",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage.create_issue(&issue_b, "tester").unwrap();
+
+        let existing_comment = storage
+            .add_comment("bd-c-import-b", "bob", "Existing comment")
+            .unwrap();
+
+        let imported_comment = crate::model::Comment {
+            id: existing_comment.id,
+            issue_id: "bd-c-import-a".to_string(),
+            author: "alice".to_string(),
+            body: "Imported comment".to_string(),
+            created_at: t1 + chrono::Duration::minutes(5),
+        };
+        storage
+            .sync_comments_for_import("bd-c-import-a", &[imported_comment])
+            .unwrap();
+
+        let comments_a = storage.get_comments("bd-c-import-a").unwrap();
+        assert_eq!(comments_a.len(), 1);
+        assert_eq!(comments_a[0].issue_id, "bd-c-import-a");
+        assert_eq!(comments_a[0].body, "Imported comment");
+        assert_ne!(comments_a[0].id, existing_comment.id);
+
+        let comments_b = storage.get_comments("bd-c-import-b").unwrap();
+        assert_eq!(comments_b, vec![existing_comment]);
+    }
+
+    #[test]
+    fn test_external_project_capabilities_ignore_tombstones() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("external.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+
+        let mut closed_issue = make_issue(
+            "bd-cap-closed",
+            "Closed provider",
+            Status::Closed,
+            2,
+            None,
+            t1,
+            None,
+        );
+        closed_issue.closed_at = Some(t1);
+        let mut tombstone_issue = make_issue(
+            "bd-cap-tombstone",
+            "Deleted provider",
+            Status::Tombstone,
+            2,
+            None,
+            t1,
+            None,
+        );
+        tombstone_issue.deleted_at = Some(t1);
+        tombstone_issue.delete_reason = Some("deleted".to_string());
+
+        storage.create_issue(&closed_issue, "tester").unwrap();
+        storage.create_issue(&tombstone_issue, "tester").unwrap();
+        storage
+            .add_label("bd-cap-closed", "provides:closed-cap", "tester")
+            .unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO labels (issue_id, label) VALUES (?, ?)",
+                &[
+                    SqliteValue::from("bd-cap-tombstone"),
+                    SqliteValue::from("provides:deleted-cap"),
+                ],
+            )
+            .unwrap();
+        drop(storage);
+
+        let capabilities = HashSet::from(["closed-cap".to_string(), "deleted-cap".to_string()]);
+        let satisfied = query_external_project_capabilities(&db_path, &capabilities).unwrap();
+
+        assert!(satisfied.contains("closed-cap"));
+        assert!(!satisfied.contains("deleted-cap"));
+    }
+
+    #[test]
     fn test_add_comment_marks_dirty() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
@@ -7190,7 +7319,7 @@ mod tests {
             "CREATE INDEX IF NOT EXISTS idx_issues_tombstone ON issues(status) WHERE status = 'tombstone'",
             "CREATE INDEX IF NOT EXISTS idx_issues_due_at ON issues(due_at) WHERE due_at IS NOT NULL",
             "CREATE INDEX IF NOT EXISTS idx_issues_defer_until ON issues(defer_until) WHERE defer_until IS NOT NULL",
-            "CREATE INDEX IF NOT EXISTS idx_issues_ready ON issues(status, priority, created_at) WHERE status IN ('open', 'in_progress') AND ephemeral = 0 AND pinned = 0 AND (is_template = 0 OR is_template IS NULL)",
+            "CREATE INDEX IF NOT EXISTS idx_issues_ready ON issues(status, priority, created_at) WHERE status = 'open' AND ephemeral = 0 AND pinned = 0 AND (is_template = 0 OR is_template IS NULL)",
         ];
         for (i, sql) in indexes.iter().enumerate() {
             match conn.execute(sql) {
