@@ -1,13 +1,15 @@
 //! Comments command implementation.
 
+use super::resolve_issue_id;
 use crate::cli::{CommentAddArgs, CommentCommands, CommentsArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::Comment;
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
-use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
-use chrono::{DateTime, Utc};
+use crate::util::id::{IdResolver, ResolverConfig};
+use crate::util::time::format_relative_time;
+use chrono::Utc;
 use rich_rust::prelude::*;
 use std::fs;
 use std::io::Read;
@@ -286,58 +288,6 @@ fn render_comment_added_rich(issue_id: &str, comment: &Comment, ctx: &OutputCont
     comment_text.append("\n");
     comment_text.append(comment.body.trim_end_matches('\n'));
     console.print_renderable(&comment_text);
-}
-
-/// Format a timestamp as relative time (e.g., "2 days ago", "3 hours ago").
-fn format_relative_time(timestamp: DateTime<Utc>, now: DateTime<Utc>) -> String {
-    let duration = now.signed_duration_since(timestamp);
-    let seconds = duration.num_seconds();
-
-    if seconds < 60 {
-        return "just now".to_string();
-    }
-
-    let minutes = duration.num_minutes();
-    if minutes < 60 {
-        return format!(
-            "{} minute{} ago",
-            minutes,
-            if minutes == 1 { "" } else { "s" }
-        );
-    }
-
-    let hours = duration.num_hours();
-    if hours < 24 {
-        return format!("{} hour{} ago", hours, if hours == 1 { "" } else { "s" });
-    }
-
-    let days = duration.num_days();
-    if days < 30 {
-        return format!("{} day{} ago", days, if days == 1 { "" } else { "s" });
-    }
-
-    let months = days / 30;
-    if months < 12 {
-        return format!("{} month{} ago", months, if months == 1 { "" } else { "s" });
-    }
-
-    let years = months / 12;
-    format!("{} year{} ago", years, if years == 1 { "" } else { "s" })
-}
-
-fn resolve_issue_id(
-    storage: &SqliteStorage,
-    resolver: &IdResolver,
-    all_ids: &[String],
-    input: &str,
-) -> Result<String> {
-    resolver
-        .resolve_fallible(
-            input,
-            |id| storage.id_exists(id),
-            |hash| Ok(find_matching_ids(all_ids, hash)),
-        )
-        .map(|resolved| resolved.id)
 }
 
 const MAX_STDIN_COMMENT_BYTES: usize = 10 * 1024 * 1024;

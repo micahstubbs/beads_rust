@@ -267,9 +267,9 @@ impl SqliteStorage {
     ///
     /// Returns an error if any step fails (e.g. database error, logic error).
     /// The transaction is rolled back on error.
-    pub(crate) fn with_write_transaction<F, R>(&self, mut f: F) -> Result<R>
+    pub(crate) fn with_write_transaction<F, R>(&mut self, mut f: F) -> Result<R>
     where
-        F: FnMut() -> Result<R>,
+        F: FnMut(&mut Self) -> Result<R>,
     {
         const MAX_RETRIES: u32 = 5;
         let base_backoff_ms: u64 = 10;
@@ -285,10 +285,18 @@ impl SqliteStorage {
                 Err(e) => return Err(e.into()),
             }
 
-            match f() {
+            match f(self) {
                 Ok(result) => {
                     match self.conn.execute("COMMIT") {
-                        Ok(_) => return Ok(result),
+                        Ok(_) => {
+                            // Periodic WAL checkpoint to prevent unbounded WAL growth
+                            self.mutation_count += 1;
+                            if self.mutation_count >= WAL_CHECKPOINT_INTERVAL {
+                                self.mutation_count = 0;
+                                self.try_wal_checkpoint();
+                            }
+                            return Ok(result);
+                        }
                         Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
                             let _ = self.conn.execute("ROLLBACK");
                             let backoff = base_backoff_ms * 2u64.pow(attempt);
@@ -322,14 +330,15 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database operation fails.
     pub(crate) fn set_export_hashes_in_tx(&self, exports: &[(String, String)]) -> Result<usize> {
-        if exports.is_empty() {
+        let unique_exports = Self::dedupe_export_hash_batch(exports);
+        if unique_exports.is_empty() {
             return Ok(0);
         }
 
         let now = Utc::now().to_rfc3339();
         let mut count = 0;
 
-        for chunk in exports.chunks(EXPORT_HASH_CHUNK_SIZE) {
+        for chunk in unique_exports.chunks(EXPORT_HASH_CHUNK_SIZE) {
             // Bulk delete existing hashes for this chunk
             let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
             let sql = format!(
@@ -361,6 +370,22 @@ impl SqliteStorage {
         }
 
         Ok(count)
+    }
+
+    fn dedupe_export_hash_batch(exports: &[(String, String)]) -> Vec<(String, String)> {
+        let mut deduped: Vec<(String, String)> = Vec::with_capacity(exports.len());
+        let mut positions: HashMap<String, usize> = HashMap::with_capacity(exports.len());
+
+        for (issue_id, content_hash) in exports {
+            if let Some(position) = positions.get(issue_id).copied() {
+                deduped[position].1 = content_hash.clone();
+            } else {
+                positions.insert(issue_id.clone(), deduped.len());
+                deduped.push((issue_id.clone(), content_hash.clone()));
+            }
+        }
+
+        deduped
     }
 
     /// Clear export hashes using the caller's active transaction.
@@ -810,7 +835,7 @@ impl SqliteStorage {
     ///
     /// The previous implementation used a `WITH RECURSIVE` CTE, but
     /// frankensqlite produces false positives for that query once the issue
-    /// count exceeds ~20 rows (see #131).  This Rust-side BFS is immune to
+    /// count exceeds ~20 rows (see #131).  This Rust-side DFS is immune to
     /// that bug and also avoids unbounded SQL recursion.
     fn check_cycle(
         conn: &Connection,
@@ -2046,20 +2071,7 @@ impl SqliteStorage {
         if !force_rebuild {
             return Ok(0);
         }
-        // Use BEGIN IMMEDIATE to acquire a write lock upfront, matching
-        // the convention used by mutate() and preventing lock-escalation
-        // failures when the first DML statement tries to upgrade.
-        self.conn.execute("BEGIN IMMEDIATE")?;
-        match Self::rebuild_blocked_cache_impl(&self.conn) {
-            Ok(count) => {
-                self.conn.execute("COMMIT")?;
-                Ok(count)
-            }
-            Err(e) => {
-                let _ = self.conn.execute("ROLLBACK");
-                Err(e)
-            }
-        }
+        self.with_write_transaction(|storage| Self::rebuild_blocked_cache_impl(&storage.conn))
     }
 
     /// Rebuild the blocked cache using the caller's active transaction.
@@ -2122,7 +2134,21 @@ impl SqliteStorage {
     fn rebuild_blocked_cache_impl(conn: &Connection) -> Result<usize> {
         let mut blocked_issues_map = Self::load_direct_blockers_impl(conn)?;
         let children_by_parent = Self::load_local_parent_child_edges_impl(conn)?;
+
+        // 1. Propagate standard blockers (blocks, conditional-blocks, waits-for)
+        // from parent to children.
         Self::propagate_blocked_parents(&mut blocked_issues_map, &children_by_parent);
+
+        // 2. Add blockers for parents with open children.
+        // We do this AFTER propagation so that a parent blocked only by its children
+        // does not transitively block those same children (avoiding logic cycle).
+        let child_blockers = Self::load_local_open_child_blockers_impl(conn)?;
+        for (parent_id, mut blockers) in child_blockers {
+            blocked_issues_map
+                .entry(parent_id)
+                .or_default()
+                .append(&mut blockers);
+        }
 
         let existing_rows = conn.query("SELECT issue_id FROM blocked_issues_cache")?;
         let mut stale_issue_ids: HashSet<String> = existing_rows
@@ -2181,8 +2207,9 @@ impl SqliteStorage {
             WHERE d.type IN ('blocks', 'conditional-blocks', 'waits-for')
               AND (
                 i.status NOT IN ('closed', 'tombstone')
-                OR (i.id IS NULL AND d.depends_on_id NOT LIKE 'external:%')
+                OR i.id IS NULL
               )
+              AND (i.is_template = 0 OR i.is_template IS NULL OR i.id IS NULL)
             ",
         )?;
         let mut blocked_issues_map: HashMap<String, Vec<String>> = HashMap::new();
@@ -2233,6 +2260,36 @@ impl SqliteStorage {
         }
 
         Ok(children_by_parent)
+    }
+
+    fn load_local_open_child_blockers_impl(
+        conn: &Connection,
+    ) -> Result<HashMap<String, Vec<String>>> {
+        let rows = conn.query(
+            "SELECT DISTINCT d.depends_on_id as parent_id, d.issue_id || ':child-open' as blocker
+             FROM dependencies d
+             JOIN issues i ON d.issue_id = i.id
+             WHERE d.type = 'parent-child'
+               AND i.status NOT IN ('closed', 'tombstone')
+               AND (i.is_template = 0 OR i.is_template IS NULL)
+               AND d.depends_on_id NOT LIKE 'external:%'
+               AND d.issue_id NOT LIKE 'external:%'",
+        )?;
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for row in &rows {
+            let parent_id = row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string();
+            let blocker = row
+                .get(1)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string();
+            map.entry(parent_id).or_default().push(blocker);
+        }
+        Ok(map)
     }
 
     fn propagate_blocked_parents(
@@ -2656,7 +2713,8 @@ impl SqliteStorage {
                 i.status
              FROM dependencies d
              JOIN issues i ON d.issue_id = i.id
-             WHERE d.type = 'parent-child'",
+             WHERE d.type = 'parent-child'
+               AND (i.is_template = 0 OR i.is_template IS NULL)",
         )?;
         let mut counts: std::collections::HashMap<String, (usize, usize)> =
             std::collections::HashMap::new();
@@ -4044,52 +4102,17 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn set_config(&mut self, key: &str, value: &str) -> Result<()> {
-        const MAX_RETRIES: u32 = 5;
-        let base_backoff_ms: u64 = 10;
-
-        for attempt in 0..MAX_RETRIES {
-            match self.conn.execute("BEGIN IMMEDIATE") {
-                Ok(_) => {}
-                Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
-                    let backoff = base_backoff_ms * 2u64.pow(attempt);
-                    std::thread::sleep(Duration::from_millis(backoff));
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
-            }
-
-            let result = (|| -> Result<()> {
-                self.conn.execute_with_params(
-                    "DELETE FROM config WHERE key = ?",
-                    &[SqliteValue::from(key)],
-                )?;
-                self.conn.execute_with_params(
-                    "INSERT INTO config (key, value) VALUES (?, ?)",
-                    &[SqliteValue::from(key), SqliteValue::from(value)],
-                )?;
-                Ok(())
-            })();
-
-            match result {
-                Ok(()) => match self.conn.execute("COMMIT") {
-                    Ok(_) => return Ok(()),
-                    Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
-                        let _ = self.conn.execute("ROLLBACK");
-                        let backoff = base_backoff_ms * 2u64.pow(attempt);
-                        std::thread::sleep(Duration::from_millis(backoff));
-                    }
-                    Err(e) => {
-                        let _ = self.conn.execute("ROLLBACK");
-                        return Err(e.into());
-                    }
-                },
-                Err(e) => {
-                    let _ = self.conn.execute("ROLLBACK");
-                    return Err(e);
-                }
-            }
-        }
-        unreachable!()
+        self.with_write_transaction(|storage| {
+            storage.conn.execute_with_params(
+                "DELETE FROM config WHERE key = ?",
+                &[SqliteValue::from(key)],
+            )?;
+            storage.conn.execute_with_params(
+                "INSERT INTO config (key, value) VALUES (?, ?)",
+                &[SqliteValue::from(key), SqliteValue::from(value)],
+            )?;
+            Ok(())
+        })
     }
 
     /// Delete a config value.
@@ -4372,33 +4395,21 @@ impl SqliteStorage {
     /// Returns an error if the database update fails.
     pub fn set_export_hash(&mut self, issue_id: &str, content_hash: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        // DELETE + INSERT instead of INSERT OR REPLACE (fsqlite UNIQUE limitation)
-        // Wrapped in BEGIN IMMEDIATE to make the pair atomic.
-        self.conn.execute("BEGIN IMMEDIATE")?;
-        match (|| -> Result<()> {
-            self.conn.execute_with_params(
+        self.with_write_transaction(|storage| {
+            storage.conn.execute_with_params(
                 "DELETE FROM export_hashes WHERE issue_id = ?",
                 &[SqliteValue::from(issue_id)],
             )?;
-            self.conn.execute_with_params(
+            storage.conn.execute_with_params(
                 "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
                 &[
                     SqliteValue::from(issue_id),
                     SqliteValue::from(content_hash),
-                    SqliteValue::from(now),
+                    SqliteValue::from(now.as_str()),
                 ],
             )?;
             Ok(())
-        })() {
-            Ok(()) => {
-                self.conn.execute("COMMIT")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute("ROLLBACK");
-                Err(e)
-            }
-        }
+        })
     }
 
     /// Batch set export hashes for multiple issues after successful export.
@@ -4413,18 +4424,7 @@ impl SqliteStorage {
             return Ok(0);
         }
 
-        // Wrap the entire batch in a single transaction for atomicity and performance
-        self.conn.execute("BEGIN IMMEDIATE")?;
-        match self.set_export_hashes_in_tx(exports) {
-            Ok(count) => {
-                self.conn.execute("COMMIT")?;
-                Ok(count)
-            }
-            Err(e) => {
-                let _ = self.conn.execute("ROLLBACK");
-                Err(e)
-            }
-        }
+        self.with_write_transaction(|storage| storage.set_export_hashes_in_tx(exports))
     }
 
     /// Clear all export hashes.
@@ -7847,6 +7847,26 @@ mod tests {
         let result = storage.create_issue(&dup, "tester");
 
         assert!(result.is_err(), "Creating duplicate ID should fail");
+    }
+
+    #[test]
+    fn test_set_export_hashes_deduplicates_duplicate_issue_ids_last_value_wins() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
+        let issue = make_issue("bd-hash-1", "Hash target", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let inserted = storage
+            .set_export_hashes(&[
+                ("bd-hash-1".to_string(), "hash-old".to_string()),
+                ("bd-hash-1".to_string(), "hash-new".to_string()),
+            ])
+            .unwrap();
+
+        assert_eq!(inserted, 1, "duplicate issue IDs should collapse to one row");
+
+        let (content_hash, _) = storage.get_export_hash("bd-hash-1").unwrap().unwrap();
+        assert_eq!(content_hash, "hash-new");
     }
 
     #[test]

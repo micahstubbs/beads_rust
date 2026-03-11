@@ -1,3 +1,4 @@
+use super::resolve_issue_id;
 use crate::cli::CreateArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -182,10 +183,11 @@ pub fn create_issue_impl(
     let due_at = parse_optional_date(args.due.as_deref())?;
     let defer_until = parse_optional_date(args.defer.as_deref())?;
     let id_resolver = IdResolver::new(ResolverConfig::with_prefix(config.id_config.prefix.clone()));
+    let all_ids = storage.get_all_ids()?;
     let resolved_parent = args
         .parent
         .as_deref()
-        .map(|parent| resolve_issue_id(&id_resolver, storage, parent))
+        .map(|parent| resolve_issue_id(storage, &id_resolver, &all_ids, parent))
         .transpose()?;
 
     // Parse status (default to Open if not provided)
@@ -279,9 +281,9 @@ pub fn create_issue_impl(
             now,
             resolved_parent.as_deref(),
             storage,
+            &all_ids,
             &config.id_config.prefix,
         )?;
-
         // 7. Dry Run check - return early
         if args.dry_run {
             return Ok(issue);
@@ -366,26 +368,17 @@ fn generate_new_id(
     }
 }
 
-fn resolve_issue_id(resolver: &IdResolver, storage: &SqliteStorage, input: &str) -> Result<String> {
-    resolver
-        .resolve_fallible(
-            input,
-            |id| storage.id_exists(id),
-            |hash| storage.find_ids_by_hash(hash),
-        )
-        .map(|resolved| resolved.id)
-}
-
 fn resolve_dependency_id(
     resolver: &IdResolver,
     storage: &SqliteStorage,
+    all_ids: &[String],
     input: &str,
 ) -> Result<String> {
     if input.starts_with("external:") {
         return Ok(input.to_string());
     }
 
-    resolve_issue_id(resolver, storage, input)
+    resolve_issue_id(storage, resolver, all_ids, input)
 }
 
 fn validate_relations(args: &CreateArgs, issue_id: &str) -> Result<()> {
@@ -457,6 +450,7 @@ fn populate_relations(
     now: DateTime<Utc>,
     resolved_parent: Option<&str>,
     storage: &crate::storage::SqliteStorage,
+    all_ids: &[String],
     prefix: &str,
 ) -> Result<()> {
     let resolver = IdResolver::new(ResolverConfig::with_prefix(prefix.to_string()));
@@ -499,7 +493,7 @@ fn populate_relations(
             type_str
         };
 
-        let resolved_dep_id = resolve_dependency_id(&resolver, storage, dep_id)?;
+        let resolved_dep_id = resolve_dependency_id(&resolver, storage, all_ids, dep_id)?;
 
         // from_str is infallible - Custom types are rejected by validate_relations above
         let dep_type: DependencyType = normalized_type.parse().expect("validated above");
@@ -563,9 +557,8 @@ fn execute_import(
     let mut count = storage.count_issues()?;
     let mut last_created_id: Option<String> = None;
 
-    // Track created IDs for output
-    let mut created_ids = Vec::new();
     let mut created_issues = Vec::new();
+    let all_ids = storage.get_all_ids()?;
 
     for parsed in parsed_issues {
         let title = parsed.title.trim().to_string();
@@ -714,7 +707,7 @@ fn execute_import(
                     type_str = "blocks".to_string();
                 }
 
-                let resolved_dep_id = match resolve_dependency_id(&resolver, storage, &dep_id) {
+                let resolved_dep_id = match resolve_dependency_id(&resolver, storage, &all_ids, &dep_id) {
                     Ok(resolved_dep) => resolved_dep,
                     Err(err) => {
                         dependency_error = Some(format!(

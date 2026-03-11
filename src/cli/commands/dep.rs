@@ -1,5 +1,6 @@
 //! Dependency command implementation.
 
+use super::resolve_issue_id;
 use crate::cli::{
     DepAddArgs, DepCommands, DepCyclesArgs, DepDirection, DepListArgs, DepRemoveArgs, DepTreeArgs,
     OutputFormat, resolve_output_format_basic_with_outer_mode,
@@ -10,7 +11,7 @@ use crate::format::truncate_title;
 use crate::model::DependencyType;
 use crate::output::{OutputContext, OutputMode, Theme};
 use crate::storage::SqliteStorage;
-use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
+use crate::util::id::{IdResolver, ResolverConfig};
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -1064,21 +1065,6 @@ fn render_cycles_rich(ctx: &OutputContext, cycles: &[Vec<String>], count: usize)
         .border_style(theme.error.clone());
 
     ctx.render(&panel);
-}
-
-fn resolve_issue_id(
-    storage: &SqliteStorage,
-    resolver: &IdResolver,
-    all_ids: &[String],
-    input: &str,
-) -> Result<String> {
-    resolver
-        .resolve_fallible(
-            input,
-            |id| storage.id_exists(id),
-            |hash| Ok(find_matching_ids(all_ids, hash)),
-        )
-        .map(|resolved| resolved.id)
 }
 
 #[cfg(test)]

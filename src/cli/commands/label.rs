@@ -2,12 +2,13 @@
 //!
 //! Provides label management: add, remove, list, list-all, and rename.
 
+use super::resolve_issue_id;
 use crate::cli::{LabelAddArgs, LabelCommands, LabelListArgs, LabelRemoveArgs, LabelRenameArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
-use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
+use crate::util::id::{IdResolver, ResolverConfig};
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -50,6 +51,13 @@ struct LabelActionResult {
     status: String,
     issue_id: String,
     label: String,
+}
+
+struct PreparedLabelRoute {
+    issue_inputs: Vec<String>,
+    resolved_ids: Vec<String>,
+    storage_ctx: config::OpenStorageResult,
+    actor: String,
 }
 
 /// JSON output for list-all.
@@ -130,28 +138,13 @@ fn execute_routed_label_add(
 ) -> Result<()> {
     let (issue_inputs, label) = parse_issues_and_label(&args.issues, args.label.as_ref())?;
     validate_label(&label)?;
-
-    let routed_batches = config::routing::group_issue_inputs_by_route(&issue_inputs, beads_dir)?;
+    let prepared_routes = prepare_label_routes(&issue_inputs, cli, beads_dir)?;
     let mut routed_results = Vec::new();
 
-    for batch in routed_batches {
-        let batch_cli = routed_cli_for_batch(cli, batch.is_external);
-        let mut storage_ctx = config::open_storage_with_cli(&batch.beads_dir, &batch_cli)?;
-        let config_layer = storage_ctx.load_config(&batch_cli)?;
-        let id_config = config::id_config_from_layer(&config_layer);
-        let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-        let all_ids = storage_ctx.storage.get_all_ids()?;
-        let actor = config::resolve_actor(&config_layer);
-
-        let batch_results = label_add(
-            &batch.issue_inputs,
-            &label,
-            &mut storage_ctx,
-            &resolver,
-            &all_ids,
-            &actor,
-        )?;
-        routed_results.push((batch.issue_inputs, batch_results));
+    for mut prepared_route in prepared_routes {
+        let batch_inputs = prepared_route.issue_inputs.clone();
+        let batch_results = label_add(&mut prepared_route, &label)?;
+        routed_results.push((batch_inputs, batch_results));
     }
 
     let results = reorder_routed_items_by_requested_inputs(
@@ -164,23 +157,16 @@ fn execute_routed_label_add(
 }
 
 fn label_add(
-    issue_inputs: &[String],
+    prepared_route: &mut PreparedLabelRoute,
     label: &str,
-    storage_ctx: &mut config::OpenStorageResult,
-    resolver: &IdResolver,
-    all_ids: &[String],
-    actor: &str,
 ) -> Result<Vec<LabelActionResult>> {
-    let storage = &mut storage_ctx.storage;
+    let storage = &mut prepared_route.storage_ctx.storage;
     let mut results = Vec::new();
-    let mut last_issue_id = None;
 
-    for input in issue_inputs {
-        let issue_id = resolve_issue_id(storage, resolver, all_ids, input)?;
-
+    for issue_id in &prepared_route.resolved_ids {
         info!(issue_id = %issue_id, label = %label, "Adding label");
 
-        let added = storage.add_label(&issue_id, label, actor)?;
+        let added = storage.add_label(issue_id, label, &prepared_route.actor)?;
 
         debug!(already_exists = !added, "Label status check");
 
@@ -193,11 +179,10 @@ fn label_add(
             issue_id: issue_id.clone(),
             label: label.to_string(),
         });
-        last_issue_id = Some(issue_id);
     }
 
-    storage_ctx.flush_no_db_then(|ctx| {
-        if let Some(issue_id) = last_issue_id.as_deref() {
+    prepared_route.storage_ctx.flush_no_db_then(|ctx| {
+        if let Some(issue_id) = prepared_route.resolved_ids.last() {
             crate::util::set_last_touched_id(&ctx.paths.beads_dir, issue_id);
         }
         Ok(())
@@ -213,27 +198,13 @@ fn execute_routed_label_remove(
     beads_dir: &Path,
 ) -> Result<()> {
     let (issue_inputs, label) = parse_issues_and_label(&args.issues, args.label.as_ref())?;
-    let routed_batches = config::routing::group_issue_inputs_by_route(&issue_inputs, beads_dir)?;
+    let prepared_routes = prepare_label_routes(&issue_inputs, cli, beads_dir)?;
     let mut routed_results = Vec::new();
 
-    for batch in routed_batches {
-        let batch_cli = routed_cli_for_batch(cli, batch.is_external);
-        let mut storage_ctx = config::open_storage_with_cli(&batch.beads_dir, &batch_cli)?;
-        let config_layer = storage_ctx.load_config(&batch_cli)?;
-        let id_config = config::id_config_from_layer(&config_layer);
-        let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-        let all_ids = storage_ctx.storage.get_all_ids()?;
-        let actor = config::resolve_actor(&config_layer);
-
-        let batch_results = label_remove(
-            &batch.issue_inputs,
-            &label,
-            &mut storage_ctx,
-            &resolver,
-            &all_ids,
-            &actor,
-        )?;
-        routed_results.push((batch.issue_inputs, batch_results));
+    for mut prepared_route in prepared_routes {
+        let batch_inputs = prepared_route.issue_inputs.clone();
+        let batch_results = label_remove(&mut prepared_route, &label)?;
+        routed_results.push((batch_inputs, batch_results));
     }
 
     let results = reorder_routed_items_by_requested_inputs(
@@ -246,34 +217,26 @@ fn execute_routed_label_remove(
 }
 
 fn label_remove(
-    issue_inputs: &[String],
+    prepared_route: &mut PreparedLabelRoute,
     label: &str,
-    storage_ctx: &mut config::OpenStorageResult,
-    resolver: &IdResolver,
-    all_ids: &[String],
-    actor: &str,
 ) -> Result<Vec<LabelActionResult>> {
-    let storage = &mut storage_ctx.storage;
+    let storage = &mut prepared_route.storage_ctx.storage;
     let mut results = Vec::new();
-    let mut last_issue_id = None;
 
-    for input in issue_inputs {
-        let issue_id = resolve_issue_id(storage, resolver, all_ids, input)?;
-
+    for issue_id in &prepared_route.resolved_ids {
         info!(issue_id = %issue_id, label = %label, "Removing label");
 
-        let removed = storage.remove_label(&issue_id, label, actor)?;
+        let removed = storage.remove_label(issue_id, label, &prepared_route.actor)?;
 
         results.push(LabelActionResult {
             status: if removed { "removed" } else { "not_found" }.to_string(),
             issue_id: issue_id.clone(),
             label: label.to_string(),
         });
-        last_issue_id = Some(issue_id);
     }
 
-    storage_ctx.flush_no_db_then(|ctx| {
-        if let Some(issue_id) = last_issue_id.as_deref() {
+    prepared_route.storage_ctx.flush_no_db_then(|ctx| {
+        if let Some(issue_id) = prepared_route.resolved_ids.last() {
             crate::util::set_last_touched_id(&ctx.paths.beads_dir, issue_id);
         }
         Ok(())
@@ -306,6 +269,38 @@ fn execute_label_list_command(
         let all_ids = storage_ctx.storage.get_all_ids()?;
         label_list(args, &storage_ctx.storage, &resolver, &all_ids, json, ctx)
     }
+}
+
+fn prepare_label_routes(
+    issue_inputs: &[String],
+    cli: &config::CliOverrides,
+    beads_dir: &Path,
+) -> Result<Vec<PreparedLabelRoute>> {
+    let routed_batches = config::routing::group_issue_inputs_by_route(issue_inputs, beads_dir)?;
+    let mut prepared_routes = Vec::new();
+
+    for batch in routed_batches {
+        let batch_cli = routed_cli_for_batch(cli, batch.is_external);
+        let storage_ctx = config::open_storage_with_cli(&batch.beads_dir, &batch_cli)?;
+        let config_layer = storage_ctx.load_config(&batch_cli)?;
+        let id_config = config::id_config_from_layer(&config_layer);
+        let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+        let all_ids = storage_ctx.storage.get_all_ids()?;
+        let resolved_ids = batch
+            .issue_inputs
+            .iter()
+            .map(|input| resolve_issue_id(&storage_ctx.storage, &resolver, &all_ids, input))
+            .collect::<Result<Vec<_>>>()?;
+
+        prepared_routes.push(PreparedLabelRoute {
+            issue_inputs: batch.issue_inputs,
+            resolved_ids,
+            storage_ctx,
+            actor: config::resolve_actor(&config_layer),
+        });
+    }
+
+    Ok(prepared_routes)
 }
 
 fn routed_cli_for_batch(cli: &config::CliOverrides, is_external: bool) -> config::CliOverrides {
@@ -554,21 +549,6 @@ fn label_rename(
     }
 
     Ok(())
-}
-
-fn resolve_issue_id(
-    storage: &SqliteStorage,
-    resolver: &IdResolver,
-    all_ids: &[String],
-    input: &str,
-) -> Result<String> {
-    resolver
-        .resolve_fallible(
-            input,
-            |id| storage.id_exists(id),
-            |hash| Ok(find_matching_ids(all_ids, hash)),
-        )
-        .map(|resolved| resolved.id)
 }
 
 fn reorder_routed_items_by_requested_inputs<T>(

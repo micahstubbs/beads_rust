@@ -1995,26 +1995,25 @@ pub fn finalize_export(
     jsonl_path: &Path,
 ) -> Result<()> {
     use chrono::Utc;
-    let storage_ref: &SqliteStorage = storage;
 
-    storage_ref.with_write_transaction(|| -> Result<()> {
+    storage.with_write_transaction(|storage| -> Result<()> {
         // Clear dirty flags for exported issues (safe version with timestamp validation)
         if !result.exported_marked_at.is_empty() {
-            storage_ref.clear_dirty_issues(&result.exported_marked_at)?;
+            storage.clear_dirty_issues(&result.exported_marked_at)?;
         }
 
         // Record export hashes for each exported issue (for incremental export detection)
         if let Some(hashes) = issue_hashes {
-            storage_ref.set_export_hashes_in_tx(hashes)?;
+            storage.set_export_hashes_in_tx(hashes)?;
         }
 
         // Update metadata
-        storage_ref.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, &result.content_hash)?;
-        storage_ref.set_metadata_in_tx(METADATA_LAST_EXPORT_TIME, &Utc::now().to_rfc3339())?;
-        record_jsonl_mtime_in_tx(storage_ref, jsonl_path)?;
+        storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, &result.content_hash)?;
+        storage.set_metadata_in_tx(METADATA_LAST_EXPORT_TIME, &Utc::now().to_rfc3339())?;
+        record_jsonl_mtime_in_tx(storage, jsonl_path)?;
 
         // Clear force-flush flag if it was set
-        storage_ref.execute_raw("DELETE FROM metadata WHERE key = 'needs_flush'")?;
+        storage.execute_raw("DELETE FROM metadata WHERE key = 'needs_flush'")?;
 
         Ok(())
     })?;
@@ -2034,7 +2033,7 @@ fn is_issue_exportable(issue: &Issue, retention_days: Option<u64>) -> bool {
 }
 
 fn finalize_incremental_auto_flush(
-    storage: &SqliteStorage,
+    storage: &mut SqliteStorage,
     clear_dirty_metadata: &[(String, String)],
     removed_hash_ids: &[String],
     issue_hashes: &[(String, String)],
@@ -2042,29 +2041,27 @@ fn finalize_incremental_auto_flush(
     jsonl_path: Option<&Path>,
 ) -> Result<()> {
     use chrono::Utc;
-    let storage_ref: &SqliteStorage = storage;
-
-    storage_ref.with_write_transaction(|| -> Result<()> {
+    storage.with_write_transaction(|storage| -> Result<()> {
         if !clear_dirty_metadata.is_empty() {
-            storage_ref.clear_dirty_issues(clear_dirty_metadata)?;
+            storage.clear_dirty_issues(clear_dirty_metadata)?;
         }
         if !removed_hash_ids.is_empty() {
-            storage_ref.clear_export_hashes_in_tx(removed_hash_ids)?;
+            storage.clear_export_hashes_in_tx(removed_hash_ids)?;
         }
         if !issue_hashes.is_empty() {
-            storage_ref.set_export_hashes_in_tx(issue_hashes)?;
+            storage.set_export_hashes_in_tx(issue_hashes)?;
         }
         if let Some(content_hash) = content_hash {
-            storage_ref.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, content_hash)?;
-            storage_ref.set_metadata_in_tx(METADATA_LAST_EXPORT_TIME, &Utc::now().to_rfc3339())?;
+            storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, content_hash)?;
+            storage.set_metadata_in_tx(METADATA_LAST_EXPORT_TIME, &Utc::now().to_rfc3339())?;
             let jsonl_path = jsonl_path.ok_or_else(|| {
                 BeadsError::Config(
                     "incremental auto-flush metadata update requires a JSONL path".to_string(),
                 )
             })?;
-            record_jsonl_mtime_in_tx(storage_ref, jsonl_path)?;
+            record_jsonl_mtime_in_tx(storage, jsonl_path)?;
         }
-        storage_ref.execute_raw("DELETE FROM metadata WHERE key = 'needs_flush'")?;
+        storage.execute_raw("DELETE FROM metadata WHERE key = 'needs_flush'")?;
         Ok(())
     })?;
 
@@ -2173,7 +2170,7 @@ fn write_jsonl_lines_atomically(
 }
 
 fn try_incremental_auto_flush(
-    storage: &SqliteStorage,
+    storage: &mut SqliteStorage,
     beads_dir: &Path,
     jsonl_path: &Path,
 ) -> Result<Option<AutoFlushResult>> {
@@ -2961,15 +2958,14 @@ pub fn import_from_jsonl(
         "Importing issues",
         config.show_progress,
     );
-    let storage_ref: &SqliteStorage = storage;
-    let apply_result = storage_ref.with_write_transaction(|| -> Result<ImportResult> {
+    let apply_result = storage.with_write_transaction(|storage| -> Result<ImportResult> {
         let mut tx_result = result.clone();
         // Keep export-hash state transactional so failed imports do not
         // erase incremental export bookkeeping.
-        storage_ref.clear_all_export_hashes_in_tx()?;
+        storage.clear_all_export_hashes_in_tx()?;
 
         for (issue, action) in &import_ops {
-            process_import_action(storage_ref, action, issue, &mut tx_result)?;
+            process_import_action(storage, action, issue, &mut tx_result)?;
             progress.inc(1);
         }
 
@@ -2994,7 +2990,7 @@ pub fn import_from_jsonl(
             } else {
                 format!("DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues)")
             };
-            orphans_cleaned += storage_ref.execute_raw_count(&sql)?;
+            orphans_cleaned += storage.execute_raw_count(&sql)?;
         }
         if orphans_cleaned > 0 {
             tracing::info!(
@@ -3005,15 +3001,15 @@ pub fn import_from_jsonl(
         }
 
         if !new_export_hashes.is_empty() {
-            storage_ref.set_export_hashes_in_tx(&new_export_hashes)?;
+            storage.set_export_hashes_in_tx(&new_export_hashes)?;
         }
 
-        storage_ref.rebuild_blocked_cache_in_tx()?;
-        storage_ref.rebuild_child_counters_in_tx()?;
-        storage_ref
+        storage.rebuild_blocked_cache_in_tx()?;
+        storage.rebuild_child_counters_in_tx()?;
+        storage
             .set_metadata_in_tx(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
-        storage_ref.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, &jsonl_hash)?;
-        record_jsonl_mtime_in_tx(storage_ref, input_path)?;
+        storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, &jsonl_hash)?;
+        record_jsonl_mtime_in_tx(storage, input_path)?;
 
         Ok(tx_result)
     });

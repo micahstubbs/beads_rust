@@ -988,6 +988,100 @@ fn e2e_routing_comments_add_and_list_external_issue_via_main_workspace() {
 }
 
 #[test]
+fn e2e_routing_label_add_failure_does_not_mutate_earlier_batches() {
+    let _log = common::test_log("e2e_routing_label_add_failure_does_not_mutate_earlier_batches");
+
+    let main_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+
+    let init = run_br(&main_workspace, ["init"], "init_main");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let init_external = run_br(&external_workspace, ["init"], "init_external");
+    assert!(
+        init_external.status.success(),
+        "external init failed: {}",
+        init_external.stderr
+    );
+
+    fs::write(
+        external_workspace.root.join(".beads").join("config.yaml"),
+        "issue_prefix: ext\n",
+    )
+    .expect("write external config");
+    create_routes_file(
+        &main_workspace,
+        &[("ext-", external_workspace.root.to_string_lossy().as_ref())],
+    );
+
+    let create_target = run_br(
+        &main_workspace,
+        ["create", "Local label target", "--json"],
+        "create_local_label_target",
+    );
+    assert!(
+        create_target.status.success(),
+        "target create failed: {}",
+        create_target.stderr
+    );
+    let target_issue: Value =
+        serde_json::from_str(&extract_json_payload(&create_target.stdout)).expect("target json");
+    let target_id = target_issue["id"].as_str().expect("target id").to_string();
+
+    let create_other = run_br(
+        &main_workspace,
+        ["create", "Last touched sentinel", "--json"],
+        "create_last_touched_sentinel",
+    );
+    assert!(
+        create_other.status.success(),
+        "sentinel create failed: {}",
+        create_other.stderr
+    );
+    let last_touched_path = main_workspace.root.join(".beads").join("last_touched");
+    let last_touched_before = fs::read_to_string(&last_touched_path).ok();
+
+    let label_add = run_br(
+        &main_workspace,
+        [
+            "label",
+            "add",
+            &target_id,
+            "ext-missing",
+            "triage",
+            "--json",
+        ],
+        "label_add_partial_failure",
+    );
+    assert!(
+        !label_add.status.success(),
+        "expected routed label add with missing external issue to fail"
+    );
+    assert!(
+        label_add.stdout.trim().is_empty(),
+        "failing routed label add should not emit partial success output: {}",
+        label_add.stdout
+    );
+
+    let label_list = run_br(
+        &main_workspace,
+        ["label", "list", &target_id, "--json"],
+        "label_list_after_failed_routed_add",
+    );
+    assert!(
+        label_list.status.success(),
+        "label list after failed add failed: {}",
+        label_list.stderr
+    );
+    let labels: Vec<String> =
+        serde_json::from_str(&extract_json_payload(&label_list.stdout)).expect("labels json");
+    assert!(labels.is_empty(), "local target should remain unlabeled");
+
+    let last_touched_after = fs::read_to_string(&last_touched_path).ok();
+    assert_eq!(last_touched_after, last_touched_before);
+}
+
+#[test]
 fn e2e_routing_show_external_issue_uses_metadata_database_path() {
     let _log = common::test_log("e2e_routing_show_external_issue_uses_metadata_database_path");
 
@@ -1396,6 +1490,123 @@ fn e2e_routing_update_failure_does_not_print_partial_success() {
 
     let last_touched_after = fs::read_to_string(&last_touched_path).ok();
     assert_eq!(last_touched_after, last_touched_before);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_routing_update_text_preserves_requested_order_across_routes() {
+    let _log = common::test_log("e2e_routing_update_text_preserves_requested_order_across_routes");
+
+    let main_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+
+    let init_main = run_br(&main_workspace, ["init"], "init_update_text_main");
+    assert!(
+        init_main.status.success(),
+        "init failed: {}",
+        init_main.stderr
+    );
+
+    let init_external = run_br(&external_workspace, ["init"], "init_update_text_external");
+    assert!(
+        init_external.status.success(),
+        "external init failed: {}",
+        init_external.stderr
+    );
+
+    fs::write(
+        external_workspace.root.join(".beads").join("config.yaml"),
+        "issue_prefix: ext\n",
+    )
+    .expect("write external config");
+
+    create_routes_file(
+        &main_workspace,
+        &[("ext-", external_workspace.root.to_string_lossy().as_ref())],
+    );
+
+    let create_local_first = run_br(
+        &main_workspace,
+        ["create", "Local first update text", "--json"],
+        "create_local_first_update_text",
+    );
+    assert!(
+        create_local_first.status.success(),
+        "create local first failed: {}",
+        create_local_first.stderr
+    );
+    let local_first: Value =
+        serde_json::from_str(&extract_json_payload(&create_local_first.stdout))
+            .expect("local first update text json");
+    let local_first_id = local_first["id"]
+        .as_str()
+        .expect("local first update text id")
+        .to_string();
+
+    let create_external_middle = run_br(
+        &external_workspace,
+        ["create", "External middle update text", "--json"],
+        "create_external_middle_update_text",
+    );
+    assert!(
+        create_external_middle.status.success(),
+        "create external middle failed: {}",
+        create_external_middle.stderr
+    );
+    let external_middle: Value =
+        serde_json::from_str(&extract_json_payload(&create_external_middle.stdout))
+            .expect("external middle update text json");
+    let external_middle_id = external_middle["id"]
+        .as_str()
+        .expect("external middle update text id")
+        .to_string();
+
+    let create_local_last = run_br(
+        &main_workspace,
+        ["create", "Local last update text", "--json"],
+        "create_local_last_update_text",
+    );
+    assert!(
+        create_local_last.status.success(),
+        "create local last failed: {}",
+        create_local_last.stderr
+    );
+    let local_last: Value = serde_json::from_str(&extract_json_payload(&create_local_last.stdout))
+        .expect("local last update text json");
+    let local_last_id = local_last["id"]
+        .as_str()
+        .expect("local last update text id")
+        .to_string();
+
+    let update = run_br(
+        &main_workspace,
+        [
+            "update",
+            &local_first_id,
+            &external_middle_id,
+            &local_last_id,
+            "--status",
+            "in_progress",
+        ],
+        "update_mixed_route_text_order",
+    );
+    assert!(update.status.success(), "update failed: {}", update.stderr);
+
+    let local_first_pos = update
+        .stdout
+        .find("Local first update text")
+        .expect("local first update output");
+    let external_middle_pos = update
+        .stdout
+        .find("External middle update text")
+        .expect("external middle update output");
+    let local_last_pos = update
+        .stdout
+        .find("Local last update text")
+        .expect("local last update output");
+
+    assert!(local_first_pos < external_middle_pos);
+    assert!(external_middle_pos < local_last_pos);
 }
 
 #[test]

@@ -4,7 +4,7 @@ use crate::cli::CloseArgs as CliCloseArgs;
 use crate::cli::commands::preserve_blocked_cache_on_error;
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::model::Status;
+use crate::model::{IssueType, Status};
 use crate::output::OutputContext;
 use crate::storage::IssueUpdate;
 use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
@@ -508,14 +508,18 @@ fn execute_route(
         }
 
         if !args.force
-            && issue.issue_type == crate::model::IssueType::Epic
             && let Some(&(total, closed)) = epic_counts.get(id)
             && closed < total
         {
+            let label = if issue.issue_type == IssueType::Epic {
+                "epic"
+            } else {
+                "parent issue"
+            };
             let skipped = SkippedIssue {
                 id: id.clone(),
                 reason: format!(
-                    "epic has {}/{} open children (use --force to close anyway)",
+                    "{label} has {}/{} open children (use --force to close anyway)",
                     total - closed,
                     total
                 ),

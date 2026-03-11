@@ -6,6 +6,10 @@
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
+pub const MAX_ID_PREFIX_LEN: usize = 64;
+pub const MAX_ID_HASH_LEN: usize = 40;
+pub const MAX_ID_LENGTH: usize = MAX_ID_PREFIX_LEN + 1 + MAX_ID_HASH_LEN;
+
 /// Default ID generation configuration.
 #[derive(Debug, Clone)]
 pub struct IdConfig {
@@ -388,11 +392,30 @@ pub fn parse_id(id: &str) -> Result<ParsedId> {
         return Err(BeadsError::InvalidId { id: id.to_string() });
     };
 
+    if prefix.is_empty() || prefix.len() > MAX_ID_PREFIX_LEN {
+        return Err(BeadsError::InvalidId { id: id.to_string() });
+    }
+
+    if !prefix
+        .chars()
+        .all(|c| {
+            c.is_ascii_lowercase()
+                || c.is_ascii_digit()
+                || c == '_'
+                || c == '-'
+                || c == '.'
+                || c == ':'
+                || c == '#'
+        })
+    {
+        return Err(BeadsError::InvalidId { id: id.to_string() });
+    }
+
     // Split remainder by '.' to get hash and child path
     let parts: Vec<&str> = remainder.split('.').collect();
     let hash = parts[0].to_string();
 
-    if hash.is_empty() {
+    if hash.is_empty() || hash.len() > MAX_ID_HASH_LEN {
         return Err(BeadsError::InvalidId { id: id.to_string() });
     }
 
@@ -407,6 +430,9 @@ pub fn parse_id(id: &str) -> Result<ParsedId> {
     // Parse child path segments
     let mut child_path = Vec::new();
     for part in parts.iter().skip(1) {
+        if part.is_empty() || !part.chars().all(|c| c.is_ascii_digit()) {
+            return Err(BeadsError::InvalidId { id: id.to_string() });
+        }
         match part.parse::<u32>() {
             Ok(n) => child_path.push(n),
             Err(_) => return Err(BeadsError::InvalidId { id: id.to_string() }),
@@ -1080,6 +1106,17 @@ mod tests {
         let parsed = parse_id("bd-abc123.1.2").unwrap();
         assert_eq!(parsed.child_path, vec![1, 2]);
         assert_eq!(parsed.depth(), 2);
+    }
+
+    #[test]
+    fn test_parse_id_external_style() {
+        let parsed = parse_id("external:jira-123").unwrap();
+        assert_eq!(parsed.prefix, "external:jira");
+        assert_eq!(parsed.hash, "123");
+
+        let parsed2 = parse_id("ext:github#repo-456").unwrap();
+        assert_eq!(parsed2.prefix, "ext:github#repo");
+        assert_eq!(parsed2.hash, "456");
     }
 
     #[test]

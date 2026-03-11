@@ -3,6 +3,7 @@
 //! Shows issues ready to work on next: open, unblocked, not deferred, not pinned,
 //! not ephemeral.
 
+use super::resolve_issue_id;
 use crate::cli::{
     OutputFormat, ReadyArgs, SortPolicy, resolve_output_format_basic_with_outer_mode,
 };
@@ -12,6 +13,7 @@ use crate::format::{ReadyIssue, format_priority_badge, terminal_width, truncate_
 use crate::model::{IssueType, Priority};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
 use crate::storage::{ReadyFilters, ReadySortPolicy, SqliteStorage};
+use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
 use std::io::IsTerminal;
 use std::path::Path;
 use std::str::FromStr;
@@ -109,6 +111,16 @@ fn execute_inner(
     let quiet = cli.quiet.unwrap_or(false);
     let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
 
+    let id_config = config::id_config_from_layer(&config_layer);
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let all_ids = storage.get_all_ids()?;
+
+    let resolved_parent = args
+        .parent
+        .as_deref()
+        .map(|p| resolve_issue_id(storage, &resolver, &all_ids, p))
+        .transpose()?;
+
     let filters = ReadyFilters {
         assignee,
         unassigned: args.unassigned,
@@ -119,7 +131,7 @@ fn execute_inner(
         include_deferred: args.include_deferred,
         // Fetch all candidates to allow post-filtering of external blockers
         limit: None,
-        parent: args.parent.clone(),
+        parent: resolved_parent,
         recursive: args.recursive,
     };
 

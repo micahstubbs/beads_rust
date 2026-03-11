@@ -1,5 +1,6 @@
 //! Update command implementation.
 
+use super::resolve_issue_id;
 use crate::cli::UpdateArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -446,10 +447,11 @@ fn resolve_target_ids(
         ids.push(last_touched);
     }
 
+    let all_ids = storage.get_all_ids()?;
     let resolved_ids = resolver.resolve_all_fallible(
         &ids,
         |id| storage.id_exists(id),
-        |hash| storage.find_ids_by_hash(hash),
+        |hash| Ok(crate::util::id::find_matching_ids(&all_ids, hash)),
     )?;
 
     Ok(resolved_ids.into_iter().map(|r| r.id).collect())
@@ -564,16 +566,6 @@ fn optional_date_field(value: Option<&str>) -> Result<Option<Option<DateTime<Utc
         .transpose()
 }
 
-fn resolve_issue_id(resolver: &IdResolver, storage: &SqliteStorage, input: &str) -> Result<String> {
-    resolver
-        .resolve_fallible(
-            input,
-            |id| storage.id_exists(id),
-            |hash| storage.find_ids_by_hash(hash),
-        )
-        .map(|resolved| resolved.id)
-}
-
 fn resolve_parent_update(
     parent: Option<&str>,
     resolver: &IdResolver,
@@ -583,7 +575,8 @@ fn resolve_parent_update(
         None => Ok(ParentUpdatePlan::Unchanged),
         Some("") => Ok(ParentUpdatePlan::Clear),
         Some(parent_value) => {
-            resolve_issue_id(resolver, storage, parent_value).map(ParentUpdatePlan::Set)
+            let all_ids = storage.get_all_ids()?;
+            resolve_issue_id(storage, resolver, &all_ids, parent_value).map(ParentUpdatePlan::Set)
         }
     }
 }

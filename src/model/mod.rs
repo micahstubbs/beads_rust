@@ -713,7 +713,11 @@ impl Issue {
             return false; // Keep if deletion time is unknown
         };
 
-        let days_i64 = i64::try_from(days).unwrap_or(i64::MAX);
+        // Clamp days to a safe maximum to avoid panic in Duration::days().
+        // chrono::Duration can handle up to ~292,000 years, but we'll clamp to 
+        // something extremely safe for an issue tracker (e.g., 1000 years).
+        let max_safe_days = 365 * 1000;
+        let days_i64 = i64::try_from(days.min(max_safe_days)).unwrap_or(max_safe_days as i64);
         let expiration_time = deleted_at + chrono::Duration::days(days_i64);
         Utc::now() > expiration_time
     }

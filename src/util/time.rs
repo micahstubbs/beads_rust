@@ -43,12 +43,16 @@ pub fn parse_flexible_timestamp(s: &str, field_name: &str) -> Result<DateTime<Ut
         if let Some(unit_char) = rest.chars().last() {
             let amount_str = &rest[..rest.len() - unit_char.len_utf8()];
             if let Ok(amount) = amount_str.parse::<i64>() {
-                let amount = if is_negative { -amount } else { amount };
+                let signed_amount = if is_negative { -amount } else { amount };
+                // Clamp amount to a safe range to avoid panic in Duration methods.
+                // 1000 years is plenty for any issue tracker.
+                let max_safe_amount = 365 * 1000;
+                let clamped_amount = signed_amount.clamp(-max_safe_amount, max_safe_amount);
                 let duration = match unit_char {
-                    'm' => Duration::minutes(amount),
-                    'h' => Duration::hours(amount),
-                    'd' => Duration::days(amount),
-                    'w' => Duration::weeks(amount),
+                    'm' => Duration::minutes(clamped_amount),
+                    'h' => Duration::hours(clamped_amount),
+                    'd' => Duration::days(clamped_amount),
+                    'w' => Duration::weeks(clamped_amount.clamp(-52000, 52000)), // ~1000 years in weeks
                     _ => {
                         return Err(BeadsError::validation(
                             field_name,
@@ -111,12 +115,15 @@ pub fn parse_relative_time(s: &str) -> Option<DateTime<Utc>> {
         if let Some(unit_char) = rest.chars().last() {
             let amount_str = &rest[..rest.len() - unit_char.len_utf8()];
             if let Ok(amount) = amount_str.parse::<i64>() {
-                let amount = if is_negative { -amount } else { amount };
+                let signed_amount = if is_negative { -amount } else { amount };
+                // Clamp amount to a safe range to avoid panic in Duration methods.
+                let max_safe_amount = 365 * 1000;
+                let clamped_amount = signed_amount.clamp(-max_safe_amount, max_safe_amount);
                 let duration = match unit_char {
-                    'm' => Duration::minutes(amount),
-                    'h' => Duration::hours(amount),
-                    'd' => Duration::days(amount),
-                    'w' => Duration::weeks(amount),
+                    'm' => Duration::minutes(clamped_amount),
+                    'h' => Duration::hours(clamped_amount),
+                    'd' => Duration::days(clamped_amount),
+                    'w' => Duration::weeks(clamped_amount.clamp(-52000, 52000)),
                     _ => return None,
                 };
                 return Some(Utc::now() + duration);
@@ -152,6 +159,46 @@ pub fn parse_relative_time(s: &str) -> Option<DateTime<Utc>> {
         }
         _ => None,
     }
+}
+
+/// Format a duration as a human-readable relative time string (e.g., "2 days ago").
+#[must_use]
+pub fn format_relative_time(dt: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let duration = if dt > now {
+        dt.signed_duration_since(now)
+    } else {
+        now.signed_duration_since(dt)
+    };
+
+    let suffix = if dt > now { "from now" } else { "ago" };
+
+    let seconds = duration.num_seconds();
+    if seconds < 60 {
+        return format!("just now");
+    }
+
+    let minutes = duration.num_minutes();
+    if minutes < 60 {
+        return format!("{} minute{} {}", minutes, if minutes == 1 { "" } else { "s" }, suffix);
+    }
+
+    let hours = duration.num_hours();
+    if hours < 24 {
+        return format!("{} hour{} {}", hours, if hours == 1 { "" } else { "s" }, suffix);
+    }
+
+    let days = duration.num_days();
+    if days < 30 {
+        return format!("{} day{} {}", days, if days == 1 { "" } else { "s" }, suffix);
+    }
+
+    let months = days / 30;
+    if months < 12 {
+        return format!("{} month{} {}", months, if months == 1 { "" } else { "s" }, suffix);
+    }
+
+    let years = days / 365;
+    format!("{} year{} {}", years, if years == 1 { "" } else { "s" }, suffix)
 }
 
 fn local_to_utc(naive_dt: &chrono::NaiveDateTime, field_name: &str) -> Result<DateTime<Utc>> {
@@ -213,6 +260,12 @@ mod tests {
     fn test_parse_flexible_relative() {
         let result = parse_flexible_timestamp("+1h", "test").unwrap();
         assert!(result > Utc::now());
+    }
+
+    #[test]
+    fn test_parse_flexible_relative_negative() {
+        let result = parse_flexible_timestamp("-1d", "test").unwrap();
+        assert!(result < Utc::now());
     }
 
     #[test]

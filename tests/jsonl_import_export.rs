@@ -529,6 +529,52 @@ fn import_repopulates_export_hashes() {
 }
 
 #[test]
+fn import_deduplicates_export_hash_rebuild_when_multiple_records_target_same_issue() {
+    let mut storage = SqliteStorage::open_memory().unwrap();
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("issues.jsonl");
+
+    let base_time = Utc::now() - Duration::hours(2);
+    let mut existing = issue_with_id("test-existing", "Existing");
+    existing.created_at = base_time;
+    existing.updated_at = base_time;
+    existing.external_ref = Some("EXT-1".to_string());
+    storage.create_issue(&existing, "tester").unwrap();
+    storage
+        .set_export_hashes(&[("test-existing".to_string(), "stale-hash".to_string())])
+        .unwrap();
+
+    let mut by_external_ref = issue_with_id("test-remap", "Intermediate update");
+    by_external_ref.created_at = base_time + Duration::minutes(5);
+    by_external_ref.updated_at = base_time + Duration::minutes(10);
+    by_external_ref.external_ref = Some("EXT-1".to_string());
+
+    let mut by_id = issue_with_id("test-existing", "Final update");
+    by_id.created_at = base_time + Duration::minutes(15);
+    by_id.updated_at = base_time + Duration::minutes(20);
+
+    let json = format!(
+        "{}\n{}\n",
+        serde_json::to_string(&by_external_ref).unwrap(),
+        serde_json::to_string(&by_id).unwrap()
+    );
+    fs::write(&path, json).unwrap();
+
+    import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("test-")).unwrap();
+
+    assert!(
+        storage.get_issue("test-remap").unwrap().is_none(),
+        "collision-matched issue should be merged into the existing record"
+    );
+
+    let imported = storage.get_issue("test-existing").unwrap().unwrap();
+    assert_eq!(imported.title, "Final update");
+
+    let (stored_hash, _) = storage.get_export_hash("test-existing").unwrap().unwrap();
+    assert_eq!(Some(stored_hash.as_str()), imported.content_hash.as_deref());
+}
+
+#[test]
 fn import_rejects_invalid_id_format() {
     // Import now validates issues, so invalid IDs should be rejected.
     let temp = TempDir::new().unwrap();

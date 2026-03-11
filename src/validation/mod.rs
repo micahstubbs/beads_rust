@@ -14,11 +14,8 @@
 
 use crate::error::{BeadsError, ValidationError};
 use crate::model::{Comment, Dependency, Issue, Priority};
+use crate::util::id::MAX_ID_LENGTH;
 use std::path::Path;
-
-const MAX_ID_PREFIX_LEN: usize = 64;
-const MAX_ID_HASH_LEN: usize = 40;
-const MAX_ID_LENGTH: usize = MAX_ID_PREFIX_LEN + 1 + MAX_ID_HASH_LEN;
 
 /// Validates issue fields and invariants.
 pub struct IssueValidator;
@@ -255,49 +252,7 @@ impl CommentValidator {
 
 #[must_use]
 pub fn is_valid_id_format(id: &str) -> bool {
-    let Some(parsed) = crate::util::id::split_prefix_remainder(id) else {
-        return false;
-    };
-    let (prefix, hash) = parsed;
-
-    if prefix.is_empty() || prefix.len() > MAX_ID_PREFIX_LEN {
-        return false;
-    }
-
-    if !prefix
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-' || c == '.')
-    {
-        return false;
-    }
-
-    // Allow dots for hierarchical/child IDs (e.g., "bd-abc.1", "bd-abc.1.2")
-    // Format: base_hash[.child_num]* where child_num is numeric
-    let mut segments = hash.split('.');
-    let Some(base_hash) = segments.next() else {
-        return false;
-    };
-
-    // Allow longer total hashes for hierarchical IDs (e.g., "0v1.1.1.1")
-    // but enforce the length limit on the base hash.
-    if base_hash.is_empty() || base_hash.len() > MAX_ID_HASH_LEN {
-        return false;
-    }
-
-    if !base_hash
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-    {
-        return false;
-    }
-
-    for segment in segments {
-        if segment.is_empty() || !segment.chars().all(|c| c.is_ascii_digit()) {
-            return false;
-        }
-    }
-
-    true
+    crate::util::id::is_valid_id_format(id)
 }
 
 // =============================================================================

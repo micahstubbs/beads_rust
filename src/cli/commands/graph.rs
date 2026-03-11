@@ -5,13 +5,14 @@
 //! - `br graph <issue-id>`: Show all dependents of an issue (what depends on it)
 //! - `br graph --all`: Show connected components for `open`/`in_progress`/`blocked` issues
 
+use super::resolve_issue_id;
 use crate::cli::GraphArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::{DependencyType, Issue, Priority, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
-use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
+use crate::util::id::{IdResolver, ResolverConfig};
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -843,21 +844,6 @@ const fn human_graph_render_mode(mode: OutputMode, compact: bool) -> HumanGraphR
     } else {
         HumanGraphRenderMode::Plain
     }
-}
-
-fn resolve_issue_id(
-    storage: &SqliteStorage,
-    resolver: &IdResolver,
-    all_ids: &[String],
-    input: &str,
-) -> Result<String> {
-    resolver
-        .resolve_fallible(
-            input,
-            |id| storage.id_exists(id),
-            |hash| Ok(find_matching_ids(all_ids, hash)),
-        )
-        .map(|resolved| resolved.id)
 }
 
 fn render_single_graph_plain(nodes: &[GraphNode], edges: &[(String, String)], root_issue: &Issue) {

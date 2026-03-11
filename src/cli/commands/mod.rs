@@ -1,4 +1,5 @@
 use crate::storage::SqliteStorage;
+use crate::util::id::{IdResolver, find_matching_ids};
 
 pub mod agents;
 pub mod audit;
@@ -39,6 +40,22 @@ pub mod r#where;
 
 #[cfg(feature = "self_update")]
 pub mod upgrade;
+
+/// Resolve an issue ID from a potentially partial input.
+pub(super) fn resolve_issue_id(
+    storage: &SqliteStorage,
+    resolver: &IdResolver,
+    all_ids: &[String],
+    input: &str,
+) -> crate::Result<String> {
+    resolver
+        .resolve_fallible(
+            input,
+            |id| storage.id_exists(id),
+            |hash| Ok(find_matching_ids(all_ids, hash)),
+        )
+        .map(|resolved| resolved.id)
+}
 
 pub(super) fn rebuild_blocked_cache_after_partial_mutation(
     storage: &mut SqliteStorage,
