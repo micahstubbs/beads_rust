@@ -143,6 +143,13 @@ impl SavedFilters {
     #[must_use]
     pub fn merge_with_cli(&self, cli: &ListArgs) -> ListArgs {
         let base = self.to_list_args();
+        let (assignee, unassigned) = match (&cli.assignee, cli.unassigned) {
+            (Some(assignee), false) => (Some(assignee.clone()), false),
+            (None, true) => (None, true),
+            // Preserve explicitly contradictory CLI input; the caller asked for both.
+            (Some(assignee), true) => (Some(assignee.clone()), true),
+            (None, false) => (base.assignee.clone(), base.unassigned),
+        };
         ListArgs {
             // Vec fields: CLI overrides if non-empty
             status: if cli.status.is_empty() {
@@ -176,7 +183,7 @@ impl SavedFilters {
                 cli.priority.clone()
             },
             // Option fields: CLI overrides if Some
-            assignee: cli.assignee.clone().or(base.assignee),
+            assignee,
             priority_min: cli.priority_min.or(base.priority_min),
             priority_max: cli.priority_max.or(base.priority_max),
             title_contains: cli.title_contains.clone().or(base.title_contains),
@@ -185,7 +192,7 @@ impl SavedFilters {
             limit: cli.limit.or(base.limit),
             sort: cli.sort.clone().or(base.sort),
             // Bool fields: CLI true overrides saved
-            unassigned: cli.unassigned || base.unassigned,
+            unassigned,
             all: cli.all || base.all,
             reverse: cli.reverse || base.reverse,
             deferred: cli.deferred || base.deferred,
@@ -718,6 +725,40 @@ mod tests {
         assert!(merged.reverse);
         assert!(merged.deferred);
         assert!(merged.overdue);
+    }
+
+    #[test]
+    fn test_merge_assignee_override_clears_saved_unassigned() {
+        let saved = SavedFilters {
+            unassigned: true,
+            ..Default::default()
+        };
+
+        let cli = ListArgs {
+            assignee: Some("alice".to_string()),
+            ..Default::default()
+        };
+
+        let merged = saved.merge_with_cli(&cli);
+        assert_eq!(merged.assignee, Some("alice".to_string()));
+        assert!(!merged.unassigned);
+    }
+
+    #[test]
+    fn test_merge_unassigned_override_clears_saved_assignee() {
+        let saved = SavedFilters {
+            assignee: Some("alice".to_string()),
+            ..Default::default()
+        };
+
+        let cli = ListArgs {
+            unassigned: true,
+            ..Default::default()
+        };
+
+        let merged = saved.merge_with_cli(&cli);
+        assert!(merged.assignee.is_none());
+        assert!(merged.unassigned);
     }
 
     #[test]

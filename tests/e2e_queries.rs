@@ -1140,3 +1140,84 @@ fn e2e_saved_queries_run_with_overrides() {
             .collect::<Vec<_>>()
     );
 }
+
+/// E2E test: explicit assignee override clears a saved unassigned filter.
+#[test]
+fn e2e_saved_queries_assignee_override_clears_unassigned() {
+    let _log = common::test_log("e2e_saved_queries_assignee_override_clears_unassigned");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "override_assignee_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let assigned_id = {
+        let create = run_br(
+            &workspace,
+            ["create", "Assigned issue"],
+            "override_assignee_create_assigned",
+        );
+        assert!(create.status.success(), "create failed: {}", create.stderr);
+        parse_created_id(&create.stdout)
+    };
+    let assign = run_br(
+        &workspace,
+        ["update", &assigned_id, "--assignee", "alice"],
+        "override_assignee_set_assigned",
+    );
+    assert!(assign.status.success(), "assign failed: {}", assign.stderr);
+
+    let unassigned_id = {
+        let create = run_br(
+            &workspace,
+            ["create", "Unassigned issue"],
+            "override_assignee_create_unassigned",
+        );
+        assert!(create.status.success(), "create failed: {}", create.stderr);
+        parse_created_id(&create.stdout)
+    };
+
+    let save = run_br(
+        &workspace,
+        ["query", "save", "free-only", "--unassigned"],
+        "override_assignee_save",
+    );
+    assert!(save.status.success(), "save failed: {}", save.stderr);
+
+    let run_default = run_br(
+        &workspace,
+        ["query", "run", "free-only", "--json"],
+        "override_assignee_run_default",
+    );
+    assert!(
+        run_default.status.success(),
+        "default run failed: {}",
+        run_default.stderr
+    );
+    let payload = extract_json_payload(&run_default.stdout);
+    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    assert_eq!(
+        issues.len(),
+        1,
+        "saved query should return only unassigned work"
+    );
+    assert_eq!(issues[0]["id"], unassigned_id);
+
+    let run_override = run_br(
+        &workspace,
+        ["query", "run", "free-only", "--assignee", "alice", "--json"],
+        "override_assignee_run_override",
+    );
+    assert!(
+        run_override.status.success(),
+        "override run failed: {}",
+        run_override.stderr
+    );
+    let payload = extract_json_payload(&run_override.stdout);
+    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    assert_eq!(
+        issues.len(),
+        1,
+        "assignee override should narrow results cleanly"
+    );
+    assert_eq!(issues[0]["id"], assigned_id);
+}
