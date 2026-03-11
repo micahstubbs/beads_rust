@@ -570,6 +570,54 @@ impl Issue {
         crate::util::content_hash(self)
     }
 
+    /// Compare two issues using sync semantics instead of raw struct equality.
+    ///
+    /// This ignores derived or volatile audit fields that would otherwise make
+    /// semantically identical issues look different across import/export
+    /// boundaries, while still comparing the full synced payload including
+    /// labels, dependencies, comments, and user-visible timestamps like `due_at`.
+    #[must_use]
+    pub fn sync_equals(&self, other: &Self) -> bool {
+        self.sync_compare_value() == other.sync_compare_value()
+    }
+
+    fn sync_compare_value(&self) -> serde_json::Value {
+        let mut normalized = self.clone();
+        normalized.normalize_for_sync_compare();
+        serde_json::to_value(&normalized).expect("Issue serialization should be infallible")
+    }
+
+    fn normalize_for_sync_compare(&mut self) {
+        let epoch = DateTime::from_timestamp(0, 0).expect("unix epoch should be valid");
+
+        self.content_hash = None;
+        self.created_at = epoch;
+        self.updated_at = epoch;
+
+        self.labels.sort_unstable();
+        self.labels.dedup();
+
+        self.dependencies.sort_by(|left, right| {
+            left.issue_id
+                .cmp(&right.issue_id)
+                .then_with(|| left.depends_on_id.cmp(&right.depends_on_id))
+                .then_with(|| left.dep_type.as_str().cmp(right.dep_type.as_str()))
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.created_by.cmp(&right.created_by))
+                .then_with(|| left.metadata.cmp(&right.metadata))
+                .then_with(|| left.thread_id.cmp(&right.thread_id))
+        });
+
+        self.comments.sort_by(|left, right| {
+            left.issue_id
+                .cmp(&right.issue_id)
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.author.cmp(&right.author))
+                .then_with(|| left.body.cmp(&right.body))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+    }
+
     /// Check if this issue is a tombstone that has exceeded its TTL.
     #[must_use]
     pub fn is_expired_tombstone(&self, retention_days: Option<u64>) -> bool {
@@ -1293,6 +1341,68 @@ mod tests {
         let hash2 = issue2.compute_content_hash();
 
         assert_eq!(hash1, hash2, "Different ID should NOT change hash");
+    }
+
+    #[test]
+    fn test_issue_sync_equals_ignores_audit_timestamps_and_relation_order() {
+        let mut issue1 = create_test_issue();
+        issue1.labels = vec!["backend".to_string(), "bug".to_string()];
+        issue1.dependencies = vec![
+            Dependency {
+                issue_id: issue1.id.clone(),
+                depends_on_id: "bd-parent".to_string(),
+                dep_type: DependencyType::Blocks,
+                created_at: Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+                created_by: Some("alice".to_string()),
+                metadata: Some("{\"source\":\"cli\"}".to_string()),
+                thread_id: Some("br-1".to_string()),
+            },
+            Dependency {
+                issue_id: issue1.id.clone(),
+                depends_on_id: "bd-epic".to_string(),
+                dep_type: DependencyType::ParentChild,
+                created_at: Utc.timestamp_opt(1_700_000_200, 0).unwrap(),
+                created_by: Some("alice".to_string()),
+                metadata: None,
+                thread_id: None,
+            },
+        ];
+        issue1.comments = vec![
+            Comment {
+                id: 2,
+                issue_id: issue1.id.clone(),
+                author: "alice".to_string(),
+                body: "second".to_string(),
+                created_at: Utc.timestamp_opt(1_700_000_200, 0).unwrap(),
+            },
+            Comment {
+                id: 1,
+                issue_id: issue1.id.clone(),
+                author: "alice".to_string(),
+                body: "first".to_string(),
+                created_at: Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+            },
+        ];
+
+        let mut issue2 = issue1.clone();
+        issue2.created_at = Utc.timestamp_opt(1_800_000_000, 0).unwrap();
+        issue2.updated_at = Utc.timestamp_opt(1_800_000_500, 0).unwrap();
+        issue2.labels.reverse();
+        issue2.dependencies.reverse();
+        issue2.comments.reverse();
+        issue2.content_hash = Some("stale-hash".to_string());
+
+        assert!(issue1.sync_equals(&issue2));
+        assert!(issue2.sync_equals(&issue1));
+    }
+
+    #[test]
+    fn test_issue_sync_equals_detects_semantic_changes() {
+        let issue1 = create_test_issue();
+        let mut issue2 = create_test_issue();
+        issue2.due_at = Some(Utc.timestamp_opt(1_800_000_000, 0).unwrap());
+
+        assert!(!issue1.sync_equals(&issue2));
     }
 
     // ========================================================================

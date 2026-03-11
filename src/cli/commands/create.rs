@@ -254,7 +254,7 @@ pub fn create_issue_impl(
             resolved_parent.as_deref(),
             storage,
             &config.id_config.prefix,
-        );
+        )?;
 
         // 7. Dry Run check - return early
         if args.dry_run {
@@ -350,6 +350,18 @@ fn resolve_issue_id(resolver: &IdResolver, storage: &SqliteStorage, input: &str)
         .map(|resolved| resolved.id)
 }
 
+fn resolve_dependency_id(
+    resolver: &IdResolver,
+    storage: &SqliteStorage,
+    input: &str,
+) -> Result<String> {
+    if input.starts_with("external:") {
+        return Ok(input.to_string());
+    }
+
+    resolve_issue_id(resolver, storage, input)
+}
+
 fn validate_relations(args: &CreateArgs, issue_id: &str) -> Result<()> {
     // Validate Labels
     for label in &args.labels {
@@ -420,7 +432,7 @@ fn populate_relations(
     resolved_parent: Option<&str>,
     storage: &crate::storage::SqliteStorage,
     prefix: &str,
-) {
+) -> Result<()> {
     let resolver = IdResolver::new(ResolverConfig::with_prefix(prefix.to_string()));
 
     // Labels
@@ -461,11 +473,7 @@ fn populate_relations(
             type_str
         };
 
-        let resolved_dep_id = if dep_id.starts_with("external:") {
-            dep_id.to_string()
-        } else {
-            resolve_issue_id(&resolver, storage, dep_id).unwrap_or_else(|_| dep_id.to_string())
-        };
+        let resolved_dep_id = resolve_dependency_id(&resolver, storage, dep_id)?;
 
         // from_str is infallible - Custom types are rejected by validate_relations above
         let dep_type: DependencyType = normalized_type.parse().expect("validated above");
@@ -479,6 +487,8 @@ fn populate_relations(
             thread_id: None,
         });
     }
+
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -664,6 +674,7 @@ fn execute_import(
             let mut deps = parsed.dependencies.clone();
             deps.extend(args.deps.clone());
             let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix.clone()));
+            let mut dependency_error = None;
             for dep_str in deps {
                 let (mut type_str, dep_id, valid) = parse_dependency(&dep_str);
                 if !valid {
@@ -676,10 +687,14 @@ fn execute_import(
                     type_str = "blocks".to_string();
                 }
 
-                let resolved_dep_id = if dep_id.starts_with("external:") {
-                    dep_id.clone()
-                } else {
-                    resolve_issue_id(&resolver, storage, &dep_id).unwrap_or_else(|_| dep_id.clone())
+                let resolved_dep_id = match resolve_dependency_id(&resolver, storage, &dep_id) {
+                    Ok(resolved) => resolved,
+                    Err(err) => {
+                        dependency_error = Some(format!(
+                            "unresolved dependency '{dep_id}' for issue {id}: {err}"
+                        ));
+                        break;
+                    }
                 };
 
                 if resolved_dep_id == id {
@@ -704,6 +719,11 @@ fn execute_import(
                     metadata: None,
                     thread_id: None,
                 });
+            }
+
+            if let Some(message) = dependency_error {
+                eprintln!("✗ Failed to create {title}: {message}");
+                break;
             }
 
             match storage.create_issue(&issue, &actor) {
@@ -954,6 +974,21 @@ mod tests {
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0], target.id);
         info!("test_create_issue_with_labels_and_deps: assertions passed");
+    }
+
+    #[test]
+    fn test_create_issue_with_missing_dependency_fails() {
+        init_test_logging();
+        info!("test_create_issue_with_missing_dependency_fails: starting");
+        let mut storage = setup_memory_storage();
+        let config = default_config();
+        let mut args = default_args();
+        args.deps = vec!["bd-missing".to_string()];
+
+        let err = create_issue_impl(&mut storage, &args, &config).unwrap_err();
+
+        assert!(matches!(err, BeadsError::IssueNotFound { id } if id == "bd-missing"));
+        info!("test_create_issue_with_missing_dependency_fails: assertions passed");
     }
 
     #[test]

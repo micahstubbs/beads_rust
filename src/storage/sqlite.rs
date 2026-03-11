@@ -631,6 +631,7 @@ impl SqliteStorage {
                 if !seen_deps.insert(dep.depends_on_id.as_str()) {
                     continue;
                 }
+                Self::ensure_dependency_target_exists_in_tx(conn, &dep.depends_on_id)?;
                 // Check cycle if blocking
                 if dep.dep_type.is_blocking()
                     && Self::check_cycle(conn, &issue.id, &dep.depends_on_id, true)?
@@ -961,7 +962,7 @@ impl SqliteStorage {
             }
             if let Some(ref val) = updates.external_ref {
                 // Explicit uniqueness check for fsqlite
-                if let Some(ref ext_ref) = val {
+                if let Some(ext_ref) = val {
                     let existing_ext = conn.query_with_params(
                         "SELECT id FROM issues WHERE external_ref = ? AND id != ?",
                         &[SqliteValue::from(ext_ref.as_str()), SqliteValue::from(id)],
@@ -2312,22 +2313,36 @@ impl SqliteStorage {
         Ok(!rows.is_empty())
     }
 
+    fn issue_exists_in_tx(conn: &Connection, id: &str) -> Result<bool> {
+        let rows = conn.query_with_params(
+            "SELECT 1 FROM issues WHERE id = ? LIMIT 1",
+            &[SqliteValue::from(id)],
+        )?;
+        Ok(!rows.is_empty())
+    }
+
+    fn ensure_dependency_target_exists_in_tx(conn: &Connection, depends_on_id: &str) -> Result<()> {
+        if depends_on_id.starts_with("external:") {
+            return Ok(());
+        }
+
+        if Self::issue_exists_in_tx(conn, depends_on_id)? {
+            return Ok(());
+        }
+
+        Err(BeadsError::IssueNotFound {
+            id: depends_on_id.to_string(),
+        })
+    }
+
     /// Find issue IDs that end with the given hash substring.
     ///
     /// # Errors
     ///
     /// Returns an error if the database query fails.
     pub fn find_ids_by_hash(&self, hash_suffix: &str) -> Result<Vec<String>> {
-        let escaped = escape_like_pattern(hash_suffix);
-        let pattern = format!("%-{escaped}%");
-        let rows = self.conn.query_with_params(
-            "SELECT id FROM issues WHERE id LIKE ? ESCAPE '\\'",
-            &[SqliteValue::from(pattern)],
-        )?;
-        Ok(rows
-            .iter()
-            .filter_map(|r| r.get(0).and_then(SqliteValue::as_text).map(String::from))
-            .collect())
+        let all_ids = self.get_all_ids()?;
+        Ok(crate::util::id::find_matching_ids(&all_ids, hash_suffix))
     }
 
     /// Count total issues in the database.
@@ -2404,6 +2419,13 @@ impl SqliteStorage {
         actor: &str,
     ) -> Result<bool> {
         self.mutate("add_dependency", actor, |conn, ctx| {
+            if !Self::issue_exists_in_tx(conn, issue_id)? {
+                return Err(BeadsError::IssueNotFound {
+                    id: issue_id.to_string(),
+                });
+            }
+            Self::ensure_dependency_target_exists_in_tx(conn, depends_on_id)?;
+
             // Cycle check runs INSIDE the transaction (BEGIN IMMEDIATE) to
             // prevent TOCTOU races where a concurrent writer could insert an
             // edge between our check and our INSERT.
@@ -5852,6 +5874,42 @@ mod tests {
         assert!(removed);
         let deps = storage.get_dependencies("bd-a1").unwrap();
         assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_add_dependency_rejects_missing_target() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let issue_a = make_issue("bd-a1", "A", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue_a, "tester").unwrap();
+
+        let err = storage
+            .add_dependency("bd-a1", "bd-missing", "blocks", "tester")
+            .unwrap_err();
+
+        assert!(matches!(err, BeadsError::IssueNotFound { id } if id == "bd-missing"));
+    }
+
+    #[test]
+    fn test_find_ids_by_hash_only_matches_hash_portion() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let issue_a = make_issue("my-proj-abc123", "Alpha", Status::Open, 2, None, t1, None);
+        let issue_b = make_issue("other-proj-xyz789", "Beta", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage.create_issue(&issue_b, "tester").unwrap();
+
+        let matches = storage.find_ids_by_hash("proj").unwrap();
+        assert!(
+            matches.is_empty(),
+            "prefix fragments must not match hash lookup"
+        );
+        assert_eq!(
+            storage.find_ids_by_hash("abc").unwrap(),
+            vec!["my-proj-abc123".to_string()]
+        );
     }
 
     #[test]
