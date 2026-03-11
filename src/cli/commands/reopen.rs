@@ -120,6 +120,10 @@ pub fn execute(
         skipped_issues = result.skipped;
     }
 
+    if let Some(last_reopened) = reopened_issues.last() {
+        crate::util::set_last_touched_id(&beads_dir, &last_reopened.id);
+    }
+
     if use_structured_output {
         let result = ReopenResult {
             reopened: reopened_issues,
@@ -173,8 +177,6 @@ fn execute_route(
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     let all_ids = storage_ctx.storage.get_all_ids()?;
-    let update_last_touched_inline = !storage_ctx.no_db;
-    let last_touched_dir = storage_ctx.paths.beads_dir.clone();
     let storage = &mut storage_ctx.storage;
 
     let resolved_ids = resolver.resolve_all(
@@ -244,9 +246,6 @@ fn execute_route(
         let update_result = storage.update_issue(id, &update, &actor);
         preserve_blocked_cache_on_error(storage, cache_dirty, "reopen", update_result)?;
         cache_dirty = true;
-        if update_last_touched_inline {
-            crate::util::set_last_touched_id(&last_touched_dir, id);
-        }
         tracing::info!(id = %id, reason = ?args.reason, "Issue reopened");
 
         if let Some(ref reason) = args.reason {
@@ -274,14 +273,7 @@ fn execute_route(
         storage.rebuild_blocked_cache(true)?;
     }
 
-    storage_ctx.flush_no_db_then(|ctx| {
-        if ctx.no_db
-            && let Some(reopened) = reopened_issues.last()
-        {
-            crate::util::set_last_touched_id(&ctx.paths.beads_dir, &reopened.id);
-        }
-        Ok(())
-    })?;
+    storage_ctx.flush_no_db_if_dirty()?;
 
     Ok(ReopenResult {
         reopened: reopened_issues,

@@ -14,7 +14,6 @@ use rich_rust::prelude::*;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
-use std::process::Command;
 
 /// Execute the comments command.
 ///
@@ -64,10 +63,8 @@ fn execute_add(
         &all_ids,
         actor.as_deref(),
     )?;
-    storage_ctx.flush_no_db_then(|ctx| {
-        crate::util::set_last_touched_id(&ctx.paths.beads_dir, &issue_id);
-        Ok(())
-    })?;
+    storage_ctx.flush_no_db_if_dirty()?;
+    crate::util::set_last_touched_id(beads_dir, &issue_id);
 
     if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
@@ -314,6 +311,16 @@ fn read_comment_text(args: &CommentAddArgs) -> Result<String> {
             let mut stdin = std::io::stdin();
             return read_limited_string(&mut stdin, MAX_STDIN_COMMENT_BYTES, "text");
         }
+        let metadata = fs::metadata(path)?;
+        if metadata.len() > MAX_STDIN_COMMENT_BYTES as u64 {
+            return Err(BeadsError::validation(
+                "file",
+                format!(
+                    "file exceeds maximum comment size of {} bytes",
+                    MAX_STDIN_COMMENT_BYTES
+                ),
+            ));
+        }
         return Ok(fs::read_to_string(path)?);
     }
     if let Some(message) = &args.message {
@@ -336,40 +343,23 @@ fn resolve_author(author_override: Option<&str>, actor: Option<&str>) -> String 
     {
         return actor.to_string();
     }
-    if let Ok(value) = std::env::var("BD_ACTOR")
-        && !value.trim().is_empty()
-    {
-        return value;
-    }
-    if let Ok(value) = std::env::var("BEADS_ACTOR")
-        && !value.trim().is_empty()
-    {
-        return value;
-    }
-    if let Some(name) = git_user_name() {
-        return name;
-    }
-    if let Ok(value) = std::env::var("USER")
-        && !value.trim().is_empty()
-    {
+    if let Some(value) = resolve_author_from_env(|name| std::env::var(name).ok()) {
         return value;
     }
 
     "unknown".to_string()
 }
 
-fn git_user_name() -> Option<String> {
-    let output = Command::new("git")
-        .args(["config", "--get", "user.name"])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
+fn resolve_author_from_env(mut lookup: impl FnMut(&str) -> Option<String>) -> Option<String> {
+    for key in ["BD_ACTOR", "BEADS_ACTOR", "USER", "LOGNAME", "USERNAME"] {
+        if let Some(value) = lookup(key)
+            && !value.trim().is_empty()
+        {
+            return Some(value);
+        }
     }
 
-    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if name.is_empty() { None } else { Some(name) }
+    None
 }
 
 #[cfg(test)]
@@ -424,12 +414,24 @@ mod tests {
     fn test_resolve_author_empty_actor_falls_through() {
         init_test_logging();
         info!("test_resolve_author_empty_actor_falls_through: starting");
-        // Empty actor should fall through to env/git/USER/unknown
+        // Empty actor should fall through to env/USER/LOGNAME/USERNAME/unknown
         // Since we can't easily control env, just test that it doesn't panic
         // and returns something non-empty
         let result = resolve_author(None, Some(""));
         assert!(!result.is_empty());
         info!("test_resolve_author_empty_actor_falls_through: assertions passed");
+    }
+
+    #[test]
+    fn test_resolve_author_env_helper_checks_windows_username() {
+        init_test_logging();
+        info!("test_resolve_author_env_helper_checks_windows_username: starting");
+        let result = resolve_author_from_env(|name| match name {
+            "USERNAME" => Some("windows-user".to_string()),
+            _ => None,
+        });
+        assert_eq!(result.as_deref(), Some("windows-user"));
+        info!("test_resolve_author_env_helper_checks_windows_username: assertions passed");
     }
 
     #[test]

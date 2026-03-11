@@ -198,11 +198,6 @@ fn dep_add(
         args.metadata.as_deref(),
     )?;
 
-    // Refresh blocked-issues cache so `br ready` reflects the new dependency
-    if added {
-        storage.rebuild_blocked_cache(true)?;
-    }
-
     storage_ctx.flush_no_db_then(|ctx| {
         crate::util::set_last_touched_id(&ctx.paths.beads_dir, &issue_id);
         Ok(())
@@ -280,11 +275,6 @@ fn dep_remove(
     let dep_type = dependency_type_for_pair(storage, &issue_id, &depends_on_id)?
         .unwrap_or_else(|| "unknown".to_string());
     let removed = storage.remove_dependency(&issue_id, &depends_on_id, actor)?;
-
-    // Refresh blocked-issues cache so `br ready` reflects the removed dependency
-    if removed {
-        storage.rebuild_blocked_cache(true)?;
-    }
 
     storage_ctx.flush_no_db_then(|ctx| {
         crate::util::set_last_touched_id(&ctx.paths.beads_dir, &issue_id);

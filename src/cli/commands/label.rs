@@ -152,6 +152,9 @@ fn execute_routed_label_add(
         routed_results,
         "label add routing",
     )?;
+    if let Some(last_result) = results.last() {
+        crate::util::set_last_touched_id(beads_dir, &last_result.issue_id);
+    }
     render_label_action_results(&results, "add", ctx);
     Ok(())
 }
@@ -181,12 +184,7 @@ fn label_add(
         });
     }
 
-    prepared_route.storage_ctx.flush_no_db_then(|ctx| {
-        if let Some(issue_id) = prepared_route.resolved_ids.last() {
-            crate::util::set_last_touched_id(&ctx.paths.beads_dir, issue_id);
-        }
-        Ok(())
-    })?;
+    prepared_route.storage_ctx.flush_no_db_if_dirty()?;
 
     Ok(results)
 }
@@ -212,6 +210,9 @@ fn execute_routed_label_remove(
         routed_results,
         "label remove routing",
     )?;
+    if let Some(last_result) = results.last() {
+        crate::util::set_last_touched_id(beads_dir, &last_result.issue_id);
+    }
     render_label_action_results(&results, "remove", ctx);
     Ok(())
 }
@@ -235,12 +236,7 @@ fn label_remove(
         });
     }
 
-    prepared_route.storage_ctx.flush_no_db_then(|ctx| {
-        if let Some(issue_id) = prepared_route.resolved_ids.last() {
-            crate::util::set_last_touched_id(&ctx.paths.beads_dir, issue_id);
-        }
-        Ok(())
-    })?;
+    prepared_route.storage_ctx.flush_no_db_if_dirty()?;
 
     Ok(results)
 }

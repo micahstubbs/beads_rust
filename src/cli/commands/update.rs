@@ -52,6 +52,7 @@ enum UpdateRenderItem {
 struct UpdateRouteOutput {
     updated_issues: Vec<UpdatedIssueOutput>,
     render_items: Vec<UpdateRenderItem>,
+    resolved_ids: Vec<String>,
 }
 
 enum ParentUpdatePlan {
@@ -93,67 +94,88 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
     }
 
     let routed_batches = config::routing::group_issue_inputs_by_route(&target_inputs, &beads_dir)?;
-    let mut updated_issues = Vec::new();
-    let mut render_items = Vec::new();
 
-    if routed_batches.iter().any(|batch| batch.is_external) {
-        let normalized_local_beads_dir =
-            dunce::canonicalize(&beads_dir).unwrap_or_else(|_| beads_dir.clone());
-        let mut prepared_routes = Vec::new();
-        let mut routed_updated_issues = Vec::new();
-        let mut routed_render_items = Vec::new();
-        for batch in routed_batches {
-            let mut batch_args = args.clone();
-            batch_args.ids.clone_from(&batch.issue_inputs);
+    let (updated_issues, render_items, ordered_resolved_ids) =
+        if routed_batches.iter().any(|batch| batch.is_external) {
+            let normalized_local_beads_dir =
+                dunce::canonicalize(&beads_dir).unwrap_or_else(|_| beads_dir.clone());
+            let mut prepared_routes = Vec::new();
+            let mut routed_updated_issues = Vec::new();
+            let mut routed_render_items = Vec::new();
+            let mut routed_resolved_ids = Vec::new();
+            for batch in routed_batches {
+                let mut batch_args = args.clone();
+                batch_args.ids.clone_from(&batch.issue_inputs);
 
-            let normalized_batch_beads_dir =
-                dunce::canonicalize(&batch.beads_dir).unwrap_or_else(|_| batch.beads_dir.clone());
-            let mut batch_cli = cli.clone();
-            // Routed projects must resolve their own metadata-defined DB path
-            // instead of being forced back to the local override. Preserve the
-            // caller's explicit DB only for the local batch.
-            batch_cli.db = if normalized_batch_beads_dir == normalized_local_beads_dir {
-                cli.db.clone()
-            } else {
-                None
-            };
-            prepared_routes.push((
-                batch.issue_inputs.clone(),
-                prepare_single_route(&batch_args, &batch_cli, &batch.beads_dir)?,
-            ));
-        }
-
-        for (issue_inputs, prepared_route) in prepared_routes {
-            let route_output = execute_prepared_route(prepared_route, ctx)?;
-
-            if ctx.is_json() {
-                routed_updated_issues.push((issue_inputs.clone(), route_output.updated_issues));
-            } else if !ctx.is_quiet() {
-                routed_render_items.push((issue_inputs.clone(), route_output.render_items));
+                let normalized_batch_beads_dir = dunce::canonicalize(&batch.beads_dir)
+                    .unwrap_or_else(|_| batch.beads_dir.clone());
+                let mut batch_cli = cli.clone();
+                // Routed projects must resolve their own metadata-defined DB path
+                // instead of being forced back to the local override. Preserve the
+                // caller's explicit DB only for the local batch.
+                batch_cli.db = if normalized_batch_beads_dir == normalized_local_beads_dir {
+                    cli.db.clone()
+                } else {
+                    None
+                };
+                prepared_routes.push((
+                    batch.issue_inputs.clone(),
+                    prepare_single_route(&batch_args, &batch_cli, &batch.beads_dir)?,
+                ));
             }
-        }
 
-        if ctx.is_json() {
-            updated_issues = reorder_routed_items_by_requested_inputs(
+            for (issue_inputs, prepared_route) in prepared_routes {
+                let route_output = execute_prepared_route(prepared_route, ctx)?;
+
+                if ctx.is_json() || ctx.is_toon() {
+                    routed_updated_issues.push((issue_inputs.clone(), route_output.updated_issues));
+                } else if !ctx.is_quiet() {
+                    routed_render_items.push((issue_inputs.clone(), route_output.render_items));
+                }
+                routed_resolved_ids.push((issue_inputs, route_output.resolved_ids));
+            }
+
+            let updated_issues = if ctx.is_json() || ctx.is_toon() {
+                reorder_routed_items_by_requested_inputs(
+                    &target_inputs,
+                    routed_updated_issues,
+                    "update routing",
+                )?
+            } else {
+                Vec::new()
+            };
+            let render_items = if !ctx.is_quiet() && !ctx.is_json() && !ctx.is_toon() {
+                reorder_routed_items_by_requested_inputs(
+                    &target_inputs,
+                    routed_render_items,
+                    "update routing",
+                )?
+            } else {
+                Vec::new()
+            };
+            let ordered_resolved_ids = reorder_routed_items_by_requested_inputs(
                 &target_inputs,
-                routed_updated_issues,
+                routed_resolved_ids,
                 "update routing",
             )?;
-        } else if !ctx.is_quiet() {
-            render_items = reorder_routed_items_by_requested_inputs(
-                &target_inputs,
-                routed_render_items,
-                "update routing",
-            )?;
-        }
-    } else {
-        let route_output =
-            execute_prepared_route(prepare_single_route(args, cli, &beads_dir)?, ctx)?;
-        updated_issues = route_output.updated_issues;
-        render_items = route_output.render_items;
+            (updated_issues, render_items, ordered_resolved_ids)
+        } else {
+            let route_output =
+                execute_prepared_route(prepare_single_route(args, cli, &beads_dir)?, ctx)?;
+            (
+                route_output.updated_issues,
+                route_output.render_items,
+                route_output.resolved_ids,
+            )
+        };
+
+    if let Some(last_id) = ordered_resolved_ids.last() {
+        crate::util::set_last_touched_id(&beads_dir, last_id);
     }
 
-    if ctx.is_json() {
+    if ctx.is_toon() {
+        ctx.toon(&updated_issues);
+    } else if ctx.is_json() {
         ctx.json_pretty(&updated_issues);
     } else if !ctx.is_quiet() {
         print_render_items(&render_items);
@@ -173,7 +195,9 @@ fn prepare_single_route(
     let config_layer = storage_ctx.load_config(cli)?;
     let actor = config::resolve_actor(&config_layer);
     let resolver = build_resolver(&config_layer, &storage_ctx.storage);
-    let resolved_ids = resolve_target_ids(args, beads_dir, &resolver, &storage_ctx.storage)?;
+    let all_ids = storage_ctx.storage.get_all_ids()?;
+    let resolved_ids =
+        resolve_target_ids(args, beads_dir, &resolver, &storage_ctx.storage, &all_ids)?;
 
     let claim_exclusive = config::claim_exclusive_from_layer(&config_layer);
     let update = build_update(args, &actor, claim_exclusive)?;
@@ -203,8 +227,12 @@ fn prepare_single_route(
         }
     }
 
-    let resolved_parent =
-        resolve_parent_update(args.parent.as_deref(), &resolver, &storage_ctx.storage)?;
+    let resolved_parent = resolve_parent_update(
+        args.parent.as_deref(),
+        &resolver,
+        &storage_ctx.storage,
+        &all_ids,
+    )?;
     validate_parent_updates(&storage_ctx.storage, &resolved_ids, &resolved_parent)?;
 
     validate_transition_to_in_progress(&storage_ctx.storage, &resolved_ids, args)?;
@@ -230,7 +258,7 @@ fn execute_prepared_route(
 ) -> Result<UpdateRouteOutput> {
     let mut updated_issues: Vec<UpdatedIssueOutput> = Vec::new();
     let mut render_items = Vec::new();
-    let last_updated_id = prepared.resolved_ids.last().cloned();
+    let resolved_ids = prepared.resolved_ids.clone();
     let storage = &mut prepared.storage_ctx.storage;
 
     for id in &prepared.resolved_ids {
@@ -260,7 +288,7 @@ fn execute_prepared_route(
         let issue_after = storage.get_issue(id)?;
 
         if let Some(issue) = issue_after {
-            if ctx.is_json() {
+            if ctx.is_json() || ctx.is_toon() {
                 updated_issues.push(UpdatedIssueOutput::from(&issue));
             } else if ctx.is_quiet() {
             } else if prepared.has_updates {
@@ -276,16 +304,12 @@ fn execute_prepared_route(
         }
     }
 
-    prepared.storage_ctx.flush_no_db_then(|ctx| {
-        if let Some(id) = last_updated_id.as_deref() {
-            crate::util::set_last_touched_id(&ctx.paths.beads_dir, id);
-        }
-        Ok(())
-    })?;
+    prepared.storage_ctx.flush_no_db_if_dirty()?;
 
     Ok(UpdateRouteOutput {
         updated_issues,
         render_items,
+        resolved_ids,
     })
 }
 
@@ -434,6 +458,7 @@ fn resolve_target_ids(
     beads_dir: &std::path::Path,
     resolver: &IdResolver,
     storage: &SqliteStorage,
+    all_ids: &[String],
 ) -> Result<Vec<String>> {
     let mut ids = args.ids.clone();
     if ids.is_empty() {
@@ -447,11 +472,10 @@ fn resolve_target_ids(
         ids.push(last_touched);
     }
 
-    let all_ids = storage.get_all_ids()?;
     let resolved_ids = resolver.resolve_all_fallible(
         &ids,
         |id| storage.id_exists(id),
-        |hash| Ok(crate::util::id::find_matching_ids(&all_ids, hash)),
+        |hash| Ok(crate::util::id::find_matching_ids(all_ids, hash)),
     )?;
 
     Ok(resolved_ids.into_iter().map(|r| r.id).collect())
@@ -570,13 +594,13 @@ fn resolve_parent_update(
     parent: Option<&str>,
     resolver: &IdResolver,
     storage: &SqliteStorage,
+    all_ids: &[String],
 ) -> Result<ParentUpdatePlan> {
     match parent {
         None => Ok(ParentUpdatePlan::Unchanged),
         Some("") => Ok(ParentUpdatePlan::Clear),
         Some(parent_value) => {
-            let all_ids = storage.get_all_ids()?;
-            resolve_issue_id(storage, resolver, &all_ids, parent_value).map(ParentUpdatePlan::Set)
+            resolve_issue_id(storage, resolver, all_ids, parent_value).map(ParentUpdatePlan::Set)
         }
     }
 }
