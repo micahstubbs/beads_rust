@@ -895,13 +895,15 @@ fn e2e_list_long_format() {
     let list = run_br(&workspace, ["list", "--long"], "list_long");
     assert!(list.status.success());
 
-    // Long format should have more detail
-    // Check for common fields that appear in long output
     assert!(
-        list.stdout.contains("Priority")
-            || list.stdout.contains("P0")
-            || list.stdout.contains("P1"),
-        "long format should show priority information"
+        list.stdout.contains("Status: "),
+        "long format should emit explicit status lines: {}",
+        list.stdout
+    );
+    assert!(
+        list.stdout.contains("Created: "),
+        "long format should emit created timestamps: {}",
+        list.stdout
     );
 }
 
@@ -913,11 +915,26 @@ fn e2e_list_pretty_format() {
     let list = run_br(&workspace, ["list", "--pretty"], "list_pretty");
     assert!(list.status.success());
 
-    // Pretty format uses tree/indentation
-    // Just verify it runs without error
     assert!(
-        !list.stdout.is_empty(),
-        "pretty format should produce output"
+        list.stdout.contains("├── ") || list.stdout.contains("└── "),
+        "pretty format should emit tree connectors: {}",
+        list.stdout
+    );
+}
+
+#[test]
+fn e2e_list_default_and_pretty_outputs_differ() {
+    let _log = common::test_log("e2e_list_default_and_pretty_outputs_differ");
+    let (workspace, _ids) = setup_diverse_workspace();
+
+    let normal = run_br(&workspace, ["list"], "list_default_plain");
+    let pretty = run_br(&workspace, ["list", "--pretty"], "list_pretty_plain");
+
+    assert!(normal.status.success());
+    assert!(pretty.status.success());
+    assert_ne!(
+        normal.stdout, pretty.stdout,
+        "pretty flag should change plain-text output"
     );
 }
 

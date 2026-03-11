@@ -7,7 +7,10 @@ use crate::cli::{ListArgs, OutputFormat, resolve_output_format_with_outer_mode};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::csv;
-use crate::format::{IssueWithCounts, TextFormatOptions, format_issue_line_with, terminal_width};
+use crate::format::{
+    IssueWithCounts, TextFormatOptions, format_issue_line_with, format_issue_long_with,
+    format_issue_pretty_with, terminal_width,
+};
 use crate::model::{IssueType, Priority, Status};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
 use crate::storage::ListFilters;
@@ -159,7 +162,9 @@ pub fn execute(
             print!("{csv_output}");
         }
         OutputFormat::Text => {
-            if matches!(ctx.mode(), OutputMode::Rich) {
+            if args.pretty {
+                render_pretty_text_issues(&ctx, &issues, format_options, args.long);
+            } else if matches!(ctx.mode(), OutputMode::Rich) {
                 let columns = if args.long {
                     IssueTableColumns {
                         id: true,
@@ -191,6 +196,8 @@ pub fn execute(
                 }
                 let table = table.build();
                 ctx.render(&table);
+            } else if args.long {
+                render_long_text_issues(&ctx, &issues, format_options);
             } else {
                 // Note: bd outputs nothing when no issues found, matching that for conformance
                 for issue in &issues {
@@ -376,6 +383,37 @@ fn apply_client_filters(
     }
 
     Ok(filtered)
+}
+
+fn render_long_text_issues(
+    ctx: &OutputContext,
+    issues: &[crate::model::Issue],
+    format_options: TextFormatOptions,
+) {
+    for (index, issue) in issues.iter().enumerate() {
+        ctx.print_line(&format_issue_long_with(issue, format_options));
+        if index + 1 != issues.len() {
+            ctx.print_line("");
+        }
+    }
+}
+
+fn render_pretty_text_issues(
+    ctx: &OutputContext,
+    issues: &[crate::model::Issue],
+    format_options: TextFormatOptions,
+    include_extended: bool,
+) {
+    for (index, issue) in issues.iter().enumerate() {
+        ctx.print_line(&format_issue_pretty_with(
+            issue,
+            format_options,
+            include_extended,
+        ));
+        if index + 1 != issues.len() {
+            ctx.print_line("");
+        }
+    }
 }
 
 fn validate_sort_key(sort: Option<&str>) -> Result<()> {

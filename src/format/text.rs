@@ -280,6 +280,79 @@ pub fn format_issue_line(issue: &Issue) -> String {
     format_issue_line_with(issue, TextFormatOptions::plain())
 }
 
+fn issue_detail_lines(issue: &Issue, include_extended: bool) -> Vec<String> {
+    let mut details = vec![
+        format!("Status: {}", issue.status),
+        format!("Priority: {}", format_priority(&issue.priority)),
+        format!("Type: {}", issue.issue_type),
+    ];
+
+    if let Some(assignee) = issue.assignee.as_deref()
+        && !assignee.is_empty()
+    {
+        details.push(format!("Assignee: {assignee}"));
+    }
+    if let Some(owner) = issue.owner.as_deref()
+        && !owner.is_empty()
+    {
+        details.push(format!("Owner: {owner}"));
+    }
+    if !issue.labels.is_empty() {
+        details.push(format!("Labels: {}", issue.labels.join(", ")));
+    }
+    if let Some(due_at) = issue.due_at {
+        details.push(format!("Due: {}", due_at.format("%Y-%m-%d")));
+    }
+    if let Some(defer_until) = issue.defer_until {
+        details.push(format!(
+            "Deferred Until: {}",
+            defer_until.format("%Y-%m-%d")
+        ));
+    }
+
+    if include_extended {
+        details.push(format!("Created: {}", issue.created_at.format("%Y-%m-%d")));
+        details.push(format!("Updated: {}", issue.updated_at.format("%Y-%m-%d")));
+    }
+
+    details
+}
+
+/// Format an issue as a multi-line long text block.
+#[must_use]
+pub fn format_issue_long_with(issue: &Issue, options: TextFormatOptions) -> String {
+    let mut lines = vec![format_issue_line_with(issue, options)];
+    lines.extend(
+        issue_detail_lines(issue, true)
+            .into_iter()
+            .map(|detail| format!("  {detail}")),
+    );
+    lines.join("\n")
+}
+
+/// Format an issue as a tree-style pretty text block.
+#[must_use]
+pub fn format_issue_pretty_with(
+    issue: &Issue,
+    options: TextFormatOptions,
+    include_extended: bool,
+) -> String {
+    let mut lines = vec![format_issue_line_with(issue, options)];
+    let details = issue_detail_lines(issue, include_extended);
+    let detail_count = details.len();
+
+    for (index, detail) in details.into_iter().enumerate() {
+        let branch = if index + 1 == detail_count {
+            "└──"
+        } else {
+            "├──"
+        };
+        lines.push(format!("{branch} {detail}"));
+    }
+
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,5 +535,34 @@ mod tests {
         let line = format_issue_line_with(&issue, options);
         assert!(!line.contains("..."));
         assert!(line.contains("A very long issue title"));
+    }
+
+    #[test]
+    fn test_format_issue_long_with_includes_extended_fields() {
+        let mut issue = make_test_issue();
+        issue.assignee = Some("alice".to_string());
+        issue.labels = vec!["core".to_string(), "frontend".to_string()];
+
+        let output = format_issue_long_with(&issue, TextFormatOptions::plain());
+
+        assert!(output.contains("Status: open"));
+        assert!(output.contains("Priority: P2"));
+        assert!(output.contains("Assignee: alice"));
+        assert!(output.contains("Labels: core, frontend"));
+        assert!(output.contains("Created: "));
+        assert!(output.contains("Updated: "));
+    }
+
+    #[test]
+    fn test_format_issue_pretty_with_uses_tree_connectors() {
+        let mut issue = make_test_issue();
+        issue.assignee = Some("alice".to_string());
+
+        let output = format_issue_pretty_with(&issue, TextFormatOptions::plain(), false);
+
+        assert!(output.contains("├── Status: open"));
+        assert!(output.contains("├── Priority: P2"));
+        assert!(output.contains("└── Assignee: alice"));
+        assert!(!output.contains("Created: "));
     }
 }
