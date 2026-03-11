@@ -403,7 +403,11 @@ fn e2e_no_db_show_bypasses_corrupt_db_and_preserves_relations() {
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
     let parent = run_br(&workspace, ["create", "Parent issue"], "create_parent");
-    assert!(parent.status.success(), "create parent failed: {}", parent.stderr);
+    assert!(
+        parent.status.success(),
+        "create parent failed: {}",
+        parent.stderr
+    );
     let parent_id = parent
         .stdout
         .lines()
@@ -416,7 +420,11 @@ fn e2e_no_db_show_bypasses_corrupt_db_and_preserves_relations() {
         .to_string();
 
     let child = run_br(&workspace, ["create", "Child issue"], "create_child");
-    assert!(child.status.success(), "create child failed: {}", child.stderr);
+    assert!(
+        child.status.success(),
+        "create child failed: {}",
+        child.stderr
+    );
     let child_id = child
         .stdout
         .lines()
@@ -430,7 +438,14 @@ fn e2e_no_db_show_bypasses_corrupt_db_and_preserves_relations() {
 
     let dep = run_br(
         &workspace,
-        ["dep", "add", &child_id, &parent_id, "--type", "parent-child"],
+        [
+            "dep",
+            "add",
+            &child_id,
+            &parent_id,
+            "--type",
+            "parent-child",
+        ],
         "dep_add_parent_child",
     );
     assert!(dep.status.success(), "dep add failed: {}", dep.stderr);
@@ -438,8 +453,11 @@ fn e2e_no_db_show_bypasses_corrupt_db_and_preserves_relations() {
     let sync = run_br(&workspace, ["sync", "--flush-only"], "sync_flush");
     assert!(sync.status.success(), "sync flush failed: {}", sync.stderr);
 
-    fs::write(workspace.root.join(".beads").join("beads.db"), b"not a sqlite db")
-        .expect("corrupt db for no-db regression");
+    fs::write(
+        workspace.root.join(".beads").join("beads.db"),
+        b"not a sqlite db",
+    )
+    .expect("corrupt db for no-db regression");
 
     let show_child = run_br(
         &workspace,
@@ -468,7 +486,10 @@ fn e2e_no_db_show_bypasses_corrupt_db_and_preserves_relations() {
     let parent_payload = extract_json_payload(&show_parent.stdout);
     let parent_json: Vec<Value> = serde_json::from_str(&parent_payload).expect("valid parent JSON");
     assert_eq!(parent_json[0]["dependents"][0]["id"], child_id);
-    assert_eq!(parent_json[0]["dependents"][0]["dependency_type"], "parent-child");
+    assert_eq!(
+        parent_json[0]["dependents"][0]["dependency_type"],
+        "parent-child"
+    );
 }
 
 #[test]

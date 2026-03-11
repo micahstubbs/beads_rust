@@ -403,13 +403,19 @@ fn search_include_closed() {
 fn search_text_output() {
     let (workspace, _ids) = setup_search_workspace();
 
-    let search = run_br(&workspace, ["search", "bug"], "search_text");
+    let search = run_br(&workspace, ["search", "authentication"], "search_text");
     assert!(search.status.success(), "search failed: {}", search.stderr);
 
     // Text output should contain issue information
     assert!(
-        search.stdout.contains("bug") || search.stdout.contains("Bug"),
+        search.stdout.contains("Authentication bug in login flow")
+            && search.stdout.contains("Add two-factor authentication"),
         "Text output should contain search results"
+    );
+    assert!(
+        search.stdout.lines().count() >= 3,
+        "expected header plus one line per result, got: {}",
+        search.stdout
     );
 }
 

@@ -326,7 +326,12 @@ fn e2e_parallel_read_only_commands_do_not_busy_on_drop() {
 
     let create = run_br_in_dir(
         &root,
-        ["--no-auto-import", "--no-auto-flush", "create", "Concurrency seed issue"],
+        [
+            "--no-auto-import",
+            "--no-auto-flush",
+            "create",
+            "Concurrency seed issue",
+        ],
     );
     assert!(create.success, "seed create failed: {}", create.stderr);
     let issue_id = parse_created_id(&create.stdout);
@@ -348,7 +353,14 @@ fn e2e_parallel_read_only_commands_do_not_busy_on_drop() {
                 let result = if worker % 2 == 0 {
                     run_br_in_dir(
                         &root_clone,
-                        ["--lock-timeout", "1", "--no-auto-import", "--no-auto-flush", "ready", "--json"],
+                        [
+                            "--lock-timeout",
+                            "1",
+                            "--no-auto-import",
+                            "--no-auto-flush",
+                            "ready",
+                            "--json",
+                        ],
                     )
                 } else {
                     run_br_in_dir(

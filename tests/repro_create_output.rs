@@ -40,3 +40,56 @@ fn test_create_json_output_is_single_object() {
     assert!(json.get("id").is_some());
     assert!(json.get("title").is_some());
 }
+
+#[test]
+fn test_create_dry_run_plain_output_is_line_oriented() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path();
+
+    let bin = assert_cmd::cargo::cargo_bin!("br");
+
+    Command::new(bin)
+        .current_dir(path)
+        .arg("init")
+        .assert()
+        .success();
+
+    let output = Command::new(bin)
+        .current_dir(path)
+        .env("NO_COLOR", "1")
+        .arg("create")
+        .arg("Dry run output check")
+        .arg("--dry-run")
+        .arg("--type")
+        .arg("task")
+        .arg("--priority")
+        .arg("2")
+        .output()
+        .expect("create dry run");
+
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("Dry run: would create issue ")),
+        "missing dry-run header: {stdout}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == &"Title: Dry run output check"),
+        "missing standalone title line: {stdout}"
+    );
+    assert!(
+        lines.iter().any(|line| line == &"Type: task"),
+        "missing standalone type line: {stdout}"
+    );
+    assert!(
+        lines.iter().any(|line| line == &"Priority: P2"),
+        "missing standalone priority line: {stdout}"
+    );
+}
