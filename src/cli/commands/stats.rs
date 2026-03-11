@@ -163,7 +163,7 @@ impl ActivityCounts {
                     self.issues_updated += 1;
                 }
             }
-            (Some(_), None) | (None, None) => {}
+            (Some(_) | None, None) => {}
         }
     }
 }
@@ -874,7 +874,7 @@ mod tests {
     use super::*;
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
-    use chrono::Utc;
+    use chrono::{TimeZone, Utc};
     use std::fs;
     use tempfile::TempDir;
 

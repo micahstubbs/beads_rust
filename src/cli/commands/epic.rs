@@ -427,7 +427,7 @@ fn render_close_result_rich(closed_ids: &[String], ctx: &OutputContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Issue, Priority};
+    use crate::model::{Issue, Priority, Status};
     use crate::storage::IssueUpdate;
     use chrono::TimeZone;
 
