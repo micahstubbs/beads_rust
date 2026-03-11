@@ -77,6 +77,18 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContex
     // Output
     if args.silent {
         println!("{}", issue.id);
+    } else if ctx.is_toon() {
+        if args.dry_run {
+            ctx.toon(&issue);
+        } else {
+            let full_issue = storage_ctx
+                .storage
+                .get_issue_for_export(&issue.id)?
+                .ok_or_else(|| BeadsError::IssueNotFound {
+                    id: issue.id.clone(),
+                })?;
+            ctx.toon(&full_issue);
+        }
     } else if ctx.is_json() {
         if args.dry_run {
             ctx.json_pretty(&issue);
@@ -755,7 +767,7 @@ fn execute_import(
         // Increment count for next ID generation in the loop
         count += 1;
 
-        if ctx.is_json() {
+        if ctx.is_json() || ctx.is_toon() {
             if let Some(full_issue) = storage.get_issue_for_export(&id)? {
                 created_issues.push(full_issue);
             } else {
@@ -766,7 +778,13 @@ fn execute_import(
         created_ids.push((id, title));
     }
 
-    if ctx.is_json() {
+    if args.silent {
+        for (id, _) in created_ids {
+            println!("{id}");
+        }
+    } else if ctx.is_toon() {
+        ctx.toon(&created_issues);
+    } else if ctx.is_json() {
         ctx.json_pretty(&created_issues);
     } else if !created_ids.is_empty() {
         ctx.success(&format!(
