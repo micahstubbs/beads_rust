@@ -34,10 +34,25 @@ pub fn parse_flexible_timestamp(s: &str, field_name: &str) -> Result<DateTime<Ut
     if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         let time = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
         let naive_dt = date.and_time(time);
-        let local_dt = Local
-            .from_local_datetime(&naive_dt)
-            .single()
-            .ok_or_else(|| BeadsError::validation(field_name, "ambiguous local time"))?;
+
+        // Handle DST transitions smoothly
+        use chrono::LocalResult;
+        let local_dt = match Local.from_local_datetime(&naive_dt) {
+            LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => dt,
+            LocalResult::None => {
+                // Time doesn't exist (DST gap), push forward by 1 hour
+                let shifted = naive_dt + Duration::hours(1);
+                match Local.from_local_datetime(&shifted) {
+                    LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => dt,
+                    LocalResult::None => {
+                        return Err(BeadsError::validation(
+                            field_name,
+                            "invalid local time around DST transition",
+                        ));
+                    }
+                }
+            }
+        };
         return Ok(local_dt.with_timezone(&Utc));
     }
 
@@ -72,20 +87,46 @@ pub fn parse_flexible_timestamp(s: &str, field_name: &str) -> Result<DateTime<Ut
             let tomorrow = now.date_naive() + Duration::days(1);
             let time = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
             let naive_dt = tomorrow.and_time(time);
-            let local_dt = Local
-                .from_local_datetime(&naive_dt)
-                .single()
-                .ok_or_else(|| BeadsError::validation(field_name, "ambiguous local time"))?;
+
+            use chrono::LocalResult;
+            let local_dt = match Local.from_local_datetime(&naive_dt) {
+                LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => dt,
+                LocalResult::None => {
+                    let shifted = naive_dt + Duration::hours(1);
+                    match Local.from_local_datetime(&shifted) {
+                        LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => dt,
+                        LocalResult::None => {
+                            return Err(BeadsError::validation(
+                                field_name,
+                                "invalid local time around DST transition",
+                            ));
+                        }
+                    }
+                }
+            };
             Ok(local_dt.with_timezone(&Utc))
         }
         "next-week" | "nextweek" => {
             let next_week = now.date_naive() + Duration::weeks(1);
             let time = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
             let naive_dt = next_week.and_time(time);
-            let local_dt = Local
-                .from_local_datetime(&naive_dt)
-                .single()
-                .ok_or_else(|| BeadsError::validation(field_name, "ambiguous local time"))?;
+
+            use chrono::LocalResult;
+            let local_dt = match Local.from_local_datetime(&naive_dt) {
+                LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => dt,
+                LocalResult::None => {
+                    let shifted = naive_dt + Duration::hours(1);
+                    match Local.from_local_datetime(&shifted) {
+                        LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => dt,
+                        LocalResult::None => {
+                            return Err(BeadsError::validation(
+                                field_name,
+                                "invalid local time around DST transition",
+                            ));
+                        }
+                    }
+                }
+            };
             Ok(local_dt.with_timezone(&Utc))
         }
         _ => Err(BeadsError::validation(
@@ -132,19 +173,43 @@ pub fn parse_relative_time(s: &str) -> Option<DateTime<Utc>> {
             let tomorrow = now.date_naive() + Duration::days(1);
             let time = NaiveTime::from_hms_opt(9, 0, 0)?;
             let naive_dt = tomorrow.and_time(time);
-            Local
-                .from_local_datetime(&naive_dt)
-                .single()
-                .map(|dt| dt.with_timezone(&Utc))
+
+            use chrono::LocalResult;
+            match Local.from_local_datetime(&naive_dt) {
+                LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => {
+                    Some(dt.with_timezone(&Utc))
+                }
+                LocalResult::None => {
+                    let shifted = naive_dt + Duration::hours(1);
+                    match Local.from_local_datetime(&shifted) {
+                        LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => {
+                            Some(dt.with_timezone(&Utc))
+                        }
+                        LocalResult::None => None,
+                    }
+                }
+            }
         }
         "next-week" | "nextweek" => {
             let next_week = now.date_naive() + Duration::weeks(1);
             let time = NaiveTime::from_hms_opt(9, 0, 0)?;
             let naive_dt = next_week.and_time(time);
-            Local
-                .from_local_datetime(&naive_dt)
-                .single()
-                .map(|dt| dt.with_timezone(&Utc))
+
+            use chrono::LocalResult;
+            match Local.from_local_datetime(&naive_dt) {
+                LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => {
+                    Some(dt.with_timezone(&Utc))
+                }
+                LocalResult::None => {
+                    let shifted = naive_dt + Duration::hours(1);
+                    match Local.from_local_datetime(&shifted) {
+                        LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => {
+                            Some(dt.with_timezone(&Utc))
+                        }
+                        LocalResult::None => None,
+                    }
+                }
+            }
         }
         _ => None,
     }

@@ -961,7 +961,10 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         .and_then(SqliteValue::as_integer)
         .unwrap_or(0);
 
-    if user_version < 3 && table_exists(conn, "issues") && issues_filter_columns_require_v3_rebuild(conn) {
+    if user_version < 3
+        && table_exists(conn, "issues")
+        && issues_filter_columns_require_v3_rebuild(conn)
+    {
         tracing::info!("Migrating database to schema version 3 (NOT NULL filter columns)");
         // 1. Backfill NULL values
         conn.execute("UPDATE issues SET ephemeral = 0 WHERE ephemeral IS NULL")?;

@@ -2544,10 +2544,8 @@ impl SqliteStorage {
     pub fn remove_all_dependencies(&mut self, issue_id: &str, actor: &str) -> Result<usize> {
         self.mutate("remove_all_dependencies", actor, |conn, ctx| {
             let affected_rows = conn.query_with_params(
-                "SELECT DISTINCT issue_id FROM dependencies WHERE depends_on_id = ?
-                 UNION
-                 SELECT DISTINCT depends_on_id FROM dependencies WHERE issue_id = ?",
-                &[SqliteValue::from(issue_id), SqliteValue::from(issue_id)],
+                "SELECT DISTINCT issue_id FROM dependencies WHERE depends_on_id = ?",
+                &[SqliteValue::from(issue_id)],
             )?;
             let affected: Vec<String> = affected_rows
                 .iter()

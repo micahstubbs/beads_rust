@@ -783,7 +783,7 @@ pub fn find_matching_ids(all_ids: &[String], hash_substring: &str) -> Vec<String
     all_ids
         .iter()
         .filter(|id| {
-            // Extract hash portion (after the first dash)
+            // Extract hash portion (after the last dash)
             split_prefix_remainder(id).is_some_and(|(_, remainder)| {
                 let base_hash = remainder.split('.').next().unwrap_or(remainder);
                 base_hash.contains(hash_substring)
