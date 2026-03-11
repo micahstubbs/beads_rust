@@ -17,6 +17,34 @@ use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// RAII guard to safely toggle `PRAGMA foreign_keys`.
+///
+/// Ensures that foreign keys are re-enabled even if an operation fails or panics.
+pub struct ForeignKeyGuard<'a> {
+    conn: &'a Connection,
+}
+
+impl<'a> ForeignKeyGuard<'a> {
+    /// Disables foreign keys on the given connection and returns a guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the PRAGMA execution fails.
+    pub fn disable(conn: &'a Connection) -> Result<Self> {
+        conn.execute("PRAGMA foreign_keys = OFF")?;
+        Ok(Self { conn })
+    }
+}
+
+impl Drop for ForeignKeyGuard<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = self.conn.execute("PRAGMA foreign_keys = ON") {
+            tracing::error!(error = %e, "Failed to re-enable foreign keys on guard drop");
+        }
+    }
+}
+
 /// Number of mutations between WAL checkpoint attempts.
 const WAL_CHECKPOINT_INTERVAL: u32 = 50;
 const DEFAULT_BUSY_TIMEOUT_MS: u64 = 30_000;
@@ -298,19 +326,25 @@ impl SqliteStorage {
                             return Ok(result);
                         }
                         Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
-                            let _ = self.conn.execute("ROLLBACK");
+                            if let Err(rb_err) = self.conn.execute("ROLLBACK") {
+                                tracing::warn!(error = %rb_err, "ROLLBACK failed after transient COMMIT error");
+                            }
                             let backoff = base_backoff_ms * 2u64.pow(attempt);
                             std::thread::sleep(Duration::from_millis(backoff));
                             // retry
                         }
                         Err(e) => {
-                            let _ = self.conn.execute("ROLLBACK");
+                            if let Err(rb_err) = self.conn.execute("ROLLBACK") {
+                                tracing::warn!(error = %rb_err, "ROLLBACK failed after COMMIT error");
+                            }
                             return Err(e.into());
                         }
                     }
                 }
                 Err(e) => {
-                    let _ = self.conn.execute("ROLLBACK");
+                    if let Err(rb_err) = self.conn.execute("ROLLBACK") {
+                        tracing::warn!(error = %rb_err, "ROLLBACK failed after transaction error");
+                    }
                     if e.is_transient() && attempt < MAX_RETRIES - 1 {
                         let backoff = base_backoff_ms * 2u64.pow(attempt);
                         std::thread::sleep(Duration::from_millis(backoff));
@@ -2081,48 +2115,39 @@ impl SqliteStorage {
                 .append(&mut blockers);
         }
 
-        let existing_rows = conn.query("SELECT issue_id FROM blocked_issues_cache")?;
-        let mut stale_issue_ids: HashSet<String> = existing_rows
-            .iter()
-            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from))
-            .collect();
+        // Atomic update: Clear and Re-insert
+        // Since we are within a BEGIN IMMEDIATE transaction, this is safe and efficient.
+        conn.execute("DELETE FROM blocked_issues_cache")?;
 
-        // Reconcile blocked issues in place to avoid repeated delete/reinsert churn on the same
-        // primary keys under frankensqlite.
         let mut count = 0;
-        for (issue_id, blockers) in blocked_issues_map {
+        for (issue_id, mut blockers) in blocked_issues_map {
             if blockers.is_empty() {
                 continue;
             }
-            let blockers_json =
-                serde_json::to_string(&blockers).unwrap_or_else(|_| "[]".to_string());
-            let updated = conn.execute_with_params(
-                "UPDATE blocked_issues_cache
-                 SET blocked_by = ?, blocked_at = CURRENT_TIMESTAMP
-                 WHERE issue_id = ?",
+            blockers.sort();
+            blockers.dedup();
+            let blockers_json = match serde_json::to_string(&blockers) {
+                Ok(blockers_json) => blockers_json,
+                Err(error) => {
+                    tracing::warn!(
+                        issue_id = %issue_id,
+                        %error,
+                        "Failed to serialize blocker list; treating issue as unblocked"
+                    );
+                    continue;
+                }
+            };
+
+            conn.execute_with_params(
+                "INSERT INTO blocked_issues_cache (issue_id, blocked_by, blocked_at)
+                 VALUES (?, ?, CURRENT_TIMESTAMP)",
                 &[
-                    SqliteValue::from(blockers_json.as_str()),
                     SqliteValue::from(issue_id.as_str()),
+                    SqliteValue::from(blockers_json.as_str()),
                 ],
             )?;
-            if updated == 0 {
-                conn.execute_with_params(
-                    "INSERT INTO blocked_issues_cache (issue_id, blocked_by) VALUES (?, ?)",
-                    &[
-                        SqliteValue::from(issue_id.as_str()),
-                        SqliteValue::from(blockers_json.as_str()),
-                    ],
-                )?;
-            }
-            stale_issue_ids.remove(&issue_id);
-            count += 1;
-        }
 
-        for stale_issue_id in stale_issue_ids {
-            conn.execute_with_params(
-                "DELETE FROM blocked_issues_cache WHERE issue_id = ?",
-                &[SqliteValue::from(stale_issue_id.as_str())],
-            )?;
+            count += 1;
         }
 
         tracing::debug!(blocked_count = count, "Rebuilt blocked issues cache");
@@ -2132,10 +2157,14 @@ impl SqliteStorage {
     fn load_direct_blockers_impl(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {
         let rows = conn.query(
             r"
+            // Direct dependencies (blocks, conditional-blocks, waits-for)
+            // Exclude external dependencies from the cache as their status is
+            // not locally known and must be resolved at runtime.
             SELECT DISTINCT d.issue_id, d.depends_on_id || ':' || COALESCE(i.status, 'unknown')
             FROM dependencies d
             LEFT JOIN issues i ON d.depends_on_id = i.id
             WHERE d.type IN ('blocks', 'conditional-blocks', 'waits-for')
+              AND d.depends_on_id NOT LIKE 'external:%'
               AND (
                 i.status NOT IN ('closed', 'tombstone')
                 OR i.id IS NULL
@@ -2146,20 +2175,19 @@ impl SqliteStorage {
         let mut blocked_issues_map: HashMap<String, Vec<String>> = HashMap::new();
 
         for row in &rows {
-            let issue_id = row
-                .get(0)
-                .and_then(SqliteValue::as_text)
-                .unwrap_or("")
-                .to_string();
-            let blocker_ref = row
-                .get(1)
-                .and_then(SqliteValue::as_text)
-                .unwrap_or("")
-                .to_string();
+            let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let Some(blocker_ref) = row.get(1).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            if issue_id.is_empty() || blocker_ref.is_empty() {
+                continue;
+            }
             blocked_issues_map
-                .entry(issue_id)
+                .entry(issue_id.to_string())
                 .or_default()
-                .push(blocker_ref);
+                .push(blocker_ref.to_string());
         }
 
         Ok(blocked_issues_map)
@@ -2208,17 +2236,18 @@ impl SqliteStorage {
         )?;
         let mut map: HashMap<String, Vec<String>> = HashMap::new();
         for row in &rows {
-            let parent_id = row
-                .get(0)
-                .and_then(SqliteValue::as_text)
-                .unwrap_or("")
-                .to_string();
-            let blocker = row
-                .get(1)
-                .and_then(SqliteValue::as_text)
-                .unwrap_or("")
-                .to_string();
-            map.entry(parent_id).or_default().push(blocker);
+            let Some(parent_id) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let Some(blocker) = row.get(1).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            if parent_id.is_empty() || blocker.is_empty() {
+                continue;
+            }
+            map.entry(parent_id.to_string())
+                .or_default()
+                .push(blocker.to_string());
         }
         Ok(map)
     }
@@ -4437,52 +4466,17 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn set_metadata(&mut self, key: &str, value: &str) -> Result<()> {
-        const MAX_RETRIES: u32 = 5;
-        let base_backoff_ms: u64 = 10;
-
-        for attempt in 0..MAX_RETRIES {
-            match self.conn.execute("BEGIN IMMEDIATE") {
-                Ok(_) => {}
-                Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
-                    let backoff = base_backoff_ms * 2u64.pow(attempt);
-                    std::thread::sleep(Duration::from_millis(backoff));
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
-            }
-
-            let result = (|| -> Result<()> {
-                self.conn.execute_with_params(
-                    "DELETE FROM metadata WHERE key = ?",
-                    &[SqliteValue::from(key)],
-                )?;
-                self.conn.execute_with_params(
-                    "INSERT INTO metadata (key, value) VALUES (?, ?)",
-                    &[SqliteValue::from(key), SqliteValue::from(value)],
-                )?;
-                Ok(())
-            })();
-
-            match result {
-                Ok(()) => match self.conn.execute("COMMIT") {
-                    Ok(_) => return Ok(()),
-                    Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
-                        let _ = self.conn.execute("ROLLBACK");
-                        let backoff = base_backoff_ms * 2u64.pow(attempt);
-                        std::thread::sleep(Duration::from_millis(backoff));
-                    }
-                    Err(e) => {
-                        let _ = self.conn.execute("ROLLBACK");
-                        return Err(e.into());
-                    }
-                },
-                Err(e) => {
-                    let _ = self.conn.execute("ROLLBACK");
-                    return Err(e);
-                }
-            }
-        }
-        unreachable!()
+        self.with_write_transaction(|storage| {
+            storage.conn.execute_with_params(
+                "DELETE FROM metadata WHERE key = ?",
+                &[SqliteValue::from(key)],
+            )?;
+            storage.conn.execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[SqliteValue::from(key), SqliteValue::from(value)],
+            )?;
+            Ok(())
+        })
     }
 
     /// Delete a metadata key.
