@@ -213,7 +213,20 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, ctx: &OutputContex
     }
 
     // Perform the update
-    let status = updater.update().map_err(map_update_error)?;
+    let status = updater.update().map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("archive-tar") || msg.contains("ArchiveNotEnabled") {
+            BeadsError::Other(anyhow::anyhow!(
+                "{msg}\n\n\
+                 This binary was built without tar archive support.\n\
+                 Please upgrade manually by running:\n\n  \
+                 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/beads_rust/main/install.sh | bash\n\n\
+                 After that, `br upgrade` will work for future updates."
+            ))
+        } else {
+            map_update_error(e)
+        }
+    })?;
 
     let result = UpdateResult {
         current_version: current_version.to_string(),
