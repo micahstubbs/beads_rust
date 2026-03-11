@@ -97,6 +97,10 @@ pub enum BeadsError {
     #[error("Import collision: {count} issues have conflicting content")]
     ImportCollision { count: usize },
 
+    /// Conflict detected between local and external changes.
+    #[error("Sync conflict: {message}")]
+    SyncConflict { message: String },
+
     // === Dependency Errors ===
     /// Adding the dependency would create a cycle.
     #[error("Cycle detected in dependencies: {path}")]

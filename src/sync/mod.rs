@@ -653,10 +653,7 @@ pub fn preflight_export(
             if count > 0 && !config.force && output_path.exists() {
                 match get_issue_ids_from_jsonl(output_path) {
                     Ok(jsonl_ids) if !jsonl_ids.is_empty() => {
-                        let db_ids: HashSet<String> = storage
-                            .get_all_issues_for_export()
-                            .map(|issues| issues.into_iter().map(|i| i.id).collect())
-                            .unwrap_or_default();
+                        let db_ids: HashSet<String> = storage.get_all_ids()?.into_iter().collect();
                         let missing: Vec<_> = jsonl_ids.difference(&db_ids).take(5).collect();
                         if missing.is_empty() {
                             result.add(PreflightCheck::pass(
@@ -1772,7 +1769,9 @@ pub const METADATA_LAST_IMPORT_TIME: &str = "last_import_time";
 /// Result of a staleness check between JSONL and DB.
 #[derive(Debug, Clone, Copy)]
 pub struct StalenessCheck {
+    pub dirty_count: usize,
     pub jsonl_exists: bool,
+    pub jsonl_mtime: Option<std::time::SystemTime>,
     pub jsonl_newer: bool,
     pub db_newer: bool,
 }
@@ -1791,7 +1790,7 @@ pub fn compute_staleness(storage: &SqliteStorage, jsonl_path: &Path) -> Result<S
     let jsonl_content_hash = storage.get_metadata(METADATA_JSONL_CONTENT_HASH)?;
     let jsonl_exists = jsonl_path.exists();
 
-    let (jsonl_newer, db_newer) = if jsonl_exists {
+    let (jsonl_mtime, jsonl_newer, db_newer) = if jsonl_exists {
         let jsonl_mtime = fs::symlink_metadata(jsonl_path)?.modified()?;
 
         // Get the latest known sync time (either import or export)
@@ -1828,13 +1827,15 @@ pub fn compute_staleness(storage: &SqliteStorage, jsonl_path: &Path) -> Result<S
             false
         };
 
-        (jsonl_newer, dirty_count > 0)
+        (Some(jsonl_mtime), jsonl_newer, dirty_count > 0)
     } else {
-        (false, dirty_count > 0)
+        (None, false, dirty_count > 0)
     };
 
     Ok(StalenessCheck {
+        dirty_count,
         jsonl_exists,
+        jsonl_mtime,
         jsonl_newer,
         db_newer,
     })
@@ -1869,6 +1870,23 @@ pub fn auto_import_if_stale(
         return Ok(AutoImportResult::default());
     }
 
+    // Refuse to auto-import if DB is dirty (has local unsaved changes)
+    // to prevent silent data loss during Last-Write-Wins import.
+    if staleness.db_newer && !allow_stale {
+        return Err(BeadsError::SyncConflict {
+            message: format!(
+                "JSONL is newer ({}), but the database also has {} unsaved change(s).\n\
+                 A silent auto-import would risk overwriting local changes.\n\
+                 Hint: run `br sync` to perform a safe 3-way merge, or `br sync --export-only` to push your changes first.",
+                staleness
+                    .jsonl_mtime
+                    .map(|t| chrono::DateTime::<Utc>::from(t).to_rfc3339())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                staleness.dirty_count
+            ),
+        });
+    }
+
     if allow_stale {
         tracing::warn!(
             jsonl_path = %jsonl_path.display(),
@@ -1886,12 +1904,14 @@ pub fn auto_import_if_stale(
         ));
     }
 
+    let allow_external_jsonl =
+        crate::config::resolved_jsonl_path_is_external(beads_dir, jsonl_path);
     let import_config = ImportConfig {
         // Auto-import should be strict about prefix mismatches to prevent
         // silently importing issues from another project.
         skip_prefix_validation: false,
         beads_dir: Some(beads_dir.to_path_buf()),
-        allow_external_jsonl: false,
+        allow_external_jsonl,
         show_progress: false,
         ..Default::default()
     };
@@ -2180,6 +2200,7 @@ fn try_incremental_auto_flush(
     let export_config = ExportConfig {
         force: false,
         beads_dir: Some(beads_dir.to_path_buf()),
+        allow_external_jsonl: crate::config::resolved_jsonl_path_is_external(beads_dir, jsonl_path),
         ..Default::default()
     };
     let content_hash = write_jsonl_lines_atomically(&lines_by_id, jsonl_path, &export_config)?;
@@ -2275,6 +2296,7 @@ pub fn auto_flush(
     let export_config = ExportConfig {
         force: false,
         beads_dir: Some(beads_dir.to_path_buf()),
+        allow_external_jsonl: crate::config::resolved_jsonl_path_is_external(beads_dir, jsonl_path),
         ..Default::default()
     };
 

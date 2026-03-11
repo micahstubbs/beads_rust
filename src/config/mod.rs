@@ -993,7 +993,7 @@ fn import_config_for_resolved_jsonl(beads_dir: &Path, jsonl_path: &Path) -> Impo
     }
 }
 
-fn resolved_jsonl_path_is_external(beads_dir: &Path, jsonl_path: &Path) -> bool {
+pub(crate) fn resolved_jsonl_path_is_external(beads_dir: &Path, jsonl_path: &Path) -> bool {
     !path_is_within_beads_dir(jsonl_path, beads_dir)
 }
 

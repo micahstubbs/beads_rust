@@ -85,6 +85,8 @@ pub enum ErrorCode {
     PrefixMismatch,
     /// Import collision detected
     ImportCollision,
+    /// Conflict detected between local database changes and newer JSONL
+    SyncConflict,
     /// Conflict markers in JSONL
     ConflictMarkers,
     /// Path traversal attempt blocked
@@ -148,6 +150,7 @@ impl ErrorCode {
             Self::JsonlParseError => "JSONL_PARSE_ERROR",
             Self::PrefixMismatch => "PREFIX_MISMATCH",
             Self::ImportCollision => "IMPORT_COLLISION",
+            Self::SyncConflict => "SYNC_CONFLICT",
             Self::ConflictMarkers => "CONFLICT_MARKERS",
             Self::PathTraversal => "PATH_TRAVERSAL",
             // Config
@@ -227,6 +230,7 @@ impl ErrorCode {
             Self::JsonlParseError
             | Self::PrefixMismatch
             | Self::ImportCollision
+            | Self::SyncConflict
             | Self::ConflictMarkers
             | Self::PathTraversal => 6,
             // Config (7)
@@ -611,6 +615,9 @@ impl StructuredError {
                 ErrorCode::ImportCollision,
                 Some(json!({"collision_count": count})),
             ),
+            BeadsError::SyncConflict { message } => {
+                (ErrorCode::SyncConflict, Some(json!({"message": message})))
+            }
             BeadsError::DependencyCycle { path } => {
                 (ErrorCode::CycleDetected, Some(json!({"cycle_path": path})))
             }
