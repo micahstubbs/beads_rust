@@ -4,7 +4,7 @@ use crate::cli::CloseArgs as CliCloseArgs;
 use crate::cli::commands::preserve_blocked_cache_on_error;
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::model::Status;
+use crate::model::{IssueType, Status};
 use crate::output::OutputContext;
 use crate::storage::IssueUpdate;
 use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
