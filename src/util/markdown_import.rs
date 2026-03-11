@@ -264,8 +264,12 @@ fn apply_section_to_issue(issue: &mut ParsedIssue, section: Section, lines: &[St
 /// Split content on commas or whitespace for labels/deps.
 fn split_list_content(content: &str) -> Vec<String> {
     let mut result = Vec::new();
-    for line in content.lines() {
-        let line = strip_markdown_list_prefix(line).trim();
+    for raw_line in content.lines() {
+        let is_list_item = raw_line.trim_start().starts_with('-')
+            || raw_line.trim_start().starts_with('*')
+            || raw_line.trim_start().starts_with('+');
+
+        let line = strip_markdown_list_prefix(raw_line).trim();
         if line.is_empty() {
             continue;
         }
@@ -275,6 +279,8 @@ fn split_list_content(content: &str) -> Vec<String> {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty() && !is_marker_only_token(s)),
             );
+        } else if is_list_item || line.contains(':') {
+            result.push(line.to_string());
         } else {
             result.extend(
                 line.split_whitespace()
@@ -512,6 +518,13 @@ This is the actual description.
         assert!(validate_dependency_type("related").is_some());
         assert!(validate_dependency_type("duplicates").is_some());
         assert!(validate_dependency_type("invalid").is_none());
+    }
+
+    #[test]
+    fn test_split_list_content_spaces() {
+        let content = "- blocks: bd-123\n- parent-child: bd-456";
+        let items = split_list_content(content);
+        assert_eq!(items, vec!["blocks: bd-123", "parent-child: bd-456"]);
     }
 
     #[test]

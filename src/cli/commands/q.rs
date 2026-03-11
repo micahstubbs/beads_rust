@@ -157,6 +157,14 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
 
     // Parent dependency
     if let Some(ref parent_id) = args.parent {
+        // Double-check cycle even though we are a new issue, to catch logic errors
+        // and ensure the storage would_create_cycle works correctly for prospective links
+        if storage.would_create_cycle(&issue.id, parent_id, true)? {
+            return Err(BeadsError::DependencyCycle {
+                path: format!("{} -> {}", issue.id, parent_id),
+            });
+        }
+
         issue.dependencies.push(Dependency {
             issue_id: issue.id.clone(),
             depends_on_id: parent_id.clone(),

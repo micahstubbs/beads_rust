@@ -309,7 +309,10 @@ fn read_comment_text(args: &CommentAddArgs) -> Result<String> {
     if let Some(path) = &args.file {
         if path.as_os_str() == "-" {
             let mut buffer = String::new();
-            std::io::stdin().read_to_string(&mut buffer)?;
+            // Limit stdin to 10MB to prevent OOM
+            std::io::stdin()
+                .take(10 * 1024 * 1024)
+                .read_to_string(&mut buffer)?;
             return Ok(buffer);
         }
         return Ok(fs::read_to_string(path)?);

@@ -415,28 +415,23 @@ fn collect_single_graph(
     root_id: &str,
     root_issue: &Issue,
 ) -> Result<SingleGraphTraversal> {
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut stack: Vec<String> = vec![root_id.to_string()];
+    // For single graph (dependents), we want to show all paths from the root.
+    // However, to prevent infinite loops in case of cycles, we track the current path.
+    // We also want traversal_order to contain each node at most once for node metadata lookup.
     let mut traversal_order: Vec<String> = Vec::new();
     let mut issues_by_id: HashMap<String, Issue> = HashMap::new();
     let mut edges: Vec<(String, String)> = Vec::new();
+    let mut seen_edges: HashSet<(String, String)> = HashSet::new();
+    let mut discovered_nodes: HashSet<String> = HashSet::new();
 
-    visited.insert(root_id.to_string());
+    // Stack stores (current_id, path_to_this_node)
+    let mut stack: Vec<(String, Vec<String>)> = vec![(root_id.to_string(), vec![])];
 
-    while let Some(current_id) = stack.pop() {
-        let issue = if current_id == root_id {
-            root_issue.clone()
-        } else {
-            storage.get_issue(&current_id)?.ok_or_else(|| {
-                BeadsError::Config(format!(
-                    "dependency graph references missing issue {current_id}"
-                ))
-            })?
-        };
+    traversal_order.push(root_id.to_string());
+    issues_by_id.insert(root_id.to_string(), root_issue.clone());
+    discovered_nodes.insert(root_id.to_string());
 
-        traversal_order.push(current_id.clone());
-        issues_by_id.insert(current_id.clone(), issue);
-
+    while let Some((current_id, path)) = stack.pop() {
         let mut dependents = storage.get_dependents_with_metadata(&current_id)?;
         dependents.retain(|dep| {
             dep.dep_type
@@ -444,13 +439,32 @@ fn collect_single_graph(
                 .unwrap_or(DependencyType::Blocks)
                 .affects_ready_work()
         });
+        // Sort for deterministic traversal: priority then ID
         dependents.sort_by(|a, b| a.priority.0.cmp(&b.priority.0).then(a.id.cmp(&b.id)));
 
         for dep in dependents.into_iter().rev() {
-            edges.push((dep.id.clone(), current_id.clone()));
+            let edge = (dep.id.clone(), current_id.clone());
+            if seen_edges.insert(edge.clone()) {
+                edges.push(edge);
+            }
 
-            if visited.insert(dep.id.clone()) {
-                stack.push(dep.id.clone());
+            if !discovered_nodes.contains(&dep.id) {
+                let issue = storage.get_issue(&dep.id)?.ok_or_else(|| {
+                    BeadsError::Config(format!(
+                        "dependency graph references missing issue {}",
+                        dep.id
+                    ))
+                })?;
+                traversal_order.push(dep.id.clone());
+                issues_by_id.insert(dep.id.clone(), issue);
+                discovered_nodes.insert(dep.id.clone());
+            }
+
+            // Cycle prevention: only descend if the child isn't already in the path to here
+            if !path.contains(&dep.id) && dep.id != current_id {
+                let mut new_path = path.clone();
+                new_path.push(current_id.clone());
+                stack.push((dep.id.clone(), new_path));
             }
         }
     }

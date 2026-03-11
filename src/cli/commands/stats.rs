@@ -9,7 +9,7 @@ use crate::error::Result;
 use crate::format::{
     Breakdown, BreakdownEntry, RecentActivity, Statistics, StatsSummary, truncate_title,
 };
-use crate::model::{IssueType, Status};
+use crate::model::{Issue, IssueType, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
 use chrono::Utc;
@@ -115,6 +115,55 @@ pub fn execute(
 
 const fn should_include_activity(args: &StatsArgs) -> bool {
     !args.no_activity
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ActivityCounts {
+    issues_created: usize,
+    issues_closed: usize,
+    issues_updated: usize,
+    issues_reopened: usize,
+}
+
+impl ActivityCounts {
+    const fn total_changes(self) -> usize {
+        self.issues_created + self.issues_closed + self.issues_updated + self.issues_reopened
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.issues_created += other.issues_created;
+        self.issues_closed += other.issues_closed;
+        self.issues_updated += other.issues_updated;
+        self.issues_reopened += other.issues_reopened;
+    }
+
+    fn record_transition(&mut self, previous: Option<&Issue>, current: Option<&Issue>) {
+        match (previous, current) {
+            (None, Some(issue)) => {
+                if issue.status != Status::Tombstone {
+                    self.issues_created += 1;
+                }
+            }
+            (Some(before), Some(after)) => {
+                if !matches!(before.status, Status::Closed | Status::Tombstone)
+                    && after.status == Status::Closed
+                {
+                    self.issues_closed += 1;
+                    return;
+                }
+
+                if before.status == Status::Closed && after.status != Status::Closed {
+                    self.issues_reopened += 1;
+                    return;
+                }
+
+                if !before.sync_equals(after) {
+                    self.issues_updated += 1;
+                }
+            }
+            (Some(_), None) | (None, None) => {}
+        }
+    }
 }
 
 /// Compute summary statistics.
@@ -241,28 +290,18 @@ fn compute_summary(
 
 /// Count epics that have all children closed.
 fn count_epics_eligible_for_closure(storage: &SqliteStorage, epic_ids: &[String]) -> Result<usize> {
+    if epic_ids.is_empty() {
+        return Ok(0);
+    }
+
     let mut eligible = 0;
+    let counts = storage.get_epic_counts()?;
 
     for epic_id in epic_ids {
-        // Get children via parent-child dependencies
-        let children = storage.get_dependents_with_metadata(epic_id)?;
-        let parent_child_children: Vec<_> = children
-            .iter()
-            .filter(|c| c.dep_type == "parent-child")
-            .collect();
-
-        if parent_child_children.is_empty() {
-            // No children means not eligible (nothing to close)
-            continue;
-        }
-
-        // Check if all children are closed
-        let all_closed = parent_child_children
-            .iter()
-            .all(|c| matches!(c.status, Status::Closed | Status::Tombstone));
-
-        if all_closed {
-            eligible += 1;
+        if let Some(&(total, closed)) = counts.get(epic_id) {
+            if total > 0 && total == closed {
+                eligible += 1;
+            }
         }
     }
 
@@ -387,11 +426,32 @@ fn compute_recent_activity(jsonl_path: &Path, hours: u32) -> Option<RecentActivi
     let since = format!("{hours} hours ago");
     let repo_root = git_repo_root(jsonl_path.parent()?)?;
     let pathspec = repo_relative_git_path(jsonl_path, &repo_root)?;
-    let pathspec_str = pathspec.to_string_lossy().into_owned();
+    let commits = git_recent_commits(&repo_root, &pathspec, &since)?;
+    let commit_count = commits.len();
+    let mut counts = ActivityCounts::default();
 
+    for commit in &commits {
+        counts.merge(git_issue_activity_for_commit(
+            &repo_root, commit, &pathspec,
+        )?);
+    }
+
+    Some(RecentActivity {
+        hours_tracked: hours,
+        commit_count,
+        issues_created: counts.issues_created,
+        issues_closed: counts.issues_closed,
+        issues_updated: counts.issues_updated,
+        issues_reopened: counts.issues_reopened,
+        total_changes: counts.total_changes(),
+    })
+}
+
+fn git_recent_commits(repo_root: &Path, pathspec: &Path, since: &str) -> Option<Vec<String>> {
+    let pathspec_str = pathspec.to_string_lossy().into_owned();
     let output = Command::new("git")
-        .args(["log", "--oneline", "--since", &since, "--", &pathspec_str])
-        .current_dir(&repo_root)
+        .args(["log", "--format=%H", "--since", since, "--", &pathspec_str])
+        .current_dir(repo_root)
         .output()
         .ok()?;
 
@@ -401,18 +461,107 @@ fn compute_recent_activity(jsonl_path: &Path, hours: u32) -> Option<RecentActivi
         return None;
     }
 
-    let stdout_str = String::from_utf8_lossy(&output.stdout);
-    let commit_count = stdout_str.lines().count();
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+    )
+}
 
-    Some(RecentActivity {
-        hours_tracked: hours,
-        commit_count,
-        issues_created: 0,
-        issues_closed: 0,
-        issues_updated: 0,
-        issues_reopened: 0,
-        total_changes: 0,
-    })
+fn git_issue_activity_for_commit(
+    repo_root: &Path,
+    commit: &str,
+    pathspec: &Path,
+) -> Option<ActivityCounts> {
+    let pathspec_str = pathspec.to_string_lossy().into_owned();
+    let output = Command::new("git")
+        .args([
+            "show",
+            "--format=",
+            "--unified=0",
+            "--no-color",
+            commit,
+            "--",
+            &pathspec_str,
+        ])
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        let err_msg = String::from_utf8_lossy(&output.stderr);
+        debug!(commit, stderr = %err_msg, "Git show failed for activity diff");
+        return None;
+    }
+
+    Some(parse_issue_activity_patch(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn parse_issue_activity_patch(patch: &str) -> ActivityCounts {
+    let mut removed = BTreeMap::new();
+    let mut added = BTreeMap::new();
+
+    for line in patch.lines() {
+        let Some((marker, payload)) = parse_issue_patch_line(line) else {
+            continue;
+        };
+
+        match serde_json::from_str::<Issue>(payload) {
+            Ok(issue) => match marker {
+                '+' => {
+                    added.insert(issue.id.clone(), issue);
+                }
+                '-' => {
+                    removed.insert(issue.id.clone(), issue);
+                }
+                _ => unreachable!("parse_issue_patch_line only returns +/- markers"),
+            },
+            Err(err) => {
+                debug!(%err, "Skipping unparsable issue line from git diff");
+            }
+        }
+    }
+
+    let mut counts = ActivityCounts::default();
+    let mut issue_ids: HashSet<&str> = removed.keys().map(String::as_str).collect();
+    issue_ids.extend(added.keys().map(String::as_str));
+
+    for issue_id in issue_ids {
+        counts.record_transition(removed.get(issue_id), added.get(issue_id));
+    }
+
+    counts
+}
+
+fn parse_issue_patch_line(line: &str) -> Option<(char, &str)> {
+    if line.starts_with("+++ ")
+        || line.starts_with("--- ")
+        || line.starts_with("@@")
+        || line.starts_with("diff --git")
+        || line.starts_with("index ")
+        || line.starts_with("new file mode ")
+        || line.starts_with("deleted file mode ")
+        || line.starts_with("\\ No newline at end of file")
+    {
+        return None;
+    }
+
+    let marker = *line.as_bytes().first()? as char;
+    if !matches!(marker, '+' | '-') {
+        return None;
+    }
+
+    let payload = &line[1..];
+    if !payload.starts_with('{') {
+        return None;
+    }
+
+    Some((marker, payload))
 }
 
 fn git_repo_root(start: &Path) -> Option<PathBuf> {
@@ -971,6 +1120,11 @@ mod tests {
         assert!(status.success(), "git {:?} failed", args);
     }
 
+    fn write_issue_jsonl(path: &Path, issue: &Issue) {
+        let line = serde_json::to_string(issue).expect("serialize issue");
+        fs::write(path, format!("{line}\n")).expect("write issue jsonl");
+    }
+
     #[test]
     fn test_compute_recent_activity_uses_resolved_jsonl_path() {
         let temp = TempDir::new().expect("tempdir");
@@ -996,6 +1150,58 @@ mod tests {
             compute_recent_activity(&jsonl_path, 24).expect("activity for committed custom jsonl");
         assert_eq!(activity.commit_count, 1);
         assert_eq!(activity.hours_tracked, 24);
+    }
+
+    #[test]
+    fn test_compute_recent_activity_counts_issue_transitions_from_git_history() {
+        let temp = TempDir::new().expect("tempdir");
+        git(temp.path(), &["init", "-q"]);
+        git(temp.path(), &["config", "user.email", "tester@example.com"]);
+        git(temp.path(), &["config", "user.name", "Tester"]);
+
+        let jsonl_dir = temp.path().join(".beads");
+        fs::create_dir_all(&jsonl_dir).expect("create beads dir");
+        let jsonl_path = jsonl_dir.join("issues.jsonl");
+
+        let base_time = Utc.with_ymd_and_hms(2026, 3, 11, 0, 0, 0).unwrap();
+        let mut issue = make_issue("bd-activity", Status::Open, IssueType::Task);
+        issue.title = "Track recent activity".to_string();
+        issue.created_at = base_time;
+        issue.updated_at = base_time;
+
+        write_issue_jsonl(&jsonl_path, &issue);
+        git(temp.path(), &["add", ".beads/issues.jsonl"]);
+        git(temp.path(), &["commit", "-q", "-m", "Create bd-activity"]);
+
+        issue.title = "Track recent activity better".to_string();
+        issue.updated_at = base_time + chrono::Duration::hours(1);
+        write_issue_jsonl(&jsonl_path, &issue);
+        git(temp.path(), &["add", ".beads/issues.jsonl"]);
+        git(temp.path(), &["commit", "-q", "-m", "Update bd-activity"]);
+
+        issue.status = Status::Closed;
+        issue.updated_at = base_time + chrono::Duration::hours(2);
+        issue.closed_at = Some(issue.updated_at);
+        issue.close_reason = Some("done".to_string());
+        write_issue_jsonl(&jsonl_path, &issue);
+        git(temp.path(), &["add", ".beads/issues.jsonl"]);
+        git(temp.path(), &["commit", "-q", "-m", "Close bd-activity"]);
+
+        issue.status = Status::Open;
+        issue.updated_at = base_time + chrono::Duration::hours(3);
+        issue.closed_at = None;
+        issue.close_reason = None;
+        write_issue_jsonl(&jsonl_path, &issue);
+        git(temp.path(), &["add", ".beads/issues.jsonl"]);
+        git(temp.path(), &["commit", "-q", "-m", "Reopen bd-activity"]);
+
+        let activity = compute_recent_activity(&jsonl_path, 24).expect("recent activity");
+        assert_eq!(activity.commit_count, 4);
+        assert_eq!(activity.issues_created, 1);
+        assert_eq!(activity.issues_updated, 1);
+        assert_eq!(activity.issues_closed, 1);
+        assert_eq!(activity.issues_reopened, 1);
+        assert_eq!(activity.total_changes, 4);
     }
 
     #[test]

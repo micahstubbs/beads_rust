@@ -272,7 +272,10 @@ fn record_entry(
 
     let mut entry = if use_stdin {
         let mut input = String::new();
-        io::stdin().read_to_string(&mut input)?;
+        // Limit stdin to 10MB to prevent OOM
+        io::stdin()
+            .take(10 * 1024 * 1024)
+            .read_to_string(&mut input)?;
         let trimmed = input.trim();
         if trimmed.is_empty() {
             return Err(BeadsError::validation(
@@ -523,10 +526,11 @@ fn new_audit_id() -> String {
     hasher.update(pid.to_le_bytes());
 
     let digest = hasher.finalize();
-    let bytes = &digest[..4];
+    // Use 8 bytes (16 hex chars) for much lower collision probability
+    let bytes = &digest[..8];
     format!(
-        "int-{:02x}{:02x}{:02x}{:02x}",
-        bytes[0], bytes[1], bytes[2], bytes[3]
+        "int-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]
     )
 }
 

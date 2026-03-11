@@ -137,21 +137,20 @@ pub fn execute(
     );
 
     if json {
-        if args.robot {
-            // Print JSON directly - don't rely on ctx.json_pretty() since the
-            // OutputContext may not be in JSON mode when --robot flag is used
+        if args.robot || !ctx.is_json() {
+            // Print JSON directly when robot mode bypasses the top-level
+            // OutputContext JSON detection.
             println!(
                 "{}",
                 serde_json::to_string_pretty(&output).expect("Failed to serialize JSON output")
             );
-            return Ok(());
-        }
-
-        if matches!(ctx.mode(), OutputMode::Rich) {
-            render_changelog_rich(&output, ctx);
         } else {
-            print_text_output(&output);
+            ctx.json_pretty(&output);
         }
+    } else if matches!(ctx.mode(), OutputMode::Rich) {
+        render_changelog_rich(&output, ctx);
+    } else {
+        print_text_output(&output);
     }
 
     Ok(())

@@ -3,11 +3,12 @@
 use crate::cli::{EpicCloseEligibleArgs, EpicCommands, EpicStatusArgs};
 use crate::config;
 use crate::error::Result;
-use crate::model::{EpicStatus, IssueType, Status};
+use crate::model::{EpicStatus, EventType, IssueType};
 use crate::output::{OutputContext, OutputMode};
-use crate::storage::{IssueUpdate, ListFilters, SqliteStorage};
+use crate::storage::{ListFilters, SqliteStorage};
 use chrono::Utc;
 use crossterm::style::Stylize;
+use fsqlite_types::value::SqliteValue;
 use rich_rust::prelude::*;
 use serde::Serialize;
 
@@ -117,25 +118,34 @@ fn execute_close_eligible(
     }
 
     let mut closed_ids = Vec::new();
-    for epic_status in &epics {
-        let now = Utc::now();
-        let update = IssueUpdate {
-            status: Some(Status::Closed),
-            closed_at: Some(Some(now)),
-            close_reason: Some(Some("All children completed".to_string())),
-            skip_cache_rebuild: true,
-            ..Default::default()
-        };
+    let now = Utc::now();
+    let now_str = now.to_rfc3339();
+    let reason = "All children completed";
 
-        match storage.update_issue(&epic_status.epic.id, &update, &actor) {
-            Ok(_) => closed_ids.push(epic_status.epic.id.clone()),
-            Err(err) => eprintln!("Error closing {}: {err}", epic_status.epic.id),
+    // Use a single transaction for efficiency and atomicity
+    storage.mutate("close_eligible_epics", &actor, |conn, ctx| {
+        for epic_status in &epics {
+            let id = &epic_status.epic.id;
+
+            let rows = conn.execute_with_params(
+                "UPDATE issues SET status = 'closed', updated_at = ?, closed_at = ?, close_reason = ? WHERE id = ? AND status != 'closed'",
+                &[
+                    SqliteValue::from(now_str.as_str()),
+                    SqliteValue::from(now_str.as_str()),
+                    SqliteValue::from(reason),
+                    SqliteValue::from(id.as_str()),
+                ],
+            )?;
+
+            if rows > 0 {
+                closed_ids.push(id.clone());
+                ctx.record_event(EventType::Closed, id, Some(reason.to_string()));
+                ctx.mark_dirty(id);
+            }
         }
-    }
-
-    if !closed_ids.is_empty() {
-        storage.rebuild_blocked_cache(true)?;
-    }
+        ctx.invalidate_cache();
+        Ok(())
+    })?;
 
     if ctx.is_json() {
         let result = CloseEligibleResult {
