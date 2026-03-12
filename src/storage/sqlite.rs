@@ -2003,12 +2003,12 @@ impl SqliteStorage {
             }
         }
 
-        // Ready condition 1: status is `open` by default; optionally include
-        // explicitly deferred issues when requested.
+        // Ready condition 1: status is `open` or `in_progress` by default; optionally
+        // include explicitly deferred issues when requested.
         if filters.include_deferred {
-            sql.push_str(" AND status IN ('open', 'deferred')");
+            sql.push_str(" AND status IN ('open', 'in_progress', 'deferred')");
         } else {
-            sql.push_str(" AND status = 'open'");
+            sql.push_str(" AND status IN ('open', 'in_progress')");
         }
 
         // Ready condition 2: NOT in blocked_issues_cache (NOT IN — frankensqlite
@@ -2100,12 +2100,10 @@ impl SqliteStorage {
         // Sorting
         match sort {
             ReadySortPolicy::Hybrid => {
-                sql.push_str(
-                    " ORDER BY CASE WHEN priority <= 1 THEN 0 ELSE 1 END, created_at DESC",
-                );
+                sql.push_str(" ORDER BY CASE WHEN priority <= 1 THEN 0 ELSE 1 END, created_at ASC");
             }
             ReadySortPolicy::Priority => {
-                sql.push_str(" ORDER BY priority ASC, created_at DESC");
+                sql.push_str(" ORDER BY priority ASC, created_at ASC");
             }
             ReadySortPolicy::Oldest => {
                 sql.push_str(" ORDER BY created_at ASC");
@@ -9696,6 +9694,49 @@ mod tests {
         assert_eq!(
             next_for_child1, 2,
             "After bd-parent.1.1 exists, next for bd-parent.1 should be .2"
+        );
+    }
+
+    #[test]
+    fn test_rebuild_child_counters_skips_missing_parents() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let timestamp = Utc.with_ymd_and_hms(2026, 3, 12, 0, 0, 0).unwrap();
+        let stamp = timestamp.to_rfc3339();
+
+        storage
+            .conn
+            .execute_with_params(
+                r"
+                INSERT INTO issues (
+                    id, title, status, priority, issue_type, created_at, updated_at,
+                    ephemeral, pinned, is_template
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ",
+                &[
+                    SqliteValue::from("bd-orphan.6"),
+                    SqliteValue::from("Recovered orphan child"),
+                    SqliteValue::from("open"),
+                    SqliteValue::from(2_i64),
+                    SqliteValue::from("task"),
+                    SqliteValue::from(stamp.as_str()),
+                    SqliteValue::from(stamp.as_str()),
+                    SqliteValue::from(0_i64),
+                    SqliteValue::from(0_i64),
+                    SqliteValue::from(0_i64),
+                ],
+            )
+            .unwrap();
+
+        let rebuilt = storage.rebuild_child_counters_in_tx().unwrap();
+        assert_eq!(
+            rebuilt, 0,
+            "missing parents should not get counters rebuilt"
+        );
+        assert!(
+            !storage
+                .has_missing_issue_reference("child_counters", "parent_id")
+                .unwrap(),
+            "rebuild should not create orphan child counter rows"
         );
     }
 

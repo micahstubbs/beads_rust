@@ -371,26 +371,32 @@ fn ready_sort_policy_priority() {
     let p2 = fixtures::IssueBuilder::new("Medium first")
         .with_priority(Priority::MEDIUM)
         .build();
-    let p0 = fixtures::IssueBuilder::new("Critical second")
+    let p0_old = fixtures::IssueBuilder::new("Critical old")
+        .with_priority(Priority::CRITICAL)
+        .build();
+    let p0_new = fixtures::IssueBuilder::new("Critical new")
         .with_priority(Priority::CRITICAL)
         .build();
     let p1 = fixtures::IssueBuilder::new("High third")
         .with_priority(Priority::HIGH)
         .build();
 
-    // Create in specific order to test that sorting overrides creation order
+    // Create in specific order
     storage.create_issue(&p2, "tester").unwrap();
-    storage.create_issue(&p0, "tester").unwrap();
+    storage.create_issue(&p0_old, "tester").unwrap();
+    storage.create_issue(&p0_new, "tester").unwrap();
     storage.create_issue(&p1, "tester").unwrap();
 
     let filters = ReadyFilters::default();
     let ids = ready_ids(&storage, &filters, ReadySortPolicy::Priority);
 
-    // Should be sorted by priority: P0, P1, P2
-    assert_eq!(ids.len(), 3);
-    assert_eq!(ids[0], p0.id);
-    assert_eq!(ids[1], p1.id);
-    assert_eq!(ids[2], p2.id);
+    // Should be sorted by priority ASC, then created_at ASC:
+    // P0_old, P0_new, P1, P2
+    assert_eq!(ids.len(), 4);
+    assert_eq!(ids[0], p0_old.id);
+    assert_eq!(ids[1], p0_new.id);
+    assert_eq!(ids[2], p1.id);
+    assert_eq!(ids[3], p2.id);
 }
 
 #[test]
@@ -443,17 +449,17 @@ fn ready_sort_policy_hybrid() {
     let filters = ReadyFilters::default();
     let ids = ready_ids(&storage, &filters, ReadySortPolicy::Hybrid);
 
-    // Hybrid: P0/P1 first (by created_at), then P2+ (by created_at)
+    // Hybrid: P0/P1 first (by created_at ASC), then P2+ (by created_at ASC)
     // P0 and P1 should be in first two positions
     assert_eq!(ids.len(), 4);
 
-    // First two should be P0/P1 (critical/high) in creation order
-    assert!(ids[0] == p0.id || ids[0] == p1.id);
-    assert!(ids[1] == p0.id || ids[1] == p1.id);
+    // First two should be P0/P1 (critical/high) in creation order (ASC)
+    assert_eq!(ids[0], p0.id); // created first
+    assert_eq!(ids[1], p1.id); // created later
 
-    // Last two should be P2/P3 (medium/low) in creation order
-    assert!(ids[2] == p2.id || ids[2] == p3.id);
-    assert!(ids[3] == p2.id || ids[3] == p3.id);
+    // Last two should be P2/P3 (medium/low) in creation order (ASC)
+    assert_eq!(ids[2], p3.id); // created first among these (1st overall)
+    assert_eq!(ids[3], p2.id); // created last among these (3rd overall)
 }
 
 // ============================================================================
@@ -581,7 +587,7 @@ fn ready_excludes_blocked_issues_with_filters() {
 // ============================================================================
 
 #[test]
-fn ready_excludes_in_progress_but_keeps_open() {
+fn ready_includes_in_progress_and_open() {
     let mut storage = test_db();
 
     let open = fixtures::IssueBuilder::new("Open issue")
@@ -606,7 +612,7 @@ fn ready_excludes_in_progress_but_keeps_open() {
     let ids = ready_ids(&storage, &filters, ReadySortPolicy::Oldest);
 
     assert!(ids.contains(&open.id));
-    assert!(!ids.contains(&in_progress.id));
+    assert!(ids.contains(&in_progress.id));
     assert!(!ids.contains(&closed.id));
     assert!(!ids.contains(&deferred.id));
 }
