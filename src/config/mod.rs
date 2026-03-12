@@ -2455,13 +2455,9 @@ labels:
         let db_path = beads_dir.join("beads.db");
         fs::create_dir_all(&beads_dir).expect("create beads dir");
 
-        let discovered = discover_beads_dir_with_cli_from(
-            None,
-            &CliOverrides::default(),
-            None,
-            Some(&db_path),
-        )
-        .expect("discovery with env db override");
+        let discovered =
+            discover_beads_dir_with_cli_from(None, &CliOverrides::default(), None, Some(&db_path))
+                .expect("discovery with env db override");
 
         assert_eq!(discovered, beads_dir);
     }

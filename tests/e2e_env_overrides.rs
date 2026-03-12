@@ -184,13 +184,24 @@ fn e2e_bd_db_env_override_allows_access_outside_workspace() {
     let db_path = actual_workspace.root.join(".beads").join("beads.db");
     let env_vars = vec![("BD_DB", db_path.to_str().expect("db path"))];
 
-    let list = run_br_with_env(&cwd_workspace, ["list", "--json"], env_vars, "list_via_bd_db");
-    assert!(list.status.success(), "list via BD_DB failed: {}", list.stderr);
+    let list = run_br_with_env(
+        &cwd_workspace,
+        ["list", "--json"],
+        env_vars,
+        "list_via_bd_db",
+    );
+    assert!(
+        list.status.success(),
+        "list via BD_DB failed: {}",
+        list.stderr
+    );
 
     let payload = extract_json_payload(&list.stdout);
     let list_json: Vec<Value> = serde_json::from_str(&payload).expect("list json");
     assert!(
-        list_json.iter().any(|item| item["title"] == "BD_DB env test"),
+        list_json
+            .iter()
+            .any(|item| item["title"] == "BD_DB env test"),
         "issue not found via BD_DB override"
     );
 }

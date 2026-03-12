@@ -187,22 +187,11 @@ fn validate_sync_paths(
         ))
     })?;
 
-    let jsonl_path = if jsonl_path.exists() {
-        dunce::canonicalize(jsonl_path).map_err(|e| {
-            BeadsError::Config(format!(
-                "Failed to resolve JSONL path {}: {e}",
-                jsonl_path.display()
-            ))
-        })?
-    } else {
-        let jsonl_parent = jsonl_path.parent().ok_or_else(|| {
-            BeadsError::Config("JSONL path must include a parent directory".to_string())
-        })?;
-        let file_name = jsonl_path
-            .file_name()
-            .ok_or_else(|| BeadsError::Config("JSONL path must include a filename".to_string()))?;
-        resolve_sync_parent_path(jsonl_parent)?.join(file_name)
-    };
+    // Resolve the requested path to an absolute operator-facing location without
+    // collapsing the final component. Raw-path validation must inspect the
+    // actual path the operator asked sync to touch so symlink and `.git`
+    // invariants cannot be bypassed by early canonicalization.
+    let jsonl_path = resolve_requested_sync_path(jsonl_path)?;
 
     let extension = jsonl_path
         .extension()
@@ -260,6 +249,22 @@ fn validate_sync_paths(
         beads_dir: canonical_beads,
         is_external,
     })
+}
+
+fn resolve_requested_sync_path(jsonl_path: &Path) -> Result<PathBuf> {
+    if jsonl_path.is_absolute() {
+        return Ok(jsonl_path.to_path_buf());
+    }
+
+    let file_name = jsonl_path
+        .file_name()
+        .ok_or_else(|| BeadsError::Config("JSONL path must include a filename".to_string()))?;
+    let jsonl_parent = jsonl_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    Ok(resolve_sync_parent_path(jsonl_parent)?.join(file_name))
 }
 
 fn resolve_sync_parent_path(jsonl_parent: &Path) -> Result<PathBuf> {
@@ -1584,6 +1589,61 @@ mod tests {
             BeadsError::Config(message) => {
                 assert!(
                     message.contains("traversal"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_sync_paths_rejects_symlinked_external_jsonl_with_opt_in() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let outside_target = temp.path().join("outside.jsonl");
+        fs::write(&outside_target, "{}\n").unwrap();
+
+        let symlink_path = temp.path().join("linked.jsonl");
+        symlink(&outside_target, &symlink_path).unwrap();
+
+        let err = validate_sync_paths(&beads_dir, &symlink_path, true).unwrap_err();
+
+        match err {
+            BeadsError::Config(message) => {
+                assert!(message.contains("symlink"), "unexpected message: {message}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_sync_paths_rejects_git_symlinked_jsonl_even_with_opt_in() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let git_dir = temp.path().join(".git");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&git_dir).unwrap();
+
+        let outside_target = temp.path().join("outside.jsonl");
+        fs::write(&outside_target, "{}\n").unwrap();
+
+        let git_link = git_dir.join("linked.jsonl");
+        symlink(&outside_target, &git_link).unwrap();
+
+        let err = validate_sync_paths(&beads_dir, &git_link, true).unwrap_err();
+
+        match err {
+            BeadsError::Config(message) => {
+                assert!(
+                    message.contains(".git") || message.contains("git"),
                     "unexpected message: {message}"
                 );
             }

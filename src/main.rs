@@ -518,8 +518,8 @@ fn build_cli_overrides(cli: &Cli) -> config::CliOverrides {
         json: Some(cli.json),
         display_color: if cli.no_color { Some(false) } else { None },
         quiet: Some(cli.quiet),
-        no_db: Some(cli.no_db),
-        no_daemon: Some(cli.no_daemon),
+        no_db: if cli.no_db { Some(true) } else { None },
+        no_daemon: if cli.no_daemon { Some(true) } else { None },
         no_auto_flush: if cli.no_auto_flush { Some(true) } else { None },
         no_auto_import: if cli.no_auto_import { Some(true) } else { None },
         lock_timeout: cli.lock_timeout,
@@ -581,6 +581,7 @@ mod tests {
             "br",
             "--json",
             "--no-color",
+            "--no-db",
             "--no-auto-flush",
             "--lock-timeout",
             "2500",
@@ -589,8 +590,20 @@ mod tests {
         let overrides = build_cli_overrides(&cli);
         assert_eq!(overrides.json, Some(true));
         assert_eq!(overrides.display_color, Some(false));
+        assert_eq!(overrides.no_db, Some(true));
         assert_eq!(overrides.no_auto_flush, Some(true));
         assert_eq!(overrides.lock_timeout, Some(2500));
+    }
+
+    #[test]
+    fn build_overrides_omits_absent_startup_bool_flags() {
+        let cli = Cli::parse_from(["br", "list"]);
+        let overrides = build_cli_overrides(&cli);
+
+        assert_eq!(overrides.no_db, None);
+        assert_eq!(overrides.no_daemon, None);
+        assert_eq!(overrides.no_auto_flush, None);
+        assert_eq!(overrides.no_auto_import, None);
     }
 
     #[test]
