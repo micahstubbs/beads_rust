@@ -6,6 +6,7 @@
 mod common;
 
 use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env};
+use common::harness::parse_created_id;
 use serde_json::Value;
 use std::fs;
 #[cfg(unix)]
@@ -1065,6 +1066,67 @@ fn e2e_count_honors_toon_env_mode() {
 }
 
 #[test]
+fn e2e_version_honors_toon_env_mode() {
+    let _log = common::test_log("e2e_version_honors_toon_env_mode");
+    let workspace = BrWorkspace::new();
+
+    let version = run_br_with_env(
+        &workspace,
+        ["version"],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "version_toon_env",
+    );
+    assert!(
+        version.status.success(),
+        "version toon failed: {}",
+        version.stderr
+    );
+
+    let json = Value::from(try_decode(version.stdout.trim(), None).expect("valid version TOON"));
+    assert!(
+        json["version"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "TOON version output should include a version string: {json}"
+    );
+    assert!(
+        json["build"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "TOON version output should include a build string: {json}"
+    );
+}
+
+#[test]
+fn e2e_lint_honors_toon_env_mode() {
+    let _log = common::test_log("e2e_lint_honors_toon_env_mode");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_lint_toon");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Lint TOON bug", "--type", "bug"],
+        "create_lint_toon",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let lint = run_br_with_env(
+        &workspace,
+        ["lint"],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "lint_toon_env",
+    );
+    assert!(lint.status.success(), "lint toon failed: {}", lint.stderr);
+
+    let json = Value::from(try_decode(lint.stdout.trim(), None).expect("valid lint TOON"));
+    assert_eq!(json["total"].as_u64(), Some(2));
+    assert_eq!(json["issues"].as_u64(), Some(1));
+    assert_eq!(json["results"][0]["issue_type"].as_str(), Some("bug"));
+}
+
+#[test]
 fn e2e_stale_honors_toon_env_mode() {
     let _log = common::test_log("e2e_stale_honors_toon_env_mode");
     let workspace = BrWorkspace::new();
@@ -1280,6 +1342,95 @@ fn e2e_comments_add_honors_toon_env_mode() {
     let json = Value::from(decoded);
     assert_eq!(json["issue_id"].as_str(), Some(issue_id.as_str()));
     assert_eq!(json["text"].as_str(), Some("TOON comment"));
+}
+
+#[test]
+fn e2e_audit_record_honors_toon_env_mode() {
+    let _log = common::test_log("e2e_audit_record_honors_toon_env_mode");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_audit_record_toon");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let record = run_br_with_env(
+        &workspace,
+        ["audit", "record", "--kind", "llm_call"],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "audit_record_toon_env",
+    );
+    assert!(
+        record.status.success(),
+        "audit record toon failed: {}",
+        record.stderr
+    );
+
+    let json =
+        Value::from(try_decode(record.stdout.trim(), None).expect("valid audit record TOON"));
+    assert!(
+        json["id"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("int-")),
+        "TOON audit record output should include an interaction id: {json}"
+    );
+    assert_eq!(json["kind"].as_str(), Some("llm_call"));
+}
+
+#[test]
+fn e2e_audit_log_and_summary_honor_toon_env_mode() {
+    let _log = common::test_log("e2e_audit_log_and_summary_honor_toon_env_mode");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_audit_log_toon");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Audit TOON seed"],
+        "create_audit_toon_seed",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let issue_id = parse_created_id(&create.stdout);
+
+    let log = run_br_with_env(
+        &workspace,
+        ["audit", "log", &issue_id],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "audit_log_toon_env",
+    );
+    assert!(
+        log.status.success(),
+        "audit log toon failed: {}",
+        log.stderr
+    );
+    let log_json = Value::from(try_decode(log.stdout.trim(), None).expect("valid audit log TOON"));
+    assert_eq!(log_json["issue_id"].as_str(), Some(issue_id.as_str()));
+    assert!(
+        log_json["events"]
+            .as_array()
+            .is_some_and(|events| !events.is_empty()),
+        "TOON audit log output should include events: {log_json}"
+    );
+
+    let summary = run_br_with_env(
+        &workspace,
+        ["audit", "summary", "--days", "30"],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "audit_summary_toon_env",
+    );
+    assert!(
+        summary.status.success(),
+        "audit summary toon failed: {}",
+        summary.stderr
+    );
+    let summary_json =
+        Value::from(try_decode(summary.stdout.trim(), None).expect("valid audit summary TOON"));
+    assert_eq!(summary_json["period_days"].as_u64(), Some(30));
+    assert!(
+        summary_json["totals"]["total"]
+            .as_u64()
+            .is_some_and(|total| total >= 1),
+        "TOON audit summary output should include totals: {summary_json}"
+    );
 }
 
 #[test]

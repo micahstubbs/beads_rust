@@ -40,8 +40,12 @@ struct LintSummary {
 }
 
 impl LintSummary {
-    const fn exit_code(&self, json: bool) -> i32 {
-        if json || self.warnings == 0 { 0 } else { 1 }
+    const fn exit_code(&self, structured: bool) -> i32 {
+        if structured || self.warnings == 0 {
+            0
+        } else {
+            1
+        }
     }
 }
 
@@ -96,6 +100,16 @@ pub fn execute(
     };
 
     let summary = lint_issues(&issues);
+
+    if ctx.is_toon() {
+        let output = LintOutput {
+            total: summary.warnings,
+            issues: summary.results.len(),
+            results: summary.results,
+        };
+        ctx.toon(&output);
+        return Ok(());
+    }
 
     if ctx.is_json() {
         let output = LintOutput {

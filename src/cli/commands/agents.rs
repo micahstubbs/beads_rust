@@ -310,7 +310,9 @@ pub fn remove_blurb(content: &str) -> String {
     let mut end = end_idx;
 
     // Remove trailing newlines (and carriage returns)
-    while end < content.len() && (content[end..].starts_with('\n') || content[end..].starts_with('\r')) {
+    while end < content.len()
+        && (content[end..].starts_with('\n') || content[end..].starts_with('\r'))
+    {
         end += 1;
     }
 
@@ -358,7 +360,9 @@ pub fn remove_legacy_blurb(content: &str) -> String {
     let mut end = end_idx;
 
     // Remove trailing newlines (and carriage returns)
-    while end < content.len() && (content[end..].starts_with('\n') || content[end..].starts_with('\r')) {
+    while end < content.len()
+        && (content[end..].starts_with('\n') || content[end..].starts_with('\r'))
+    {
         end += 1;
     }
 

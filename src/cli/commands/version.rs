@@ -63,6 +63,20 @@ pub fn execute(args: &VersionArgs, ctx: &OutputContext) -> Result<()> {
         features.push("self_update");
     }
 
+    if ctx.is_toon() {
+        let output = VersionOutput {
+            version,
+            build,
+            commit,
+            branch,
+            rust_version,
+            target,
+            features,
+        };
+        ctx.toon(&output);
+        return Ok(());
+    }
+
     if ctx.is_json() {
         let output = VersionOutput {
             version,
@@ -203,7 +217,14 @@ fn execute_update_check(current_version: &str, ctx: &OutputContext) {
     let latest = match fetch_latest_version() {
         Ok(v) => v,
         Err(e) => {
-            if ctx.is_json() {
+            if ctx.is_toon() {
+                ctx.toon(&serde_json::json!({
+                    "current": current_version,
+                    "latest": null,
+                    "update_available": null,
+                    "error": e.to_string()
+                }));
+            } else if ctx.is_json() {
                 ctx.json(&serde_json::json!({
                     "current": current_version,
                     "latest": null,
@@ -225,7 +246,13 @@ fn execute_update_check(current_version: &str, ctx: &OutputContext) {
         _ => false,
     };
 
-    if ctx.is_json() {
+    if ctx.is_toon() {
+        ctx.toon(&serde_json::json!({
+            "current": current_version,
+            "latest": latest,
+            "update_available": update_available
+        }));
+    } else if ctx.is_json() {
         ctx.json(&serde_json::json!({
             "current": current_version,
             "latest": latest,

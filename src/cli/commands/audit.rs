@@ -122,7 +122,7 @@ struct ActorSummary {
 /// Returns an error if audit entry creation fails or file IO fails.
 pub fn execute(
     command: &AuditCommands,
-    json: bool,
+    _json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
@@ -133,8 +133,8 @@ pub fn execute(
     match command {
         AuditCommands::Record(args) => record_entry(args, &beads_dir, &actor, ctx),
         AuditCommands::Label(args) => label_entry(args, &beads_dir, &actor, ctx),
-        AuditCommands::Log(args) => execute_log(args, &beads_dir, cli, json, ctx),
-        AuditCommands::Summary(args) => execute_summary(args, &beads_dir, cli, json, ctx),
+        AuditCommands::Log(args) => execute_log(args, &beads_dir, cli, ctx),
+        AuditCommands::Summary(args) => execute_summary(args, &beads_dir, cli, ctx),
     }
 }
 
@@ -142,7 +142,6 @@ fn execute_log(
     args: &AuditLogArgs,
     beads_dir: &Path,
     cli: &config::CliOverrides,
-    _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     let storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
@@ -150,6 +149,15 @@ fn execute_log(
     let events = storage_ctx.storage.get_events(issue_id, 0)?;
 
     if ctx.is_quiet() {
+        return Ok(());
+    }
+
+    if ctx.is_toon() {
+        let output = AuditLogOutput {
+            issue_id: issue_id.clone(),
+            events: events.iter().map(map_event_to_output).collect(),
+        };
+        ctx.toon(&output);
         return Ok(());
     }
 
@@ -175,7 +183,6 @@ fn execute_summary(
     args: &AuditSummaryArgs,
     beads_dir: &Path,
     cli: &config::CliOverrides,
-    _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     let storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
@@ -228,6 +235,16 @@ fn execute_summary(
     actors.sort_by_key(|b| std::cmp::Reverse(b.total));
 
     if ctx.is_quiet() {
+        return Ok(());
+    }
+
+    if ctx.is_toon() {
+        let output = AuditSummaryOutput {
+            period_days: args.days,
+            totals,
+            actors,
+        };
+        ctx.toon(&output);
         return Ok(());
     }
 
@@ -322,7 +339,9 @@ fn record_entry(
         kind: entry.kind.clone(),
     };
 
-    if ctx.is_json() {
+    if ctx.is_toon() {
+        ctx.toon(&output);
+    } else if ctx.is_json() {
         ctx.json_pretty(&output);
     } else if !ctx.is_quiet() {
         println!("{id}");
@@ -380,7 +399,9 @@ fn label_entry(
         label,
     };
 
-    if ctx.is_json() {
+    if ctx.is_toon() {
+        ctx.toon(&output);
+    } else if ctx.is_json() {
         ctx.json_pretty(&output);
     } else if !ctx.is_quiet() {
         println!("{id}");
