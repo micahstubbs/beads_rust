@@ -653,6 +653,33 @@ fn force_rebuild_matches_auto_rebuild() {
     );
 }
 
+#[test]
+fn force_rebuild_with_direct_blocker_dependency_succeeds() {
+    let mut storage = test_db();
+
+    let blocker = fixtures::issue("ok70-force-blocker");
+    let blocked_issue = fixtures::issue("ok70-force-blocked");
+
+    storage.create_issue(&blocker, "tester").unwrap();
+    storage.create_issue(&blocked_issue, "tester").unwrap();
+
+    storage
+        .add_dependency(
+            &blocked_issue.id,
+            &blocker.id,
+            DependencyType::Blocks.as_str(),
+            "tester",
+        )
+        .unwrap();
+
+    let rebuilt = storage.rebuild_blocked_cache(true).unwrap();
+    assert_eq!(rebuilt, 1, "force rebuild should persist one blocked issue");
+    assert!(
+        blocked_ids(&storage).contains(&blocked_issue.id),
+        "force rebuild should keep the direct blocker in cache"
+    );
+}
+
 // ===========================================================================
 // 15. Deep transitive parent-child chain
 // ===========================================================================

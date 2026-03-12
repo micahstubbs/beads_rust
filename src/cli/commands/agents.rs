@@ -309,16 +309,26 @@ pub fn remove_blurb(content: &str) -> String {
     let mut start = start_idx;
     let mut end = end_idx;
 
-    // Remove trailing newlines
-    while end < content.len() && content[end..].starts_with('\n') {
+    // Remove trailing newlines (and carriage returns)
+    while end < content.len() && (content[end..].starts_with('\n') || content[end..].starts_with('\r')) {
         end += 1;
     }
 
-    // Remove leading newlines (up to 2)
+    // Remove leading newlines (up to 2, handling CRLF)
     let mut removed_leading = 0;
-    while start > 0 && content[..start].ends_with('\n') && removed_leading < 2 {
-        start -= 1;
-        removed_leading += 1;
+    while start > 0 && removed_leading < 2 {
+        if content[..start].ends_with('\n') {
+            start -= 1;
+            if start > 0 && content[..start].ends_with('\r') {
+                start -= 1;
+            }
+            removed_leading += 1;
+        } else if content[..start].ends_with('\r') {
+            start -= 1;
+            removed_leading += 1;
+        } else {
+            break;
+        }
     }
 
     format!("{}{}", &content[..start], &content[end..])
@@ -347,14 +357,26 @@ pub fn remove_legacy_blurb(content: &str) -> String {
     let mut start = start_idx;
     let mut end = end_idx;
 
-    while end < content.len() && content[end..].starts_with('\n') {
+    // Remove trailing newlines (and carriage returns)
+    while end < content.len() && (content[end..].starts_with('\n') || content[end..].starts_with('\r')) {
         end += 1;
     }
 
+    // Remove leading newlines (up to 2, handling CRLF)
     let mut removed_leading = 0;
-    while start > 0 && content[..start].ends_with('\n') && removed_leading < 2 {
-        start -= 1;
-        removed_leading += 1;
+    while start > 0 && removed_leading < 2 {
+        if content[..start].ends_with('\n') {
+            start -= 1;
+            if start > 0 && content[..start].ends_with('\r') {
+                start -= 1;
+            }
+            removed_leading += 1;
+        } else if content[..start].ends_with('\r') {
+            start -= 1;
+            removed_leading += 1;
+        } else {
+            break;
+        }
     }
 
     format!("{}{}", &content[..start], &content[end..])
