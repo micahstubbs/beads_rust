@@ -5,6 +5,7 @@
 
 #![allow(dead_code)]
 
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -54,6 +55,7 @@ impl DatasetMetadata {
 }
 
 const SOURCE_COMMIT_OVERRIDE_ENV: &str = "BR_DATASET_SOURCE_COMMIT";
+const WORKSPACE_FAILURE_FIXTURE_DIR: &str = "tests/fixtures/workspace_failures";
 
 /// Known datasets for testing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -104,6 +106,104 @@ impl KnownDataset {
 pub struct DatasetRegistry {
     datasets: HashMap<String, DatasetMetadata>,
     source_hashes: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceFailureFixtureMetadata {
+    pub name: String,
+    pub family: String,
+    pub description: String,
+    pub expected_classification: String,
+    pub expected_command_surface: Vec<String>,
+    pub source_hint: String,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkspaceFailureFixture {
+    pub root: PathBuf,
+    pub manifest_path: PathBuf,
+    pub metadata: WorkspaceFailureFixtureMetadata,
+}
+
+pub struct IsolatedWorkspaceFailureFixture {
+    pub temp_dir: TempDir,
+    pub root: PathBuf,
+    pub beads_dir: PathBuf,
+    pub fixture: WorkspaceFailureFixture,
+}
+
+impl WorkspaceFailureFixture {
+    fn load_from_root(root: PathBuf) -> std::io::Result<Self> {
+        let manifest_path = root.join("fixture.json");
+        let manifest = fs::read_to_string(&manifest_path)?;
+        let metadata = serde_json::from_str(&manifest).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Invalid fixture.json for {}: {err}", root.display()),
+            )
+        })?;
+
+        Ok(Self {
+            root,
+            manifest_path,
+            metadata,
+        })
+    }
+}
+
+impl IsolatedWorkspaceFailureFixture {
+    pub fn workspace_root(&self) -> &Path {
+        &self.root
+    }
+}
+
+fn workspace_failure_fixture_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(WORKSPACE_FAILURE_FIXTURE_DIR)
+}
+
+pub fn list_workspace_failure_fixtures() -> std::io::Result<Vec<WorkspaceFailureFixture>> {
+    let fixture_root = workspace_failure_fixture_root();
+    if !fixture_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut fixtures = Vec::new();
+    for entry in fs::read_dir(fixture_root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        fixtures.push(WorkspaceFailureFixture::load_from_root(entry.path())?);
+    }
+
+    fixtures.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
+    Ok(fixtures)
+}
+
+pub fn isolated_workspace_failure_fixture(
+    name: &str,
+) -> std::io::Result<IsolatedWorkspaceFailureFixture> {
+    let fixture = list_workspace_failure_fixtures()?
+        .into_iter()
+        .find(|fixture| fixture.metadata.name == name)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Workspace failure fixture '{name}' not found"),
+            )
+        })?;
+
+    let temp_dir = TempDir::new()?;
+    let root = temp_dir.path().to_path_buf();
+    copy_workspace_failure_fixture_root(&fixture.root, &root)?;
+
+    Ok(IsolatedWorkspaceFailureFixture {
+        temp_dir,
+        root: root.clone(),
+        beads_dir: root.join(".beads"),
+        fixture,
+    })
 }
 
 impl DatasetRegistry {
@@ -394,6 +494,63 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
                 continue;
             }
             copy_dir_recursive(&src_path, &dst_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn copy_fixture_workspace_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+
+        if file_type.is_dir() {
+            copy_fixture_workspace_recursive(&src_path, &dst_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn copy_workspace_failure_fixture_root(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+
+    let visible_payload = src.join("beads");
+    let hidden_payload = src.join(".beads");
+    let payload = if visible_payload.exists() {
+        Some(visible_payload)
+    } else if hidden_payload.exists() {
+        Some(hidden_payload)
+    } else {
+        None
+    };
+
+    if let Some(payload) = payload {
+        copy_fixture_workspace_recursive(&payload, &dst.join(".beads"))?;
+    }
+
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if matches!(name.as_ref(), "fixture.json" | "beads" | ".beads") {
+            continue;
+        }
+
+        let src_path = entry.path();
+        let dst_path = dst.join(file_name);
+        if file_type.is_dir() {
+            copy_fixture_workspace_recursive(&src_path, &dst_path)?;
         } else if file_type.is_file() {
             fs::copy(&src_path, &dst_path)?;
         }
@@ -1128,6 +1285,71 @@ mod tests {
 
         let result = isolated_from_override(&override_cfg);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_workspace_failure_fixture_catalog_is_loadable() {
+        let fixtures = list_workspace_failure_fixtures().expect("fixture catalog");
+        let names: Vec<&str> = fixtures
+            .iter()
+            .map(|fixture| fixture.metadata.name.as_str())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec![
+                "corrupt_db_text",
+                "db_jsonl_disagreement",
+                "duplicate_config_rows",
+                "interrupted_rebuild_leftovers",
+                "jsonl_conflict_markers",
+                "metadata_custom_paths",
+                "sidecar_wal_without_shm",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_isolated_workspace_failure_fixture_preserves_sidecars_and_recovery_debris() {
+        let wal_fixture =
+            isolated_workspace_failure_fixture("sidecar_wal_without_shm").expect("sidecar fixture");
+        assert!(
+            wal_fixture.beads_dir.join("beads.db-wal").exists(),
+            "sidecar WAL should be preserved in copied fixture"
+        );
+
+        let rebuild_fixture = isolated_workspace_failure_fixture("interrupted_rebuild_leftovers")
+            .expect("interrupted rebuild fixture");
+        assert!(
+            rebuild_fixture
+                .beads_dir
+                .join("beads.db.bad_20260312T000000Z")
+                .exists(),
+            "backup database should be preserved in copied fixture"
+        );
+        assert!(
+            rebuild_fixture
+                .beads_dir
+                .join(".br_recovery")
+                .join("beads.db.20260312T000000Z.rebuild-failed")
+                .exists(),
+            "recovery debris should be preserved in copied fixture"
+        );
+    }
+
+    #[test]
+    fn test_isolated_workspace_failure_fixture_preserves_custom_metadata_targets() {
+        let fixture = isolated_workspace_failure_fixture("metadata_custom_paths")
+            .expect("metadata override fixture");
+
+        assert!(
+            fixture.beads_dir.join("custom.db").exists(),
+            "custom database path should be preserved"
+        );
+        assert!(
+            fixture.beads_dir.join("custom.jsonl").exists(),
+            "custom jsonl path should be preserved"
+        );
     }
 
     // =========================================================================

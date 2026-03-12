@@ -1,0 +1,17 @@
+{
+  "name": "interrupted_rebuild_leftovers",
+  "family": "recovery_debris",
+  "description": "A failed rebuild left a bad replacement database in place along with preserved backups and recovery artifacts.",
+  "expected_classification": "recoverable",
+  "expected_command_surface": [
+    "startup/open",
+    "doctor --repair",
+    "sync --status",
+    "history"
+  ],
+  "source_hint": "Inspired by the large repo-root recovery dumps collected during real-world investigation.",
+  "notes": [
+    "The live beads.db is plain text on purpose; the interesting state is the preserved backup and .br_recovery trail.",
+    "Future replay tests can assert that recovery tooling prefers the preserved backups over the broken live file."
+  ]
+}

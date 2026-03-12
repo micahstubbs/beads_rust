@@ -2292,22 +2292,49 @@ impl SqliteStorage {
         // Clear existing counters
         conn.execute("DELETE FROM child_counters")?;
 
-        // Find all hierarchical IDs
-        let rows = conn.query("SELECT id FROM issues WHERE id LIKE '%.%'")?;
+        // Build counters only for parents that still exist. Recovered imports can
+        // contain hierarchical IDs whose root parent was deleted long ago.
+        let rows = conn.query("SELECT id FROM issues")?;
+        let issue_ids: HashSet<String> = rows
+            .iter()
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from))
+            .collect();
         let mut max_children: HashMap<String, u32> = HashMap::new();
+        let mut skipped_missing_parents = 0usize;
 
-        for row in &rows {
-            if let Some(id) = row.get(0).and_then(SqliteValue::as_text)
-                && let Ok(parsed) = parse_id(id)
-                && !parsed.is_root()
-                && let Some(parent) = parsed.parent()
-                && let Some(&child_num) = parsed.child_path.last()
-            {
-                let entry = max_children.entry(parent).or_insert(0);
-                if child_num > *entry {
-                    *entry = child_num;
-                }
+        for id in &issue_ids {
+            let Ok(parsed) = parse_id(id) else {
+                continue;
+            };
+            if parsed.is_root() {
+                continue;
             }
+
+            let Some(parent) = parsed.parent() else {
+                skipped_missing_parents += 1;
+                continue;
+            };
+            if !issue_ids.contains(&parent) {
+                skipped_missing_parents += 1;
+                continue;
+            }
+
+            let Some(&child_num) = parsed.child_path.last() else {
+                skipped_missing_parents += 1;
+                continue;
+            };
+
+            let entry = max_children.entry(parent).or_insert(0);
+            if child_num > *entry {
+                *entry = child_num;
+            }
+        }
+
+        if skipped_missing_parents > 0 {
+            tracing::debug!(
+                skipped_missing_parents,
+                "Skipped child counter rebuild for hierarchical issues whose parent ID is missing"
+            );
         }
 
         let mut count = 0;

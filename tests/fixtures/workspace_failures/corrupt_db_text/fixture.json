@@ -1,0 +1,17 @@
+{
+  "name": "corrupt_db_text",
+  "family": "corrupt_db",
+  "description": "The primary database file is plain text while JSONL remains present and parseable.",
+  "expected_classification": "recoverable",
+  "expected_command_surface": [
+    "startup/open",
+    "doctor",
+    "sync --status",
+    "list --no-db"
+  ],
+  "source_hint": "Derived from the malformed-db repair cases in tests/e2e_workspace_commands.rs and tests/e2e_global_flags.rs.",
+  "notes": [
+    "Represents the simplest non-SQLite database corruption case.",
+    "Intended to drive rebuild-or-bypass behavior rather than low-level SQLite recovery."
+  ]
+}

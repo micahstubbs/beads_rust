@@ -4358,6 +4358,91 @@ mod tests {
     }
 
     #[test]
+    fn test_import_skips_child_counters_for_missing_parents() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+
+        let orphan_child = make_test_issue("bd-orphan.6", "Recovered orphan child");
+        let json = serde_json::to_string(&orphan_child).unwrap();
+        fs::write(&jsonl_path, format!("{json}\n")).unwrap();
+
+        import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .unwrap();
+
+        let child_counters = storage
+            .execute_raw_query("SELECT parent_id FROM child_counters")
+            .unwrap();
+        assert!(
+            child_counters.is_empty(),
+            "orphan child IDs should not rebuild counters for missing parents"
+        );
+        assert!(
+            !storage
+                .has_missing_issue_reference("child_counters", "parent_id")
+                .unwrap(),
+            "child counters must remain free of FK orphans after import"
+        );
+    }
+
+    #[test]
+    fn test_import_rebuilds_nested_child_counters_only_for_existing_parents() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+
+        let orphan_child = make_test_issue("bd-orphan.6", "Recovered orphan child");
+        let nested_child = make_test_issue("bd-orphan.6.1", "Recovered nested child");
+        let orphan_json = serde_json::to_string(&orphan_child).unwrap();
+        let nested_json = serde_json::to_string(&nested_child).unwrap();
+        fs::write(&jsonl_path, format!("{orphan_json}\n{nested_json}\n")).unwrap();
+
+        import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .unwrap();
+
+        let child_counters = storage
+            .execute_raw_query(
+                "SELECT parent_id, last_child FROM child_counters ORDER BY parent_id",
+            )
+            .unwrap();
+        assert_eq!(
+            child_counters.len(),
+            1,
+            "only the existing intermediate parent should get a counter"
+        );
+        assert_eq!(
+            child_counters[0]
+                .first()
+                .and_then(SqliteValue::as_text)
+                .unwrap_or(""),
+            "bd-orphan.6"
+        );
+        assert_eq!(
+            child_counters[0]
+                .get(1)
+                .and_then(SqliteValue::as_integer)
+                .unwrap_or_default(),
+            1
+        );
+        assert!(
+            !storage
+                .has_missing_issue_reference("child_counters", "parent_id")
+                .unwrap(),
+            "nested rebuild should not recreate orphan counters for missing roots"
+        );
+    }
+
+    #[test]
     fn test_normalize_issue_wisp_detection() {
         let mut issue = make_test_issue("bd-wisp-123", "Wisp issue");
         assert!(!issue.ephemeral);

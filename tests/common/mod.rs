@@ -26,8 +26,9 @@ pub use baseline::{
 pub use binary_discovery::{BinaryVersion, DiscoveredBinaries, discover_binaries};
 pub use dataset_registry::{
     DatasetIntegrityGuard, DatasetMetadata, DatasetOverride, DatasetProvenance, DatasetRegistry,
-    IntegrityCheckResult, IsolatedDataset, KnownDataset, isolated_from_override,
-    run_with_integrity,
+    IntegrityCheckResult, IsolatedDataset, IsolatedWorkspaceFailureFixture, KnownDataset,
+    WorkspaceFailureFixture, WorkspaceFailureFixtureMetadata, isolated_from_override,
+    isolated_workspace_failure_fixture, list_workspace_failure_fixtures, run_with_integrity,
 };
 pub use harness::{ParallelismMode, ResourceGuardrails, RunnerPolicy};
 pub use report_indexer::{
