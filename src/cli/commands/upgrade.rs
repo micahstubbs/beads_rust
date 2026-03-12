@@ -219,7 +219,7 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, ctx: &OutputContex
             BeadsError::Other(anyhow::anyhow!(
                 "{msg}\n\n\
                  This binary was built without archive support for the required format (e.g., .tar.gz).\n\
-                 This is a known issue in some versions (e.g., 0.1.21 - 0.1.26) where the 'archive-tar' feature was not correctly linked.\n\n\
+                 This is a known issue in some older versions (e.g., 0.1.21 - 0.1.26). Version 0.1.27 and later include the correct 'archive-tar' linkage.\n\n\
                  Please upgrade manually by running:\n\n  \
                  curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/beads_rust/main/install.sh | bash\n\n\
                  Or by downloading the release from:\n  \
