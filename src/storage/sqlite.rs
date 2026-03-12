@@ -524,25 +524,18 @@ impl SqliteStorage {
             // Mark dirty
             if !ctx.dirty_ids.is_empty() {
                 let now_str = Utc::now().to_rfc3339();
-                let dirty_vec: Vec<String> = ctx.dirty_ids.drain().collect();
+                // Collect IDs into a Vec for chunked processing
+                let dirty_vec: Vec<_> = ctx.dirty_ids.iter().collect();
 
                 for chunk in dirty_vec.chunks(DIRTY_ISSUE_CHUNK_SIZE) {
-                    // Bulk delete existing dirty flags for this chunk
-                    let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
-                    let sql = format!(
-                        "DELETE FROM dirty_issues WHERE issue_id IN ({})",
-                        placeholders.join(",")
-                    );
-                    let params: Vec<SqliteValue> =
-                        chunk.iter().map(|id| SqliteValue::from(id.as_str())).collect();
-                    storage.conn.execute_with_params(&sql, &params)?;
-
-                    // Insert new dirty flags
-                    for insert_chunk in chunk.chunks(400) {
+                    // Use INSERT OR REPLACE (REPLACE) for a single-step atomic update.
+                    // This is more efficient than DELETE + INSERT and correctly handles
+                    // existing dirty flags by updating their marked_at time.
+                    for insert_chunk in chunk.chunks(450) {
                         let placeholders: Vec<&str> =
                             insert_chunk.iter().map(|_| "(?, ?)").collect();
                         let insert_sql = format!(
-                            "INSERT INTO dirty_issues (issue_id, marked_at) VALUES {}",
+                            "INSERT OR REPLACE INTO dirty_issues (issue_id, marked_at) VALUES {}",
                             placeholders.join(", ")
                         );
                         let mut insert_params = Vec::with_capacity(insert_chunk.len() * 2);
@@ -2106,6 +2099,8 @@ impl SqliteStorage {
         conn.execute("DELETE FROM blocked_issues_cache")?;
 
         let mut count = 0;
+        let mut entries = Vec::with_capacity(blocked_issues_map.len());
+
         for (issue_id, mut blockers) in blocked_issues_map {
             if blockers.is_empty() {
                 continue;
@@ -2123,17 +2118,25 @@ impl SqliteStorage {
                     continue;
                 }
             };
+            entries.push((issue_id, blockers_json));
+        }
 
-            conn.execute_with_params(
-                "INSERT INTO blocked_issues_cache (issue_id, blocked_by, blocked_at)
-                 VALUES (?, ?, CURRENT_TIMESTAMP)",
-                &[
-                    SqliteValue::from(issue_id.as_str()),
-                    SqliteValue::from(blockers_json.as_str()),
-                ],
-            )?;
-
-            count += 1;
+        // Use chunked multi-row inserts to stay within SQLite's 999 parameter limit.
+        // Each row has 3 columns (including CURRENT_TIMESTAMP, but we only bind 2).
+        for chunk in entries.chunks(450) {
+            let placeholders: Vec<&str> =
+                chunk.iter().map(|_| "(?, ?, CURRENT_TIMESTAMP)").collect();
+            let sql = format!(
+                "INSERT INTO blocked_issues_cache (issue_id, blocked_by, blocked_at) VALUES {}",
+                placeholders.join(", ")
+            );
+            let mut params = Vec::with_capacity(chunk.len() * 2);
+            for (issue_id, blockers_json) in chunk {
+                params.push(SqliteValue::from(issue_id.as_str()));
+                params.push(SqliteValue::from(blockers_json.as_str()));
+            }
+            conn.execute_with_params(&sql, &params)?;
+            count += chunk.len();
         }
 
         tracing::debug!(blocked_count = count, "Rebuilt blocked issues cache");

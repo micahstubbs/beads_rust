@@ -447,9 +447,7 @@ fn hash_beads_directory(beads_dir: &Path) -> std::io::Result<String> {
     Ok(format!("{:x}", hasher.finalize())[..16].to_string())
 }
 
-fn source_commit_override_with(
-    get_env: impl Fn(&str) -> Option<String>,
-) -> Option<String> {
+fn source_commit_override_with(get_env: impl Fn(&str) -> Option<String>) -> Option<String> {
     get_env(SOURCE_COMMIT_OVERRIDE_ENV)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -1317,7 +1315,10 @@ mod tests {
             source_commit_override_with(|_| Some(" abc1234 \n".to_string())),
             Some("abc1234".to_string())
         );
-        assert_eq!(source_commit_override_with(|_| Some("   ".to_string())), None);
+        assert_eq!(
+            source_commit_override_with(|_| Some("   ".to_string())),
+            None
+        );
         assert_eq!(source_commit_override_with(|_| None), None);
     }
 }

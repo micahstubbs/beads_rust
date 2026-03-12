@@ -2999,7 +2999,18 @@ pub fn import_from_jsonl(
         // Determine target ID and record mapping
         let target_id = match &collision {
             CollisionResult::Match { existing_id, .. } => existing_id.clone(),
-            CollisionResult::NewIssue => issue.id.clone(),
+            CollisionResult::NewIssue => {
+                let id = issue.id.clone();
+                // Update maps for intra-JSONL collision detection.
+                // This ensures that if the JSONL file has duplicate issues (same content hash),
+                // the second one is correctly identified as a match to the first one
+                // even if the first one hasn't been committed to the database yet.
+                id_by_hash.insert(computed_hash.clone(), id.clone());
+                if let Some(ref ext_ref) = issue.external_ref {
+                    id_by_ext_ref.insert(ext_ref.clone(), id.clone());
+                }
+                id
+            }
         };
 
         if target_id != issue.id {
@@ -3211,24 +3222,26 @@ fn sync_issue_relations(storage: &SqliteStorage, issue: &Issue) -> Result<()> {
 ///
 /// Returns an error if the file cannot be read.
 pub fn compute_jsonl_hash(path: &Path) -> Result<String> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
+    use std::io::BufRead;
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
     let mut hasher = Sha256::new();
-    let mut line_buf = String::new();
+    let mut line_buf = Vec::with_capacity(4096);
+
     loop {
         line_buf.clear();
-        let bytes = reader.read_line(&mut line_buf)?;
-        if bytes == 0 {
+        let bytes_read = reader.read_until(b'\n', &mut line_buf)?;
+        if bytes_read == 0 {
             break;
         }
 
-        let trimmed = line_buf.trim();
-        if trimmed.is_empty() {
-            continue;
+        // Efficiently skip empty or whitespace-only lines without UTF-8 validation.
+        // trim_ascii() is a fast byte-based trim.
+        let trimmed = line_buf.trim_ascii();
+        if !trimmed.is_empty() {
+            hasher.update(trimmed);
+            hasher.update(b"\n");
         }
-
-        hasher.update(trimmed.as_bytes());
-        hasher.update(b"\n");
     }
 
     Ok(format!("{:x}", hasher.finalize()))
