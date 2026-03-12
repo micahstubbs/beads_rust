@@ -2085,25 +2085,43 @@ fn restore_foreign_keys_after_import(
         return Ok(());
     }
 
-    let fk_violations = storage
-        .execute_raw_query("PRAGMA foreign_key_check")
-        .map_err(|source| BeadsError::WithContext {
-            context: "Failed to verify foreign key integrity after import".to_string(),
-            source: Box::new(source),
-        })?;
-
-    if let Some(first_violation) = fk_violations.first() {
-        let first_table = first_violation
-            .first()
-            .and_then(SqliteValue::as_text)
-            .unwrap_or("unknown");
+    if let Some((table, column)) = find_post_import_fk_violation(storage)? {
         return Err(BeadsError::Other(anyhow::anyhow!(
-            "Import finished with {} foreign key violation(s); first violation table: {first_table}",
-            fk_violations.len()
+            "Import finished with orphaned rows in {table}.{column}"
         )));
     }
 
     Ok(())
+}
+
+fn find_post_import_fk_violation(storage: &SqliteStorage) -> Result<Option<(String, String)>> {
+    let fk_backed_tables = [
+        ("dependencies", "issue_id"),
+        ("labels", "issue_id"),
+        ("comments", "issue_id"),
+        ("events", "issue_id"),
+        ("dirty_issues", "issue_id"),
+        ("export_hashes", "issue_id"),
+        ("blocked_issues_cache", "issue_id"),
+        ("child_counters", "parent_id"),
+    ];
+
+    for (table, column) in fk_backed_tables {
+        let has_orphan = storage
+            .has_missing_issue_reference(table, column)
+            .map_err(|source| BeadsError::WithContext {
+                context: format!(
+                    "Failed to verify import integrity for foreign-key-backed table {table}.{column}"
+                ),
+                source: Box::new(source),
+            })?;
+
+        if has_orphan {
+            return Ok(Some((table.to_string(), column.to_string())));
+        }
+    }
+
+    Ok(None)
 }
 
 fn is_issue_exportable(issue: &Issue, retention_days: Option<u64>) -> bool {
@@ -4682,7 +4700,7 @@ mod tests {
 
         let err = restore_foreign_keys_after_import(&storage, true).unwrap_err();
         assert!(
-            err.to_string().contains("foreign key violation"),
+            err.to_string().contains("orphaned rows in comments.issue_id"),
             "unexpected error: {err}"
         );
 

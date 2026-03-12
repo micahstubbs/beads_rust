@@ -32,6 +32,38 @@ fn create_redirect_file(beads_dir: &std::path::Path, target: &str) {
     fs::write(&redirect_path, target).expect("write redirect");
 }
 
+fn init_workspace(workspace: &BrWorkspace, label: &str) {
+    let init = run_br(workspace, ["init"], label);
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+}
+
+fn configure_external_route(main_workspace: &BrWorkspace, external_workspace: &BrWorkspace) {
+    fs::write(
+        external_workspace.root.join(".beads").join("config.yaml"),
+        "issue_prefix: ext\n",
+    )
+    .expect("write external config");
+
+    create_routes_file(
+        main_workspace,
+        &[("ext-", external_workspace.root.to_string_lossy().as_ref())],
+    );
+}
+
+fn create_issue_and_get_id(workspace: &BrWorkspace, title: &str, label: &str) -> String {
+    let create = run_br(workspace, ["create", title, "--json"], label);
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let issue: Value =
+        serde_json::from_str(&extract_json_payload(&create.stdout)).expect("create json");
+    issue["id"].as_str().expect("issue id").to_string()
+}
+
+fn show_issue_json(workspace: &BrWorkspace, issue_id: &str, label: &str) -> Vec<Value> {
+    let show = run_br(workspace, ["show", issue_id, "--json"], label);
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    serde_json::from_str(&extract_json_payload(&show.stdout)).expect("show json")
+}
+
 fn switch_workspace_to_custom_database(workspace: &BrWorkspace, database_name: &str) {
     let beads_dir = workspace.root.join(".beads");
     let old_db = beads_dir.join("beads.db");
@@ -1809,65 +1841,20 @@ fn e2e_routing_update_claim_failure_does_not_mutate_earlier_routes() {
     let main_workspace = BrWorkspace::new();
     let external_workspace = BrWorkspace::new();
 
-    let init = run_br(&main_workspace, ["init"], "init_routed_claim_failure_main");
-    assert!(init.status.success(), "init failed: {}", init.stderr);
+    init_workspace(&main_workspace, "init_routed_claim_failure_main");
+    init_workspace(&external_workspace, "init_routed_claim_failure_external");
+    configure_external_route(&main_workspace, &external_workspace);
 
-    let init_external = run_br(
-        &external_workspace,
-        ["init"],
-        "init_routed_claim_failure_external",
-    );
-    assert!(
-        init_external.status.success(),
-        "external init failed: {}",
-        init_external.stderr
-    );
-
-    fs::write(
-        external_workspace.root.join(".beads").join("config.yaml"),
-        "issue_prefix: ext\n",
-    )
-    .expect("write external config");
-
-    create_routes_file(
+    let local_id = create_issue_and_get_id(
         &main_workspace,
-        &[("ext-", external_workspace.root.to_string_lossy().as_ref())],
-    );
-
-    let create_local = run_br(
-        &main_workspace,
-        ["create", "Local routed claim target", "--json"],
+        "Local routed claim target",
         "create_local_routed_claim_target",
     );
-    assert!(
-        create_local.status.success(),
-        "local create failed: {}",
-        create_local.stderr
-    );
-    let local_issue: Value = serde_json::from_str(&extract_json_payload(&create_local.stdout))
-        .expect("local create json");
-    let local_id = local_issue["id"]
-        .as_str()
-        .expect("local issue id")
-        .to_string();
-
-    let create_external = run_br(
+    let external_id = create_issue_and_get_id(
         &external_workspace,
-        ["create", "External routed claim target", "--json"],
+        "External routed claim target",
         "create_external_routed_claim_target",
     );
-    assert!(
-        create_external.status.success(),
-        "external create failed: {}",
-        create_external.stderr
-    );
-    let external_issue: Value =
-        serde_json::from_str(&extract_json_payload(&create_external.stdout))
-            .expect("external create json");
-    let external_id = external_issue["id"]
-        .as_str()
-        .expect("external issue id")
-        .to_string();
 
     let claim_external = run_br(
         &external_workspace,
@@ -1905,18 +1892,11 @@ fn e2e_routing_update_claim_failure_does_not_mutate_earlier_routes() {
         "expected routed claim to fail when external issue is already assigned"
     );
 
-    let show_local = run_br(
+    let local_after = show_issue_json(
         &main_workspace,
-        ["show", &local_id, "--json"],
+        &local_id,
         "show_local_after_failed_routed_claim",
     );
-    assert!(
-        show_local.status.success(),
-        "show local failed: {}",
-        show_local.stderr
-    );
-    let local_after: Vec<Value> =
-        serde_json::from_str(&extract_json_payload(&show_local.stdout)).expect("show local json");
     assert_eq!(local_after[0]["status"].as_str(), Some("open"));
     assert!(local_after[0]["assignee"].is_null());
 }

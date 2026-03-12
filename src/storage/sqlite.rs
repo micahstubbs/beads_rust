@@ -248,6 +248,19 @@ impl SqliteStorage {
         Ok(rows.iter().map(|r| r.values().to_vec()).collect())
     }
 
+    /// Check whether a foreign-key-backed table contains rows whose reference
+    /// column points at a missing issue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub(crate) fn has_missing_issue_reference(&self, table: &str, column: &str) -> Result<bool> {
+        let row = self.conn.query_row(&format!(
+            "SELECT COUNT(*) FROM {table} WHERE {column} NOT IN (SELECT id FROM issues)"
+        ))?;
+        Ok(row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0) > 0)
+    }
+
     /// Execute a raw SQL statement and return the number of affected rows.
     ///
     /// # Errors
