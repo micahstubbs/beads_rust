@@ -28,6 +28,7 @@ use std::fs;
 use std::io::{BufRead, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use tempfile::tempdir;
 use tracing::warn;
 
 /// Default database filename used when metadata is missing.
@@ -128,7 +129,10 @@ pub fn discover_jsonl(beads_dir: &Path) -> Option<PathBuf> {
 /// Returns `true` for merge artifacts, deletion logs, and interaction logs.
 #[must_use]
 pub fn is_excluded_jsonl(filename: &str) -> bool {
-    EXCLUDED_JSONL_FILES.contains(&filename)
+    Path::new(filename)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|basename| EXCLUDED_JSONL_FILES.contains(&basename))
 }
 
 /// Resolved paths for this workspace.
@@ -305,10 +309,22 @@ fn discover_beads_dir_with_cli_from(
     beads_dir_env_override: Option<&Path>,
     db_env_override: Option<&Path>,
 ) -> Result<PathBuf> {
-    let startup_db_override = cli
+    let explicit_external_cli_db = cli
         .db
-        .clone()
-        .or_else(|| db_env_override.map(Path::to_path_buf))
+        .as_deref()
+        .filter(|db_path| beads_dir_from_db_path(db_path).is_none());
+
+    if let Some(db_path) = cli.db.as_deref()
+        && let Some(beads_dir) = beads_dir_from_db_path(db_path)
+    {
+        return resolve_explicit_beads_dir(
+            &beads_dir,
+            &format!("database override '{}'", db_path.display()),
+        );
+    }
+
+    let startup_db_override = db_env_override
+        .map(Path::to_path_buf)
         .or_else(startup_db_override_from_env);
 
     if let Some(db_path) = startup_db_override.as_deref()
@@ -321,7 +337,10 @@ fn discover_beads_dir_with_cli_from(
     }
 
     discover_beads_dir_with_env(start, beads_dir_env_override).map_err(
-        |err| match (err, startup_db_override.as_deref()) {
+        |err| match (
+            err,
+            explicit_external_cli_db.or(startup_db_override.as_deref()),
+        ) {
             (BeadsError::NotInitialized, Some(db_path)) => BeadsError::WithContext {
                 context: format!(
                     "Cannot resolve the project .beads directory for database override '{}'; run from the target workspace or set BEADS_DIR",
@@ -340,10 +359,22 @@ fn discover_beads_dir_candidate_with_cli_from(
     beads_dir_env_override: Option<&Path>,
     db_env_override: Option<&Path>,
 ) -> Result<PathBuf> {
-    let startup_db_override = cli
+    let explicit_external_cli_db = cli
         .db
-        .clone()
-        .or_else(|| db_env_override.map(Path::to_path_buf))
+        .as_deref()
+        .filter(|db_path| beads_dir_from_db_path(db_path).is_none());
+
+    if let Some(db_path) = cli.db.as_deref()
+        && let Some(beads_dir) = beads_dir_from_db_path(db_path)
+    {
+        return validate_explicit_beads_dir(
+            &beads_dir,
+            &format!("database override '{}'", db_path.display()),
+        );
+    }
+
+    let startup_db_override = db_env_override
+        .map(Path::to_path_buf)
         .or_else(startup_db_override_from_env);
 
     if let Some(db_path) = startup_db_override.as_deref()
@@ -356,7 +387,10 @@ fn discover_beads_dir_candidate_with_cli_from(
     }
 
     discover_beads_dir_candidate_with_env(start, beads_dir_env_override).map_err(
-        |err| match (err, startup_db_override.as_deref()) {
+        |err| match (
+            err,
+            explicit_external_cli_db.or(startup_db_override.as_deref()),
+        ) {
             (BeadsError::NotInitialized, Some(db_path)) => BeadsError::WithContext {
                 context: format!(
                     "Cannot resolve the project .beads directory for database override '{}'; run from the target workspace or set BEADS_DIR",
@@ -590,7 +624,7 @@ pub(crate) fn repair_database_from_jsonl(
     show_progress: bool,
 ) -> Result<(SqliteStorage, ImportResult)> {
     let prefix = resolve_bootstrap_issue_prefix(bootstrap_layer, beads_dir, jsonl_path)?;
-    let mut import_config = import_config_for_resolved_jsonl(beads_dir, jsonl_path);
+    let mut import_config = import_config_for_resolved_jsonl(beads_dir, db_path, jsonl_path);
     import_config.show_progress = show_progress;
 
     preflight_import(jsonl_path, &import_config, Some(&prefix))?.into_result()?;
@@ -851,7 +885,7 @@ fn restore_database_family_after_failed_rebuild(backup_set: &RecoveryBackupSet) 
     Ok(())
 }
 
-fn recovery_dir_for_db_path(db_path: &Path, beads_dir: &Path) -> PathBuf {
+pub(crate) fn recovery_dir_for_db_path(db_path: &Path, beads_dir: &Path) -> PathBuf {
     db_path
         .parent()
         .unwrap_or(beads_dir)
@@ -868,12 +902,108 @@ fn database_family_paths(db_path: &Path) -> Vec<PathBuf> {
     ]
 }
 
+fn copy_database_family_to_directory(db_path: &Path, destination_dir: &Path) -> Result<PathBuf> {
+    let snapshot_db_name = db_path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new(DEFAULT_DB_FILENAME));
+    let snapshot_db_path = destination_dir.join(snapshot_db_name);
+
+    for original in database_family_paths(db_path) {
+        match fs::symlink_metadata(&original) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(BeadsError::Config(format!(
+                    "Database snapshot source '{}' must not be a symlink",
+                    original.display()
+                )));
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(BeadsError::Config(format!(
+                    "Database snapshot source '{}' must be a regular file",
+                    original.display()
+                )));
+            }
+            Ok(_) => {
+                let snapshot_path = destination_dir.join(
+                    original
+                        .file_name()
+                        .unwrap_or_else(|| std::ffi::OsStr::new(DEFAULT_DB_FILENAME)),
+                );
+                fs::copy(&original, &snapshot_path).with_context(|| {
+                    format!(
+                        "Failed to copy database snapshot artifact '{}' to '{}'",
+                        original.display(),
+                        snapshot_path.display()
+                    )
+                })?;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if original == db_path {
+                    return Err(err.into());
+                }
+            }
+            Err(err) => {
+                return Err(BeadsError::WithContext {
+                    context: format!(
+                        "Failed to inspect database snapshot source '{}'",
+                        original.display()
+                    ),
+                    source: Box::new(err),
+                });
+            }
+        }
+    }
+
+    Ok(snapshot_db_path)
+}
+
+pub(crate) fn with_database_family_snapshot<T, F>(db_path: &Path, read: F) -> Result<T>
+where
+    F: FnOnce(&Path) -> Result<T>,
+{
+    let snapshot_dir = tempdir().with_context(|| {
+        format!(
+            "Failed to create a temporary directory for the database snapshot '{}'",
+            db_path.display()
+        )
+    })?;
+    let snapshot_db_path = copy_database_family_to_directory(db_path, snapshot_dir.path())?;
+    read(&snapshot_db_path)
+}
+
 fn recovery_backup_filename(path: &Path, stamp: &str, suffix: &str) -> String {
     let filename = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("beads.db");
     format!("{filename}.{stamp}.{suffix}")
+}
+
+pub(crate) fn quarantine_database_artifacts<I>(
+    db_path: &Path,
+    beads_dir: &Path,
+    artifact_paths: I,
+    suffix: &str,
+) -> Result<Vec<PathBuf>>
+where
+    I: IntoIterator<Item = PathBuf>,
+{
+    let stamp = Utc::now().format("%Y%m%d_%H%M%S_%f").to_string();
+    let recovery_dir = recovery_dir_for_db_path(db_path, beads_dir);
+    fs::create_dir_all(&recovery_dir)?;
+
+    let renamed_paths = rename_existing_paths(
+        artifact_paths.into_iter().map(|original| {
+            let backup = recovery_dir.join(recovery_backup_filename(&original, &stamp, suffix));
+            (original, backup)
+        }),
+        "quarantine database artifacts",
+        MissingRenameSourcePolicy::Skip,
+    )?;
+
+    Ok(renamed_paths
+        .into_iter()
+        .map(|(_, backup)| backup)
+        .collect())
 }
 
 /// Open storage using resolved config paths, returning the storage and paths used.
@@ -908,6 +1038,7 @@ pub struct OpenStorageResult {
     pub storage: SqliteStorage,
     pub paths: ConfigPaths,
     pub no_db: bool,
+    allow_external_jsonl: bool,
     startup_layers: Vec<ConfigLayer>,
     bootstrap_layer: ConfigLayer,
     resolved_lock_timeout: Option<u64>,
@@ -1010,10 +1141,7 @@ impl OpenStorageResult {
             force: needs_flush && dirty_issue_count == 0,
             is_default_path: self.paths.jsonl_path == self.paths.beads_dir.join("issues.jsonl"),
             beads_dir: Some(self.paths.beads_dir.clone()),
-            allow_external_jsonl: resolved_jsonl_path_is_external(
-                &self.paths.beads_dir,
-                &self.paths.jsonl_path,
-            ),
+            allow_external_jsonl: self.allow_external_jsonl,
             show_progress: false,
             ..Default::default()
         };
@@ -1068,6 +1196,8 @@ pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<Ope
     let merged_layer = ConfigLayer::merge_layers(&all_layers);
 
     let no_db = no_db_from_layer(&merged_layer).unwrap_or(false);
+    let allow_external_jsonl =
+        implicit_external_jsonl_allowed(beads_dir, &paths.db_path, &paths.jsonl_path);
 
     let resolved_lock_timeout = cli
         .lock_timeout
@@ -1080,7 +1210,8 @@ pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<Ope
         storage.set_config("issue_prefix", &prefix)?;
 
         if paths.jsonl_path.is_file() {
-            let import_config = import_config_for_resolved_jsonl(beads_dir, &paths.jsonl_path);
+            let import_config =
+                import_config_for_resolved_jsonl(beads_dir, &paths.db_path, &paths.jsonl_path);
             import_from_jsonl(
                 &mut storage,
                 &paths.jsonl_path,
@@ -1098,6 +1229,7 @@ pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<Ope
             storage,
             paths,
             no_db,
+            allow_external_jsonl,
             startup_layers,
             bootstrap_layer: merged_layer,
             resolved_lock_timeout,
@@ -1114,6 +1246,7 @@ pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<Ope
             storage,
             paths,
             no_db,
+            allow_external_jsonl,
             startup_layers,
             bootstrap_layer: merged_layer,
             resolved_lock_timeout,
@@ -1189,10 +1322,14 @@ fn resolve_bootstrap_issue_prefix(
     Ok("bd".to_string())
 }
 
-fn import_config_for_resolved_jsonl(beads_dir: &Path, jsonl_path: &Path) -> ImportConfig {
+fn import_config_for_resolved_jsonl(
+    beads_dir: &Path,
+    db_path: &Path,
+    jsonl_path: &Path,
+) -> ImportConfig {
     ImportConfig {
         beads_dir: Some(beads_dir.to_path_buf()),
-        allow_external_jsonl: resolved_jsonl_path_is_external(beads_dir, jsonl_path),
+        allow_external_jsonl: implicit_external_jsonl_allowed(beads_dir, db_path, jsonl_path),
         show_progress: false,
         ..Default::default()
     }
@@ -1200,6 +1337,25 @@ fn import_config_for_resolved_jsonl(beads_dir: &Path, jsonl_path: &Path) -> Impo
 
 pub(crate) fn resolved_jsonl_path_is_external(beads_dir: &Path, jsonl_path: &Path) -> bool {
     !path_is_within_beads_dir(jsonl_path, beads_dir)
+}
+
+/// Return whether an external JSONL path can be trusted implicitly without
+/// a command-level `--allow-external-jsonl` opt-in.
+///
+/// This is only allowed when the database itself also lives outside `.beads/`
+/// and the JSONL is its sibling, which covers explicit external DB families
+/// without allowing ambient `BEADS_JSONL` or metadata overrides to bypass the
+/// external-path safety model.
+#[must_use]
+pub fn implicit_external_jsonl_allowed(
+    beads_dir: &Path,
+    db_path: &Path,
+    jsonl_path: &Path,
+) -> bool {
+    resolved_jsonl_path_is_external(beads_dir, jsonl_path)
+        && !path_is_within_beads_dir(db_path, beads_dir)
+        && db_path.parent().is_some()
+        && db_path.parent() == jsonl_path.parent()
 }
 
 fn path_is_within_beads_dir(path: &Path, beads_dir: &Path) -> bool {
@@ -1223,7 +1379,7 @@ fn path_is_within_beads_dir(path: &Path, beads_dir: &Path) -> bool {
 
 /// Fast prefix inference: reads only the first issue from JSONL.
 /// Used by `load_config` on every command — must be O(1) not O(n).
-fn first_prefix_from_jsonl(jsonl_path: &Path) -> Result<Option<String>> {
+pub(crate) fn first_prefix_from_jsonl(jsonl_path: &Path) -> Result<Option<String>> {
     if !jsonl_path.is_file() {
         return Ok(None);
     }
@@ -1684,12 +1840,20 @@ pub fn load_startup_config_with_paths(
     let project = load_project_config(beads_dir)?;
     let env_layer = ConfigLayer::from_env();
 
+    let resolved_db_override = db_override.cloned().or_else(|| {
+        [
+            resolve_db_override_from_layer(beads_dir, &env_layer),
+            resolve_db_override_from_layer(beads_dir, &project),
+            resolve_db_override_from_layer(beads_dir, &user),
+            resolve_db_override_from_layer(beads_dir, &legacy_user),
+        ]
+        .into_iter()
+        .flatten()
+        .next()
+    });
+
     let layers = vec![legacy_user, user, project, env_layer];
     let merged_startup = ConfigLayer::merge_layers(&layers);
-
-    let resolved_db_override = db_override
-        .cloned()
-        .or_else(|| db_override_from_layer(&merged_startup));
 
     let paths = ConfigPaths::resolve(beads_dir, resolved_db_override.as_ref())?;
 
@@ -1698,6 +1862,19 @@ pub fn load_startup_config_with_paths(
         layers,
         merged_config: merged_startup,
     })
+}
+
+#[must_use]
+pub(crate) fn configured_issue_prefix_from_map(
+    config_map: &HashMap<String, String>,
+) -> Option<String> {
+    ["issue_prefix", "issue-prefix", "prefix"]
+        .iter()
+        .filter_map(|key| config_map.get(*key))
+        .map(String::as_str)
+        .map(str::trim)
+        .find(|prefix| !prefix.is_empty())
+        .map(str::to_string)
 }
 
 /// Build ID generation config from a merged config layer.
@@ -2005,6 +2182,16 @@ fn db_override_from_layer(layer: &ConfigLayer) -> Option<PathBuf> {
     })
 }
 
+fn resolve_db_override_from_layer(beads_dir: &Path, layer: &ConfigLayer) -> Option<PathBuf> {
+    db_override_from_layer(layer).map(|path| {
+        if path.is_absolute() {
+            path
+        } else {
+            crate::util::resolve_cache_dir(beads_dir).join(path)
+        }
+    })
+}
+
 fn lock_timeout_from_layer(layer: &ConfigLayer) -> Option<u64> {
     get_startup_value(layer, &["lock-timeout", "lock_timeout"])
         .and_then(|value| value.trim().parse::<u64>().ok())
@@ -2296,6 +2483,22 @@ labels:
 
         let override_path = db_override_from_layer(&layer).expect("db override");
         assert_eq!(override_path, PathBuf::from("/tmp/beads.db"));
+    }
+
+    #[test]
+    fn resolve_db_override_from_layer_anchors_relative_paths_to_beads_cache_dir() {
+        let beads_dir = PathBuf::from("/tmp/project/.beads");
+        let mut layer = ConfigLayer::default();
+        layer
+            .startup
+            .insert("db".to_string(), "custom.db".to_string());
+
+        let override_path =
+            resolve_db_override_from_layer(&beads_dir, &layer).expect("db override");
+        assert_eq!(
+            override_path,
+            crate::util::resolve_cache_dir(&beads_dir).join("custom.db")
+        );
     }
 
     #[test]
@@ -2632,6 +2835,77 @@ labels:
     }
 
     #[test]
+    fn discover_beads_dir_with_cli_from_falls_back_to_workspace_for_external_cli_db_override() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let start = temp.path().join("nested").join("dir");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::create_dir_all(&start).expect("create nested dir");
+
+        let discovered = discover_beads_dir_with_cli_from(
+            Some(&start),
+            &CliOverrides {
+                db: Some(temp.path().join("cache").join("custom.db")),
+                ..CliOverrides::default()
+            },
+            None,
+            None,
+        )
+        .expect("external cli db override should reuse discovered workspace");
+
+        assert_eq!(discovered, beads_dir);
+    }
+
+    #[test]
+    fn discover_beads_dir_with_cli_from_falls_back_to_workspace_for_relative_cli_db_override() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let start = temp.path().join("nested").join("dir");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::create_dir_all(&start).expect("create nested dir");
+
+        let discovered = discover_beads_dir_with_cli_from(
+            Some(&start),
+            &CliOverrides {
+                db: Some(PathBuf::from("custom.db")),
+                ..CliOverrides::default()
+            },
+            None,
+            None,
+        )
+        .expect("relative cli db override should reuse discovered workspace");
+
+        assert_eq!(discovered, beads_dir);
+    }
+
+    #[test]
+    fn discover_beads_dir_with_cli_from_errors_for_external_cli_db_override_without_workspace() {
+        let temp = TempDir::new().expect("tempdir");
+        let start = temp.path().join("nested").join("dir");
+        fs::create_dir_all(&start).expect("create nested dir");
+
+        let db_override = temp.path().join("cache").join("custom.db");
+        let err = discover_beads_dir_with_cli_from(
+            Some(&start),
+            &CliOverrides {
+                db: Some(db_override.clone()),
+                ..CliOverrides::default()
+            },
+            None,
+            None,
+        )
+        .expect_err("external cli db without workspace should error");
+
+        assert!(matches!(err, BeadsError::WithContext { .. }));
+        assert!(
+            err.to_string()
+                .contains(db_override.to_string_lossy().as_ref())
+                && (err.to_string().contains("BEADS_DIR") || err.to_string().contains("workspace")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn discover_beads_dir_with_cli_from_errors_for_external_db_override_without_workspace() {
         let temp = TempDir::new().expect("tempdir");
         let start = temp.path().join("nested").join("dir");
@@ -2959,6 +3233,20 @@ routing:
     }
 
     #[test]
+    fn resolve_paths_honors_relative_project_db_override() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::write(beads_dir.join("config.yaml"), "db: custom.db\n").expect("write config");
+
+        let paths = resolve_paths(&beads_dir, None).expect("resolve paths");
+        assert_eq!(
+            paths.db_path,
+            crate::util::resolve_cache_dir(&beads_dir).join("custom.db")
+        );
+    }
+
+    #[test]
     fn resolve_actor_falls_back_to_unknown() {
         let layer = ConfigLayer::default();
         // This test assumes USER env var may not be set in test context
@@ -3152,11 +3440,17 @@ routing:
     #[test]
     fn is_excluded_jsonl_detects_deletion_log() {
         assert!(is_excluded_jsonl("deletions.jsonl"));
+        assert!(is_excluded_jsonl("./deletions.jsonl"));
     }
 
     #[test]
     fn is_excluded_jsonl_detects_interaction_log() {
         assert!(is_excluded_jsonl("interactions.jsonl"));
+    }
+
+    #[test]
+    fn is_excluded_jsonl_detects_excluded_basename_in_absolute_path() {
+        assert!(is_excluded_jsonl("/tmp/beads.base.jsonl"));
     }
 
     #[test]
@@ -3741,6 +4035,63 @@ routing:
         assert!(
             exported.contains("\"id\":\"bd-extflsh\""),
             "flush should export to the resolved external JSONL path"
+        );
+    }
+
+    #[test]
+    fn implicit_external_jsonl_allowed_requires_external_db_family() {
+        let beads_dir = PathBuf::from("/tmp/project/.beads");
+        let local_db = beads_dir.join("beads.db");
+        let external_jsonl = PathBuf::from("/tmp/external/issues.jsonl");
+        assert!(!implicit_external_jsonl_allowed(
+            &beads_dir,
+            &local_db,
+            &external_jsonl
+        ));
+
+        let external_db = PathBuf::from("/tmp/external/beads.db");
+        assert!(implicit_external_jsonl_allowed(
+            &beads_dir,
+            &external_db,
+            &external_jsonl
+        ));
+    }
+
+    #[test]
+    fn database_snapshot_keeps_live_sidecars_absent() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        let db_path = beads_dir.join("beads.db");
+
+        {
+            let mut storage = SqliteStorage::open(&db_path).expect("open db");
+            storage
+                .set_config("issue_prefix", "bd")
+                .expect("write config");
+        }
+
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+        let shm_path = PathBuf::from(format!("{}-shm", db_path.to_string_lossy()));
+        let journal_path = PathBuf::from(format!("{}-journal", db_path.to_string_lossy()));
+        let _ = fs::remove_file(&wal_path);
+        let _ = fs::remove_file(&shm_path);
+        let _ = fs::remove_file(&journal_path);
+
+        let prefix = with_database_family_snapshot(&db_path, |snapshot_db_path| {
+            let conn = fsqlite::Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
+            let row = conn.query_row("SELECT value FROM config WHERE key = 'issue_prefix'")?;
+            Ok(row
+                .get(0)
+                .and_then(fsqlite_types::SqliteValue::as_text)
+                .map(str::to_string))
+        })
+        .expect("read snapshot");
+
+        assert_eq!(prefix.as_deref(), Some("bd"));
+        assert!(
+            !wal_path.exists() && !shm_path.exists() && !journal_path.exists(),
+            "snapshot reads must not create live sidecar files"
         );
     }
 

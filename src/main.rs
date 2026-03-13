@@ -65,6 +65,11 @@ fn main() {
     if let (Some(res), Some(paths)) = (storage_result.as_mut(), ctx.paths.as_ref())
         && should_auto_import(&cli.command)
     {
+        let allow_external_jsonl = config::implicit_external_jsonl_allowed(
+            &paths.beads_dir,
+            &paths.db_path,
+            &paths.jsonl_path,
+        );
         let expected_prefix = match res.storage.get_config("issue_prefix") {
             Ok(p) => p,
             Err(e) => {
@@ -76,6 +81,7 @@ fn main() {
             &paths.beads_dir,
             &paths.jsonl_path,
             expected_prefix.as_deref(),
+            allow_external_jsonl,
             cli.allow_stale,
             ctx.no_auto_import(),
         );
@@ -275,7 +281,16 @@ fn main() {
     if is_mutating
         && !ctx.no_auto_flush()
         && let (Some(res), Some(paths)) = (storage_result.as_mut(), ctx.paths.as_ref())
-        && let Err(e) = auto_flush(&mut res.storage, &paths.beads_dir, &paths.jsonl_path)
+        && let Err(e) = auto_flush(
+            &mut res.storage,
+            &paths.beads_dir,
+            &paths.jsonl_path,
+            config::implicit_external_jsonl_allowed(
+                &paths.beads_dir,
+                &paths.db_path,
+                &paths.jsonl_path,
+            ),
+        )
     {
         debug!(?e, "Auto-flush failed (non-fatal)");
     }
