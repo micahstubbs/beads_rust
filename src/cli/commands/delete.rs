@@ -438,7 +438,10 @@ fn render_dependents_warning_rich(
     let theme = ctx.theme();
     let width = ctx.width();
 
-    let mut all_ids: Vec<&String> = direct_dependents.iter().chain(full_cascade.iter()).collect();
+    let mut all_ids: Vec<&String> = direct_dependents
+        .iter()
+        .chain(full_cascade.iter())
+        .collect();
     all_ids.sort();
     all_ids.dedup();
     let all_ids_owned: Vec<String> = all_ids.into_iter().cloned().collect();
@@ -483,7 +486,7 @@ fn render_dependents_warning_rich(
         );
         for dep_id in &transitive {
             content.append_styled("  \u{21b3} ", theme.warning.clone());
-            content.append_styled(*dep_id, theme.issue_id.clone());
+            content.append_styled(dep_id, theme.issue_id.clone());
             if let Some(issue) = issues_by_id.get(*dep_id) {
                 content.append_styled(": ", theme.dimmed.clone());
                 content.append(&issue.title);
@@ -934,11 +937,7 @@ mod tests {
         let cascade = collect_sorted_cascade_dependents(&storage, &["bd-a".to_string()]).unwrap();
         assert_eq!(
             cascade,
-            vec![
-                "bd-b".to_string(),
-                "bd-c".to_string(),
-                "bd-d".to_string()
-            ]
+            vec!["bd-b".to_string(), "bd-c".to_string(), "bd-d".to_string()]
         );
 
         // The cascade closure MUST be a strict superset of direct dependents

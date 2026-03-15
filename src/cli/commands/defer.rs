@@ -881,7 +881,9 @@ mod tests {
 
     #[test]
     fn execute_defer_sets_status_and_until() {
-        let _lock = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
         commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
@@ -906,7 +908,9 @@ mod tests {
 
     #[test]
     fn execute_defer_without_until_sets_indefinite() {
-        let _lock = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
         commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
@@ -931,7 +935,9 @@ mod tests {
 
     #[test]
     fn execute_undefer_clears_defer_until() {
-        let _lock = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
         commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
@@ -965,7 +971,9 @@ mod tests {
 
     #[test]
     fn execute_undefer_preserves_non_deferred_status_for_soft_defer() {
-        let _lock = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
         commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");

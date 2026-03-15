@@ -1130,7 +1130,9 @@ mod tests {
 
     #[test]
     fn execute_with_args_closes_requested_blocker_chain_in_one_batch() {
-        let _lock = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
         commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
@@ -1178,7 +1180,9 @@ mod tests {
 
     #[test]
     fn execute_with_args_returns_nothing_to_do_when_all_requested_issues_are_skipped() {
-        let _lock = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
         commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");

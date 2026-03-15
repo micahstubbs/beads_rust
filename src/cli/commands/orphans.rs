@@ -407,8 +407,7 @@ fn output_empty(render_mode: OrphanRenderMode, ctx: &OutputContext) {
             } else {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&empty)
-                        .expect("Failed to serialize JSON output")
+                    serde_json::to_string_pretty(&empty).expect("Failed to serialize JSON output")
                 );
             }
         }

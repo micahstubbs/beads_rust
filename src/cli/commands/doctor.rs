@@ -1023,25 +1023,19 @@ fn check_null_defaults(conn: &Connection, checks: &mut Vec<CheckResult>) {
     let mut null_findings = Vec::new();
 
     for (table, column, fix_sql) in queries {
-        let count_sql = format!(
-            "SELECT COUNT(*) FROM {table} WHERE typeof({column}) = 'null'"
-        );
-        match conn.query_row(&count_sql) {
-            Ok(row) => {
-                let count = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
-                if count > 0 {
-                    null_findings.push(serde_json::json!({
-                        "table": table,
-                        "column": column,
-                        "null_count": count,
-                        "fix_sql": fix_sql,
-                    }));
-                }
-            }
-            Err(_) => {
-                // Table might not exist yet; skip silently
+        let count_sql = format!("SELECT COUNT(*) FROM {table} WHERE typeof({column}) = 'null'");
+        if let Ok(row) = conn.query_row(&count_sql) {
+            let count = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
+            if count > 0 {
+                null_findings.push(serde_json::json!({
+                    "table": table,
+                    "column": column,
+                    "null_count": count,
+                    "fix_sql": fix_sql,
+                }));
             }
         }
+        // Err case: table might not exist yet; skip silently
     }
 
     if null_findings.is_empty() {

@@ -467,7 +467,9 @@ mod tests {
 
     #[test]
     fn execute_clears_defer_until_when_reopening_closed_deferred_issue() {
-        let _lock = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
         commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
@@ -504,7 +506,9 @@ mod tests {
 
     #[test]
     fn execute_reopen_tombstone_skips_without_resurrecting_it() {
-        let _lock = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
         commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");

@@ -352,7 +352,9 @@ mod tests {
 
     #[test]
     fn resolve_where_output_preserves_redirect_origin() {
-        let _lock = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let source_root = temp.path().join("source");
         let target_root = temp.path().join("target");
@@ -402,7 +404,9 @@ mod tests {
 
     #[test]
     fn resolve_where_output_does_not_create_missing_db() {
-        let _lock = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let root = temp.path().join("workspace");
         let beads_dir = root.join(".beads");
@@ -429,7 +433,9 @@ mod tests {
 
     #[test]
     fn resolve_where_output_falls_back_for_external_db_override() {
-        let _lock = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let root = temp.path().join("workspace");
         let beads_dir = root.join(".beads");
@@ -531,7 +537,9 @@ mod tests {
 
     #[test]
     fn resolve_where_output_accepts_startup_prefix_alias() {
-        let _lock = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let root = temp.path().join("workspace");
         let beads_dir = root.join(".beads");
