@@ -590,7 +590,7 @@ impl StructuredError {
                 )
             }
             BeadsError::InvalidPriority { priority } => {
-                let hint = detect_priority_intent(&priority.to_string()).map_or_else(
+                let hint = detect_priority_intent(priority).map_or_else(
                     || Some("Priority must be 0-4 (0=critical, 4=backlog).".to_string()),
                     |detected| Some(format!("Did you mean --priority {detected}?")),
                 );
@@ -688,7 +688,7 @@ impl StructuredError {
                 Some("Run 'br list' to see available issues.".to_string())
             }
             BeadsError::InvalidPriority { priority } => {
-                if let Some(detected) = detect_priority_intent(&priority.to_string()) {
+                if let Some(detected) = detect_priority_intent(priority) {
                     Some(format!("Did you mean --priority {detected}?"))
                 } else {
                     Some("Priority must be 0-4 (0=critical, 4=backlog).".to_string())

@@ -457,13 +457,17 @@ fn validate_priority_bounds(priority_min: Option<u8>, priority_max: Option<u8>) 
     if let Some(min) = priority_min.map(i32::from)
         && !(0..=4).contains(&min)
     {
-        return Err(BeadsError::InvalidPriority { priority: min });
+        return Err(BeadsError::InvalidPriority {
+            priority: min.to_string(),
+        });
     }
 
     if let Some(max) = priority_max.map(i32::from)
         && !(0..=4).contains(&max)
     {
-        return Err(BeadsError::InvalidPriority { priority: max });
+        return Err(BeadsError::InvalidPriority {
+            priority: max.to_string(),
+        });
     }
 
     Ok(())
@@ -659,6 +663,9 @@ mod tests {
         })
         .expect_err("invalid priority should fail");
 
-        assert!(matches!(err, BeadsError::InvalidPriority { priority: 7 }));
+        assert!(matches!(
+            err,
+            BeadsError::InvalidPriority { ref priority } if priority == "7"
+        ));
     }
 }

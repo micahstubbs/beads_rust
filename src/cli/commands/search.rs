@@ -454,12 +454,16 @@ fn apply_client_filters(
     if let Some(min) = min_priority
         && !(0..=4).contains(&min)
     {
-        return Err(BeadsError::InvalidPriority { priority: min });
+        return Err(BeadsError::InvalidPriority {
+            priority: min.to_string(),
+        });
     }
     if let Some(max) = max_priority
         && !(0..=4).contains(&max)
     {
-        return Err(BeadsError::InvalidPriority { priority: max });
+        return Err(BeadsError::InvalidPriority {
+            priority: max.to_string(),
+        });
     }
 
     for issue in issues {

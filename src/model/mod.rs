@@ -140,8 +140,12 @@ impl FromStr for Priority {
 
         match val.parse::<i32>() {
             Ok(p) if (0..=4).contains(&p) => Ok(Self(p)),
-            Ok(p) => Err(crate::error::BeadsError::InvalidPriority { priority: p }),
-            Err(_) => Err(crate::error::BeadsError::InvalidPriority { priority: -1 }),
+            Ok(p) => Err(crate::error::BeadsError::InvalidPriority {
+                priority: p.to_string(),
+            }),
+            Err(_) => Err(crate::error::BeadsError::InvalidPriority {
+                priority: val.to_string(),
+            }),
         }
     }
 }

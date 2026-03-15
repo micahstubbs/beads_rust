@@ -82,7 +82,7 @@ pub enum BeadsError {
 
     /// Priority out of valid range (0-4).
     #[error("Priority must be 0-4, got: {priority}")]
-    InvalidPriority { priority: i32 },
+    InvalidPriority { priority: String },
 
     // === JSONL Errors ===
     /// Failed to parse a line in the JSONL file.
