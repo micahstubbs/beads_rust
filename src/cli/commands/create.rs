@@ -697,6 +697,19 @@ fn execute_import(
             deps.extend(args.deps.clone());
             let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix.clone()));
             let mut dependency_error = None;
+
+            if let Some(parent_id) = resolved_parent.as_deref() {
+                issue.dependencies.push(Dependency {
+                    issue_id: id.clone(),
+                    depends_on_id: parent_id.to_string(),
+                    dep_type: DependencyType::ParentChild,
+                    created_at: now,
+                    created_by: Some(actor.clone()),
+                    metadata: None,
+                    thread_id: None,
+                });
+            }
+
             for dep_str in deps {
                 let (mut type_str, dep_id, valid) = parse_dependency(&dep_str);
                 if !valid {
