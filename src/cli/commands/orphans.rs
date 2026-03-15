@@ -8,7 +8,7 @@ use crate::cli::commands::close::{self, CloseArgs};
 use crate::config;
 use crate::error::Result;
 use crate::model::{Issue, Status};
-use crate::output::{IssueTable, IssueTableColumns, OutputContext};
+use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
 use crate::storage::ListFilters;
 use crate::util::id::normalize_id;
 use regex::Regex;
@@ -30,6 +30,29 @@ pub struct OrphanIssue {
     pub latest_commit_message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrphanRenderMode {
+    Quiet,
+    Json,
+    Toon,
+    Rich,
+    Plain,
+}
+
+const fn resolve_render_mode(json: bool, output_mode: OutputMode) -> OrphanRenderMode {
+    if json || matches!(output_mode, OutputMode::Json) {
+        return OrphanRenderMode::Json;
+    }
+
+    match output_mode {
+        OutputMode::Json => OrphanRenderMode::Json,
+        OutputMode::Quiet => OrphanRenderMode::Quiet,
+        OutputMode::Toon => OrphanRenderMode::Toon,
+        OutputMode::Rich => OrphanRenderMode::Rich,
+        OutputMode::Plain => OrphanRenderMode::Plain,
+    }
+}
+
 /// Execute the orphans command.
 ///
 /// Scans git log for issue ID references and returns `open/in_progress`
@@ -43,16 +66,16 @@ pub struct OrphanIssue {
 #[allow(clippy::too_many_lines)]
 pub fn execute(
     args: &OrphansArgs,
-    _json: bool,
+    json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
     let Some(beads_dir) = config::discover_optional_beads_dir_with_cli(cli)? else {
-        output_empty(args.robot, ctx);
+        output_empty(resolve_render_mode(json, ctx.mode()), ctx);
         return Ok(());
     };
 
-    execute_inner(args, cli, ctx, &beads_dir, None)
+    execute_inner(args, json, cli, ctx, &beads_dir, None)
 }
 
 /// Execute orphans using the caller's preopened storage context.
@@ -63,17 +86,19 @@ pub fn execute(
 /// Returns an empty list when git metadata is unavailable in the current repository.
 pub fn execute_with_storage_ctx(
     args: &OrphansArgs,
+    json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
     beads_dir: &Path,
     storage_ctx: &config::OpenStorageResult,
 ) -> Result<()> {
-    execute_inner(args, cli, ctx, beads_dir, Some(storage_ctx))
+    execute_inner(args, json, cli, ctx, beads_dir, Some(storage_ctx))
 }
 
 #[allow(clippy::too_many_lines)]
 fn execute_inner(
     args: &OrphansArgs,
+    json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
     beads_dir: &Path,
@@ -92,10 +117,11 @@ fn execute_inner(
     // Get issue prefix from config
     let config_layer = storage_ctx.load_config(cli)?;
     let prefix = config::id_config_from_layer(&config_layer).prefix;
+    let render_mode = resolve_render_mode(json, ctx.mode());
     let Some(repo_root) = git_repo_root_for_path(&storage_ctx.paths.jsonl_path)
         .or_else(|| git_repo_root_for_path(beads_dir))
     else {
-        output_empty(args.robot, ctx);
+        output_empty(render_mode, ctx);
         return Ok(());
     };
 
@@ -108,7 +134,7 @@ fn execute_inner(
     );
 
     if commit_refs.is_empty() {
-        output_empty(args.robot, ctx);
+        output_empty(render_mode, ctx);
         return Ok(());
     }
 
@@ -160,77 +186,78 @@ fn execute_inner(
     orphan_issues.sort_by(|a, b| a.id.cmp(&b.id));
     debug!(orphan_count = orphans.len(), "Scanning for orphaned issues");
 
-    if args.robot {
-        emit_json_output(&orphans);
-        return Ok(());
-    }
-
-    if ctx.is_json() {
-        ctx.json_pretty(&orphans);
-        return Ok(());
-    }
-
-    if ctx.is_toon() {
-        ctx.toon(&orphans);
-        return Ok(());
-    }
-
     if orphans.is_empty() {
-        output_empty(args.robot, ctx);
+        output_empty(render_mode, ctx);
         return Ok(());
     }
 
-    if ctx.is_quiet() {
-        return Ok(());
-    }
-
-    if ctx.is_rich() {
-        let columns = IssueTableColumns {
-            id: true,
-            priority: true,
-            status: false,
-            issue_type: false,
-            title: true,
-            assignee: false,
-            labels: false,
-            created: false,
-            updated: false,
-            context: args.details,
-        };
-
-        let mut table = IssueTable::new(&orphan_issues, ctx.theme())
-            .columns(columns)
-            .title(format!("Orphan Issues ({})", orphan_issues.len()));
-
-        if args.details {
-            table = table.context_snippets(context_snippets);
-        }
-
-        let table = table.build();
-        ctx.render(&table);
-        ctx.print(
-            "\nSuggestion: Assign these to an epic or set a parent with br update <ID> --parent <EPIC_ID>\n",
-        );
-    } else {
-        println!(
-            "Orphan issues ({} open/in_progress referenced in commits):",
-            orphans.len()
-        );
-        println!();
-
-        for (idx, orphan) in orphans.iter().enumerate() {
-            println!(
-                "{}. [{}] {} {}",
-                idx + 1,
-                orphan.status,
-                orphan.issue_id,
-                orphan.title
-            );
-            if args.details {
+    match render_mode {
+        OrphanRenderMode::Quiet => {}
+        OrphanRenderMode::Json => {
+            if ctx.is_json() {
+                ctx.json_pretty(&orphans);
+            } else {
+                // Robot mode requests JSON even though the shared output context only
+                // sees global flags.
                 println!(
-                    "   Commit: {} {}",
-                    orphan.latest_commit, orphan.latest_commit_message
+                    "{}",
+                    serde_json::to_string_pretty(&orphans)
+                        .expect("Failed to serialize JSON output")
                 );
+            }
+        }
+        OrphanRenderMode::Toon => {
+            ctx.toon(&orphans);
+        }
+        OrphanRenderMode::Rich => {
+            let columns = IssueTableColumns {
+                id: true,
+                priority: true,
+                status: false,
+                issue_type: false,
+                title: true,
+                assignee: false,
+                labels: false,
+                created: false,
+                updated: false,
+                context: args.details,
+            };
+
+            let mut table = IssueTable::new(&orphan_issues, ctx.theme())
+                .columns(columns)
+                .title(format!("Orphan Issues ({})", orphan_issues.len()));
+
+            if args.details {
+                table = table.context_snippets(context_snippets);
+            }
+
+            let table = table.build();
+            ctx.render(&table);
+            ctx.print(
+                "\nSuggestion: Assign these to an epic or set a parent with br update <ID> --parent <EPIC_ID>\n",
+            );
+        }
+        OrphanRenderMode::Plain => {
+            println!(
+                "Orphan issues ({} open/in_progress referenced in commits):",
+                orphans.len()
+            );
+            println!();
+
+            for (idx, orphan) in orphans.iter().enumerate() {
+                println!(
+                    "{}. [{}] {} {}",
+                    idx + 1,
+                    orphan.status,
+                    orphan.issue_id,
+                    orphan.title
+                );
+                if args.details {
+                    println!(
+                        "   Commit: {} {}",
+                        orphan.latest_commit, orphan.latest_commit_message
+                    );
+                }
             }
         }
     }
@@ -369,41 +396,38 @@ fn parse_git_log<R: BufRead>(reader: R, prefix: &str) -> Result<Vec<(String, Str
     Ok(results)
 }
 
-fn emit_json_output<T: Serialize>(value: &T) {
-    let json_ctx = OutputContext::from_flags(true, false, true);
-    json_ctx.json_pretty(value);
-}
-
 /// Output empty result in appropriate format.
-fn output_empty(force_json: bool, ctx: &OutputContext) {
+fn output_empty(render_mode: OrphanRenderMode, ctx: &OutputContext) {
     let empty: Vec<OrphanIssue> = Vec::new();
-    if force_json {
-        emit_json_output(&empty);
-        return;
+    match render_mode {
+        OrphanRenderMode::Quiet => {}
+        OrphanRenderMode::Json => {
+            if ctx.is_json() {
+                ctx.json_pretty(&empty);
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&empty)
+                        .expect("Failed to serialize JSON output")
+                );
+            }
+        }
+        OrphanRenderMode::Toon => {
+            ctx.toon(&empty);
+        }
+        OrphanRenderMode::Rich => {
+            let theme = ctx.theme();
+            let panel = Panel::from_text("No orphaned issues found.")
+                .title(Text::styled("Orphans", theme.panel_title.clone()))
+                .box_style(theme.box_style)
+                .border_style(theme.panel_border.clone());
+            ctx.render(&panel);
+        }
+        OrphanRenderMode::Plain => {
+            // Match bd format
+            println!("✓ No orphaned issues found");
+        }
     }
-    if ctx.is_json() {
-        ctx.json_pretty(&empty);
-        return;
-    }
-    if ctx.is_toon() {
-        ctx.toon(&empty);
-        return;
-    }
-    if ctx.is_quiet() {
-        return;
-    }
-    if ctx.is_rich() {
-        let theme = ctx.theme();
-        let panel = Panel::from_text("No orphaned issues found.")
-            .title(Text::styled("Orphans", theme.panel_title.clone()))
-            .box_style(theme.box_style)
-            .border_style(theme.panel_border.clone());
-        ctx.render(&panel);
-        return;
-    }
-
-    // Match bd format
-    println!("✓ No orphaned issues found");
 }
 
 #[cfg(test)]
@@ -515,5 +539,61 @@ ccc Oldest (bd-1)";
         let refs = get_git_commit_refs("bd", temp.path()).expect("refs");
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].2, "bd-xyz123");
+    }
+
+    #[test]
+    fn test_resolve_render_mode_robot_overrides_inherited_toon() {
+        assert_eq!(
+            resolve_render_mode(true, OutputMode::Toon),
+            OrphanRenderMode::Json
+        );
+    }
+
+    #[test]
+    fn test_resolve_render_mode_robot_overrides_rich() {
+        assert_eq!(
+            resolve_render_mode(true, OutputMode::Rich),
+            OrphanRenderMode::Json
+        );
+    }
+
+    #[test]
+    fn test_resolve_render_mode_robot_overrides_plain() {
+        assert_eq!(
+            resolve_render_mode(true, OutputMode::Plain),
+            OrphanRenderMode::Json
+        );
+    }
+
+    #[test]
+    fn test_resolve_render_mode_robot_overrides_quiet() {
+        assert_eq!(
+            resolve_render_mode(true, OutputMode::Quiet),
+            OrphanRenderMode::Json
+        );
+    }
+
+    #[test]
+    fn test_resolve_render_mode_preserves_toon_without_robot() {
+        assert_eq!(
+            resolve_render_mode(false, OutputMode::Toon),
+            OrphanRenderMode::Toon
+        );
+    }
+
+    #[test]
+    fn test_resolve_render_mode_preserves_json_context() {
+        assert_eq!(
+            resolve_render_mode(false, OutputMode::Json),
+            OrphanRenderMode::Json
+        );
+    }
+
+    #[test]
+    fn test_resolve_render_mode_respects_quiet() {
+        assert_eq!(
+            resolve_render_mode(false, OutputMode::Quiet),
+            OrphanRenderMode::Quiet
+        );
     }
 }

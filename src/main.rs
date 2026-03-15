@@ -234,6 +234,7 @@ fn main() {
             {
                 commands::orphans::execute_with_storage_ctx(
                     &args,
+                    cli.json || args.robot,
                     &overrides,
                     &output_ctx,
                     beads_dir,
