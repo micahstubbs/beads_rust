@@ -356,31 +356,32 @@ pub fn insert_restored_event(
 ///
 /// Returns an error if the database query fails.
 pub fn get_events(conn: &Connection, issue_id: &str, limit: usize) -> Result<Vec<Event>> {
-    let events = if limit > 0 {
-        conn.query_with_params(
+    let events = conn.query_with_params(
+        &format!(
             r"
             SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
             FROM events
             WHERE issue_id = ?1
             ORDER BY created_at DESC, id DESC
-            LIMIT ?2
+            {}
             ",
-            #[allow(clippy::cast_possible_wrap)]
-            &[SqliteValue::from(issue_id), SqliteValue::from(limit as i64)],
-        )?
-    } else {
-        conn.query_with_params(
-            r"
-            SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
-            FROM events
-            WHERE issue_id = ?1
-            ORDER BY created_at DESC, id DESC
-            ",
-            &[SqliteValue::from(issue_id)],
-        )?
-    };
+            if limit > 0 {
+                format!("LIMIT {limit}")
+            } else {
+                String::new()
+            }
+        ),
+        &[SqliteValue::from(issue_id)],
+    )?;
 
-    events.iter().map(event_from_row).collect()
+    let mut result: Vec<Event> = events.iter().map(event_from_row).collect::<Result<_>>()?;
+    // fsqlite may not honour ORDER BY DESC or LIMIT in all query plans;
+    // enforce both in Rust for correctness.
+    result.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+    if limit > 0 && result.len() > limit {
+        result.truncate(limit);
+    }
+    Ok(result)
 }
 
 fn event_from_row(row: &Row) -> Result<Event> {
@@ -448,28 +449,30 @@ fn parse_event_timestamp(value: &str) -> Result<DateTime<Utc>> {
 ///
 /// Returns an error if the database query fails.
 pub fn get_all_events(conn: &Connection, limit: usize) -> Result<Vec<Event>> {
-    let rows = if limit > 0 {
-        conn.query_with_params(
+    let rows = conn.query(
+        &format!(
             r"
             SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
             FROM events
             ORDER BY created_at DESC, id DESC
-            LIMIT ?1
+            {}
             ",
-            #[allow(clippy::cast_possible_wrap)]
-            &[SqliteValue::from(limit as i64)],
-        )?
-    } else {
-        conn.query(
-            r"
-            SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
-            FROM events
-            ORDER BY created_at DESC, id DESC
-            ",
-        )?
-    };
+            if limit > 0 {
+                format!("LIMIT {limit}")
+            } else {
+                String::new()
+            }
+        ),
+    )?;
 
-    rows.iter().map(event_from_row).collect()
+    let mut result: Vec<Event> = rows.iter().map(event_from_row).collect::<Result<_>>()?;
+    // fsqlite may not honour ORDER BY DESC or LIMIT in all query plans;
+    // enforce both in Rust for correctness.
+    result.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+    if limit > 0 && result.len() > limit {
+        result.truncate(limit);
+    }
+    Ok(result)
 }
 
 /// Get event count for an issue.

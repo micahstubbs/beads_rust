@@ -1093,6 +1093,12 @@ impl OpenStorageResult {
             ));
         }
 
+        // Close the old connection before rebuilding at the same path.
+        // fsqlite tracks pages by file path, so keeping the old connection
+        // open while creating a new database at the same path causes
+        // BusySnapshot conflicts.
+        self.storage = SqliteStorage::open_memory()?;
+
         let (storage, _) = repair_database_from_jsonl(
             &self.paths.beads_dir,
             &self.paths.db_path,
@@ -4597,14 +4603,22 @@ routing:
 
         fs::write(&db_path, b"original-db").expect("write original db");
         fs::write(&wal_path, b"original-wal").expect("write original wal");
-        let wal_backup = recovery_dir_for_db_path(&wal_path, &beads_dir);
-        fs::create_dir_all(&wal_backup).expect("create wal backup dir");
+        let recovery_dir = recovery_dir_for_db_path(&db_path, &beads_dir);
+        fs::create_dir_all(&recovery_dir).expect("create recovery dir");
+
+        // Use a specific backup file path that does NOT exist, so the
+        // restore step fails with a missing-backup error.
+        let wal_backup_file = recovery_dir.join(recovery_backup_filename(
+            &wal_path,
+            "fixed-stamp",
+            "bak",
+        ));
 
         let err = restore_database_family_after_failed_rebuild(&RecoveryBackupSet {
             db_path: db_path.clone(),
-            recovery_dir: wal_backup.clone(),
+            recovery_dir: recovery_dir.clone(),
             stamp: "fixed-stamp".to_string(),
-            files: vec![(wal_path.clone(), wal_backup.clone())],
+            files: vec![(wal_path.clone(), wal_backup_file.clone())],
         })
         .expect_err("missing backup should fail restore");
         assert!(
@@ -4617,7 +4631,7 @@ routing:
         );
         assert!(
             err.to_string().contains("expected")
-                && err.to_string().contains(&wal_backup.display().to_string()),
+                && err.to_string().contains(&wal_backup_file.display().to_string()),
             "unexpected error: {err}"
         );
         assert_eq!(
@@ -4630,13 +4644,13 @@ routing:
             b"original-wal",
             "rebuilt wal should remain in place after rollback"
         );
-        let wal_backup = wal_backup.join(recovery_backup_filename(
+        let rebuild_failed_wal = recovery_dir.join(recovery_backup_filename(
             &wal_path,
             "fixed-stamp",
             "rebuild-failed",
         ));
         assert!(
-            !wal_backup.exists(),
+            !rebuild_failed_wal.exists(),
             "rolled back wal backup should not remain in recovery dir"
         );
     }
