@@ -351,7 +351,7 @@ fn apply_client_filters(
     let notes_needle = args.notes_contains.as_deref().map(str::to_lowercase);
     // Deferred issues are included by default when no status filter is specified
     let include_deferred = args.deferred
-        || args.status.is_empty()
+        || (!args.overdue && args.status.is_empty())
         || args
             .status
             .iter()

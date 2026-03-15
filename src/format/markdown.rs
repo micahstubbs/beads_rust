@@ -155,11 +155,24 @@ fn try_skip_formatting(chars: &[char], i: usize, processed: &mut String) -> Opti
             }
 
             // Don't strip single asterisk if surrounded by spaces (e.g., math or bullet)
+            // or if it opens emphasis but has no matching closing asterisk (e.g., "pointer *p")
             if c == '*' {
                 let prev_space = i == 0 || chars[i - 1].is_whitespace();
                 let next_space = i + 1 >= chars.len() || chars[i + 1].is_whitespace();
                 if prev_space && next_space {
                     return None;
+                }
+                if prev_space && !next_space {
+                    // Look for a right-flanking closing * (preceded by non-space)
+                    let has_closing =
+                        chars[i + 1..].iter().enumerate().any(|(k, &ch)| {
+                            ch == '*'
+                                && k > 0
+                                && !chars[i + 1 + k - 1].is_whitespace()
+                        });
+                    if !has_closing {
+                        return None;
+                    }
                 }
             }
         }
