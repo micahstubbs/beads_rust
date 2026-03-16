@@ -106,12 +106,11 @@ fn detect_placeholder(s: &str) -> Option<McpError> {
         return Some(placeholder_error(s));
     }
 
-    // Substring detection
-    if lower.contains("your_")
-        || lower.contains("replace")
-        || lower.contains("placeholder")
-        || lower.contains("example")
-    {
+    // Substring detection — only match patterns specific to hallucinated IDs.
+    // Broader terms like "replace" and "example" are already covered by exact
+    // matches; substring matching them would reject legitimate IDs whose
+    // prefix or hash portion happens to contain those words.
+    if lower.contains("your_") || lower.contains("placeholder") {
         return Some(placeholder_error(s));
     }
 
@@ -1177,25 +1176,40 @@ impl ToolHandler for CreateIssueTool {
             ..Issue::default()
         };
 
+        // Validate parent exists BEFORE creating the issue to avoid orphans
+        let parent_id = args
+            .get("parent")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if let Some(ref pid) = parent_id {
+            require_valid_issue(&storage, pid)?;
+        }
+
         storage
             .create_issue(&issue, &self.0.actor)
             .map_err(beads_to_mcp)?;
+
+        let mut warnings: Vec<String> = Vec::new();
 
         // Attach labels
         if let Some(labels) = args.get("labels").and_then(|v| v.as_array()) {
             for label_val in labels {
                 if let Some(label) = label_val.as_str() {
-                    let _ = storage.add_label(&id, label, &self.0.actor);
+                    if let Err(e) = storage.add_label(&id, label, &self.0.actor) {
+                        warnings.push(format!("failed to add label '{label}': {e}"));
+                    }
                 }
             }
         }
 
-        // Create parent-child dependency if parent specified
+        // Create parent-child dependency (parent already validated above)
         let mut parent_linked = false;
-        if let Some(parent_id) = args.get("parent").and_then(|v| v.as_str()) {
-            require_valid_issue(&storage, parent_id)?;
-            let _ = storage.add_dependency(&id, parent_id, "parent-child", &self.0.actor);
-            parent_linked = true;
+        if let Some(ref pid) = parent_id {
+            if let Err(e) = storage.add_dependency(&id, pid, "parent-child", &self.0.actor) {
+                warnings.push(format!("failed to link parent '{pid}': {e}"));
+            } else {
+                parent_linked = true;
+            }
         }
 
         let mut result = json!({
@@ -1211,11 +1225,15 @@ impl ToolHandler for CreateIssueTool {
         });
 
         if parent_linked {
-            result["parent"] = json!(args.get("parent").and_then(|v| v.as_str()));
+            result["parent"] = json!(parent_id);
         }
 
         if !coercions.is_empty() {
             result["coercions"] = json!(coercions);
+        }
+
+        if !warnings.is_empty() {
+            result["warnings"] = json!(warnings);
         }
 
         Ok(vec![Content::text(result.to_string())])
@@ -1386,18 +1404,24 @@ impl ToolHandler for UpdateIssueTool {
             ));
         };
 
+        let mut warnings: Vec<String> = Vec::new();
+
         // Handle label mutations
         if let Some(labels) = args.get("labels_add").and_then(|v| v.as_array()) {
             for label_val in labels {
                 if let Some(label) = label_val.as_str() {
-                    let _ = storage.add_label(id, label, &self.0.actor);
+                    if let Err(e) = storage.add_label(id, label, &self.0.actor) {
+                        warnings.push(format!("failed to add label '{label}': {e}"));
+                    }
                 }
             }
         }
         if let Some(labels) = args.get("labels_remove").and_then(|v| v.as_array()) {
             for label_val in labels {
                 if let Some(label) = label_val.as_str() {
-                    let _ = storage.remove_label(id, label, &self.0.actor);
+                    if let Err(e) = storage.remove_label(id, label, &self.0.actor) {
+                        warnings.push(format!("failed to remove label '{label}': {e}"));
+                    }
                 }
             }
         }
@@ -1406,7 +1430,9 @@ impl ToolHandler for UpdateIssueTool {
         if let Some(comment) = args.get("comment").and_then(|v| v.as_str())
             && !comment.is_empty()
         {
-            let _ = storage.add_comment(id, &self.0.actor, comment);
+            if let Err(e) = storage.add_comment(id, &self.0.actor, comment) {
+                warnings.push(format!("failed to add comment: {e}"));
+            }
         }
 
         let mut result = json!({
@@ -1419,6 +1445,10 @@ impl ToolHandler for UpdateIssueTool {
 
         if !coercions.is_empty() {
             result["coercions"] = json!(coercions);
+        }
+
+        if !warnings.is_empty() {
+            result["warnings"] = json!(warnings);
         }
 
         Ok(vec![Content::text(result.to_string())])
