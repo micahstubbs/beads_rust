@@ -62,6 +62,9 @@ pub fn execute(args: &VersionArgs, ctx: &OutputContext) -> Result<()> {
     if cfg!(feature = "self_update") {
         features.push("self_update");
     }
+    if cfg!(feature = "mcp") {
+        features.push("mcp");
+    }
 
     if ctx.is_toon() {
         let output = VersionOutput {

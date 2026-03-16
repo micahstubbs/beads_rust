@@ -197,7 +197,7 @@ fn main() {
         Commands::Version(args) => commands::version::execute(&args, &output_ctx),
 
         #[cfg(feature = "mcp")]
-        Commands::Serve(ref args) => beads_rust::mcp::run_serve(args, &overrides),
+        Commands::Serve(args) => beads_rust::mcp::run_serve(&args, &overrides),
 
         #[cfg(feature = "self_update")]
         Commands::Upgrade(args) => commands::upgrade::execute(&args, &output_ctx),
