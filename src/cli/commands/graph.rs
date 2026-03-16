@@ -136,14 +136,18 @@ fn graph_single(
     let mut nodes = build_graph_nodes(&traversal.traversal_order, &traversal.issues_by_id, &depths);
     sort_single_graph_nodes(&mut nodes, root_id);
 
-    if ctx.is_json() {
+    if ctx.is_json() || ctx.is_toon() {
         let output = SingleGraphOutput {
             root: root_id.to_string(),
             count: nodes.len(),
             nodes,
             edges: traversal.edges,
         };
-        ctx.json_pretty(&output);
+        if ctx.is_toon() {
+            ctx.toon(&output);
+        } else {
+            ctx.json_pretty(&output);
+        }
         return Ok(());
     }
 
@@ -194,13 +198,17 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
     debug!(count = issues.len(), "Found issues for graph");
 
     if issues.is_empty() {
-        if ctx.is_json() {
+        if ctx.is_json() || ctx.is_toon() {
             let output = AllGraphOutput {
                 components: vec![],
                 total_nodes: 0,
                 total_components: 0,
             };
-            ctx.json_pretty(&output);
+            if ctx.is_toon() {
+                ctx.toon(&output);
+            } else {
+                ctx.json_pretty(&output);
+            }
         } else if matches!(ctx.mode(), OutputMode::Rich) {
             render_no_issues_rich(ctx);
         } else {
@@ -324,13 +332,17 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
 
     let total_nodes: usize = components.iter().map(|c| c.nodes.len()).sum();
 
-    if ctx.is_json() {
+    if ctx.is_json() || ctx.is_toon() {
         let output = AllGraphOutput {
             total_nodes,
             total_components: components.len(),
             components,
         };
-        ctx.json_pretty(&output);
+        if ctx.is_toon() {
+            ctx.toon(&output);
+        } else {
+            ctx.json_pretty(&output);
+        }
         return Ok(());
     }
 

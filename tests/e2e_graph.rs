@@ -2,8 +2,9 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env};
 use serde_json::Value;
+use toon_rust::try_decode;
 
 fn parse_created_id(stdout: &str) -> String {
     let line = stdout.lines().next().unwrap_or("");
@@ -141,6 +142,59 @@ fn e2e_graph_single_issue_json() {
     assert_eq!(edges.len(), 1, "should have 1 edge");
     assert_eq!(edges[0][0], blocked_id, "edge from should be blocked");
     assert_eq!(edges[0][1], blocker_id, "edge to should be blocker");
+}
+
+#[test]
+fn e2e_graph_single_issue_honors_toon_env_mode() {
+    let _log = common::test_log("e2e_graph_single_issue_honors_toon_env_mode");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let blocker = run_br(&workspace, ["create", "TOON blocker"], "create_blocker");
+    assert!(
+        blocker.status.success(),
+        "blocker create failed: {}",
+        blocker.stderr
+    );
+    let blocker_id = parse_created_id(&blocker.stdout);
+
+    let blocked = run_br(&workspace, ["create", "TOON blocked"], "create_blocked");
+    assert!(
+        blocked.status.success(),
+        "blocked create failed: {}",
+        blocked.stderr
+    );
+    let blocked_id = parse_created_id(&blocked.stdout);
+
+    let dep_add = run_br(
+        &workspace,
+        ["dep", "add", &blocked_id, &blocker_id],
+        "dep_add",
+    );
+    assert!(
+        dep_add.status.success(),
+        "dep add failed: {}",
+        dep_add.stderr
+    );
+
+    let graph = run_br_with_env(
+        &workspace,
+        ["graph", &blocker_id],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "graph_toon_env",
+    );
+    assert!(graph.status.success(), "graph failed: {}", graph.stderr);
+
+    let decoded = try_decode(graph.stdout.trim(), None).expect("valid graph TOON");
+    let json = Value::from(decoded);
+    assert_eq!(json["root"].as_str(), Some(blocker_id.as_str()));
+    assert_eq!(json["count"].as_u64(), Some(2));
+    assert_eq!(json["nodes"].as_array().map(Vec::len), Some(2));
+    assert_eq!(json["edges"].as_array().map(Vec::len), Some(1));
+    assert_eq!(json["edges"][0][0].as_str(), Some(blocked_id.as_str()));
+    assert_eq!(json["edges"][0][1].as_str(), Some(blocker_id.as_str()));
 }
 
 #[test]
