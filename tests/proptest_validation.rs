@@ -338,6 +338,9 @@ fn all_standard_statuses_valid() {
     for status in statuses {
         let mut issue = make_valid_issue("Test Issue");
         issue.status = status.clone();
+        if status == Status::Closed {
+            issue.closed_at = Some(issue.updated_at);
+        }
 
         let result = IssueValidator::validate(&issue);
         assert!(result.is_ok(), "Status {status:?} should be valid");

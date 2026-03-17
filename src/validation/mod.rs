@@ -13,7 +13,7 @@
 //! See `SyncSafetyValidator` for runtime guards.
 
 use crate::error::{BeadsError, ValidationError};
-use crate::model::{Comment, Dependency, Issue, Priority};
+use crate::model::{Comment, Dependency, Issue, Priority, Status};
 use crate::util::id::MAX_ID_LENGTH;
 use std::path::Path;
 
@@ -88,6 +88,21 @@ impl IssueValidator {
                     "exceeds maximum (525960 minutes / ~1 year)",
                 ));
             }
+        }
+
+        if issue.status == Status::Closed && issue.closed_at.is_none() {
+            errors.push(ValidationError::new(
+                "closed_at",
+                "closed issues must set closed_at",
+            ));
+        }
+
+        if !matches!(issue.status, Status::Closed | Status::Tombstone) && issue.closed_at.is_some()
+        {
+            errors.push(ValidationError::new(
+                "closed_at",
+                "only closed or tombstone issues may set closed_at",
+            ));
         }
 
         // Closed timestamps: closed_at must not precede created_at.
@@ -483,6 +498,32 @@ mod tests {
 
         let errors = IssueValidator::validate(&issue).unwrap_err();
         assert!(errors.iter().any(|err| err.field == "description"));
+    }
+
+    #[test]
+    fn issue_validation_rejects_closed_without_closed_at() {
+        let mut issue = base_issue();
+        issue.status = Status::Closed;
+
+        let errors = IssueValidator::validate(&issue).unwrap_err();
+        assert!(errors.iter().any(|err| err.field == "closed_at"));
+    }
+
+    #[test]
+    fn issue_validation_rejects_non_terminal_closed_at() {
+        let mut issue = base_issue();
+        issue.closed_at = Some(issue.updated_at);
+
+        let errors = IssueValidator::validate(&issue).unwrap_err();
+        assert!(errors.iter().any(|err| err.field == "closed_at"));
+    }
+
+    #[test]
+    fn issue_validation_allows_tombstone_without_closed_at() {
+        let mut issue = base_issue();
+        issue.status = Status::Tombstone;
+
+        assert!(IssueValidator::validate(&issue).is_ok());
     }
 
     #[test]
