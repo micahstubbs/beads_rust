@@ -156,6 +156,24 @@ fn extract_json_payload(stdout: &str) -> String {
     stdout.trim().to_string()
 }
 
+/// Parse issues list from `br list --json` stdout, handling both the legacy
+/// plain-array format and the current paginated envelope format:
+/// `{"issues": [...], "total": N, "limit": N, "offset": 0, "has_more": false}`.
+fn extract_issues_array(stdout: &str) -> Vec<serde_json::Value> {
+    let payload = extract_json_payload(stdout);
+    // Try plain array first (legacy / future-proof).
+    if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&payload) {
+        return arr;
+    }
+    // Try paginated envelope.
+    if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&payload) {
+        if let Some(issues) = obj.get("issues").and_then(|v| v.as_array()) {
+            return issues.clone();
+        }
+    }
+    vec![]
+}
+
 fn create_routes_file(root: &Path, entries: &[(&str, &Path)]) {
     let routes_path = root.join(".beads").join("routes.jsonl");
     let content = entries
@@ -260,8 +278,7 @@ fn e2e_concurrent_writes_succeed_with_retry() {
     // Verify successful issues were created.
     let list = run_br_in_dir(&root, ["list", "--json"]);
     assert!(list.success, "list failed: {}", list.stderr);
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<serde_json::Value> = serde_json::from_str(&payload).expect("parse list json");
+    let issues = extract_issues_array(&list.stdout);
     assert!(
         issues.len() >= success_count,
         "expected at least {success_count} concurrent issues, got {}",
@@ -646,8 +663,7 @@ fn e2e_write_serialization() {
     // Verify all successful writes persist.
     let list = run_br_in_dir(&root, ["list", "--json"]);
     assert!(list.success, "final list failed: {}", list.stderr);
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<serde_json::Value> = serde_json::from_str(&payload).expect("parse list json");
+    let issues = extract_issues_array(&list.stdout);
     assert!(
         issues.len() >= success_count,
         "expected at least {success_count} serialized issues, got {}",
@@ -751,8 +767,7 @@ fn e2e_mixed_read_write_concurrency() {
     assert!(list.success, "final list failed: {}", list.stderr);
 
     // All successful writers should persist; explicit contention failures are acceptable.
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<serde_json::Value> = serde_json::from_str(&payload).expect("parse list json");
+    let issues = extract_issues_array(&list.stdout);
     assert!(
         issues.len() >= 3 + writer_successes,
         "expected at least {} issues, got {}",
@@ -1124,8 +1139,7 @@ fn e2e_sync_status_observer_stays_available_during_writes() {
 
     let list = run_br_in_dir(&root, ["list", "--json"]);
     assert!(list.success, "final list failed: {}", list.stderr);
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<serde_json::Value> = serde_json::from_str(&payload).expect("parse list json");
+    let issues = extract_issues_array(&list.stdout);
     assert_eq!(issues.len(), 6, "expected all writer issues to persist");
 }
 
@@ -1313,8 +1327,7 @@ fn e2e_interleaved_command_families_preserve_workspace_integrity() {
         "list failed after contention: {}",
         list.stderr
     );
-    let issues: Vec<serde_json::Value> =
-        serde_json::from_str(&extract_json_payload(&list.stdout)).expect("parse list json");
+    let issues = extract_issues_array(&list.stdout);
     assert!(
         issues.len() > create_successes,
         "expected at least {} issues after concurrent creates, got {}",
@@ -1507,8 +1520,7 @@ fn e2e_external_access_and_background_status_are_bounded_during_mutation() {
         "list failed after contention: {}",
         list.stderr
     );
-    let issues: Vec<serde_json::Value> =
-        serde_json::from_str(&extract_json_payload(&list.stdout)).expect("parse list json");
+    let issues = extract_issues_array(&list.stdout);
     assert!(
         issues.len() > writer_successes,
         "expected at least {} issues after local mutation, got {}",

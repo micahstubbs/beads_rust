@@ -8088,9 +8088,26 @@ mod tests {
             .add_dependency("bd-c1", "bd-b1", "related", "tester")
             .unwrap();
 
-        // Cache should be rebuilt - since "related" is not a blocking type,
-        // bd-c1 should no longer be in the blocked cache (the manually
-        // inserted entry gets cleared and not replaced)
+        // With deferred cache refresh, add_dependency now marks the cache stale
+        // rather than rebuilding immediately.  The stale entry persists until a
+        // read that calls ensure_blocked_cache_fresh triggers the lazy rebuild.
+        // Verify the stale marker was set.
+        assert!(
+            storage.blocked_cache_marked_stale().unwrap(),
+            "cache should be marked stale after add_dependency"
+        );
+
+        // Trigger a read — is_blocked calls ensure_blocked_cache_fresh internally.
+        let blocked = storage.is_blocked("bd-c1").unwrap();
+        assert!(!blocked, "bd-c1 should not be blocked after adding only a 'related' dep");
+
+        // After the lazy rebuild the stale marker should be cleared.
+        assert!(
+            !storage.blocked_cache_marked_stale().unwrap(),
+            "cache should no longer be stale after lazy rebuild"
+        );
+
+        // And the old stale entry should be gone.
         let count = storage
             .conn
             .query_row_with_params(

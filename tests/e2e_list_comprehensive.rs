@@ -15,8 +15,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
-use serde_json::Value;
+use common::cli::{BrWorkspace, parse_list_issues, run_br};
 
 fn parse_created_id(stdout: &str) -> String {
     let line = stdout.lines().next().unwrap_or("");
@@ -205,8 +204,7 @@ fn e2e_list_json_output() {
     let list = run_br(&workspace, ["list", "--json"], "list_json");
     assert!(list.status.success(), "list json failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("list json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Default list excludes closed but includes deferred
     // Should have 5 issues (4 open + 1 deferred)
@@ -256,8 +254,7 @@ fn e2e_list_status_filter_open() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // All issues should be open
     for issue in &issues {
@@ -277,8 +274,7 @@ fn e2e_list_status_filter_closed() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Should have exactly 1 closed issue
     assert_eq!(issues.len(), 1);
@@ -298,8 +294,7 @@ fn e2e_list_status_filter_deferred() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Should have exactly 1 deferred issue
     assert_eq!(issues.len(), 1);
@@ -315,8 +310,7 @@ fn e2e_list_all_includes_closed() {
     let list = run_br(&workspace, ["list", "--all", "--json"], "list_all");
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Should have all 6 issues
     assert_eq!(issues.len(), 6, "expected all 6 issues");
@@ -340,8 +334,7 @@ fn e2e_list_multiple_status_filter() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Should have open and closed issues (5 total: 4 open + 1 closed)
     assert_eq!(issues.len(), 5);
@@ -372,8 +365,7 @@ fn e2e_list_type_filter_task() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Should have 2 open tasks (task1 and task3; task2 is closed)
     assert_eq!(issues.len(), 2);
@@ -394,8 +386,7 @@ fn e2e_list_type_filter_bug() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Should have exactly 1 bug
     assert_eq!(issues.len(), 1);
@@ -415,8 +406,7 @@ fn e2e_list_multiple_type_filter() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Should have 1 bug + 1 feature = 2 issues
     assert_eq!(issues.len(), 2);
@@ -445,8 +435,7 @@ fn e2e_list_priority_filter_exact() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Should have exactly 1 P0 issue (the critical bug)
     assert_eq!(issues.len(), 1);
@@ -467,8 +456,7 @@ fn e2e_list_priority_min() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Should have issues with priority >= 2 (feature1 P2, epic1 P2 deferred, task3 P4)
     // Note: deferred issues ARE included by default
@@ -492,8 +480,7 @@ fn e2e_list_priority_max() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Should have issues with priority <= 1 (task1 P1, bug1 P0)
     assert_eq!(issues.len(), 2);
@@ -523,8 +510,7 @@ fn e2e_list_priority_range() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Should have P1 and P2 issues (task1 P1, feature1 P2, epic1 P2 deferred)
     // Note: deferred issues ARE included by default
@@ -555,8 +541,7 @@ fn e2e_list_label_filter_and() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Should have 2 issues with "core" label (task1, feature1)
     assert_eq!(issues.len(), 2);
@@ -577,8 +562,7 @@ fn e2e_list_label_filter_multiple_and() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Should have only feature1 (has both core and frontend)
     assert_eq!(issues.len(), 1);
@@ -605,8 +589,7 @@ fn e2e_list_label_filter_or() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Should have bug1 (urgent) and feature1 (frontend) = 2 issues
     assert_eq!(issues.len(), 2);
@@ -630,8 +613,7 @@ fn e2e_list_assignee_filter() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Should have exactly 1 issue assigned to alice (bug1)
     assert_eq!(issues.len(), 1);
@@ -651,8 +633,7 @@ fn e2e_list_unassigned_filter() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Should have 3 unassigned non-closed issues: task1, epic1 (deferred), task3
     // bug1 assigned to alice, feature1 assigned to bob, task2 is closed
@@ -681,8 +662,7 @@ fn e2e_list_title_contains() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Should match "Critical bug"
     assert_eq!(issues.len(), 1);
@@ -702,8 +682,7 @@ fn e2e_list_desc_contains() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Should match the backlog item with "searchable" in description
     assert_eq!(issues.len(), 1);
@@ -726,8 +705,7 @@ fn e2e_list_sort_by_priority() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Verify sorted by priority ascending (P0 first)
     let priorities: Vec<u64> = issues
@@ -754,8 +732,7 @@ fn e2e_list_sort_by_priority_reverse() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Verify sorted by priority descending (P4 first)
     let priorities: Vec<u64> = issues
@@ -783,8 +760,7 @@ fn e2e_list_sort_by_title() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Verify sorted by title alphabetically
     let titles: Vec<&str> = issues
@@ -808,8 +784,7 @@ fn e2e_list_limit() {
     let list = run_br(&workspace, ["list", "--limit", "2", "--json"], "list_limit");
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Should have exactly 2 issues
     assert_eq!(issues.len(), 2);
@@ -827,8 +802,7 @@ fn e2e_list_limit_with_label_filter() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     assert_eq!(issues.len(), 1);
     assert_eq!(issues[0]["title"], "Core task");
@@ -846,8 +820,7 @@ fn e2e_list_limit_zero_unlimited() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Should have all 5 non-closed issues (limit=0 means unlimited)
     // Default list excludes closed but includes deferred
@@ -870,8 +843,7 @@ fn e2e_list_deferred_flag() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Should include all open + deferred issues (5 total)
     assert_eq!(issues.len(), 5);
@@ -1058,8 +1030,7 @@ fn e2e_list_combined_filters() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Should match only task1 (task, P1, has core label)
     assert_eq!(issues.len(), 1);
@@ -1086,8 +1057,7 @@ fn e2e_list_empty_result() {
     );
     assert!(list.status.success());
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
 
     // Should be empty
     assert!(issues.is_empty(), "expected no matching issues");
@@ -1147,8 +1117,7 @@ fn e2e_list_custom_type() {
     );
 
     // Since no issues have type "custom_type", result should be empty
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<serde_json::Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = parse_list_issues(&list.stdout);
     assert!(
         issues.is_empty(),
         "no issues should match custom type filter"

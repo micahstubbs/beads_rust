@@ -19,8 +19,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
-use serde_json::Value;
+use common::cli::{BrWorkspace, parse_list_issues, run_br};
 
 fn parse_created_id(stdout: &str) -> String {
     let line = stdout.lines().next().unwrap_or("");
@@ -226,8 +225,7 @@ fn list_filter_by_status_open() {
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     // All returned issues should have status "open"
     for issue in &json {
@@ -257,8 +255,7 @@ fn list_filter_by_status_closed() {
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     assert_eq!(json.len(), 1, "Expected exactly 1 closed issue");
     assert_eq!(json[0]["status"], "closed");
@@ -275,8 +272,7 @@ fn list_filter_by_status_in_progress() {
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     assert_eq!(json.len(), 1, "Expected exactly 1 in_progress issue");
     assert_eq!(json[0]["status"], "in_progress");
@@ -294,8 +290,7 @@ fn list_filter_by_status_deferred() {
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     assert_eq!(json.len(), 1, "Expected exactly 1 deferred issue");
     assert_eq!(json[0]["status"], "deferred");
@@ -308,8 +303,7 @@ fn list_include_closed_shows_all() {
     let list = run_br(&workspace, ["list", "--all", "--json"], "list_all");
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     // Should include all 8 issues
     assert_eq!(
@@ -336,8 +330,7 @@ fn list_filter_by_type_bug() {
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     // All should be bugs
     for issue in &json {
@@ -362,8 +355,7 @@ fn list_filter_by_type_feature() {
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     assert_eq!(json.len(), 2, "Expected 2 feature issues");
     for issue in &json {
@@ -382,8 +374,7 @@ fn list_filter_by_type_task() {
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     assert_eq!(json.len(), 2, "Expected 2 task issues");
 }
@@ -399,8 +390,7 @@ fn list_filter_by_priority_p0() {
     let list = run_br(&workspace, ["list", "-p", "0", "--json"], "list_p0");
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     assert_eq!(json.len(), 1, "Expected 1 P0 issue");
     assert_eq!(json[0]["priority"], 0);
@@ -423,8 +413,7 @@ fn list_filter_by_priority_p1() {
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     assert_eq!(json.len(), 3, "Expected 3 P1 issues");
     for issue in &json {
@@ -444,8 +433,7 @@ fn list_filter_by_multiple_priorities() {
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     // Should include P0 and P1 issues (excluding closed)
     for issue in &json {
@@ -473,8 +461,7 @@ fn list_filter_by_assignee() {
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     assert_eq!(json.len(), 2, "Expected 2 issues assigned to alice");
     for issue in &json {
@@ -494,8 +481,7 @@ fn list_filter_by_unassigned() {
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     // All returned issues should have no assignee
     for issue in &json {
@@ -522,8 +508,7 @@ fn list_filter_by_label_single() {
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     assert_eq!(json.len(), 2, "Expected 2 issues with 'backend' label");
 }
@@ -540,8 +525,7 @@ fn list_filter_by_label_multiple() {
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     // Should find the one issue with both labels
     assert_eq!(
@@ -572,8 +556,7 @@ fn list_combined_filters_type_and_priority() {
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     assert_eq!(json.len(), 1, "Expected 1 P1 bug");
     assert_eq!(json[0]["issue_type"], "bug");
@@ -598,8 +581,7 @@ fn list_combined_filters_assignee_and_label() {
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     assert_eq!(
         json.len(),
@@ -629,8 +611,7 @@ fn list_sort_by_priority_asc() {
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     // Verify issues are sorted by priority (ascending = P0 first)
     let priorities: Vec<u64> = json
@@ -659,8 +640,7 @@ fn list_sort_by_priority_desc() {
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     let priorities: Vec<u64> = json
         .iter()
@@ -689,8 +669,7 @@ fn list_sort_by_created_at_desc() {
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     let timestamps: Vec<&str> = json
         .iter()
@@ -720,8 +699,7 @@ fn list_sort_by_created_at_asc() {
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     let timestamps: Vec<&str> = json
         .iter()
@@ -754,8 +732,7 @@ fn list_with_limit() {
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     assert_eq!(json.len(), 3, "Expected exactly 3 issues with --limit 3");
 }
@@ -772,8 +749,7 @@ fn list_with_limit_zero_unlimited() {
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     // Should get all non-closed issues (default excludes closed)
     // We have 8 total issues, 1 closed, so at least 5 open ones
@@ -811,8 +787,7 @@ fn list_json_output_format() {
     let list = run_br(&workspace, ["list", "--json"], "list_json");
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     // Verify JSON structure has expected fields
     if !json.is_empty() {
@@ -885,8 +860,7 @@ fn list_empty_workspace() {
     let list = run_br(&workspace, ["list", "--json"], "list_empty");
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     assert_eq!(json.len(), 0, "Expected empty list for new workspace");
 }
@@ -899,8 +873,7 @@ fn list_filter_no_matches() {
     let list = run_br(&workspace, ["list", "-t", "epic", "--json"], "list_no_epic");
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     assert_eq!(json.len(), 0, "Expected no epic issues");
 }
@@ -916,8 +889,7 @@ fn list_filter_nonexistent_label() {
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     assert_eq!(json.len(), 0, "Expected no issues with nonexistent label");
 }
@@ -933,8 +905,7 @@ fn list_filter_nonexistent_assignee() {
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list.stdout);
 
     assert_eq!(
         json.len(),
@@ -978,8 +949,7 @@ fn list_issue_with_special_chars_in_title() {
     let list_json = run_br(&workspace, ["list", "--json"], "list_special_json");
     assert!(list_json.status.success());
 
-    let payload = extract_json_payload(&list_json.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = parse_list_issues(&list_json.stdout);
 
     assert_eq!(json.len(), 1);
     let title = json[0]["title"].as_str().unwrap();
