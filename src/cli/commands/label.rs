@@ -59,6 +59,7 @@ struct PreparedLabelRoute {
     resolved_ids: Vec<String>,
     storage_ctx: config::OpenStorageResult,
     actor: String,
+    auto_flush_external: bool,
 }
 
 /// JSON output for list-all.
@@ -177,6 +178,15 @@ fn label_add(
     }
 
     prepared_route.storage_ctx.flush_no_db_if_dirty()?;
+    if prepared_route.auto_flush_external
+        && let Err(error) = prepared_route.storage_ctx.auto_flush_if_enabled()
+    {
+        tracing::debug!(
+            beads_dir = %prepared_route.storage_ctx.paths.beads_dir.display(),
+            error = %error,
+            "Routed auto-flush failed (non-fatal)"
+        );
+    }
 
     Ok(results)
 }
@@ -238,6 +248,15 @@ fn label_remove(
     }
 
     prepared_route.storage_ctx.flush_no_db_if_dirty()?;
+    if prepared_route.auto_flush_external
+        && let Err(error) = prepared_route.storage_ctx.auto_flush_if_enabled()
+    {
+        tracing::debug!(
+            beads_dir = %prepared_route.storage_ctx.paths.beads_dir.display(),
+            error = %error,
+            "Routed auto-flush failed (non-fatal)"
+        );
+    }
 
     Ok(results)
 }
@@ -294,6 +313,7 @@ fn prepare_label_routes(
             resolved_ids,
             storage_ctx,
             actor: config::resolve_actor(&config_layer),
+            auto_flush_external: batch.is_external,
         });
     }
 

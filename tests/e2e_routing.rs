@@ -65,6 +65,16 @@ fn show_issue_json(workspace: &BrWorkspace, issue_id: &str, label: &str) -> Vec<
     serde_json::from_str(&extract_json_payload(&show.stdout)).expect("show json")
 }
 
+fn issue_from_jsonl(workspace: &BrWorkspace, issue_id: &str) -> Value {
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let contents = fs::read_to_string(&jsonl_path).expect("read issues.jsonl");
+    contents
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("parse issue jsonl line"))
+        .find(|issue| issue["id"].as_str() == Some(issue_id))
+        .expect("issue should exist in issues.jsonl")
+}
+
 fn switch_workspace_to_custom_database(workspace: &BrWorkspace, database_name: &str) {
     let beads_dir = workspace.root.join(".beads");
     let old_db = beads_dir.join("beads.db");
@@ -672,6 +682,9 @@ fn e2e_routing_update_external_issue_via_main_workspace() {
     let shown: Vec<Value> = serde_json::from_str(&show_payload).expect("show json");
     assert_eq!(shown.len(), 1);
     assert_eq!(shown[0]["status"].as_str(), Some("in_progress"));
+
+    let jsonl_issue = issue_from_jsonl(&external_workspace, &external_id);
+    assert_eq!(jsonl_issue["status"].as_str(), Some("in_progress"));
 }
 
 #[test]
@@ -746,6 +759,9 @@ fn e2e_routing_update_sets_invoking_workspace_last_touched_for_follow_up_close()
     let shown: Vec<Value> =
         serde_json::from_str(&extract_json_payload(&show_external.stdout)).expect("show json");
     assert_eq!(shown[0]["status"].as_str(), Some("closed"));
+
+    let jsonl_issue = issue_from_jsonl(&external_workspace, &external_id);
+    assert_eq!(jsonl_issue["status"].as_str(), Some("closed"));
 }
 
 #[test]
@@ -886,6 +902,9 @@ fn e2e_routing_close_sets_invoking_workspace_last_touched_for_follow_up_reopen()
     let shown: Vec<Value> =
         serde_json::from_str(&extract_json_payload(&show_external.stdout)).expect("show json");
     assert_eq!(shown[0]["status"].as_str(), Some("open"));
+
+    let jsonl_issue = issue_from_jsonl(&external_workspace, &external_id);
+    assert_eq!(jsonl_issue["status"].as_str(), Some("open"));
 }
 
 #[test]
@@ -1026,6 +1045,9 @@ fn e2e_routing_defer_and_undefer_external_issue_via_main_workspace() {
         serde_json::from_str(&extract_json_payload(&show_deferred.stdout)).expect("show json");
     assert_eq!(deferred_issue[0]["status"].as_str(), Some("deferred"));
 
+    let deferred_jsonl_issue = issue_from_jsonl(&external_workspace, &external_id);
+    assert_eq!(deferred_jsonl_issue["status"].as_str(), Some("deferred"));
+
     let undefer = run_br(
         &main_workspace,
         ["undefer", &routed_input, "--json"],
@@ -1059,6 +1081,9 @@ fn e2e_routing_defer_and_undefer_external_issue_via_main_workspace() {
     let undeferred_issue: Vec<Value> =
         serde_json::from_str(&extract_json_payload(&show_undeferred.stdout)).expect("show json");
     assert_eq!(undeferred_issue[0]["status"].as_str(), Some("open"));
+
+    let undeferred_jsonl_issue = issue_from_jsonl(&external_workspace, &external_id);
+    assert_eq!(undeferred_jsonl_issue["status"].as_str(), Some("open"));
 }
 
 #[test]
@@ -1146,6 +1171,15 @@ fn e2e_routing_label_add_and_list_external_issue_via_main_workspace() {
     let shown: Vec<Value> =
         serde_json::from_str(&extract_json_payload(&show_external.stdout)).expect("show json");
     assert_eq!(shown[0]["labels"][0].as_str(), Some("triage"));
+
+    let jsonl_issue = issue_from_jsonl(&external_workspace, &external_id);
+    let jsonl_labels = jsonl_issue["labels"].as_array().expect("labels array");
+    assert!(
+        jsonl_labels
+            .iter()
+            .any(|label| label.as_str() == Some("triage")),
+        "expected triage label in issues.jsonl"
+    );
 }
 
 #[test]

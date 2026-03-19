@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 /// JSON output structure for updated issues.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct UpdatedIssueOutput {
     id: String,
     title: String,
@@ -40,6 +40,7 @@ impl From<&Issue> for UpdatedIssueOutput {
     }
 }
 
+#[derive(Debug)]
 enum UpdateRenderItem {
     Summary {
         id: String,
@@ -52,6 +53,7 @@ enum UpdateRenderItem {
     },
 }
 
+#[derive(Debug)]
 struct UpdateRouteOutput {
     updated_issues: Vec<UpdatedIssueOutput>,
     render_items: Vec<UpdateRenderItem>,
@@ -75,6 +77,7 @@ struct PreparedUpdateRoute {
     set_labels: bool,
     valid_set_labels: Vec<String>,
     resolved_parent: ParentUpdatePlan,
+    auto_flush_external: bool,
 }
 
 /// Execute the update command.
@@ -125,7 +128,7 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
             };
             prepared_routes.push((
                 batch.issue_inputs.clone(),
-                prepare_single_route(&batch_args, &batch_cli, &batch.beads_dir)?,
+                prepare_single_route(&batch_args, &batch_cli, &batch.beads_dir, batch.is_external)?,
             ));
         }
 
@@ -172,7 +175,7 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         (updated_issues, render_items, ordered_resolved_ids)
     } else {
         let route_output =
-            execute_prepared_route(prepare_single_route(args, cli, &beads_dir)?, ctx)?;
+            execute_prepared_route(prepare_single_route(args, cli, &beads_dir, false)?, ctx)?;
         (
             route_output.updated_issues,
             route_output.render_items,
@@ -200,6 +203,7 @@ fn prepare_single_route(
     args: &UpdateArgs,
     cli: &config::CliOverrides,
     beads_dir: &Path,
+    auto_flush_external: bool,
 ) -> Result<PreparedUpdateRoute> {
     let storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
 
@@ -260,6 +264,7 @@ fn prepare_single_route(
         set_labels: !args.set_labels.is_empty(),
         valid_set_labels,
         resolved_parent,
+        auto_flush_external,
     })
 }
 
@@ -416,6 +421,15 @@ fn execute_prepared_route(
     }
 
     prepared.storage_ctx.flush_no_db_if_dirty()?;
+    if prepared.auto_flush_external
+        && let Err(error) = prepared.storage_ctx.auto_flush_if_enabled()
+    {
+        tracing::debug!(
+            beads_dir = %prepared.storage_ctx.paths.beads_dir.display(),
+            error = %error,
+            "Routed auto-flush failed (non-fatal)"
+        );
+    }
 
     Ok(UpdateRouteOutput {
         updated_issues,
@@ -1183,7 +1197,7 @@ mod tests {
             updated_at: chrono::Utc::now(),
             ..Issue::default()
         };
-        let blocked = Issue {
+        let dependent = Issue {
             id: "bd-blocked".to_string(),
             title: "Blocked".to_string(),
             status: Status::Open,
@@ -1200,7 +1214,7 @@ mod tests {
             .expect("create blocker");
         storage_ctx
             .storage
-            .create_issue(&blocked, "tester")
+            .create_issue(&dependent, "tester")
             .expect("create blocked");
         storage_ctx
             .storage
@@ -1234,6 +1248,7 @@ mod tests {
             set_labels: false,
             valid_set_labels: Vec::new(),
             resolved_parent: ParentUpdatePlan::Unchanged,
+            auto_flush_external: false,
         };
 
         let ctx = OutputContext::from_flags(false, false, true);

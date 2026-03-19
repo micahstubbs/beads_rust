@@ -100,7 +100,8 @@ pub fn execute(
                 None
             };
 
-            let result = execute_route(&batch_args, &batch_cli, &batch.beads_dir)?;
+            let result =
+                execute_route(&batch_args, &batch_cli, &batch.beads_dir, batch.is_external)?;
             routed_outcomes.push((batch.issue_inputs.clone(), result.ordered_outcomes));
         }
 
@@ -118,7 +119,7 @@ pub fn execute(
     } else {
         let mut local_args = args.clone();
         local_args.ids = target_inputs;
-        let result = execute_route(&local_args, cli, &beads_dir)?;
+        let result = execute_route(&local_args, cli, &beads_dir, false)?;
         reopened_issues = result.reopened;
         skipped_issues = result.skipped;
     }
@@ -172,6 +173,7 @@ fn execute_route(
     args: &ReopenArgs,
     cli: &config::CliOverrides,
     beads_dir: &Path,
+    auto_flush_external: bool,
 ) -> Result<ReopenResult> {
     let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
 
@@ -304,6 +306,13 @@ fn execute_route(
     }
 
     storage_ctx.flush_no_db_if_dirty()?;
+    if auto_flush_external && let Err(error) = storage_ctx.auto_flush_if_enabled() {
+        tracing::debug!(
+            beads_dir = %storage_ctx.paths.beads_dir.display(),
+            error = %error,
+            "Routed auto-flush failed (non-fatal)"
+        );
+    }
 
     Ok(ReopenResult {
         reopened: reopened_issues,

@@ -15,8 +15,8 @@ use crate::error::{BeadsError, Result, ResultExt};
 use crate::model::{IssueType, Priority};
 use crate::storage::SqliteStorage;
 use crate::sync::{
-    ExportConfig, ImportConfig, ImportResult, compute_jsonl_hash, export_to_jsonl_with_policy,
-    finalize_export, import_from_jsonl, preflight_import,
+    ExportConfig, ImportConfig, ImportResult, auto_flush, compute_jsonl_hash,
+    export_to_jsonl_with_policy, finalize_export, import_from_jsonl, preflight_import,
 };
 use crate::util::id::{IdConfig, split_prefix_remainder};
 use chrono::Utc;
@@ -1196,6 +1196,29 @@ impl OpenStorageResult {
     {
         self.flush_no_db_if_dirty()?;
         on_success(self)
+    }
+
+    /// Attempt SQLite auto-flush for this storage context when enabled.
+    ///
+    /// This mirrors the main-process post-command auto-flush policy so routed
+    /// external-project mutations can export their own JSONL instead of relying
+    /// on the caller's local workspace context.
+    ///
+    /// # Errors
+    ///
+    /// Returns any export error encountered while auto-flush is enabled.
+    pub fn auto_flush_if_enabled(&mut self) -> Result<()> {
+        if self.no_db || no_auto_flush_from_layer(&self.bootstrap_layer).unwrap_or(false) {
+            return Ok(());
+        }
+
+        auto_flush(
+            &mut self.storage,
+            &self.paths.beads_dir,
+            &self.paths.jsonl_path,
+            self.allow_external_jsonl,
+        )?;
+        Ok(())
     }
 }
 
