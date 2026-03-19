@@ -664,15 +664,36 @@ fn execute_route(
 
     let unblocked_issues: Vec<UnblockedIssue> = if args.suggest_next && !closed_issues.is_empty() {
         let blocked_after_result = storage_ctx.storage.get_blocked_issues();
-        let blocked_after: Vec<String> = preserve_blocked_cache_on_error(
+        let blocked_after = match preserve_blocked_cache_on_error(
             &mut storage_ctx.storage,
             cache_dirty,
             "close",
             blocked_after_result,
-        )?
-        .into_iter()
-        .map(|(i, _)| i.id)
-        .collect();
+        ) {
+            Ok(blocked_after) => Some(
+                blocked_after
+                    .into_iter()
+                    .map(|(issue, _)| issue.id)
+                    .collect::<Vec<_>>(),
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "Skipping suggest-next calculation after committed close because blocked-cache lookup failed"
+                );
+                None
+            }
+        };
+
+        let Some(blocked_after) = blocked_after else {
+            storage_ctx.flush_no_db_if_dirty()?;
+            return Ok(CloseExecution {
+                closed: closed_issues,
+                skipped: skipped_issues,
+                unblocked: Vec::new(),
+                ordered_outcomes,
+            });
+        };
 
         let newly_unblocked: Vec<String> = blocked_before
             .into_iter()
@@ -684,18 +705,27 @@ fn execute_route(
         let mut unblocked = Vec::new();
         for uid in newly_unblocked {
             let issue_result = storage_ctx.storage.get_issue(&uid);
-            if let Some(issue) = preserve_blocked_cache_on_error(
+            match preserve_blocked_cache_on_error(
                 &mut storage_ctx.storage,
                 cache_dirty,
                 "close",
                 issue_result,
-            )? && issue.status.is_active()
-            {
-                unblocked.push(UnblockedIssue {
-                    id: issue.id,
-                    title: issue.title,
-                    priority: issue.priority.0,
-                });
+            ) {
+                Ok(Some(issue)) if issue.status.is_active() => {
+                    unblocked.push(UnblockedIssue {
+                        id: issue.id,
+                        title: issue.title,
+                        priority: issue.priority.0,
+                    });
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        issue_id = %uid,
+                        error = %error,
+                        "Skipping suggest-next candidate after committed close because issue lookup failed"
+                    );
+                }
             }
         }
         unblocked

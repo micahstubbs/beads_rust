@@ -414,7 +414,7 @@ fn e2e_label_special_characters() {
     assert!(labels.contains(&"team:backend".to_string()));
 }
 
-/// Test 10: Very long label name
+/// Test 10: Very long label name should fail validation
 #[test]
 fn e2e_label_very_long_name() {
     let _log = common::test_log("e2e_label_very_long_name");
@@ -430,14 +430,11 @@ fn e2e_label_very_long_name() {
     // Create a very long label (100 characters)
     let long_label = "a".repeat(100);
     let add = run_br(&workspace, ["label", "add", &id, &long_label], "add_long");
-    assert!(add.status.success(), "long label failed: {}", add.stderr);
-
-    // Verify it's stored
-    let list = run_br(&workspace, ["label", "list", &id, "--json"], "list");
-    assert!(list.status.success(), "list failed: {}", list.stderr);
-    let labels_payload = extract_json_payload(&list.stdout);
-    let labels: Vec<String> = serde_json::from_str(&labels_payload).expect("labels json");
-    assert!(labels.contains(&long_label), "long label not found");
+    assert!(
+        !add.status.success(),
+        "overlong label should fail validation: {}",
+        add.stderr
+    );
 }
 
 /// Test 11: Case sensitivity (bug vs BUG are different labels)
@@ -626,6 +623,35 @@ fn e2e_label_rename() {
     assert!(
         labels1.contains(&"new-name".to_string()),
         "new-name should exist"
+    );
+}
+
+/// Test label rename rejects an overlong replacement name
+#[test]
+fn e2e_label_rename_rejects_long_new_name() {
+    let _log = common::test_log("e2e_label_rename_rejects_long_new_name");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(&workspace, ["create", "Rename validation test"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let id = parse_created_id(&create.stdout);
+
+    let add = run_br(&workspace, ["label", "add", &id, "old-name"], "add_old");
+    assert!(add.status.success(), "add failed: {}", add.stderr);
+
+    let long_label = "a".repeat(100);
+    let rename = run_br(
+        &workspace,
+        ["label", "rename", "old-name", &long_label, "--json"],
+        "rename_long_label",
+    );
+    assert!(
+        !rename.status.success(),
+        "rename with overlong label should fail validation: {}",
+        rename.stderr
     );
 }
 
