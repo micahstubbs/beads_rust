@@ -48,14 +48,14 @@ log_section "TEST 2: Create test issues"
 br create "High priority bug" --type bug --priority 0
 br create "Medium task" --type task --priority 2
 br create "Low feature" --type feature --priority 3
-ISSUE_COUNT=$(br list --json | jq 'length')
+ISSUE_COUNT=$(br list --json | jq '.issues | length')
 assert_eq "$ISSUE_COUNT" "3"
 log "✓ Created 3 issues"
 
 # Test 3: List modes
 log_section "TEST 3: List output modes"
 log "--- JSON mode:"
-br list --json | jq -c '.[] | {id, title}' | head -5
+br list --json | jq -c '.issues[] | {id, title}' | head -5
 log "--- Plain mode (--no-color):"
 PLAIN_OUTPUT=$(br list --no-color 2>&1)
 assert_no_ansi "$PLAIN_OUTPUT"
@@ -64,13 +64,13 @@ log "✓ All list modes work"
 
 # Test 4: Show command
 log_section "TEST 4: Show command"
-ID=$(br list --json | jq -r '.[0].id')
+ID=$(br list --json | jq -r '.issues[0].id')
 br show "$ID" --no-color
 log "✓ Show command works for $ID"
 
 # Test 5: JSON structure unchanged
 log_section "TEST 5: JSON structure validation"
-br list --json | jq -e '.[0] | has("id", "title", "status", "priority")' > /dev/null
+br list --json | jq -e '.issues[0] | has("id", "title", "status", "priority")' > /dev/null
 log "✓ JSON structure valid - has required fields"
 
 # Test 6: Ready command
@@ -82,8 +82,8 @@ log "✓ Ready command works"
 # Test 7: Blocked command
 log_section "TEST 7: Blocked command"
 # Create dependency to test blocked
-ID1=$(br list --json | jq -r '.[0].id')
-ID2=$(br list --json | jq -r '.[1].id')
+ID1=$(br list --json | jq -r '.issues[0].id')
+ID2=$(br list --json | jq -r '.issues[1].id')
 br dep add "$ID2" "$ID1"
 br blocked --no-color | head -5
 br blocked --json | jq -c 'length' > /dev/null

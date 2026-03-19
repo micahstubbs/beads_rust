@@ -228,7 +228,7 @@ br list --assignee $(whoami)
 br list --format csv --fields id,title,status,priority > issues.csv
 
 # JSON for scripting
-br list --json | jq '.[].id'
+br list --json | jq '.issues[].id'
 ```
 
 ---

@@ -164,7 +164,7 @@ git add .beads/ && git commit -m "..."
 Every command supports `--json` for AI coding agents:
 
 ```bash
-br list --json | jq '.[] | select(.priority <= 1)'
+br list --json | jq '.issues[] | select(.priority <= 1)'
 br ready --json  # Structured output for agents
 br show bd-abc123 --json
 ```
@@ -189,7 +189,7 @@ br show bd-abc    # Styled panels with metadata
 br list | cat     # Clean text, no ANSI codes
 
 # JSON mode (--json or --robot)
-br list --json    # Structured output for tools
+br list --json    # Structured output for tools ({issues, total, limit, offset, has_more})
 ```
 
 Output mode is auto-detected:
@@ -572,7 +572,7 @@ br sync --status  # Safe read-only check
 
 ```bash
 # Check if issue exists
-br list --json | jq '.[] | select(.id == "bd-abc123")'
+br list --json | jq '.issues[] | select(.id == "bd-abc123")'
 
 # Check for similar IDs
 br list | grep -i "abc"
@@ -625,7 +625,7 @@ br doctor
 br list --no-color
 
 # Or use JSON output
-br list --json | jq
+br list --json | jq '.issues'
 ```
 
 ---

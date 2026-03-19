@@ -91,12 +91,11 @@ fn execute_inner(
         // Bump SQL limit by 1 to detect whether results were truncated (text output).
         // For JSON output, we already have the exact total from the count query.
         let ul = filters.limit;
-        if !is_json_output {
-            if let Some(lim) = filters.limit
-                && lim > 0
-            {
-                filters.limit = Some(lim + 1);
-            }
+        if !is_json_output
+            && let Some(lim) = filters.limit
+            && lim > 0
+        {
+            filters.limit = Some(lim + 1);
         }
         ul
     };

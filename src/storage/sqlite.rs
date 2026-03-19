@@ -357,8 +357,11 @@ impl SqliteStorage {
             DROP TABLE IF EXISTS issues;
             ",
         )?;
-        // Recreate with full schema (config/metadata already exist, IF NOT EXISTS is safe)
-        apply_schema(&self.conn)?;
+        // Recreate with full schema (config/metadata already exist, IF NOT EXISTS is safe).
+        // Use apply_runtime_compatible_schema rather than apply_schema because we are
+        // mid-session: the connection is already open with correct pragmas and we only
+        // need to restore the DDL without re-running heavier first-open migrations.
+        apply_runtime_compatible_schema(&self.conn)?;
         Ok(())
     }
 
@@ -10098,7 +10101,10 @@ mod tests {
 
     #[test]
     fn test_reset_data_tables_preserves_config() {
-        let mut storage = SqliteStorage::open_memory().unwrap();
+        // Use a real file to avoid fsqlite in-memory BUSY contention under parallel tests.
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("test.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
 
         // Set config and create some issues

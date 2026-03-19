@@ -204,7 +204,7 @@ br show abc  # Matches bd-abc123
 br search "keyword"
 
 # Check if deleted (tombstoned)
-br list -a --json | jq '.[] | select(.status == "tombstone")'
+br list -a --json | jq '.issues[] | select(.status == "tombstone")'
 ```
 
 **JSON error provides hints:**
@@ -562,7 +562,7 @@ br sync --flush-only --allow-external-jsonl
 **Diagnosis:**
 ```bash
 # Check for dirty issues
-br list --json | jq '[.[] | select(.dirty)] | length'
+br list --json | jq '[.issues[] | select(.dirty)] | length'
 
 # Check file permissions
 ls -la .beads/issues.jsonl

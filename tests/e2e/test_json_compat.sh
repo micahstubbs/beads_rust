@@ -31,8 +31,8 @@ br create "Test issue two" --type bug --priority 2
 br create "Test issue three" --type feature --priority 0
 
 # Add a dependency
-ID1=$(br list --json | jq -r '.[0].id')
-ID2=$(br list --json | jq -r '.[1].id')
+ID1=$(br list --json | jq -r '.issues[0].id')
+ID2=$(br list --json | jq -r '.issues[1].id')
 br dep add "$ID2" "$ID1"
 
 log "Created test workspace with 3 issues and 1 dependency"
@@ -74,7 +74,7 @@ test_json_command "show" "$ID1"
 
 # Test JSON structure for list command
 log_section "Validating JSON structure for list"
-br list --json | jq -e '.[0] | has("id", "title", "status", "priority", "issue_type")' > /dev/null && \
+br list --json | jq -e '.issues[0] | has("id", "title", "status", "priority", "issue_type")' > /dev/null && \
     log "✓ List JSON has required fields" || \
     { log "✗ FAIL: List JSON missing required fields"; FAILED=1; }
 

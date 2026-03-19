@@ -292,13 +292,13 @@ if (ready.length > 0) {
 br ready --json | jq -r '.[].id'
 
 # Get high-priority bugs
-br list --json -t bug -p 0 -p 1 | jq '.[] | "\(.id): \(.title)"'
+br list --json -t bug -p 0 -p 1 | jq '.issues[] | "\(.id): \(.title)"'
 
 # Count by status
-br list --json -a | jq 'group_by(.status) | map({status: .[0].status, count: length})'
+br list --json -a | jq '.issues | group_by(.status) | map({status: .[0].status, count: length})'
 
 # Find my assigned work
-br list --json --assignee $(whoami) | jq '.[].title'
+br list --json --assignee $(whoami) | jq '.issues[].title'
 ```
 
 ---
@@ -505,7 +505,7 @@ br init --prefix myproj
 br show abc  # Matches bd-abc123
 
 # List to find correct ID
-br list --json | jq '.[].id'
+br list --json | jq '.issues[].id'
 ```
 
 **"Database locked"**
