@@ -332,6 +332,36 @@ impl SqliteStorage {
         })
     }
 
+    /// Drop and recreate all data tables, preserving `config` and `metadata`.
+    ///
+    /// Used before force imports to avoid fsqlite btree cursor bugs on DELETE
+    /// operations in large tables. By starting with empty tables, the import
+    /// only performs INSERTs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any DROP/CREATE statement fails.
+    pub fn reset_data_tables(&mut self) -> Result<()> {
+        use crate::storage::schema::execute_batch;
+        execute_batch(
+            &self.conn,
+            r"
+            DROP TABLE IF EXISTS blocked_issues_cache;
+            DROP TABLE IF EXISTS export_hashes;
+            DROP TABLE IF EXISTS dirty_issues;
+            DROP TABLE IF EXISTS child_counters;
+            DROP TABLE IF EXISTS events;
+            DROP TABLE IF EXISTS comments;
+            DROP TABLE IF EXISTS labels;
+            DROP TABLE IF EXISTS dependencies;
+            DROP TABLE IF EXISTS issues;
+            ",
+        )?;
+        // Recreate with full schema (config/metadata already exist, IF NOT EXISTS is safe)
+        apply_schema(&self.conn)?;
+        Ok(())
+    }
+
     /// Detect recoverable on-disk anomalies that should trigger JSONL rebuild.
     ///
     /// These checks run after the database opens successfully because some
@@ -1808,6 +1838,11 @@ impl SqliteStorage {
             && limit > 0
         {
             let _ = write!(sql, " LIMIT {limit}");
+            if let Some(offset) = filters.offset
+                && offset > 0
+            {
+                let _ = write!(sql, " OFFSET {offset}");
+            }
         }
 
         let rows = self.conn.query_with_params(&sql, &params)?;
@@ -1817,6 +1852,115 @@ impl SqliteStorage {
         }
 
         Ok(issues)
+    }
+
+    /// Count issues matching the given filters (no LIMIT/OFFSET applied).
+    ///
+    /// Runs a `SELECT COUNT(*)` using the same WHERE conditions as [`list_issues`],
+    /// without ORDER BY, LIMIT, or OFFSET clauses. Used to compute pagination metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    #[allow(clippy::too_many_lines)]
+    pub fn count_issues_with_filters(&self, filters: &ListFilters) -> Result<usize> {
+        let mut sql = String::from("SELECT COUNT(*) FROM issues WHERE 1=1");
+
+        let mut params: Vec<SqliteValue> = Vec::new();
+
+        if let Some(ref labels) = filters.labels {
+            for label in labels {
+                sql.push_str(" AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label = ?)");
+                params.push(SqliteValue::from(label.as_str()));
+            }
+        }
+
+        if let Some(ref labels_or) = filters.labels_or
+            && !labels_or.is_empty()
+        {
+            let placeholders: Vec<String> = labels_or.iter().map(|_| "?".to_string()).collect();
+            let _ = write!(
+                sql,
+                " AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label IN ({}))",
+                placeholders.join(",")
+            );
+            for label in labels_or {
+                params.push(SqliteValue::from(label.as_str()));
+            }
+        }
+
+        if let Some(ref statuses) = filters.statuses
+            && !statuses.is_empty()
+        {
+            let placeholders: Vec<String> = statuses.iter().map(|_| "?".to_string()).collect();
+            let _ = write!(sql, " AND status IN ({}) ", placeholders.join(","));
+            for s in statuses {
+                params.push(SqliteValue::from(s.as_str()));
+            }
+        }
+
+        if let Some(ref types) = filters.types
+            && !types.is_empty()
+        {
+            let placeholders: Vec<String> = types.iter().map(|_| "?".to_string()).collect();
+            let _ = write!(sql, " AND issue_type IN ({}) ", placeholders.join(","));
+            for t in types {
+                params.push(SqliteValue::from(t.as_str()));
+            }
+        }
+
+        if let Some(ref priorities) = filters.priorities
+            && !priorities.is_empty()
+        {
+            let placeholders: Vec<String> = priorities.iter().map(|_| "?".to_string()).collect();
+            let _ = write!(sql, " AND priority IN ({}) ", placeholders.join(","));
+            for p in priorities {
+                params.push(SqliteValue::from(i64::from(p.0)));
+            }
+        }
+
+        if let Some(ref assignee) = filters.assignee {
+            sql.push_str(" AND assignee = ?");
+            params.push(SqliteValue::from(assignee.as_str()));
+        }
+
+        if filters.unassigned {
+            sql.push_str(" AND (assignee IS NULL OR assignee = '')");
+        }
+
+        if !filters.include_closed {
+            if filters.include_deferred {
+                sql.push_str(" AND status NOT IN ('closed', 'tombstone')");
+            } else {
+                sql.push_str(" AND status NOT IN ('closed', 'tombstone', 'deferred')");
+            }
+        } else if filters.statuses.as_ref().is_none_or(Vec::is_empty) {
+            sql.push_str(" AND status != 'tombstone'");
+        }
+
+        if !filters.include_templates {
+            sql.push_str(" AND (is_template = 0 OR is_template IS NULL)");
+        }
+
+        if let Some(ref title_contains) = filters.title_contains {
+            sql.push_str(" AND title LIKE ? ESCAPE '\\'");
+            let escaped = escape_like_pattern(title_contains);
+            params.push(SqliteValue::from(format!("%{escaped}%")));
+        }
+
+        if let Some(ts) = filters.updated_before {
+            sql.push_str(" AND updated_at <= ?");
+            params.push(SqliteValue::from(ts.to_rfc3339()));
+        }
+
+        if let Some(ts) = filters.updated_after {
+            sql.push_str(" AND updated_at >= ?");
+            params.push(SqliteValue::from(ts.to_rfc3339()));
+        }
+
+        let row = self.conn.query_row_with_params(&sql, &params)?;
+        let count = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
+        Ok(usize::try_from(count).unwrap_or(0))
     }
 
     /// Search issues by query with optional filters.
@@ -5361,6 +5505,8 @@ pub struct ListFilters {
     pub include_templates: bool,
     pub title_contains: Option<String>,
     pub limit: Option<usize>,
+    /// Offset for pagination (number of rows to skip before applying LIMIT)
+    pub offset: Option<usize>,
     /// Sort field (priority, `created_at`, `updated_at`, title)
     pub sort: Option<String>,
     /// Reverse sort order
@@ -5661,6 +5807,12 @@ fn query_external_project_capabilities(
 }
 
 fn parse_datetime(s: &str) -> Result<DateTime<Utc>> {
+    if s.is_empty() {
+        // NULL/empty datetime columns (common when migrating from bd/Go beads)
+        // default to epoch rather than crashing the import.
+        return Ok(DateTime::<Utc>::UNIX_EPOCH);
+    }
+
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         return Ok(dt.with_timezone(&Utc));
     }
@@ -6536,7 +6688,7 @@ impl SqliteStorage {
 mod tests {
     use super::*;
     use crate::model::{Issue, IssueType, Priority, Status};
-    use chrono::{DateTime, TimeZone, Utc};
+    use chrono::{Datelike, DateTime, TimeZone, Utc};
     use std::fs;
     use tempfile::TempDir;
 
@@ -9910,5 +10062,73 @@ mod tests {
             err.to_string().contains("write failed"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_parse_datetime_empty_string_returns_epoch() {
+        let result = parse_datetime("").unwrap();
+        assert_eq!(result, DateTime::<Utc>::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn test_parse_datetime_rfc3339_with_z() {
+        let result = parse_datetime("2026-02-26T19:54:42.715824474Z").unwrap();
+        assert_eq!(result.year(), 2026);
+        assert_eq!(result.month(), 2);
+    }
+
+    #[test]
+    fn test_parse_datetime_rfc3339_with_offset() {
+        let result = parse_datetime("2026-02-26T19:54:42+00:00").unwrap();
+        assert_eq!(result.year(), 2026);
+    }
+
+    #[test]
+    fn test_parse_datetime_naive_format() {
+        let result = parse_datetime("2026-02-26 19:54:42").unwrap();
+        assert_eq!(result.year(), 2026);
+        assert_eq!(result.month(), 2);
+    }
+
+    #[test]
+    fn test_parse_datetime_garbage_returns_error() {
+        let result = parse_datetime("not-a-date");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reset_data_tables_preserves_config() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+
+        // Set config and create some issues
+        storage.set_config("issue_prefix", "test").unwrap();
+        storage.set_metadata("last_import", "2025-01-01").unwrap();
+        let issue = make_issue("test-1", "Issue 1", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue, "tester").unwrap();
+
+        // Verify issue exists
+        assert!(storage.get_issue("test-1").unwrap().is_some());
+
+        // Reset data tables
+        storage.reset_data_tables().unwrap();
+
+        // Config and metadata should be preserved
+        assert_eq!(
+            storage.get_config("issue_prefix").unwrap(),
+            Some("test".to_string()),
+        );
+        assert_eq!(
+            storage.get_metadata("last_import").unwrap(),
+            Some("2025-01-01".to_string()),
+        );
+
+        // Issue data should be gone
+        assert!(storage.get_issue("test-1").unwrap().is_none());
+
+        // Should be able to insert new issues (schema intact)
+        let issue2 = make_issue("test-2", "Issue 2", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue2, "tester").unwrap();
+        assert!(storage.get_issue("test-2").unwrap().is_some());
     }
 }

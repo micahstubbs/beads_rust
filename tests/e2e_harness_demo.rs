@@ -8,6 +8,7 @@
 
 mod common;
 
+use common::cli::parse_list_issues;
 use common::harness::{TestWorkspace, extract_json_payload, parse_created_id};
 
 #[test]
@@ -41,8 +42,7 @@ fn harness_full_workflow() {
     let list = ws.run_br(["list", "--json"], "list_json");
     list.assert_success();
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<serde_json::Value> = serde_json::from_str(&payload).expect("parse list json");
+    let issues = parse_list_issues(&list.stdout);
     assert!(!issues.is_empty(), "no issues found");
     assert!(
         issues.iter().any(|i| i["id"].as_str() == Some(&id)),

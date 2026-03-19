@@ -113,6 +113,24 @@ pub struct IssueWithCounts {
     pub dependent_count: usize,
 }
 
+/// Paginated list response envelope for `br list --json`.
+///
+/// Wraps the issue array with pagination metadata so consumers can detect
+/// truncation and iterate through all results using `--limit` / `--offset`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ListPage {
+    /// The issues in this page of results.
+    pub issues: Vec<IssueWithCounts>,
+    /// Total number of issues matching the query (ignoring LIMIT/OFFSET).
+    pub total: usize,
+    /// Maximum number of results requested (`--limit`; 0 means unlimited).
+    pub limit: usize,
+    /// Number of results skipped (`--offset`).
+    pub offset: usize,
+    /// Whether there are more results beyond this page.
+    pub has_more: bool,
+}
+
 /// Issue details with full relations for show view.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IssueDetails {

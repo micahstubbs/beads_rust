@@ -14,6 +14,7 @@
 mod common;
 
 use common::harness::{TestWorkspace, extract_json_payload};
+use common::cli::parse_list_issues;
 use serde_json::Value;
 
 // =============================================================================
@@ -76,8 +77,7 @@ fn scenario_init_reinit_rejected_without_force() {
     let list = ws.run_br(["list", "--json"], "list_after_reinit");
     list.assert_success();
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("parse list json");
+    let issues = parse_list_issues(&list.stdout);
     assert!(
         !issues.is_empty(),
         "issues should be preserved after re-init"

@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use serde_json::Value;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -233,6 +234,32 @@ pub fn extract_json_payload(stdout: &str) -> String {
         }
     }
     stdout.trim().to_string()
+}
+
+pub fn parse_json_value(stdout: &str) -> Value {
+    let payload = extract_json_payload(stdout);
+    serde_json::from_str(&payload).expect("valid JSON payload")
+}
+
+pub fn parse_list_page(stdout: &str) -> Value {
+    let json = parse_json_value(stdout);
+    assert!(
+        json.is_object(),
+        "list JSON should be an object with pagination metadata"
+    );
+    assert!(
+        json.get("issues").is_some(),
+        "list JSON should contain an issues field"
+    );
+    json
+}
+
+pub fn parse_list_issues(stdout: &str) -> Vec<Value> {
+    parse_list_page(stdout)
+        .get("issues")
+        .and_then(Value::as_array)
+        .cloned()
+        .expect("list JSON should contain an issues array")
 }
 
 #[cfg(test)]

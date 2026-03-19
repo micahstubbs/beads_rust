@@ -1,5 +1,5 @@
 mod common;
-use common::cli::{BrWorkspace, run_br};
+use common::cli::{BrWorkspace, parse_list_issues, run_br};
 
 #[test]
 fn test_ready_limit_with_external_blockers() {
@@ -24,7 +24,7 @@ fn test_ready_limit_with_external_blockers() {
     // Assuming deterministic IDs or extracting them.
     // For simplicity, let's just grep list output or use `br list --json` to get IDs.
     let list = run_br(&workspace, ["list", "--json"], "list");
-    let issues: Vec<serde_json::Value> = serde_json::from_str(&list.stdout).unwrap();
+    let issues = parse_list_issues(&list.stdout);
 
     let mut ids: Vec<String> = issues
         .iter()

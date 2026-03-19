@@ -2,7 +2,9 @@ mod common;
 
 use beads_rust::model::{Issue, IssueType, Priority, Status};
 use chrono::Utc;
-use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_smoke_at_root_with_env};
+use common::cli::{
+    BrWorkspace, extract_json_payload, parse_list_issues, run_br, run_br_smoke_at_root_with_env,
+};
 use common::isolated_workspace_failure_fixture;
 use serde_json::Value;
 use std::fs;
@@ -95,8 +97,7 @@ fn e2e_basic_lifecycle() {
 
     let list = run_br(&workspace, ["list", "--json"], "list");
     assert!(list.status.success(), "list failed: {}", list.stderr);
-    let list_payload = extract_json_payload(&list.stdout);
-    let list_json: Vec<Value> = serde_json::from_str(&list_payload).expect("list json");
+    let list_json = parse_list_issues(&list.stdout);
     assert!(
         list_json
             .iter()
@@ -655,8 +656,7 @@ fn e2e_no_db_read_write() {
         "list --no-db failed: {}",
         list.stderr
     );
-    let list_payload = extract_json_payload(&list.stdout);
-    let list_json: Vec<Value> = serde_json::from_str(&list_payload).expect("list json");
+    let list_json = parse_list_issues(&list.stdout);
     assert!(
         list_json.iter().any(|item| item["id"] == "bd-nodb1"),
         "no-db list missing injected issue"

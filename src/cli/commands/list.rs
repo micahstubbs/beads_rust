@@ -8,7 +8,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::csv;
 use crate::format::{
-    IssueWithCounts, TextFormatOptions, format_issue_line_with, format_issue_long_with,
+    IssueWithCounts, ListPage, TextFormatOptions, format_issue_line_with, format_issue_long_with,
     format_issue_pretty_with, terminal_width,
 };
 use crate::model::{IssueType, Priority, Status};
@@ -63,16 +63,40 @@ fn execute_inner(
     let mut filters = build_filters(args)?;
     let client_filters = needs_client_filters(args);
 
+    // Determine output format early so we know whether to run a count query.
+    let output_format = resolve_output_format_with_outer_mode(
+        args.format,
+        outer_ctx.inherited_output_mode(),
+        false,
+    );
+    let is_json_output = matches!(output_format, OutputFormat::Json | OutputFormat::Toon);
+
+    // The effective limit and offset from the user's request.
+    let user_limit = args.limit.unwrap_or(50);
+    let user_offset = args.offset.unwrap_or(0);
+
+    // For JSON output with SQL-path queries, run a COUNT(*) query using the same
+    // filters (without LIMIT/OFFSET) so we can include pagination metadata.
+    // For client-filter path, the total count is determined after filtering in Rust.
+    let sql_total: Option<usize> = if is_json_output && !client_filters {
+        Some(storage.count_issues_with_filters(&filters)?)
+    } else {
+        None
+    };
+
     // Extract user limit for both paths so we can detect truncation.
-    let user_limit = if client_filters {
+    let limit_for_truncation = if client_filters {
         filters.limit.take()
     } else {
-        // Bump SQL limit by 1 to detect whether results were truncated.
+        // Bump SQL limit by 1 to detect whether results were truncated (text output).
+        // For JSON output, we already have the exact total from the count query.
         let ul = filters.limit;
-        if let Some(lim) = filters.limit
-            && lim > 0
-        {
-            filters.limit = Some(lim + 1);
+        if !is_json_output {
+            if let Some(lim) = filters.limit
+                && lim > 0
+            {
+                filters.limit = Some(lim + 1);
+            }
         }
         ul
     };
@@ -86,11 +110,19 @@ fn execute_inner(
         issues = apply_client_filters(issues, args)?;
     }
 
+    // For JSON output, determine the total matching count.
+    // For client-filter path, we now know the exact total before truncation.
+    let json_total: usize = if is_json_output {
+        sql_total.unwrap_or(issues.len())
+    } else {
+        0 // unused for text/csv output
+    };
+
     // Detect and apply truncation.
     // For client-filter path we know the exact pre-truncation count.
-    // For SQL path we only know "more than limit" (we fetched limit+1).
+    // For SQL path we only know "more than limit" (we fetched limit+1 for text output).
     let total_before = issues.len();
-    let truncated = if let Some(limit) = user_limit
+    let truncated = if let Some(limit) = limit_for_truncation
         && limit > 0
         && issues.len() > limit
     {
@@ -100,12 +132,6 @@ fn execute_inner(
         false
     };
 
-    // Determine output format: --json flag overrides --format
-    let output_format = resolve_output_format_with_outer_mode(
-        args.format,
-        outer_ctx.inherited_output_mode(),
-        false,
-    );
     let quiet = cli.quiet.unwrap_or(false);
     let early_ctx = OutputContext::from_output_format(output_format, quiet, true);
 
@@ -174,10 +200,24 @@ fn execute_inner(
                 })
                 .collect();
 
-            if matches!(output_format, OutputFormat::Toon) {
-                ctx.toon_with_stats(&issues_with_counts, args.stats);
+            let has_more = if user_limit == 0 {
+                false
             } else {
-                ctx.json_pretty(&issues_with_counts);
+                json_total > user_offset + user_limit
+            };
+
+            let page = ListPage {
+                issues: issues_with_counts,
+                total: json_total,
+                limit: user_limit,
+                offset: user_offset,
+                has_more,
+            };
+
+            if matches!(output_format, OutputFormat::Toon) {
+                ctx.toon_with_stats(&page, args.stats);
+            } else {
+                ctx.json_pretty(&page);
             }
         }
         OutputFormat::Csv => {
@@ -298,6 +338,7 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         include_templates: false,
         title_contains: args.title_contains.clone(),
         limit: args.limit,
+        offset: args.offset,
         sort: args.sort.clone(),
         reverse: args.reverse,
         labels: if args.label.is_empty() {

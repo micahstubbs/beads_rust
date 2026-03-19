@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, parse_list_issues, run_br};
 use serde_json::Value;
 use std::fs;
 
@@ -75,9 +75,8 @@ fn e2e_json_flag_list() {
     let list = run_br(&workspace, ["list", "--json"], "list_json");
     assert!(list.status.success(), "list --json failed: {}", list.stderr);
 
-    // Output should be valid JSON array
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("valid JSON array");
+    // Output should be valid paginated JSON with an issues array.
+    let json = parse_list_issues(&list.stdout);
     assert!(!json.is_empty(), "JSON list should not be empty");
     assert!(
         json.iter().any(|item| item["title"] == "JSON test issue"),
@@ -426,8 +425,7 @@ fn e2e_no_db_flag_list() {
         list.stderr
     );
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("valid JSON");
+    let json = parse_list_issues(&list.stdout);
     assert!(
         json.iter().any(|item| item["title"] == "No-DB list test"),
         "issue should be visible in no-db mode"
@@ -763,6 +761,88 @@ fn e2e_no_auto_flush_flag() {
     );
 }
 
+/// `sync.auto_flush: false` in project config should suppress auto-flush,
+/// just like passing `--no-auto-flush` on the CLI.
+#[test]
+fn e2e_no_auto_flush_from_project_config() {
+    let _log = common::test_log("e2e_no_auto_flush_from_project_config");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    // Disable auto-flush via project config.
+    let config_path = workspace.root.join(".beads").join("config.yaml");
+    fs::write(&config_path, "sync:\n  auto_flush: false\n").expect("write config");
+
+    // Create without --no-auto-flush flag; config should suppress auto-flush.
+    let create = run_br(
+        &workspace,
+        ["create", "No auto-flush from config"],
+        "create_with_config",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    // Issue should not be present in JSONL until explicit flush.
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    if jsonl_path.exists() {
+        let contents = fs::read_to_string(&jsonl_path).expect("read jsonl");
+        assert!(
+            !contents.contains("No auto-flush from config"),
+            "issue should not be in JSONL before explicit flush when sync.auto_flush=false"
+        );
+    }
+
+    let sync = run_br(&workspace, ["sync", "--flush-only"], "sync_flush");
+    assert!(sync.status.success(), "sync flush failed: {}", sync.stderr);
+
+    let contents = fs::read_to_string(&jsonl_path).expect("read jsonl");
+    assert!(
+        contents.contains("No auto-flush from config"),
+        "issue should be in JSONL after explicit flush"
+    );
+}
+
+/// `sync.auto-flush: false` (hyphen variant) should behave identically to
+/// `sync.auto_flush: false` (underscore variant).
+#[test]
+fn e2e_no_auto_flush_config_hyphen_variant() {
+    let _log = common::test_log("e2e_no_auto_flush_config_hyphen_variant");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    // Use hyphen variant in config.
+    let config_path = workspace.root.join(".beads").join("config.yaml");
+    fs::write(&config_path, "sync:\n  auto-flush: false\n").expect("write config");
+
+    let create = run_br(
+        &workspace,
+        ["create", "Hyphen config no flush"],
+        "create_hyphen",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    if jsonl_path.exists() {
+        let contents = fs::read_to_string(&jsonl_path).expect("read jsonl");
+        assert!(
+            !contents.contains("Hyphen config no flush"),
+            "issue should not be in JSONL when sync.auto-flush=false (hyphen)"
+        );
+    }
+
+    let sync = run_br(&workspace, ["sync", "--flush-only"], "sync_flush");
+    assert!(sync.status.success(), "sync flush failed: {}", sync.stderr);
+
+    let contents = fs::read_to_string(&jsonl_path).expect("read jsonl");
+    assert!(
+        contents.contains("Hyphen config no flush"),
+        "issue should be in JSONL after explicit flush with hyphen config"
+    );
+}
+
 // ============================================================================
 // --lock-timeout flag tests
 // ============================================================================
@@ -791,8 +871,7 @@ fn e2e_lock_timeout_flag() {
     let list = run_br(&workspace, ["list", "--json"], "list");
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("valid JSON");
+    let json = parse_list_issues(&list.stdout);
     assert!(
         json.iter().any(|item| item["title"] == "Lock timeout test"),
         "issue should be created with custom lock timeout"
@@ -1469,8 +1548,7 @@ fn e2e_json_no_color_combined() {
     );
 
     // Should be valid JSON with no color codes
-    let payload = extract_json_payload(&list.stdout);
-    let _json: Vec<Value> = serde_json::from_str(&payload).expect("valid JSON");
+    let _json = parse_list_issues(&list.stdout);
     assert!(
         !list.stdout.contains("\x1b["),
         "no color codes in JSON output"
@@ -1499,8 +1577,7 @@ fn e2e_no_db_json_combined() {
         list.stderr
     );
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("valid JSON");
+    let json = parse_list_issues(&list.stdout);
     assert!(
         json.iter().any(|item| item["title"] == "No-DB JSON test"),
         "issue in no-db JSON output"
@@ -1527,8 +1604,7 @@ fn e2e_quiet_json_combined() {
     );
 
     // JSON should still be valid
-    let payload = extract_json_payload(&list.stdout);
-    let _json: Vec<Value> = serde_json::from_str(&payload).expect("valid JSON");
+    let _json = parse_list_issues(&list.stdout);
 }
 
 // ============================================================================
@@ -1554,8 +1630,7 @@ fn e2e_global_flag_before_command() {
         list.stderr
     );
 
-    let payload = extract_json_payload(&list.stdout);
-    let _json: Vec<Value> = serde_json::from_str(&payload).expect("valid JSON");
+    let _json = parse_list_issues(&list.stdout);
 }
 
 #[test]
@@ -1577,8 +1652,7 @@ fn e2e_global_flag_after_command() {
         list.stderr
     );
 
-    let payload = extract_json_payload(&list.stdout);
-    let _json: Vec<Value> = serde_json::from_str(&payload).expect("valid JSON");
+    let _json = parse_list_issues(&list.stdout);
 }
 
 // ============================================================================
@@ -1671,9 +1745,7 @@ fn e2e_json_overrides_quiet() {
     let output = run_br(&workspace, ["--quiet", "list", "--json"], "quiet_json_prec");
     assert!(output.status.success());
 
-    let payload = extract_json_payload(&output.stdout);
-    let json: Vec<Value> =
-        serde_json::from_str(&payload).expect("--quiet --json should produce valid JSON");
+    let json = parse_list_issues(&output.stdout);
     assert!(
         json.iter().any(|item| item["title"] == "Precedence test"),
         "JSON output should contain the issue even with --quiet"

@@ -5,7 +5,9 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env};
+use common::cli::{
+    BrWorkspace, extract_json_payload, parse_list_issues, run_br, run_br_with_env,
+};
 use fsqlite::Connection;
 use serde_json::Value;
 use std::fs;
@@ -94,11 +96,8 @@ fn e2e_sync_import_only_accepts_mixed_prefixes_and_keeps_default_prefix_for_new_
 
     let list = run_br(&workspace, ["list", "--json"], "list_after_mixed_import");
     assert!(list.status.success(), "list failed: {}", list.stderr);
-    let list_payload = extract_json_payload(&list.stdout);
-    let issues: Value = serde_json::from_str(&list_payload).expect("list JSON");
+    let issues = parse_list_issues(&list.stdout);
     let ids: Vec<&str> = issues
-        .as_array()
-        .expect("list array")
         .iter()
         .filter_map(|issue| issue["id"].as_str())
         .collect();
@@ -616,10 +615,9 @@ fn e2e_doctor_repair_json_rebuilds_when_db_is_malformed() {
         "list should succeed after malformed-db repair: {}",
         show.stderr
     );
-    let listed_payload = extract_json_payload(&show.stdout);
-    let listed: Value = serde_json::from_str(&listed_payload).expect("list json");
+    let listed = parse_list_issues(&show.stdout);
     assert!(
-        listed.as_array().is_some_and(|issues| !issues.is_empty()),
+        !listed.is_empty(),
         "expected repaired database to contain at least one issue: {listed}"
     );
 }

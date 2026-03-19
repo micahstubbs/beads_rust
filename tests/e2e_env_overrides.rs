@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env};
+use common::cli::{BrWorkspace, extract_json_payload, parse_list_issues, run_br, run_br_with_env};
 use common::harness::parse_created_id;
 use serde_json::Value;
 use std::fs;
@@ -44,8 +44,7 @@ fn e2e_beads_dir_env_overrides_discovery() {
         list.stderr
     );
 
-    let payload = extract_json_payload(&list.stdout);
-    let list_json: Vec<Value> = serde_json::from_str(&payload).expect("list json");
+    let list_json = parse_list_issues(&list.stdout);
     assert!(
         list_json
             .iter()
@@ -154,8 +153,7 @@ fn e2e_beads_dir_takes_precedence_over_cwd() {
         list.stderr
     );
 
-    let payload = extract_json_payload(&list.stdout);
-    let list_json: Vec<Value> = serde_json::from_str(&payload).expect("list json");
+    let list_json = parse_list_issues(&list.stdout);
 
     // Should see B's issue, not A's
     assert!(
@@ -196,8 +194,7 @@ fn e2e_bd_db_env_override_allows_access_outside_workspace() {
         list.stderr
     );
 
-    let payload = extract_json_payload(&list.stdout);
-    let list_json: Vec<Value> = serde_json::from_str(&payload).expect("list json");
+    let list_json = parse_list_issues(&list.stdout);
     assert!(
         list_json
             .iter()
@@ -557,8 +554,7 @@ fn e2e_no_db_with_beads_dir() {
         list.stderr
     );
 
-    let payload = extract_json_payload(&list.stdout);
-    let list_json: Vec<Value> = serde_json::from_str(&payload).expect("list json");
+    let list_json = parse_list_issues(&list.stdout);
     assert!(
         list_json
             .iter()
@@ -599,8 +595,7 @@ fn e2e_no_db_with_beads_jsonl() {
         list.stderr
     );
 
-    let payload = extract_json_payload(&list.stdout);
-    let list_json: Vec<Value> = serde_json::from_str(&payload).expect("list json");
+    let list_json = parse_list_issues(&list.stdout);
     assert!(
         list_json
             .iter()
@@ -634,8 +629,7 @@ fn e2e_no_db_ignores_lock_timeout_flag() {
         list.stderr
     );
 
-    let payload = extract_json_payload(&list.stdout);
-    let list_json: Vec<Value> = serde_json::from_str(&payload).expect("list json");
+    let list_json = parse_list_issues(&list.stdout);
     assert!(
         list_json
             .iter()
@@ -1820,8 +1814,7 @@ fn e2e_empty_beads_dir_env_ignored() {
         list.stderr
     );
 
-    let payload = extract_json_payload(&list.stdout);
-    let list_json: Vec<Value> = serde_json::from_str(&payload).expect("list json");
+    let list_json = parse_list_issues(&list.stdout);
     assert!(
         list_json
             .iter()
@@ -1857,8 +1850,7 @@ fn e2e_whitespace_beads_dir_env_ignored() {
         list.stderr
     );
 
-    let payload = extract_json_payload(&list.stdout);
-    let list_json: Vec<Value> = serde_json::from_str(&payload).expect("list json");
+    let list_json = parse_list_issues(&list.stdout);
     assert!(
         list_json
             .iter()

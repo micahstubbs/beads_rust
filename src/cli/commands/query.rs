@@ -125,6 +125,7 @@ impl SavedFilters {
             notes_contains: self.notes_contains.clone(),
             all: self.all,
             limit: self.limit,
+            offset: Some(0),
             sort: self.sort.clone(),
             reverse: self.reverse,
             deferred: self.deferred,
@@ -190,6 +191,7 @@ impl SavedFilters {
             desc_contains: cli.desc_contains.clone().or(base.desc_contains),
             notes_contains: cli.notes_contains.clone().or(base.notes_contains),
             limit: cli.limit.or(base.limit),
+            offset: cli.offset.or(base.offset),
             sort: cli.sort.clone().or(base.sort),
             // Bool fields: CLI true overrides saved
             unassigned,

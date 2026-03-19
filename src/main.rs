@@ -529,9 +529,12 @@ fn build_cli_overrides(cli: &Cli) -> config::CliOverrides {
         db: cli.db.clone(),
         actor: cli.actor.clone(),
         identity: None,
-        json: Some(cli.json),
+        // Only set bool overrides when the CLI flag was explicitly provided.
+        // Eagerly setting Some(false) would override config-file values with the
+        // CLI default, preventing users from setting these via config.
+        json: cli.json.then_some(true),
         display_color: if cli.no_color { Some(false) } else { None },
-        quiet: Some(cli.quiet),
+        quiet: cli.quiet.then_some(true),
         allow_stale: if cli.allow_stale { Some(true) } else { None },
         no_db: if cli.no_db { Some(true) } else { None },
         no_daemon: if cli.no_daemon { Some(true) } else { None },
@@ -619,6 +622,11 @@ mod tests {
         let cli = Cli::parse_from(["br", "list"]);
         let overrides = build_cli_overrides(&cli);
 
+        // Absent CLI bool flags must not produce Some(false) overrides — that
+        // would silently clobber any config-file value (e.g. `sync.auto_flush:
+        // false` would be ignored because the CLI's default `false` wins).
+        assert_eq!(overrides.json, None);
+        assert_eq!(overrides.quiet, None);
         assert_eq!(overrides.no_db, None);
         assert_eq!(overrides.no_daemon, None);
         assert_eq!(overrides.no_auto_flush, None);

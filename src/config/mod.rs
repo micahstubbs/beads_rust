@@ -1306,37 +1306,51 @@ pub fn no_db_from_layer(layer: &ConfigLayer) -> Option<bool> {
     get_startup_value(layer, &["no-db", "no_db", "no.db"]).and_then(|value| parse_bool(value))
 }
 
-/// Check merged config for `no-auto-flush` / `sync.auto_flush` (inverted).
+/// Check merged config for `sync.auto_flush` (inverted) or legacy `no-auto-flush`.
+///
+/// Priority order (highest first):
+/// 1. `sync.auto_flush` / `sync.auto-flush` / `sync.auto.flush` — canonical positive key
+/// 2. `no-auto-flush` / `no_auto_flush` / `no.auto.flush` — legacy inverted key
+///
+/// The canonical `sync.auto_flush = false` means "disable auto-flush".  The legacy
+/// `no-auto-flush = true` means the same thing.  By checking the canonical key first,
+/// a project config with `sync.auto_flush: false` wins even when the merged layer
+/// happens to contain a stale legacy `no-auto-flush` entry.
 #[must_use]
 pub fn no_auto_flush_from_layer(layer: &ConfigLayer) -> Option<bool> {
-    // Direct key: no-auto-flush / no_auto_flush / no.auto.flush
-    if let Some(v) = get_startup_value(layer, &["no-auto-flush", "no_auto_flush", "no.auto.flush"])
-        .and_then(|value| parse_bool(value))
-    {
-        return Some(v);
-    }
-    // Inverted key: sync.auto_flush (false => no_auto_flush = true)
-    get_startup_value(layer, &["sync.auto_flush", "sync.auto-flush"])
-        .and_then(|value| parse_bool(value))
-        .map(|v| !v)
-}
-
-/// Check merged config for `no-auto-import` / `sync.auto_import` (inverted).
-#[must_use]
-pub fn no_auto_import_from_layer(layer: &ConfigLayer) -> Option<bool> {
-    // Direct key: no-auto-import / no_auto_import / no.auto.import
+    // Canonical key: sync.auto_flush (false => no_auto_flush = true)
     if let Some(v) = get_startup_value(
         layer,
-        &["no-auto-import", "no_auto_import", "no.auto.import"],
+        &["sync.auto_flush", "sync.auto-flush", "sync.auto.flush"],
     )
     .and_then(|value| parse_bool(value))
     {
-        return Some(v);
+        return Some(!v);
     }
-    // Inverted key: sync.auto_import (false => no_auto_import = true)
-    get_startup_value(layer, &["sync.auto_import", "sync.auto-import"])
+    // Legacy key: no-auto-flush / no_auto_flush / no.auto.flush
+    get_startup_value(layer, &["no-auto-flush", "no_auto_flush", "no.auto.flush"])
         .and_then(|value| parse_bool(value))
-        .map(|v| !v)
+}
+
+/// Check merged config for `sync.auto_import` (inverted) or legacy `no-auto-import`.
+///
+/// Priority order (highest first):
+/// 1. `sync.auto_import` / `sync.auto-import` / `sync.auto.import` — canonical positive key
+/// 2. `no-auto-import` / `no_auto_import` / `no.auto.import` — legacy inverted key
+#[must_use]
+pub fn no_auto_import_from_layer(layer: &ConfigLayer) -> Option<bool> {
+    // Canonical key: sync.auto_import (false => no_auto_import = true)
+    if let Some(v) = get_startup_value(
+        layer,
+        &["sync.auto_import", "sync.auto-import", "sync.auto.import"],
+    )
+    .and_then(|value| parse_bool(value))
+    {
+        return Some(!v);
+    }
+    // Legacy key: no-auto-import / no_auto_import / no.auto.import
+    get_startup_value(layer, &["no-auto-import", "no_auto_import", "no.auto.import"])
+        .and_then(|value| parse_bool(value))
 }
 
 fn resolve_bootstrap_issue_prefix(
@@ -1705,10 +1719,20 @@ impl CliOverrides {
             insert_key_value(&mut layer, "no-daemon", no_daemon.to_string());
         }
         if let Some(no_auto_flush) = self.no_auto_flush {
-            insert_key_value(&mut layer, "no-auto-flush", no_auto_flush.to_string());
+            // Store as the canonical positive key so it wins over any legacy
+            // `no-auto-flush` entry in the project/user config when merged.
+            insert_key_value(
+                &mut layer,
+                "sync.auto_flush",
+                (!no_auto_flush).to_string(),
+            );
         }
         if let Some(no_auto_import) = self.no_auto_import {
-            insert_key_value(&mut layer, "no-auto-import", no_auto_import.to_string());
+            insert_key_value(
+                &mut layer,
+                "sync.auto_import",
+                (!no_auto_import).to_string(),
+            );
         }
         if let Some(lock_timeout) = self.lock_timeout {
             insert_key_value(&mut layer, "lock-timeout", lock_timeout.to_string());
@@ -3144,8 +3168,9 @@ labels:
         assert_eq!(layer.startup.get("json").unwrap(), "true");
         assert_eq!(layer.startup.get("no_db").unwrap(), "true");
         assert_eq!(layer.startup.get("no_daemon").unwrap(), "true");
-        assert_eq!(layer.startup.get("no_auto_flush").unwrap(), "true");
-        assert_eq!(layer.startup.get("no_auto_import").unwrap(), "true");
+        // no_auto_flush=true => sync.auto_flush=false (canonical positive key, inverted)
+        assert_eq!(layer.startup.get("sync.auto_flush").unwrap(), "false");
+        assert_eq!(layer.startup.get("sync.auto_import").unwrap(), "false");
         assert_eq!(layer.startup.get("lock_timeout").unwrap(), "5000");
     }
 
@@ -3156,6 +3181,94 @@ labels:
 
         assert!(layer.startup.is_empty());
         assert!(layer.runtime.is_empty());
+    }
+
+    #[test]
+    fn no_auto_flush_from_layer_reads_sync_auto_flush_false() {
+        // A project config with `sync.auto_flush: false` should disable auto-flush.
+        let mut layer = ConfigLayer::default();
+        insert_key_value(&mut layer, "sync.auto_flush", "false".to_string());
+
+        let result = no_auto_flush_from_layer(&layer);
+        assert_eq!(
+            result,
+            Some(true),
+            "sync.auto_flush=false should set no_auto_flush=true"
+        );
+    }
+
+    #[test]
+    fn no_auto_flush_from_layer_reads_sync_auto_flush_true() {
+        // A project config with `sync.auto_flush: true` should enable auto-flush.
+        let mut layer = ConfigLayer::default();
+        insert_key_value(&mut layer, "sync.auto_flush", "true".to_string());
+
+        let result = no_auto_flush_from_layer(&layer);
+        assert_eq!(
+            result,
+            Some(false),
+            "sync.auto_flush=true should set no_auto_flush=false"
+        );
+    }
+
+    #[test]
+    fn no_auto_flush_from_layer_canonical_key_beats_legacy_key() {
+        // When both canonical `sync.auto_flush` and legacy `no-auto-flush` are present,
+        // `sync.auto_flush` should take precedence.
+        let mut layer = ConfigLayer::default();
+        // sync.auto_flush=true means "enable auto-flush" (no_auto_flush=false)
+        insert_key_value(&mut layer, "sync.auto_flush", "true".to_string());
+        // no-auto-flush=true means "disable auto-flush" (no_auto_flush=true)
+        insert_key_value(&mut layer, "no-auto-flush", "true".to_string());
+
+        // sync.auto_flush should win -> no_auto_flush=false
+        let result = no_auto_flush_from_layer(&layer);
+        assert_eq!(
+            result,
+            Some(false),
+            "sync.auto_flush=true should win over legacy no-auto-flush=true"
+        );
+    }
+
+    #[test]
+    fn no_auto_flush_from_layer_hyphen_underscore_equivalence() {
+        // Config key `sync.auto-flush` (with hyphen) should be equivalent to
+        // `sync.auto_flush` (with underscore).
+        let mut layer = ConfigLayer::default();
+        insert_key_value(&mut layer, "sync.auto-flush", "false".to_string());
+
+        let result = no_auto_flush_from_layer(&layer);
+        assert_eq!(
+            result,
+            Some(true),
+            "sync.auto-flush=false (hyphen) should set no_auto_flush=true"
+        );
+    }
+
+    #[test]
+    fn cli_no_auto_flush_overrides_config_sync_auto_flush() {
+        // When --no-auto-flush is passed on CLI (no_auto_flush=Some(true)),
+        // it should translate to sync.auto_flush=false in the layer, overriding
+        // any YAML config that has sync.auto_flush=true.
+        let overrides = CliOverrides {
+            no_auto_flush: Some(true),
+            ..CliOverrides::default()
+        };
+        let cli_layer = overrides.as_layer();
+
+        // Simulate a project config layer with sync.auto_flush=true
+        let mut project_layer = ConfigLayer::default();
+        insert_key_value(&mut project_layer, "sync.auto_flush", "true".to_string());
+
+        // Merge: project first (lower precedence), CLI second (higher precedence)
+        let merged = ConfigLayer::merge_layers(&[project_layer, cli_layer]);
+
+        let result = no_auto_flush_from_layer(&merged);
+        assert_eq!(
+            result,
+            Some(true),
+            "CLI --no-auto-flush should override project config sync.auto_flush=true"
+        );
     }
 
     #[test]

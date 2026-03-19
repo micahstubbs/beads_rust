@@ -1476,6 +1476,10 @@ pub struct ListArgs {
     #[arg(long, default_value = "50")]
     pub limit: Option<usize>,
 
+    /// Number of results to skip (for pagination, default: 0)
+    #[arg(long, default_value = "0")]
+    pub offset: Option<usize>,
+
     /// Sort field (`priority`, `created_at`, `updated_at`, `title`)
     #[arg(long, add = ArgValueCompleter::new(sort_key_completer))]
     pub sort: Option<String>,

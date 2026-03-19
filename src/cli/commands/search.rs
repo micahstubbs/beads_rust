@@ -383,6 +383,7 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         include_templates: false,
         title_contains: args.title_contains.clone(),
         limit: args.limit,
+        offset: args.offset,
         sort: args.sort.clone(),
         reverse: args.reverse,
         labels: if args.label.is_empty() {
