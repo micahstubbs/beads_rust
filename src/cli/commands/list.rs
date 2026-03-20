@@ -86,7 +86,12 @@ fn execute_inner(
 
     // Extract user limit for both paths so we can detect truncation.
     let limit_for_truncation = if client_filters {
-        filters.limit.take()
+        // Remove LIMIT and OFFSET from the SQL query — the client-filter path
+        // must fetch all issues, apply Rust-side filters, and then apply
+        // offset + limit in Rust to get correct pagination.
+        filters.limit.take();
+        filters.offset.take();
+        Some(user_limit)
     } else {
         // Bump SQL limit by 1 to detect whether results were truncated (text output).
         // For JSON output, we already have the exact total from the count query.
@@ -116,6 +121,17 @@ fn execute_inner(
     } else {
         0 // unused for text/csv output
     };
+
+    // For client-filter path, apply offset here (after filtering) since it
+    // was removed from the SQL query.  SQL-path offset is already applied by
+    // the database engine.
+    if client_filters && user_offset > 0 {
+        if user_offset >= issues.len() {
+            issues.clear();
+        } else {
+            issues = issues.split_off(user_offset);
+        }
+    }
 
     // Detect and apply truncation.
     // For client-filter path we know the exact pre-truncation count.
