@@ -341,6 +341,7 @@ fn compute_summary(
                 && !all_blocked_ids.contains(&i.id)
                 && external_blockers.is_none_or(|eb| !eb.contains_key(&i.id))
                 && !i.ephemeral
+                && !is_wisp_issue_id(&i.id)
                 && !i.pinned
                 && !i.is_template
                 && i.defer_until.is_none_or(|d| d <= now)
@@ -384,6 +385,10 @@ fn compute_summary(
         epics_eligible_for_closure: epics_eligible,
         average_lead_time_hours: avg_lead_time,
     })
+}
+
+fn is_wisp_issue_id(id: &str) -> bool {
+    id.contains("-wisp-")
 }
 
 /// Count epics that have all children closed.
@@ -1349,6 +1354,25 @@ mod tests {
         storage.create_issue(&template_issue, "tester").unwrap();
 
         let all_issues = [&regular_issue, &template_issue]
+            .into_iter()
+            .map(stats_row)
+            .collect::<Vec<_>>();
+        let summary = compute_summary(&storage, &all_issues, None).unwrap();
+
+        assert_eq!(summary.ready_issues, 1);
+    }
+
+    #[test]
+    fn test_compute_summary_ready_excludes_wisp_ids() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let regular_issue = make_issue("t-1", Status::Open, IssueType::Task);
+        let wisp_issue = make_issue("t-wisp-2", Status::Open, IssueType::Task);
+
+        storage.create_issue(&regular_issue, "tester").unwrap();
+        storage.create_issue(&wisp_issue, "tester").unwrap();
+
+        let all_issues = [&regular_issue, &wisp_issue]
             .into_iter()
             .map(stats_row)
             .collect::<Vec<_>>();
