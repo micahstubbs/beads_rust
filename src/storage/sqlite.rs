@@ -1900,6 +1900,24 @@ impl SqliteStorage {
         Ok(issues)
     }
 
+    /// Get lean issue rows for stats computation without hydrating large text fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn list_stats_issues(&self) -> Result<Vec<StatsIssueRow>> {
+        let rows = self.conn.query(
+            r"SELECT id, status, priority, issue_type, assignee, created_at, closed_at,
+                     defer_until, ephemeral, pinned, is_template
+              FROM issues",
+        )?;
+        let mut issues = Vec::with_capacity(rows.len());
+        for row in &rows {
+            issues.push(Self::stats_issue_from_row(row)?);
+        }
+        Ok(issues)
+    }
+
     /// Count issues matching the given filters (no LIMIT/OFFSET applied).
     ///
     /// Runs a `SELECT COUNT(*)` using the same WHERE conditions as [`list_issues`],
@@ -5290,6 +5308,22 @@ impl SqliteStorage {
         })
     }
 
+    /// Set a metadata value using an internal write transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database update fails.
+    pub(crate) fn set_metadata_shared(&self, key: &str, value: &str) -> Result<()> {
+        Self::with_connection_write_transaction(&self.conn, |conn| {
+            Self::delete_metadata_key_in_tx(conn, key)?;
+            conn.execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[SqliteValue::from(key), SqliteValue::from(value)],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Delete a metadata key.
     ///
     /// # Errors
@@ -5440,6 +5474,51 @@ impl SqliteStorage {
         })
     }
 
+    fn stats_issue_from_row(row: &fsqlite::Row) -> Result<StatsIssueRow> {
+        let get_str = |idx: usize| -> String {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string()
+        };
+        let get_non_empty_str = |idx: usize| -> Option<String> {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let get_opt_i32 = |idx: usize| -> Option<i32> {
+            row.get(idx)
+                .and_then(SqliteValue::as_integer)
+                .map(|value| value as i32)
+        };
+        let get_bool = |idx: usize| -> bool {
+            row.get(idx).and_then(SqliteValue::as_integer).unwrap_or(0) != 0
+        };
+        let get_opt_datetime = |idx: usize| -> Result<Option<DateTime<Utc>>> {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .filter(|s| !s.is_empty())
+                .map(parse_datetime)
+                .transpose()
+        };
+
+        Ok(StatsIssueRow {
+            id: get_str(0),
+            status: parse_status(row.get(1).and_then(SqliteValue::as_text)),
+            priority: Priority(get_opt_i32(2).unwrap_or_else(|| Priority::default().0)),
+            issue_type: parse_issue_type(row.get(3).and_then(SqliteValue::as_text)),
+            assignee: get_non_empty_str(4),
+            created_at: parse_datetime(row.get(5).and_then(SqliteValue::as_text).unwrap_or(""))?,
+            closed_at: get_opt_datetime(6)?,
+            defer_until: get_opt_datetime(7)?,
+            ephemeral: get_bool(8),
+            pinned: get_bool(9),
+            is_template: get_bool(10),
+        })
+    }
+
     /// Get metadata for all active issues.
     ///
     /// This is used to pre-populate caches for graph traversals, avoiding N+1 queries.
@@ -5571,6 +5650,22 @@ pub struct ListFilters {
     pub updated_before: Option<DateTime<Utc>>,
     /// Filter by `updated_at` >= timestamp
     pub updated_after: Option<DateTime<Utc>>,
+}
+
+/// Lean issue row used by the stats command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatsIssueRow {
+    pub id: String,
+    pub status: Status,
+    pub priority: Priority,
+    pub issue_type: IssueType,
+    pub assignee: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub closed_at: Option<DateTime<Utc>>,
+    pub defer_until: Option<DateTime<Utc>>,
+    pub ephemeral: bool,
+    pub pinned: bool,
+    pub is_template: bool,
 }
 
 /// Fields to update on an issue.

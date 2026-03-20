@@ -166,12 +166,12 @@ fn extract_issues_array(stdout: &str) -> Vec<serde_json::Value> {
         return arr;
     }
     // Try paginated envelope.
-    if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&payload) {
-        if let Some(issues) = obj.get("issues").and_then(|v| v.as_array()) {
-            return issues.clone();
-        }
+    if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&payload)
+        && let Some(issues) = obj.get("issues").and_then(|v| v.as_array())
+    {
+        return issues.clone();
     }
-    vec![]
+    Vec::new()
 }
 
 /// Assert that `br doctor` reports the workspace as healthy.

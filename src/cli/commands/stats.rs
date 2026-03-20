@@ -11,9 +11,10 @@ use crate::format::{
 };
 use crate::model::{Issue, IssueType, Status};
 use crate::output::{OutputContext, OutputMode};
-use crate::storage::{ListFilters, SqliteStorage};
+use crate::storage::{SqliteStorage, StatsIssueRow};
 use chrono::Utc;
 use rich_rust::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -105,14 +106,7 @@ fn execute_inner(
 
     info!("Computing project statistics");
 
-    // Get all issues including closed and tombstones for comprehensive stats
-    let all_filters = ListFilters {
-        include_closed: true,
-        include_templates: true,
-        include_deferred: true,
-        ..Default::default()
-    };
-    let all_issues = storage.list_issues(&all_filters)?;
+    let all_issues = storage.list_stats_issues()?;
 
     debug!(total = all_issues.len(), "Loaded all issues for stats");
 
@@ -145,7 +139,7 @@ fn execute_inner(
     }
 
     let recent_activity = if should_include_activity(args) {
-        compute_recent_activity(&jsonl_path, args.activity_hours)
+        compute_recent_activity(Some(storage), &jsonl_path, args.activity_hours)
     } else {
         None
     };
@@ -239,15 +233,39 @@ impl ActivityCounts {
 struct GitActivitySummary {
     commit_count: usize,
     counts: ActivityCounts,
+    earliest_commit_ts: Option<i64>,
 }
 
 const GIT_ACTIVITY_COMMIT_MARKER: &str = "__BR_ACTIVITY_COMMIT__:";
+const RECENT_ACTIVITY_CACHE_KEY_PREFIX: &str = "stats_recent_activity";
+
+#[derive(Debug, Clone)]
+struct GitRepoContext {
+    repo_root: PathBuf,
+    head: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RecentActivityCacheEntry {
+    repo_root: String,
+    repo_head: String,
+    pathspec: String,
+    hours: u32,
+    valid_until_epoch: Option<i64>,
+    activity: RecentActivity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecentActivityCachePolicy {
+    Cache { valid_until_epoch: Option<i64> },
+    Skip,
+}
 
 /// Compute summary statistics.
 #[allow(clippy::cast_precision_loss)]
 fn compute_summary(
     storage: &SqliteStorage,
-    issues: &[crate::model::Issue],
+    issues: &[StatsIssueRow],
     external_blockers: Option<&std::collections::HashMap<String, Vec<String>>>,
 ) -> Result<StatsSummary> {
     let mut open = 0;
@@ -390,7 +408,7 @@ fn count_epics_eligible_for_closure(storage: &SqliteStorage, epic_ids: &[String]
 }
 
 /// Compute breakdown by issue type.
-fn compute_type_breakdown(issues: &[crate::model::Issue]) -> Breakdown {
+fn compute_type_breakdown(issues: &[StatsIssueRow]) -> Breakdown {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
 
     for issue in issues {
@@ -411,7 +429,7 @@ fn compute_type_breakdown(issues: &[crate::model::Issue]) -> Breakdown {
 }
 
 /// Compute breakdown by priority.
-fn compute_priority_breakdown(issues: &[crate::model::Issue]) -> Breakdown {
+fn compute_priority_breakdown(issues: &[StatsIssueRow]) -> Breakdown {
     let mut counts: BTreeMap<i32, usize> = BTreeMap::new();
 
     for issue in issues {
@@ -434,7 +452,7 @@ fn compute_priority_breakdown(issues: &[crate::model::Issue]) -> Breakdown {
 }
 
 /// Compute breakdown by assignee.
-fn compute_assignee_breakdown(issues: &[crate::model::Issue]) -> Breakdown {
+fn compute_assignee_breakdown(issues: &[StatsIssueRow]) -> Breakdown {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
 
     for issue in issues {
@@ -459,10 +477,7 @@ fn compute_assignee_breakdown(issues: &[crate::model::Issue]) -> Breakdown {
 }
 
 /// Compute breakdown by label.
-fn compute_label_breakdown(
-    storage: &SqliteStorage,
-    issues: &[crate::model::Issue],
-) -> Result<Breakdown> {
+fn compute_label_breakdown(storage: &SqliteStorage, issues: &[StatsIssueRow]) -> Result<Breakdown> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     let issue_ids: Vec<String> = issues
         .iter()
@@ -498,21 +513,44 @@ fn compute_label_breakdown(
 }
 
 /// Compute recent activity from git log on the active JSONL file.
-fn compute_recent_activity(jsonl_path: &Path, hours: u32) -> Option<RecentActivity> {
+fn compute_recent_activity(
+    storage: Option<&SqliteStorage>,
+    jsonl_path: &Path,
+    hours: u32,
+) -> Option<RecentActivity> {
     if !jsonl_path.exists() {
         debug!("No issues.jsonl found for activity tracking");
         return None;
     }
 
+    let repo_ctx = git_repo_context(jsonl_path.parent()?)?;
+    let pathspec = repo_relative_git_path(jsonl_path, &repo_ctx.repo_root)?;
+    let pathspec_str = pathspec.to_string_lossy().into_owned();
+    let cache_key = recent_activity_cache_key(&pathspec_str, hours);
+    let now_epoch = Utc::now().timestamp();
+
+    if let Some(storage) = storage
+        && let Some(activity) = load_recent_activity_cache(
+            storage,
+            &cache_key,
+            &repo_ctx,
+            &pathspec_str,
+            hours,
+            now_epoch,
+        )
+    {
+        debug!(hours, pathspec = %pathspec_str, "Using cached stats recent activity");
+        return Some(activity);
+    }
+
     let since = format!("{hours} hours ago");
-    let repo_root = git_repo_root(jsonl_path.parent()?)?;
-    let pathspec = repo_relative_git_path(jsonl_path, &repo_root)?;
     let GitActivitySummary {
         commit_count,
         counts,
-    } = git_recent_activity(&repo_root, &pathspec, &since)?;
+        earliest_commit_ts,
+    } = git_recent_activity(&repo_ctx.repo_root, &pathspec, &since)?;
 
-    Some(RecentActivity {
+    let activity = RecentActivity {
         hours_tracked: hours,
         commit_count,
         issues_created: counts.created,
@@ -520,7 +558,24 @@ fn compute_recent_activity(jsonl_path: &Path, hours: u32) -> Option<RecentActivi
         issues_updated: counts.updated,
         issues_reopened: counts.reopened,
         total_changes: counts.total_changes(),
-    })
+    };
+
+    if let Some(storage) = storage
+        && let RecentActivityCachePolicy::Cache { valid_until_epoch } =
+            recent_activity_cache_policy(commit_count, earliest_commit_ts, hours)
+    {
+        let entry = RecentActivityCacheEntry {
+            repo_root: repo_ctx.repo_root.to_string_lossy().into_owned(),
+            repo_head: repo_ctx.head,
+            pathspec: pathspec_str,
+            hours,
+            valid_until_epoch,
+            activity: activity.clone(),
+        };
+        store_recent_activity_cache(storage, &cache_key, &entry);
+    }
+
+    Some(activity)
 }
 
 fn git_recent_activity(
@@ -535,7 +590,7 @@ fn git_recent_activity(
     let mut child = Command::new("git")
         .args([
             "log",
-            "--format=__BR_ACTIVITY_COMMIT__:%H",
+            "--format=__BR_ACTIVITY_COMMIT__:%H\t%ct",
             "--patch",
             "--unified=0",
             "--no-color",
@@ -590,6 +645,13 @@ fn parse_issue_activity_stream<R: std::io::BufRead>(reader: R) -> GitActivitySum
 
             in_commit = true;
             summary.commit_count += 1;
+            if let Some(commit_ts) = parse_activity_commit_marker(&line) {
+                summary.earliest_commit_ts = Some(
+                    summary
+                        .earliest_commit_ts
+                        .map_or(commit_ts, |earliest| earliest.min(commit_ts)),
+                );
+            }
             continue;
         }
 
@@ -683,9 +745,15 @@ fn parse_issue_patch_line(line: &str) -> Option<(char, &str)> {
     Some((marker, payload))
 }
 
-fn git_repo_root(start: &Path) -> Option<PathBuf> {
+fn parse_activity_commit_marker(line: &str) -> Option<i64> {
+    let payload = line.strip_prefix(GIT_ACTIVITY_COMMIT_MARKER)?;
+    let (_, ts) = payload.rsplit_once('\t')?;
+    ts.parse::<i64>().ok()
+}
+
+fn git_repo_context(start: &Path) -> Option<GitRepoContext> {
     let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
+        .args(["rev-parse", "--show-toplevel", "HEAD"])
         .current_dir(start)
         .output()
         .ok()?;
@@ -694,12 +762,18 @@ fn git_repo_root(start: &Path) -> Option<PathBuf> {
         return None;
     }
 
-    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if root.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(root))
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    let repo_root = lines.next()?.trim();
+    let head = lines.next()?.trim();
+    if repo_root.is_empty() || head.is_empty() {
+        return None;
     }
+
+    Some(GitRepoContext {
+        repo_root: PathBuf::from(repo_root),
+        head: head.to_string(),
+    })
 }
 
 fn repo_relative_git_path(path: &Path, repo_root: &Path) -> Option<PathBuf> {
@@ -709,6 +783,85 @@ fn repo_relative_git_path(path: &Path, repo_root: &Path) -> Option<PathBuf> {
         .strip_prefix(&canonical_repo_root)
         .ok()
         .map(Path::to_path_buf)
+}
+
+fn recent_activity_cache_key(pathspec: &str, hours: u32) -> String {
+    format!("{RECENT_ACTIVITY_CACHE_KEY_PREFIX}:{hours}:{pathspec}")
+}
+
+fn load_recent_activity_cache(
+    storage: &SqliteStorage,
+    cache_key: &str,
+    repo_ctx: &GitRepoContext,
+    pathspec: &str,
+    hours: u32,
+    now_epoch: i64,
+) -> Option<RecentActivity> {
+    let raw = storage.get_metadata(cache_key).ok()??;
+    parse_recent_activity_cache(&raw, repo_ctx, pathspec, hours, now_epoch)
+}
+
+fn parse_recent_activity_cache(
+    raw: &str,
+    repo_ctx: &GitRepoContext,
+    pathspec: &str,
+    hours: u32,
+    now_epoch: i64,
+) -> Option<RecentActivity> {
+    let entry = serde_json::from_str::<RecentActivityCacheEntry>(raw)
+        .map_err(|error| {
+            debug!(%error, "Ignoring invalid recent activity cache entry");
+            error
+        })
+        .ok()?;
+
+    if entry.repo_root != repo_ctx.repo_root.to_string_lossy()
+        || entry.repo_head != repo_ctx.head
+        || entry.pathspec != pathspec
+        || entry.hours != hours
+        || entry
+            .valid_until_epoch
+            .is_some_and(|valid_until| now_epoch > valid_until)
+    {
+        return None;
+    }
+
+    Some(entry.activity)
+}
+
+fn recent_activity_cache_policy(
+    commit_count: usize,
+    earliest_commit_ts: Option<i64>,
+    hours: u32,
+) -> RecentActivityCachePolicy {
+    if commit_count == 0 {
+        return RecentActivityCachePolicy::Cache {
+            valid_until_epoch: None,
+        };
+    }
+
+    earliest_commit_ts.map_or(RecentActivityCachePolicy::Skip, |ts| {
+        RecentActivityCachePolicy::Cache {
+            valid_until_epoch: Some(ts.saturating_add(i64::from(hours) * 3600)),
+        }
+    })
+}
+
+fn store_recent_activity_cache(
+    storage: &SqliteStorage,
+    cache_key: &str,
+    entry: &RecentActivityCacheEntry,
+) {
+    let Ok(serialized) = serde_json::to_string(entry).map_err(|error| {
+        debug!(%error, cache_key, "Failed to serialize recent activity cache entry");
+        error
+    }) else {
+        return;
+    };
+
+    if let Err(error) = storage.set_metadata_shared(cache_key, &serialized) {
+        debug!(%error, cache_key, "Failed to persist recent activity cache entry");
+    }
 }
 
 /// Print text output for stats.
@@ -1039,14 +1192,33 @@ mod tests {
         }
     }
 
+    fn stats_row(issue: &Issue) -> StatsIssueRow {
+        StatsIssueRow {
+            id: issue.id.clone(),
+            status: issue.status.clone(),
+            priority: issue.priority,
+            issue_type: issue.issue_type.clone(),
+            assignee: issue.assignee.clone(),
+            created_at: issue.created_at,
+            closed_at: issue.closed_at,
+            defer_until: issue.defer_until,
+            ephemeral: issue.ephemeral,
+            pinned: issue.pinned,
+            is_template: issue.is_template,
+        }
+    }
+
     #[test]
     fn test_compute_type_breakdown() {
-        let test_issues = vec![
+        let test_issues = [
             make_issue("t-1", Status::Open, IssueType::Task),
             make_issue("t-2", Status::Open, IssueType::Task),
             make_issue("t-3", Status::Open, IssueType::Bug),
             make_issue("t-4", Status::Tombstone, IssueType::Feature), // Excluded
-        ];
+        ]
+        .iter()
+        .map(stats_row)
+        .collect::<Vec<_>>();
 
         let breakdown = compute_type_breakdown(&test_issues);
         assert_eq!(breakdown.dimension, "type");
@@ -1063,7 +1235,7 @@ mod tests {
 
     #[test]
     fn test_compute_priority_breakdown() {
-        let mut test_issues = vec![
+        let mut test_issues = [
             make_issue("t-1", Status::Open, IssueType::Task),
             make_issue("t-2", Status::Open, IssueType::Task),
             make_issue("t-3", Status::Open, IssueType::Bug),
@@ -1071,6 +1243,7 @@ mod tests {
         test_issues[0].priority = Priority::CRITICAL;
         test_issues[1].priority = Priority::CRITICAL;
         test_issues[2].priority = Priority::LOW;
+        let test_issues = test_issues.iter().map(stats_row).collect::<Vec<_>>();
 
         let breakdown = compute_priority_breakdown(&test_issues);
         assert_eq!(breakdown.dimension, "priority");
@@ -1086,13 +1259,14 @@ mod tests {
 
     #[test]
     fn test_compute_assignee_breakdown() {
-        let mut test_issues = vec![
+        let mut test_issues = [
             make_issue("t-1", Status::Open, IssueType::Task),
             make_issue("t-2", Status::Open, IssueType::Task),
             make_issue("t-3", Status::Open, IssueType::Bug),
         ];
         test_issues[0].assignee = Some("alice".to_string());
         test_issues[1].assignee = Some("alice".to_string());
+        let test_issues = test_issues.iter().map(stats_row).collect::<Vec<_>>();
 
         let breakdown = compute_assignee_breakdown(&test_issues);
         assert_eq!(breakdown.dimension, "assignee");
@@ -1119,7 +1293,10 @@ mod tests {
         storage.create_issue(&second_issue, "tester").unwrap();
         storage.create_issue(&third_issue, "tester").unwrap();
 
-        let all_issues = vec![first_issue, second_issue, third_issue];
+        let all_issues = [&first_issue, &second_issue, &third_issue]
+            .into_iter()
+            .map(stats_row)
+            .collect::<Vec<_>>();
         let summary = compute_summary(&storage, &all_issues, None).unwrap();
 
         assert_eq!(summary.total_issues, 3);
@@ -1157,7 +1334,10 @@ mod tests {
         storage.create_issue(&regular_issue, "tester").unwrap();
         storage.create_issue(&template_issue, "tester").unwrap();
 
-        let all_issues = vec![regular_issue, template_issue];
+        let all_issues = [&regular_issue, &template_issue]
+            .into_iter()
+            .map(stats_row)
+            .collect::<Vec<_>>();
         let summary = compute_summary(&storage, &all_issues, None).unwrap();
 
         assert_eq!(summary.ready_issues, 1);
@@ -1198,7 +1378,10 @@ mod tests {
         storage.add_label("t-1", "urgent", "tester").unwrap();
         storage.add_label("t-2", "backend", "tester").unwrap();
 
-        let test_issues = vec![first_issue, second_issue, third_issue];
+        let test_issues = [&first_issue, &second_issue, &third_issue]
+            .into_iter()
+            .map(stats_row)
+            .collect::<Vec<_>>();
         let breakdown = compute_label_breakdown(&storage, &test_issues).unwrap();
 
         let mut map: BTreeMap<String, usize> = BTreeMap::new();
@@ -1256,6 +1439,16 @@ mod tests {
         assert!(status.success(), "git {:?} failed", args);
     }
 
+    fn git_stdout(cwd: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("run git");
+        assert!(output.status.success(), "git {:?} failed", args);
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
     fn write_issue_jsonl(path: &Path, issue: &Issue) {
         let line = serde_json::to_string(issue).expect("serialize issue");
         fs::write(path, format!("{line}\n")).expect("write issue jsonl");
@@ -1282,8 +1475,8 @@ mod tests {
             &["commit", "-q", "-m", "Track bd-abc in custom issues file"],
         );
 
-        let activity =
-            compute_recent_activity(&jsonl_path, 24).expect("activity for committed custom jsonl");
+        let activity = compute_recent_activity(None, &jsonl_path, 24)
+            .expect("activity for committed custom jsonl");
         assert_eq!(activity.commit_count, 1);
         assert_eq!(activity.hours_tracked, 24);
     }
@@ -1331,13 +1524,52 @@ mod tests {
         git(temp.path(), &["add", ".beads/issues.jsonl"]);
         git(temp.path(), &["commit", "-q", "-m", "Reopen bd-activity"]);
 
-        let activity = compute_recent_activity(&jsonl_path, 24).expect("recent activity");
+        let activity = compute_recent_activity(None, &jsonl_path, 24).expect("recent activity");
         assert_eq!(activity.commit_count, 4);
         assert_eq!(activity.issues_created, 1);
         assert_eq!(activity.issues_updated, 1);
         assert_eq!(activity.issues_closed, 1);
         assert_eq!(activity.issues_reopened, 1);
         assert_eq!(activity.total_changes, 4);
+    }
+
+    #[test]
+    fn test_parse_recent_activity_cache_returns_matching_entry() {
+        let repo_ctx = GitRepoContext {
+            repo_root: PathBuf::from("/tmp/repo"),
+            head: "head-1".to_string(),
+        };
+        let cached_activity = RecentActivity {
+            hours_tracked: 24,
+            commit_count: 99,
+            issues_created: 88,
+            issues_closed: 77,
+            issues_updated: 66,
+            issues_reopened: 55,
+            total_changes: 286,
+        };
+        let cache_entry = RecentActivityCacheEntry {
+            repo_root: repo_ctx.repo_root.to_string_lossy().into_owned(),
+            repo_head: repo_ctx.head.clone(),
+            pathspec: ".beads/issues.jsonl".to_string(),
+            hours: 24,
+            valid_until_epoch: Some(Utc::now().timestamp() + 3600),
+            activity: cached_activity.clone(),
+        };
+        let raw = serde_json::to_string(&cache_entry).expect("serialize cache entry");
+
+        let activity = parse_recent_activity_cache(
+            &raw,
+            &repo_ctx,
+            ".beads/issues.jsonl",
+            24,
+            Utc::now().timestamp(),
+        )
+        .expect("cached recent activity");
+        assert_eq!(activity.commit_count, cached_activity.commit_count);
+        assert_eq!(activity.total_changes, cached_activity.total_changes);
+        assert_eq!(activity.issues_created, cached_activity.issues_created);
+        assert_eq!(activity.issues_closed, cached_activity.issues_closed);
     }
 
     #[test]
@@ -1392,8 +1624,10 @@ mod tests {
         closed.close_reason = Some("done".to_string());
 
         let log = format!(
-            "{marker}commit-1\n-{original}\n+{updated}\n{marker}commit-2\n-{updated}\n+{closed}\n",
+            "{marker}commit-1\t{first_ts}\n-{original}\n+{updated}\n{marker}commit-2\t{second_ts}\n-{updated}\n+{closed}\n",
             marker = GIT_ACTIVITY_COMMIT_MARKER,
+            first_ts = base_time.timestamp(),
+            second_ts = (base_time + chrono::Duration::hours(2)).timestamp(),
             original = serde_json::to_string(&original).expect("serialize original issue"),
             updated = serde_json::to_string(&updated).expect("serialize updated issue"),
             closed = serde_json::to_string(&closed).expect("serialize closed issue"),
@@ -1405,7 +1639,68 @@ mod tests {
         assert_eq!(activity.counts.updated, 1);
         assert_eq!(activity.counts.closed, 1);
         assert_eq!(activity.counts.reopened, 0);
+        assert_eq!(activity.earliest_commit_ts, Some(base_time.timestamp()));
         assert_eq!(activity.counts.total_changes(), 2);
+    }
+
+    #[test]
+    fn test_recent_activity_cache_valid_until_expires_at_boundary() {
+        let earliest_commit_ts = 1_000_i64;
+        let RecentActivityCachePolicy::Cache { valid_until_epoch } =
+            recent_activity_cache_policy(1, Some(earliest_commit_ts), 24)
+        else {
+            panic!("expected cache entry");
+        };
+        let valid_until = valid_until_epoch.expect("expiry timestamp");
+        assert_eq!(valid_until, earliest_commit_ts + 24 * 3600);
+
+        let repo_ctx = GitRepoContext {
+            repo_root: PathBuf::from("/tmp/repo"),
+            head: "head-1".to_string(),
+        };
+        let activity = RecentActivity {
+            hours_tracked: 24,
+            commit_count: 1,
+            issues_created: 1,
+            issues_closed: 0,
+            issues_updated: 0,
+            issues_reopened: 0,
+            total_changes: 1,
+        };
+        let cache_entry = RecentActivityCacheEntry {
+            repo_root: repo_ctx.repo_root.to_string_lossy().into_owned(),
+            repo_head: repo_ctx.head.clone(),
+            pathspec: ".beads/issues.jsonl".to_string(),
+            hours: 24,
+            valid_until_epoch: Some(valid_until),
+            activity,
+        };
+        let raw = serde_json::to_string(&cache_entry).expect("serialize cache entry");
+
+        assert!(
+            parse_recent_activity_cache(
+                &raw,
+                &repo_ctx,
+                ".beads/issues.jsonl",
+                24,
+                valid_until - 1,
+            )
+            .is_some()
+        );
+        assert!(
+            parse_recent_activity_cache(&raw, &repo_ctx, ".beads/issues.jsonl", 24, valid_until,)
+                .is_some()
+        );
+        assert!(
+            parse_recent_activity_cache(
+                &raw,
+                &repo_ctx,
+                ".beads/issues.jsonl",
+                24,
+                valid_until + 1,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1434,5 +1729,23 @@ mod tests {
         fs::write(&outside_path, "").expect("write outside jsonl");
 
         assert!(repo_relative_git_path(&outside_path, &repo_root).is_none());
+    }
+
+    #[test]
+    fn test_git_repo_context_reads_root_and_head() {
+        let temp = TempDir::new().expect("tempdir");
+        git(temp.path(), &["init", "-q"]);
+        git(temp.path(), &["config", "user.email", "tester@example.com"]);
+        git(temp.path(), &["config", "user.name", "Tester"]);
+        fs::write(temp.path().join("README.md"), "stats\n").expect("write readme");
+        git(temp.path(), &["add", "README.md"]);
+        git(temp.path(), &["commit", "-q", "-m", "init"]);
+
+        let repo_ctx = git_repo_context(temp.path()).expect("repo context");
+        assert_eq!(repo_ctx.repo_root, temp.path());
+        assert_eq!(
+            repo_ctx.head,
+            git_stdout(temp.path(), &["rev-parse", "HEAD"])
+        );
     }
 }
