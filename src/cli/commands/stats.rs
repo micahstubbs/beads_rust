@@ -327,6 +327,7 @@ fn compute_summary(
         // Track epics for eligible-for-closure calculation
         if issue.issue_type == IssueType::Epic
             && !matches!(issue.status, Status::Closed | Status::Tombstone)
+            && !issue.is_template
         {
             epics.push(issue.id.clone());
         }
@@ -1379,6 +1380,31 @@ mod tests {
         let summary = compute_summary(&storage, &all_issues, None).unwrap();
 
         assert_eq!(summary.ready_issues, 1);
+    }
+
+    #[test]
+    fn test_compute_summary_excludes_template_epics_from_close_eligible_count() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let mut epic = make_issue("bd-epic-template", Status::Open, IssueType::Epic);
+        epic.is_template = true;
+
+        let mut child = make_issue("bd-task-closed", Status::Closed, IssueType::Task);
+        child.closed_at = Some(Utc::now());
+
+        storage.create_issue(&epic, "tester").unwrap();
+        storage.create_issue(&child, "tester").unwrap();
+        storage
+            .add_dependency(&child.id, &epic.id, "parent-child", "tester")
+            .unwrap();
+
+        let all_issues = [&epic, &child]
+            .into_iter()
+            .map(stats_row)
+            .collect::<Vec<_>>();
+        let summary = compute_summary(&storage, &all_issues, None).unwrap();
+
+        assert_eq!(summary.epics_eligible_for_closure, 0);
     }
 
     #[test]

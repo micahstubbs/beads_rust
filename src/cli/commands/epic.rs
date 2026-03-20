@@ -203,6 +203,7 @@ fn load_epic_statuses(storage: &SqliteStorage) -> Result<Vec<EpicStatus>> {
     let filters = ListFilters {
         types: Some(vec![IssueType::Epic]),
         include_closed: false,
+        include_deferred: true,
         ..Default::default()
     };
     let epics = storage.list_issues(&filters)?;
@@ -570,6 +571,24 @@ mod tests {
 
         let epics = load_epic_statuses(&storage).unwrap();
         let epic_status = find_epic(&epics, "bd-epic-2").expect("epic not found");
+        assert_eq!(epic_status.total_children, 0);
+        assert_eq!(epic_status.closed_children, 0);
+        assert!(!epic_status.eligible_for_close);
+    }
+
+    #[test]
+    fn epic_status_includes_deferred_epics() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let epic = base_issue(
+            "bd-epic-deferred",
+            "Deferred epic",
+            IssueType::Epic,
+            Status::Deferred,
+        );
+        storage.create_issue(&epic, "tester").unwrap();
+
+        let epics = load_epic_statuses(&storage).unwrap();
+        let epic_status = find_epic(&epics, "bd-epic-deferred").expect("deferred epic not found");
         assert_eq!(epic_status.total_children, 0);
         assert_eq!(epic_status.closed_children, 0);
         assert!(!epic_status.eligible_for_close);
