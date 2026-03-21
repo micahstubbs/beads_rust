@@ -88,3 +88,56 @@ fn e2e_stale_with_status_filter() {
     assert_eq!(count_open, 1);
     assert!(!stale_open.stdout.contains("InProgress Issue"));
 }
+
+#[test]
+fn e2e_stale_with_deferred_status_filter() {
+    common::init_test_logging();
+    let workspace = BrWorkspace::new();
+    run_br(&workspace, ["init"], "init");
+
+    let open = run_br(&workspace, ["create", "Open Issue"], "create_open");
+    assert!(open.status.success(), "create open failed: {}", open.stderr);
+
+    let deferred = run_br(&workspace, ["create", "Deferred Issue"], "create_deferred");
+    assert!(
+        deferred.status.success(),
+        "create deferred failed: {}",
+        deferred.stderr
+    );
+    let deferred_id = deferred
+        .stdout
+        .split_whitespace()
+        .find(|w| w.starts_with("bd-"))
+        .unwrap()
+        .trim_end_matches(':');
+    let defer = run_br(
+        &workspace,
+        [
+            "update",
+            deferred_id,
+            "--status",
+            "deferred",
+            "--defer",
+            "2100-01-01T00:00:00Z",
+        ],
+        "defer_issue",
+    );
+    assert!(defer.status.success(), "defer failed: {}", defer.stderr);
+
+    let stale = run_br(
+        &workspace,
+        ["stale", "--days", "0", "--status", "deferred", "--json"],
+        "stale_deferred",
+    );
+    assert!(
+        stale.status.success(),
+        "stale deferred failed: {}",
+        stale.stderr
+    );
+
+    let payload = extract_json_payload(&stale.stdout);
+    let json: Vec<Value> = serde_json::from_str(&payload).expect("valid json");
+    assert_eq!(json.len(), 1);
+    assert_eq!(json[0]["title"], "Deferred Issue");
+    assert_eq!(json[0]["status"], "deferred");
+}

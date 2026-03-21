@@ -56,6 +56,9 @@ fn execute_inner(args: &StaleArgs, ctx: &OutputContext, storage: &SqliteStorage)
     if statuses.iter().any(Status::is_terminal) {
         filters.include_closed = true;
     }
+    if statuses.contains(&Status::Deferred) {
+        filters.include_deferred = true;
+    }
     filters.statuses = Some(statuses);
 
     let now = Utc::now();

@@ -258,6 +258,21 @@ fn e2e_queries_ready_stale_count_search() {
         serde_json::from_str(&count_priority_payload).expect("count priority json");
     assert_eq!(count_priority_json["total"], 1);
 
+    let deferred_count = run_br(
+        &workspace,
+        ["count", "--status", "deferred", "--json"],
+        "count_deferred",
+    );
+    assert!(
+        deferred_count.status.success(),
+        "count deferred failed: {}",
+        deferred_count.stderr
+    );
+    let deferred_count_payload = extract_json_payload(&deferred_count.stdout);
+    let deferred_count_json: Value =
+        serde_json::from_str(&deferred_count_payload).expect("count deferred json");
+    assert_eq!(deferred_count_json["count"], 1);
+
     let stale = run_br(&workspace, ["stale", "--days", "0", "--json"], "stale");
     assert!(stale.status.success(), "stale failed: {}", stale.stderr);
     let stale_payload = extract_json_payload(&stale.stdout);
