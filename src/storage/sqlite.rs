@@ -26,6 +26,10 @@ const DEFAULT_BUSY_TIMEOUT_MS: u64 = 30_000;
 // existing `export_hashes` rows with a single multi-values INSERT. Batch the
 // DELETE side for efficiency, but re-insert one row at a time for correctness.
 const EXPORT_HASH_CHUNK_SIZE: usize = 32;
+// `fsqlite` can surface the same false primary-key conflict when an existing
+// blocked-cache population is rewritten via a large multi-values INSERT. Keep
+// the delete batched/full-table, but re-insert rows individually.
+const BLOCKED_CACHE_DELETE_CHUNK_SIZE: usize = 400;
 const DIRTY_ISSUE_CHUNK_SIZE: usize = 900;
 const IMPORT_LABEL_CHUNK_SIZE: usize = 400;
 const IMPORT_DEPENDENCY_CHUNK_SIZE: usize = 140;
@@ -1323,7 +1327,9 @@ impl SqliteStorage {
                     }
                 }
 
-                if !updates.skip_cache_rebuild {
+                if updates.skip_cache_rebuild {
+                    ctx.invalidate_cache_deferred();
+                } else {
                     ctx.invalidate_cache();
                 }
             }
@@ -2620,7 +2626,6 @@ impl SqliteStorage {
         // Since we are within a BEGIN IMMEDIATE transaction, this is safe and efficient.
         conn.execute("DELETE FROM blocked_issues_cache")?;
 
-        let mut count = 0;
         let mut entries = Vec::with_capacity(blocked_issues_map.len());
 
         for (issue_id, mut blockers) in blocked_issues_map {
@@ -2643,24 +2648,7 @@ impl SqliteStorage {
             entries.push((issue_id, blockers_json));
         }
 
-        // Use chunked multi-row inserts to stay within SQLite's 999 parameter limit.
-        // Each row has 3 columns (including CURRENT_TIMESTAMP, but we only bind 2).
-        for chunk in entries.chunks(450) {
-            let placeholders: Vec<&str> =
-                chunk.iter().map(|_| "(?, ?, CURRENT_TIMESTAMP)").collect();
-            let sql = format!(
-                "INSERT OR REPLACE INTO blocked_issues_cache (issue_id, blocked_by, blocked_at) VALUES {}",
-                placeholders.join(", ")
-            );
-            let mut params = Vec::with_capacity(chunk.len() * 2);
-            for (issue_id, blockers_json) in chunk {
-                params.push(SqliteValue::from(issue_id.as_str()));
-                params.push(SqliteValue::from(blockers_json.as_str()));
-            }
-            conn.execute_with_params(&sql, &params)?;
-            count += chunk.len();
-        }
-
+        let count = Self::insert_blocked_cache_entries(conn, &entries)?;
         tracing::debug!(blocked_count = count, "Rebuilt blocked issues cache");
         Ok(count)
     }
@@ -2694,7 +2682,11 @@ impl SqliteStorage {
         }
 
         // 3. Delete only affected rows from the cache.
-        for chunk in affected.iter().collect::<Vec<_>>().chunks(400) {
+        for chunk in affected
+            .iter()
+            .collect::<Vec<_>>()
+            .chunks(BLOCKED_CACHE_DELETE_CHUNK_SIZE)
+        {
             let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
             let sql = format!(
                 "DELETE FROM blocked_issues_cache WHERE issue_id IN ({})",
@@ -2708,7 +2700,6 @@ impl SqliteStorage {
         }
 
         // 4. Re-insert only affected rows that have blockers.
-        let mut count = 0;
         let mut entries = Vec::new();
         for id in &affected {
             if let Some(mut blockers) = blocked_issues_map.remove(id.as_str()) {
@@ -2732,27 +2723,30 @@ impl SqliteStorage {
             }
         }
 
-        for chunk in entries.chunks(450) {
-            let placeholders: Vec<&str> =
-                chunk.iter().map(|_| "(?, ?, CURRENT_TIMESTAMP)").collect();
-            let sql = format!(
-                "INSERT OR REPLACE INTO blocked_issues_cache (issue_id, blocked_by, blocked_at) VALUES {}",
-                placeholders.join(", ")
-            );
-            let mut params = Vec::with_capacity(chunk.len() * 2);
-            for (issue_id, blockers_json) in chunk {
-                params.push(SqliteValue::from(issue_id.as_str()));
-                params.push(SqliteValue::from(blockers_json.as_str()));
-            }
-            conn.execute_with_params(&sql, &params)?;
-            count += chunk.len();
-        }
-
+        let count = Self::insert_blocked_cache_entries(conn, &entries)?;
         tracing::debug!(
             affected_count = affected.len(),
             blocked_count = count,
             "Incremental blocked cache update"
         );
+        Ok(count)
+    }
+
+    fn insert_blocked_cache_entries(
+        conn: &Connection,
+        entries: &[(String, String)],
+    ) -> Result<usize> {
+        let mut count = 0;
+        for (issue_id, blockers_json) in entries {
+            conn.execute_with_params(
+                "INSERT INTO blocked_issues_cache (issue_id, blocked_by, blocked_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                &[
+                    SqliteValue::from(issue_id.as_str()),
+                    SqliteValue::from(blockers_json.as_str()),
+                ],
+            )?;
+            count += 1;
+        }
         Ok(count)
     }
 
@@ -3843,7 +3837,9 @@ impl SqliteStorage {
             )?;
 
             ctx.mark_dirty(issue_id);
-            if !skip_cache_rebuild {
+            if skip_cache_rebuild {
+                ctx.invalidate_cache_deferred();
+            } else {
                 let mut cache_ids = vec![issue_id];
                 if let Some(parent_id) = previous_parent.as_deref() {
                     cache_ids.push(parent_id);
@@ -8279,6 +8275,123 @@ mod tests {
     }
 
     #[test]
+    fn test_update_issue_skip_cache_rebuild_marks_cache_stale_for_lazy_refresh() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let blocker = make_issue(
+            "bd-blocker",
+            "Blocker",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        let blocked = make_issue(
+            "bd-blocked",
+            "Blocked",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&blocker, "tester").unwrap();
+        storage.create_issue(&blocked, "tester").unwrap();
+        storage
+            .add_dependency(
+                &blocked.id,
+                &blocker.id,
+                DependencyType::Blocks.as_str(),
+                "tester",
+            )
+            .unwrap();
+
+        assert!(storage.is_blocked(&blocked.id).unwrap());
+        assert!(!storage.blocked_cache_marked_stale().unwrap());
+
+        let close_update = IssueUpdate {
+            status: Some(Status::Closed),
+            skip_cache_rebuild: true,
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue(&blocker.id, &close_update, "tester")
+            .unwrap();
+
+        assert!(
+            storage.blocked_cache_marked_stale().unwrap(),
+            "status updates with skip_cache_rebuild should leave a stale marker behind"
+        );
+        assert!(
+            !storage.is_blocked(&blocked.id).unwrap(),
+            "lazy refresh should rebuild the cache before blocked lookups"
+        );
+        assert!(
+            !storage.blocked_cache_marked_stale().unwrap(),
+            "lazy refresh should clear the stale marker after rebuilding"
+        );
+    }
+
+    #[test]
+    fn test_set_parent_skip_cache_rebuild_marks_cache_stale_for_lazy_refresh() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let blocker = make_issue(
+            "bd-parent-blocker",
+            "Parent blocker",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        let parent = make_issue(
+            "bd-parent",
+            "Parent",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        let child = make_issue("bd-child", "Child", Status::Open, 2, None, Utc::now(), None);
+        storage.create_issue(&blocker, "tester").unwrap();
+        storage.create_issue(&parent, "tester").unwrap();
+        storage.create_issue(&child, "tester").unwrap();
+        storage
+            .add_dependency(
+                &parent.id,
+                &blocker.id,
+                DependencyType::Blocks.as_str(),
+                "tester",
+            )
+            .unwrap();
+
+        assert!(storage.is_blocked(&parent.id).unwrap());
+        assert!(!storage.blocked_cache_marked_stale().unwrap());
+
+        storage
+            .set_parent_with_options(&child.id, Some(&parent.id), "tester", true)
+            .unwrap();
+
+        assert!(
+            storage.blocked_cache_marked_stale().unwrap(),
+            "parent changes with skip_cache_rebuild should leave a stale marker behind"
+        );
+        assert!(
+            storage.is_blocked(&child.id).unwrap(),
+            "lazy refresh should propagate parent blockers to the child"
+        );
+        assert!(
+            !storage.blocked_cache_marked_stale().unwrap(),
+            "lazy refresh should clear the stale marker after rebuilding"
+        );
+    }
+
+    #[test]
     fn test_expand_blocked_cache_component_includes_parent_and_siblings() {
         let children_by_parent = HashMap::from([
             (
@@ -9013,7 +9126,73 @@ mod tests {
             .and_then(|row| row.first())
             .and_then(SqliteValue::as_integer)
             .unwrap_or(-1);
-        assert_eq!(row_count, issue_ids.len() as i64);
+        assert_eq!(row_count, i64::try_from(issue_ids.len()).unwrap_or(-1));
+    }
+
+    #[test]
+    fn test_rebuild_blocked_cache_rewrites_large_existing_batch_on_file_db() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let created_at = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
+
+        let issue_pairs: Vec<(String, String)> = (0..160)
+            .map(|idx| {
+                let prefix = if idx % 2 == 0 { "bd" } else { "br" };
+                (
+                    format!("{prefix}-blocked-{idx:03}"),
+                    format!("{prefix}-blocker-{idx:03}"),
+                )
+            })
+            .collect();
+
+        for (blocked_id, blocker_id) in &issue_pairs {
+            let blocked = make_issue(
+                blocked_id,
+                &format!("Blocked target {blocked_id}"),
+                Status::Open,
+                2,
+                None,
+                created_at,
+                None,
+            );
+            let blocker = make_issue(
+                blocker_id,
+                &format!("Blocking source {blocker_id}"),
+                Status::Open,
+                2,
+                None,
+                created_at,
+                None,
+            );
+            storage.create_issue(&blocked, "tester").unwrap();
+            storage.create_issue(&blocker, "tester").unwrap();
+            storage
+                .add_dependency(
+                    blocked_id,
+                    blocker_id,
+                    DependencyType::Blocks.as_str(),
+                    "tester",
+                )
+                .unwrap();
+        }
+
+        let rebuilt = storage.rebuild_blocked_cache(true).unwrap();
+        assert_eq!(rebuilt, issue_pairs.len());
+
+        for _ in 0..4 {
+            let rewritten = storage.rebuild_blocked_cache(true).unwrap();
+            assert_eq!(rewritten, issue_pairs.len());
+        }
+
+        let row_count = storage
+            .execute_raw_query("SELECT COUNT(*) FROM blocked_issues_cache")
+            .unwrap()
+            .first()
+            .and_then(|row| row.first())
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(-1);
+        assert_eq!(row_count, i64::try_from(issue_pairs.len()).unwrap_or(-1));
     }
 
     #[test]

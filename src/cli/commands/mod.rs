@@ -128,7 +128,12 @@ pub(super) fn finalize_batched_blocked_cache_refresh(
         return Ok(());
     }
 
-    let stale_mark_error = storage.mark_blocked_cache_stale().err();
+    let cache_already_stale = storage.blocked_cache_marked_stale().unwrap_or(false);
+    let stale_mark_error = if cache_already_stale {
+        None
+    } else {
+        storage.mark_blocked_cache_stale().err()
+    };
     if let Some(mark_error) = stale_mark_error.as_ref() {
         tracing::warn!(
             command = command,
@@ -139,7 +144,7 @@ pub(super) fn finalize_batched_blocked_cache_refresh(
 
     match storage.rebuild_blocked_cache(true) {
         Ok(_) => Ok(()),
-        Err(rebuild_err) if stale_mark_error.is_none() => {
+        Err(rebuild_err) if cache_already_stale || stale_mark_error.is_none() => {
             tracing::warn!(
                 command = command,
                 error = %rebuild_err,
@@ -326,6 +331,31 @@ mod tests {
 
         finalize_batched_blocked_cache_refresh(&mut storage, true, "close")
             .expect("batched refresh should degrade to a stale marker");
+
+        assert_eq!(
+            storage
+                .get_metadata("blocked_cache_state")
+                .unwrap()
+                .as_deref(),
+            Some("stale")
+        );
+    }
+
+    #[test]
+    fn finalize_batched_refresh_degrades_when_cache_was_already_stale() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        storage
+            .mark_blocked_cache_stale()
+            .expect("mark cache stale before finalization");
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("conn");
+        conn.execute("DROP TABLE blocked_issues_cache")
+            .expect("drop blocked cache table");
+
+        finalize_batched_blocked_cache_refresh(&mut storage, true, "close")
+            .expect("pre-marked stale cache should let finalization degrade cleanly");
 
         assert_eq!(
             storage

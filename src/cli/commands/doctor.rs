@@ -1345,12 +1345,9 @@ fn check_root_gitignore(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
         return;
     };
     let gitignore_path = project_root.join(".gitignore");
-    let content = match fs::read_to_string(&gitignore_path) {
-        Ok(c) => c,
-        Err(_) => {
-            // No .gitignore is fine — nothing to warn about.
-            return;
-        }
+    let Ok(content) = fs::read_to_string(&gitignore_path) else {
+        // No .gitignore is fine — nothing to warn about.
+        return;
     };
 
     let offending: Vec<String> = content
@@ -1391,14 +1388,11 @@ fn check_root_gitignore(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
 
 /// When `--repair` is passed and the `gitignore.beads_inner` warning is present,
 /// automatically remove the offending lines from the root `.gitignore`.
-fn fix_root_gitignore_if_warned(
-    beads_dir: &Path,
-    report: &DoctorReport,
-    ctx: &OutputContext,
-) {
-    let has_warning = report.checks.iter().any(|c| {
-        c.name == "gitignore.beads_inner" && c.status == CheckStatus::Warn
-    });
+fn fix_root_gitignore_if_warned(beads_dir: &Path, report: &DoctorReport, ctx: &OutputContext) {
+    let has_warning = report
+        .checks
+        .iter()
+        .any(|c| c.name == "gitignore.beads_inner" && c.status == CheckStatus::Warn);
     if !has_warning {
         return;
     }
@@ -1406,9 +1400,8 @@ fn fix_root_gitignore_if_warned(
         return;
     };
     let gitignore_path = project_root.join(".gitignore");
-    let content = match fs::read_to_string(&gitignore_path) {
-        Ok(c) => c,
-        Err(_) => return,
+    let Ok(content) = fs::read_to_string(&gitignore_path) else {
+        return;
     };
 
     let filtered: Vec<&str> = content
@@ -1425,9 +1418,7 @@ fn fix_root_gitignore_if_warned(
 
     if let Err(err) = fs::write(&gitignore_path, new_content) {
         if !ctx.is_json() {
-            ctx.warning(&format!(
-                "Failed to fix .gitignore: {err}"
-            ));
+            ctx.warning(&format!("Failed to fix .gitignore: {err}"));
         }
     } else if !ctx.is_json() {
         ctx.info("Removed offending .beads/.gitignore pattern(s) from root .gitignore");

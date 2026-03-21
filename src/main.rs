@@ -313,6 +313,7 @@ fn main() {
 /// Returns the lock file on success. The lock is held until the returned
 /// `File` is dropped.  If another process already holds the lock, returns
 /// `None` (non-blocking).
+#[allow(clippy::incompatible_msrv)]
 fn try_sync_lock(beads_dir: &Path) -> Option<File> {
     let lock_path = beads_dir.join(".sync.lock");
     let file = File::create(&lock_path).ok()?;
