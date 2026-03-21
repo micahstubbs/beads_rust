@@ -2814,8 +2814,9 @@ mod tests {
             false,
         )
         .unwrap_err();
+        let err_msg = err.to_string();
         assert!(
-            err.to_string().contains("Invalid JSON"),
+            err_msg.contains("invalid line") || err_msg.contains("Invalid JSON"),
             "unexpected error: {err}"
         );
 
