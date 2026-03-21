@@ -552,7 +552,7 @@ fn execute_import(
 
     let mut created_ids = Vec::new();
     let mut created_issues = Vec::new();
-    
+
     let id_resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix.clone()));
 
     'outer: for parsed in parsed_issues {
@@ -789,7 +789,6 @@ fn execute_import(
         // Increment count for next ID generation in the loop
         count += 1;
         last_created_id = Some(id.clone());
-        all_ids.push(id.clone());
         created_ids.push((id, title));
     }
 

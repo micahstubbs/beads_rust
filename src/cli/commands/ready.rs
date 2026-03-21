@@ -84,37 +84,39 @@ fn execute_inner(
         .or_else(|| preloaded_storage_ctx.map(|ctx| &ctx.storage))
         .or_else(|| owned_storage_ctx.as_ref().map(|ctx| &ctx.storage))
         .expect("ready should have an open storage handle");
-    let config_layer =
-        if let Some(storage_ctx) = preloaded_storage_ctx.or(owned_storage_ctx.as_ref()) {
-            storage_ctx.load_config(cli)?
-        } else {
-            config::load_config(beads_dir, Some(storage), cli)?
-        };
-
-    let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
-    let use_color = config::should_use_color(&config_layer);
-    let max_width = if std::io::stdout().is_terminal() {
-        Some(terminal_width())
-    } else {
-        None
-    };
-    let assignee = match args.assignee.as_deref() {
-        Some("") => Some(config::resolve_actor(&config_layer)),
-        Some(value) => Some(value.to_string()),
-        None => None,
-    };
     let output_format = resolve_output_format_basic_with_outer_mode(
         args.format,
         outer_ctx.inherited_output_mode(),
         args.robot,
     );
     let quiet = cli.quiet.unwrap_or(false);
-    let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
+    let early_ctx = OutputContext::from_output_format(output_format, quiet, true);
+    let mut config_layer: Option<config::ConfigLayer> = None;
+    let mut load_config_layer = || -> Result<config::ConfigLayer> {
+        if let Some(layer) = config_layer.as_ref() {
+            return Ok(layer.clone());
+        }
+
+        let loaded = if let Some(storage_ctx) = preloaded_storage_ctx.or(owned_storage_ctx.as_ref())
+        {
+            storage_ctx.load_config(cli)?
+        } else {
+            config::load_config(beads_dir, Some(storage), cli)?
+        };
+        config_layer = Some(loaded.clone());
+        Ok(loaded)
+    };
+    let assignee = match args.assignee.as_deref() {
+        Some("") => Some(config::resolve_actor(&load_config_layer()?)),
+        Some(value) => Some(value.to_string()),
+        None => None,
+    };
 
     let resolved_parent = args
         .parent
         .as_deref()
         .map(|parent| {
+            let config_layer = load_config_layer()?;
             let id_config = config::id_config_from_layer(&config_layer);
             let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
             resolve_issue_id(storage, &resolver, parent)
@@ -146,6 +148,14 @@ fn execute_inner(
     // Optimization: if there are no external dependencies, we can apply the limit
     // directly in the SQL query to avoid loading all candidate issues into memory.
     let has_external = storage.has_external_dependencies(true)?;
+    let external_db_paths = if has_external {
+        Some(config::external_project_db_paths(
+            &load_config_layer()?,
+            beads_dir,
+        ))
+    } else {
+        None
+    };
     let mut filters = filters;
     if !has_external && args.limit > 0 {
         filters.limit = Some(args.limit);
@@ -157,8 +167,12 @@ fn execute_inner(
     let mut ready_issues = storage.get_ready_issues(&filters, sort_policy)?;
 
     if has_external {
-        let external_statuses =
-            storage.resolve_external_dependency_statuses(&external_db_paths, true)?;
+        let external_statuses = storage.resolve_external_dependency_statuses(
+            external_db_paths
+                .as_ref()
+                .expect("external dependency paths should be loaded"),
+            true,
+        )?;
         let external_blockers = storage.external_blockers(&external_statuses)?;
         if !external_blockers.is_empty() {
             ready_issues.retain(|issue| !external_blockers.contains_key(&issue.id));
@@ -175,21 +189,29 @@ fn execute_inner(
     }
 
     // Output
-    if matches!(ctx.mode(), OutputMode::Quiet) {
+    if matches!(early_ctx.mode(), OutputMode::Quiet) {
         return Ok(());
     }
     match output_format {
         OutputFormat::Json => {
             let ready_output: Vec<ReadyIssue> =
                 ready_issues.into_iter().map(ReadyIssue::from).collect();
-            ctx.json_pretty(&ready_output);
+            early_ctx.json_pretty(&ready_output);
         }
         OutputFormat::Toon => {
             let ready_output: Vec<ReadyIssue> =
                 ready_issues.into_iter().map(ReadyIssue::from).collect();
-            ctx.toon_with_stats(&ready_output, args.stats);
+            early_ctx.toon_with_stats(&ready_output, args.stats);
         }
         OutputFormat::Text | OutputFormat::Csv => {
+            let config_layer = load_config_layer()?;
+            let use_color = config::should_use_color(&config_layer);
+            let max_width = if std::io::stdout().is_terminal() {
+                Some(terminal_width())
+            } else {
+                None
+            };
+            let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
             if ready_issues.is_empty() {
                 println!("{}", empty_ready_message(storage)?);
             } else if matches!(ctx.mode(), OutputMode::Rich) {

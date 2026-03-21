@@ -3,11 +3,11 @@ use beads_rust::cli::{Cli, Commands, OutputFormat, command_requests_robot_json};
 use beads_rust::config;
 use beads_rust::logging::init_logging;
 use beads_rust::output::OutputContext;
-use beads_rust::sync::{auto_flush, auto_import_if_stale};
+use beads_rust::sync::{auto_flush, auto_import_if_stale, compute_staleness};
 use beads_rust::{BeadsError, Result, StructuredError};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use tracing::debug;
@@ -62,12 +62,18 @@ fn main() {
         None
     };
 
-    // Phase 3: Auto-Import (with advisory flock to serialize concurrent access)
+    // Phase 3: Auto-Import. Probe staleness first and only take the advisory
+    // lock when JSONL may actually need to be imported.
+    if let (Some(res), Some(paths)) = (storage_result.as_mut(), ctx.paths.as_ref())
+        && should_auto_import(&cli.command)
+        && !cli.allow_stale
+        && !ctx.no_auto_import()
     {
-        let _sync_lock = ctx.beads_dir.as_deref().and_then(try_sync_lock);
-        if let (Some(res), Some(paths)) = (storage_result.as_mut(), ctx.paths.as_ref())
-            && should_auto_import(&cli.command)
-        {
+        let should_attempt_auto_import = compute_staleness(&res.storage, &paths.jsonl_path)
+            .map_or(true, |staleness| staleness.jsonl_newer);
+
+        if should_attempt_auto_import {
+            let _sync_lock = ctx.beads_dir.as_deref().and_then(try_sync_lock);
             let allow_external_jsonl = config::implicit_external_jsonl_allowed(
                 &paths.beads_dir,
                 &paths.db_path,
@@ -85,14 +91,14 @@ fn main() {
                 &paths.jsonl_path,
                 expected_prefix.as_deref(),
                 allow_external_jsonl,
-                cli.allow_stale,
-                ctx.no_auto_import(),
+                false,
+                false,
             );
             if let Err(e) = outcome {
                 handle_error(&e, json_error_mode);
             }
+            // _sync_lock drops here, releasing the advisory lock before command execution
         }
-        // _sync_lock drops here, releasing the advisory lock before command execution
     }
 
     // Phase 4: Command Execution
@@ -287,11 +293,9 @@ fn main() {
     }
 
     // Phase 5: Auto-Flush (with advisory flock to serialize concurrent access)
-    {
+    if is_mutating && !ctx.no_auto_flush() {
         let _sync_lock = ctx.beads_dir.as_deref().and_then(try_sync_lock);
-        if is_mutating
-            && !ctx.no_auto_flush()
-            && let (Some(res), Some(paths)) = (storage_result.as_mut(), ctx.paths.as_ref())
+        if let (Some(res), Some(paths)) = (storage_result.as_mut(), ctx.paths.as_ref())
             && let Err(e) = auto_flush(
                 &mut res.storage,
                 &paths.beads_dir,
@@ -316,7 +320,13 @@ fn main() {
 #[allow(clippy::incompatible_msrv)]
 fn try_sync_lock(beads_dir: &Path) -> Option<File> {
     let lock_path = beads_dir.join(".sync.lock");
-    let file = File::create(&lock_path).ok()?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .ok()?;
     // `try_lock()` is non-blocking: returns `Ok(())` if we got the exclusive
     // lock, or `Err(WouldBlock)` if another process already holds it.
     match file.try_lock() {

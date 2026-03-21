@@ -382,10 +382,11 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
     // cache may not have been updated yet.
     run_migrations(conn, issues_rebuilt)?;
 
-    apply_runtime_pragmas(conn)?;
-
     // Mark schema as applied so future opens can skip DDL/migration work.
-    conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))?;
+    conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
+        .map_err(BeadsError::Database)?;
+
+    apply_runtime_pragmas(conn)?;
 
     Ok(())
 }
@@ -395,8 +396,9 @@ pub(crate) fn apply_runtime_compatible_schema(conn: &Connection) -> Result<()> {
     // heavier pre-schema rebuilds and just restore any missing canonical DDL.
     execute_batch(conn, SCHEMA_SQL)?;
     run_migrations(conn, false)?;
+    conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
+        .map_err(BeadsError::Database)?;
     apply_runtime_pragmas(conn)?;
-    conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))?;
     Ok(())
 }
 

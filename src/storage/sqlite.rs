@@ -329,6 +329,7 @@ impl SqliteStorage {
     /// Returns an error if the connection cannot be established or schema application fails.
     pub fn open_with_timeout(path: &Path, lock_timeout_ms: Option<u64>) -> Result<Self> {
         let conn = Connection::open(path.to_string_lossy().into_owned())?;
+        conn.set_checkpoint_on_close(false);
 
         // Configure busy_timeout so that BEGIN IMMEDIATE retries instead of
         // failing instantly when another writer holds the lock (issue #109).
@@ -2748,7 +2749,7 @@ impl SqliteStorage {
 
     fn load_blocked_issues_from_map(
         &self,
-        blocked_issues_map: HashMap<String, Vec<String>>,
+        blocked_issues_map: &HashMap<String, Vec<String>>,
     ) -> Result<Vec<(Issue, Vec<String>)>> {
         if blocked_issues_map.is_empty() {
             return Ok(Vec::new());
@@ -3205,7 +3206,7 @@ impl SqliteStorage {
         if let Err(error) = self.ensure_blocked_cache_fresh() {
             let blocked_issues_map =
                 self.recover_blocked_issues_map("get_blocked_issues_refresh", &error)?;
-            return self.load_blocked_issues_from_map(blocked_issues_map);
+            return self.load_blocked_issues_from_map(&blocked_issues_map);
         }
         let rows = match self.conn.query(
             r"SELECT i.id, i.content_hash, i.title, i.description, i.design, i.acceptance_criteria, i.notes,
@@ -3225,7 +3226,7 @@ impl SqliteStorage {
             Err(error) => {
                 let blocked_issues_map =
                     self.recover_blocked_issues_map("get_blocked_issues_query", &error)?;
-                return self.load_blocked_issues_from_map(blocked_issues_map);
+                return self.load_blocked_issues_from_map(&blocked_issues_map);
             }
         };
 
@@ -3240,7 +3241,7 @@ impl SqliteStorage {
                 Err(error) => {
                     let blocked_issues_map =
                         self.recover_blocked_issues_map("get_blocked_issues_parse", &error)?;
-                    return self.load_blocked_issues_from_map(blocked_issues_map);
+                    return self.load_blocked_issues_from_map(&blocked_issues_map);
                 }
             };
             blocked_issues.push((issue, blockers));
@@ -7075,7 +7076,9 @@ mod tests {
     #[test]
     fn test_open_memory() {
         let storage = SqliteStorage::open_memory();
-        assert!(storage.is_ok());
+        if let Err(error) = storage {
+            panic!("open_memory failed: {error:?}");
+        }
     }
 
     #[test]

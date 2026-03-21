@@ -171,23 +171,10 @@ fn execute_inner(
         return Ok(());
     }
 
-    let config_layer = storage_ctx.load_config(cli)?;
-    let use_color = config::should_use_color(&config_layer);
-    let max_width = if std::io::stdout().is_terminal() {
-        Some(terminal_width())
-    } else {
-        None
-    };
-    let format_options = TextFormatOptions {
-        use_color,
-        max_width,
-        wrap: args.wrap,
-    };
-    let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
-
     // Output
     match output_format {
         OutputFormat::Json | OutputFormat::Toon => {
+            let ctx = OutputContext::from_output_format(output_format, quiet, true);
             // Fetch relations for all issues
             let issue_ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
             let mut labels_map = storage.get_labels_for_issues(&issue_ids)?;
@@ -241,6 +228,19 @@ fn execute_inner(
             print!("{csv_output}");
         }
         OutputFormat::Text => {
+            let config_layer = storage_ctx.load_config(cli)?;
+            let use_color = config::should_use_color(&config_layer);
+            let max_width = if std::io::stdout().is_terminal() {
+                Some(terminal_width())
+            } else {
+                None
+            };
+            let format_options = TextFormatOptions {
+                use_color,
+                max_width,
+                wrap: args.wrap,
+            };
+            let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
             if args.pretty {
                 render_pretty_text_issues(&ctx, &issues, format_options, args.long);
             } else if matches!(ctx.mode(), OutputMode::Rich) {
