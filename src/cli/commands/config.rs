@@ -532,7 +532,7 @@ fn set_config_value(
 
     // Write back atomically (temp file + rename) to prevent corruption on crash
     let yaml_str = serde_yml::to_string(&config)?;
-    let temp_path = config_path.with_extension("yaml.tmp");
+    let temp_path = config_path.with_extension(format!("yaml.{}.tmp", std::process::id()));
     fs::write(&temp_path, &yaml_str)?;
     fs::rename(&temp_path, &config_path)?;
 
@@ -812,7 +812,7 @@ fn apply_prepared_yaml_delete(prepared: Option<PreparedYamlDelete>) -> Result<bo
     };
 
     // Atomic write: temp file + rename to prevent corruption on crash
-    let temp_path = prepared.path.with_extension("yaml.tmp");
+    let temp_path = prepared.path.with_extension(format!("yaml.{}.tmp", std::process::id()));
     fs::write(&temp_path, &prepared.yaml)?;
     fs::rename(&temp_path, &prepared.path)?;
     Ok(true)
