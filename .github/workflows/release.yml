@@ -128,24 +128,28 @@ jobs:
         run: |
           EXPECTED="${{ github.ref_name }}"
           EXPECTED="${EXPECTED#v}"  # strip leading v
-          ACTUAL=$(./target/${{ matrix.target }}/release/br --version 2>&1)
-          if ! echo "$ACTUAL" | grep -q "$EXPECTED"; then
-            echo "ERROR: Binary reports '$ACTUAL' but expected version '$EXPECTED'"
+          RAW=$(./target/${{ matrix.target }}/release/br --version 2>&1)
+          # clap outputs "br X.Y.Z"; extract the version token
+          ACTUAL=$(echo "$RAW" | awk '{print $NF}')
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "ERROR: Binary reports version '$ACTUAL' (from '$RAW') but expected '$EXPECTED'"
             exit 1
           fi
-          echo "Version check passed: $ACTUAL contains $EXPECTED"
+          echo "Version check passed: $ACTUAL == $EXPECTED"
 
       - name: Verify binary version matches tag (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $expected = "${{ github.ref_name }}" -replace '^v', ''
-          $actual = & ./target/${{ matrix.target }}/release/br.exe --version 2>&1 | Out-String
-          if ($actual -notmatch [regex]::Escape($expected)) {
-            Write-Error "ERROR: Binary reports '$actual' but expected version '$expected'"
+          $raw = & ./target/${{ matrix.target }}/release/br.exe --version 2>&1 | Out-String
+          # clap outputs "br X.Y.Z"; extract the version token
+          $actual = ($raw.Trim() -split '\s+')[-1]
+          if ($actual -ne $expected) {
+            Write-Error "ERROR: Binary reports version '$actual' (from '$raw') but expected '$expected'"
             exit 1
           }
-          Write-Host "Version check passed: $actual contains $expected"
+          Write-Host "Version check passed: $actual == $expected"
 
       - name: Create archive (Unix)
         if: runner.os != 'Windows'
