@@ -533,7 +533,7 @@ pub fn abbreviate_prefix(prefix: &str) -> String {
 
     let fallback: String = normalized
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
+        .filter(char::is_ascii_alphanumeric)
         .take(3)
         .collect();
     if fallback.is_empty() {

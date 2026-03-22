@@ -1922,8 +1922,7 @@ pub fn id_config_from_layer(layer: &ConfigLayer) -> IdConfig {
     let prefix = get_value(layer, &["issue_prefix", "issue-prefix", "prefix"])
         .cloned()
         .filter(|p| !p.trim().is_empty())
-        .map(|prefix| normalize_prefix(&prefix))
-        .unwrap_or_else(|| "br".to_string());
+        .map_or_else(|| "br".to_string(), |prefix| normalize_prefix(&prefix));
 
     let min_hash_length = parse_usize(layer, &["min_hash_length", "min-hash-length"]).unwrap_or(3);
     let max_hash_length = parse_usize(layer, &["max_hash_length", "max-hash-length"]).unwrap_or(8);
