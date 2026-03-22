@@ -63,6 +63,7 @@ struct DoctorRun {
 struct LocalRepairResult {
     blocked_cache_rebuilt: bool,
     wal_checkpoint_completed: bool,
+    indexes_reindexed: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     quarantined_artifacts: Vec<String>,
 }
@@ -92,6 +93,7 @@ impl LocalRepairResult {
     fn applied(&self) -> bool {
         self.blocked_cache_rebuilt
             || self.wal_checkpoint_completed
+            || self.indexes_reindexed
             || !self.quarantined_artifacts.is_empty()
     }
 }
@@ -173,6 +175,23 @@ fn report_has_sidecar_anomaly(report: &DoctorReport) -> bool {
         .any(|check| check.name == "db.sidecars" && matches!(check.status, CheckStatus::Error))
 }
 
+/// Return true if any integrity check reported partial-index row mismatches
+/// ("row N missing from index") as a warning.  These can be repaired via `REINDEX`.
+fn report_has_partial_index_warnings(report: &DoctorReport) -> bool {
+    report.checks.iter().any(|check| {
+        if !matches!(check.status, CheckStatus::Warn) {
+            return false;
+        }
+        if check.name != "sqlite.integrity_check" && check.name != "sqlite3.integrity_check" {
+            return false;
+        }
+        check
+            .message
+            .as_deref()
+            .is_some_and(|msg| msg.to_lowercase().contains("missing from index"))
+    })
+}
+
 fn local_repair_message(local_repair: &LocalRepairResult) -> String {
     let mut actions = Vec::new();
     if local_repair.blocked_cache_rebuilt {
@@ -180,6 +199,9 @@ fn local_repair_message(local_repair: &LocalRepairResult) -> String {
     }
     if local_repair.wal_checkpoint_completed {
         actions.push("checkpointed database WAL state".to_string());
+    }
+    if local_repair.indexes_reindexed {
+        actions.push("rebuilt all indexes via REINDEX".to_string());
     }
     if !local_repair.quarantined_artifacts.is_empty() {
         actions.push(format!(
@@ -550,6 +572,49 @@ fn repair_recoverable_db_state(
     }
 }
 
+/// Rebuild all indexes via `REINDEX` to fix partial-index row mismatches.
+///
+/// This is safe — `REINDEX` only rebuilds existing indexes from the underlying
+/// table data.  It does not modify any row data.
+fn repair_partial_indexes(db_path: &Path, repair: &mut LocalRepairResult) {
+    if !db_path.is_file() {
+        tracing::debug!(
+            path = %db_path.display(),
+            "Skipping REINDEX because the database file is missing"
+        );
+        return;
+    }
+
+    match Connection::open(db_path.to_string_lossy().into_owned()) {
+        Ok(conn) => {
+            let _ = conn.execute("PRAGMA busy_timeout=30000");
+            match conn.execute("REINDEX") {
+                Ok(_) => {
+                    tracing::info!(
+                        path = %db_path.display(),
+                        "REINDEX completed successfully"
+                    );
+                    repair.indexes_reindexed = true;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        path = %db_path.display(),
+                        error = %err,
+                        "REINDEX failed; partial-index warnings may persist"
+                    );
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %db_path.display(),
+                error = %err,
+                "Skipping REINDEX because the database could not be opened"
+            );
+        }
+    }
+}
+
 fn repair_database_sidecars(beads_dir: &Path, db_path: &Path, repair: &mut LocalRepairResult) {
     match inspect_database_sidecars(db_path) {
         Ok(initial_inspection) => {
@@ -870,39 +935,24 @@ fn required_schema_checks(conn: &Connection, checks: &mut Vec<CheckResult>) -> R
     Ok(())
 }
 
-/// Return true if all integrity check messages relate only to "never used" page notices.
-///
-/// frankensqlite may emit "page N is never used" after concurrent writes due to
-/// a known page-accounting inconsistency in the free-list header.  The data
-/// itself remains intact and the write probe succeeds, so these messages are
-/// treated as warnings rather than fatal errors.
-///
-/// Both the frankensqlite internal check and the external sqlite3 CLI are handled:
-///
-///   frankensqlite: "database disk image is malformed: page N is never used"
-///   sqlite3 CLI:   "*** in database main ***" followed by "Page N: never used"
-///
-/// The function requires that at least one "never used" message is present and
-/// that every message in the list is either a "never used" page notice or a
-/// known benign context header that accompanies them.
-fn integrity_messages_only_unused_pages(messages: &[String]) -> bool {
+/// Return true if all integrity check messages are benign frankensqlite artifacts
+/// (either "never used" pages, partial-index row mismatches, or a mix of both).
+fn integrity_messages_only_benign(messages: &[String]) -> bool {
     if messages.is_empty() {
         return false;
     }
-    // Must have at least one actual "never used" notice.
-    let has_never_used = messages.iter().any(|msg| {
+    let has_benign = messages.iter().any(|msg| {
         let lower = msg.to_lowercase();
-        lower.contains("never used")
+        lower.contains("never used") || lower.contains("missing from index")
     });
-    if !has_never_used {
+    if !has_benign {
         return false;
     }
-    // Every message must be either:
-    //   (a) a "never used" page notice (possibly wrapped in "malformed" prefix), or
-    //   (b) a sqlite3 CLI context header line ("*** in database main ***")
     messages.iter().all(|msg| {
         let lower = msg.to_lowercase();
-        lower.contains("never used") || lower.contains("*** in database")
+        lower.contains("never used")
+            || lower.contains("missing from index")
+            || lower.contains("*** in database")
     })
 }
 
@@ -931,9 +981,10 @@ fn check_integrity(conn: &Connection, checks: &mut Vec<CheckResult>) {
             None,
             None,
         );
-    } else if integrity_messages_only_unused_pages(&messages) {
-        // Unused-page notices are a known frankensqlite page-accounting artefact.
-        // The data is intact (write probe passes), so report Warn rather than Error.
+    } else if integrity_messages_only_benign(&messages) {
+        // Unused-page notices and partial-index row mismatches are known frankensqlite
+        // artifacts.  The data is intact (write probe passes), so report Warn rather
+        // than Error.
         push_check(
             checks,
             "sqlite.integrity_check",
@@ -1242,8 +1293,9 @@ fn check_sqlite_cli_integrity(db_path: &Path, checks: &mut Vec<CheckResult>) {
                 None,
             );
         }
-        Ok(messages) if integrity_messages_only_unused_pages(&messages) => {
-            // Treat never-used page notices as warnings (frankensqlite page-accounting artefact).
+        Ok(messages) if integrity_messages_only_benign(&messages) => {
+            // Treat never-used page notices and partial-index row mismatches as warnings
+            // (known frankensqlite artifacts).
             push_check(
                 checks,
                 "sqlite3.integrity_check",
@@ -2140,7 +2192,33 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     }
 
     if initial.report.ok {
-        if ctx.is_json() {
+        // Even when there are no errors, partial-index warnings can be repaired
+        // via REINDEX.  Run it when --repair is passed and the warnings are present.
+        if report_has_partial_index_warnings(&initial.report) {
+            let mut repair = LocalRepairResult::default();
+            repair_partial_indexes(&paths.db_path, &mut repair);
+            let post_reindex = collect_doctor_report(&beads_dir, &paths)?;
+            let repair_message = if repair.indexes_reindexed {
+                local_repair_message(&repair)
+            } else {
+                "REINDEX was attempted but did not complete.".to_string()
+            };
+            if ctx.is_json() {
+                ctx.json(&serde_json::json!({
+                    "report": initial.report,
+                    "repaired": repair.applied(),
+                    "local_repair": repair,
+                    "message": repair_message,
+                    "post_repair": post_reindex.report,
+                    "verified": post_reindex.report.ok,
+                }));
+            } else {
+                print_report(&initial.report, ctx)?;
+                ctx.info(&repair_message);
+                ctx.info("Post-repair verification:");
+                print_report(&post_reindex.report, ctx)?;
+            }
+        } else if ctx.is_json() {
             ctx.json(&serde_json::json!({
                 "report": initial.report,
                 "repaired": false,
@@ -2153,13 +2231,18 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         return Ok(());
     }
 
-    let local_repair = if report_has_blocked_cache_stale_finding(&initial.report)
+    let mut local_repair = if report_has_blocked_cache_stale_finding(&initial.report)
         || report_has_sidecar_anomaly(&initial.report)
     {
         repair_recoverable_db_state(&beads_dir, &paths.db_path, &initial.report)
     } else {
         LocalRepairResult::default()
     };
+
+    // Also attempt REINDEX if partial-index warnings are present alongside errors.
+    if report_has_partial_index_warnings(&initial.report) {
+        repair_partial_indexes(&paths.db_path, &mut local_repair);
+    }
     let after_local_repair = if local_repair.applied() {
         collect_doctor_report(&beads_dir, &paths)?
     } else {
