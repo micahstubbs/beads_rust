@@ -18,7 +18,7 @@ use crate::sync::{
     ExportConfig, ImportConfig, ImportResult, auto_flush, compute_jsonl_hash,
     export_to_jsonl_with_policy, finalize_export, import_from_jsonl, preflight_import,
 };
-use crate::util::id::{IdConfig, split_prefix_remainder};
+use crate::util::id::{IdConfig, abbreviate_prefix, normalize_prefix, split_prefix_remainder};
 use chrono::Utc;
 use fsqlite_error::FrankenError;
 use serde::{Deserialize, Serialize};
@@ -1364,12 +1364,12 @@ fn resolve_bootstrap_issue_prefix(
     if let Some(prefix) = get_value(bootstrap_layer, &["issue_prefix", "issue-prefix", "prefix"]) {
         let trimmed = prefix.trim();
         if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
+            return Ok(normalize_prefix(trimmed));
         }
     }
 
     if let Some(prefix) = first_prefix_from_jsonl(jsonl_path)? {
-        return Ok(prefix);
+        return Ok(normalize_prefix(&prefix));
     }
 
     if let Some(name) = beads_dir
@@ -1379,7 +1379,7 @@ fn resolve_bootstrap_issue_prefix(
         .map(str::trim)
         .filter(|name| !name.is_empty())
     {
-        return Ok(name.to_string());
+        return Ok(abbreviate_prefix(name));
     }
 
     Ok("br".to_string())
@@ -1922,6 +1922,7 @@ pub fn id_config_from_layer(layer: &ConfigLayer) -> IdConfig {
     let prefix = get_value(layer, &["issue_prefix", "issue-prefix", "prefix"])
         .cloned()
         .filter(|p| !p.trim().is_empty())
+        .map(|prefix| normalize_prefix(&prefix))
         .unwrap_or_else(|| "br".to_string());
 
     let min_hash_length = parse_usize(layer, &["min_hash_length", "min-hash-length"]).unwrap_or(3);
@@ -3557,6 +3558,17 @@ routing:
         assert_eq!(config.prefix, "legacy");
     }
 
+    #[test]
+    fn id_config_normalizes_issue_prefix_values() {
+        let mut layer = ConfigLayer::default();
+        layer
+            .runtime
+            .insert("issue_prefix".to_string(), " Project-Name! ".to_string());
+
+        let config = id_config_from_layer(&layer);
+        assert_eq!(config.prefix, "project-name");
+    }
+
     // ==================== JSONL Discovery Tests ====================
     // Tests for beads_rust-ndl: JSONL discovery + metadata.json handling
 
@@ -3932,6 +3944,21 @@ routing:
         let prefix = resolve_bootstrap_issue_prefix(&bootstrap_layer, &beads_dir, &jsonl_path)
             .expect("prefix");
         assert_eq!(prefix, "cfg");
+    }
+
+    #[test]
+    fn resolve_bootstrap_issue_prefix_normalizes_directory_name() {
+        let temp = TempDir::new().expect("tempdir");
+        let project_dir = temp.path().join("My_Project-Name");
+        let beads_dir = project_dir.join(".beads");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::write(&jsonl_path, "").expect("write empty jsonl");
+
+        let prefix =
+            resolve_bootstrap_issue_prefix(&ConfigLayer::default(), &beads_dir, &jsonl_path)
+                .expect("prefix");
+        assert_eq!(prefix, "mpn");
     }
 
     #[test]

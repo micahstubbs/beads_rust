@@ -15,7 +15,7 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
-## [v0.1.31](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.1.31) -- 2026-03-22 (Release)
+## [v0.1.31](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.1.31) -- 2026-03-21 (Release)
 
 Focused hardening for concurrent agent workflows, plus a release-process cleanup pass.
 
@@ -25,7 +25,7 @@ Focused hardening for concurrent agent workflows, plus a release-process cleanup
 - **Graceful missing-dependency fallback** in storage and graph code paths -- dangling dep references no longer crash ([`617572f`](https://github.com/Dicklesworthstone/beads_rust/commit/617572f), [`a1b63dd`](https://github.com/Dicklesworthstone/beads_rust/commit/a1b63dd)).
 - **Blocked-cache hardening**: single-row inserts, deferred invalidation, INSERT OR REPLACE semantics, graceful read fallbacks ([`ad27f47`](https://github.com/Dicklesworthstone/beads_rust/commit/ad27f47), [`acedf9d`](https://github.com/Dicklesworthstone/beads_rust/commit/acedf9d), [`f687166`](https://github.com/Dicklesworthstone/beads_rust/commit/f687166)).
 - **Lazy config loading** and reduced sync lock contention, with checkpoint-on-close opt-out ([`a690d58`](https://github.com/Dicklesworthstone/beads_rust/commit/a690d58)).
-- **Ready-query/storage fast path**: column-projected ready queries, compare-and-set claims, and JSONL size witnesses improve concurrency correctness and reduce unnecessary work.
+- **Ready-query/storage fast path**: column-projected ready queries, compare-and-set claims, and JSONL size witnesses improve concurrency correctness and reduce unnecessary work ([`9550859`](https://github.com/Dicklesworthstone/beads_rust/commit/9550859)).
 - Switch test storage from `:memory:` to temp files for better parity with production ([`5e8f91c`](https://github.com/Dicklesworthstone/beads_rust/commit/5e8f91c)).
 
 ### Sync and Concurrency
@@ -47,7 +47,7 @@ Focused hardening for concurrent agent workflows, plus a release-process cleanup
 
 ### Documentation
 
-- Rebuilt `CHANGELOG.md` from git history with live commit links.
+- Rebuilt `CHANGELOG.md` from git history with live commit links ([`53fef3a`](https://github.com/Dicklesworthstone/beads_rust/commit/53fef3a)).
 
 ### CI
 

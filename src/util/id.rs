@@ -39,7 +39,7 @@ impl IdConfig {
     #[must_use]
     pub fn with_prefix(prefix: impl Into<String>) -> Self {
         Self {
-            prefix: prefix.into(),
+            prefix: normalize_prefix(&prefix.into()),
             ..Default::default()
         }
     }
@@ -477,6 +477,72 @@ pub fn normalize_id(id: &str) -> String {
     id.to_lowercase()
 }
 
+/// Normalize a configured issue prefix into a valid runtime form.
+///
+/// This trims whitespace, lowercases ASCII letters, removes unsupported
+/// characters, and clamps the prefix to the maximum supported length. If no
+/// usable characters remain, it falls back to `br`.
+#[must_use]
+pub fn normalize_prefix(prefix: &str) -> String {
+    let normalized: String = prefix
+        .trim()
+        .chars()
+        .filter_map(|c| {
+            let normalized = c.to_ascii_lowercase();
+            (normalized.is_ascii_lowercase()
+                || normalized.is_ascii_digit()
+                || matches!(normalized, '_' | '-' | '.' | ':' | '#'))
+            .then_some(normalized)
+        })
+        .take(MAX_ID_PREFIX_LEN)
+        .collect();
+
+    if normalized.is_empty() {
+        "br".to_string()
+    } else {
+        normalized
+    }
+}
+
+/// Abbreviate a long auto-derived issue ID prefix.
+///
+/// If the normalized prefix is short enough (<= 6 chars), it is returned
+/// unchanged. Otherwise, multi-word prefixes are abbreviated to their initials
+/// and single-word prefixes fall back to their first three alphanumeric chars.
+#[must_use]
+pub fn abbreviate_prefix(prefix: &str) -> String {
+    let normalized = normalize_prefix(prefix);
+    if normalized.len() <= 6 {
+        return normalized;
+    }
+
+    let segments: Vec<&str> = normalized
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|segment| !segment.is_empty())
+        .collect();
+
+    if segments.len() > 1 {
+        let abbrev: String = segments
+            .iter()
+            .filter_map(|segment| segment.chars().next())
+            .collect();
+        if abbrev.len() > 1 {
+            return abbrev;
+        }
+    }
+
+    let fallback: String = normalized
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(3)
+        .collect();
+    if fallback.is_empty() {
+        normalized
+    } else {
+        fallback
+    }
+}
+
 /// Check if a string looks like a valid issue ID format.
 #[must_use]
 pub fn is_valid_id_format(id: &str) -> bool {
@@ -513,7 +579,7 @@ impl ResolverConfig {
     #[must_use]
     pub fn with_prefix(prefix: impl Into<String>) -> Self {
         Self {
-            default_prefix: prefix.into(),
+            default_prefix: normalize_prefix(&prefix.into()),
             ..Default::default()
         }
     }
@@ -1177,6 +1243,18 @@ mod tests {
         assert!(validate_prefix("bd-abc123", "bd", &[]).is_ok());
         assert!(validate_prefix("bd-abc123", "other", &["bd".to_string()]).is_ok());
         assert!(validate_prefix("bd-abc123", "other", &[]).is_err());
+    }
+
+    #[test]
+    fn test_normalize_prefix_sanitizes_and_lowercases() {
+        assert_eq!(normalize_prefix("  Project-Name_2!  "), "project-name_2");
+        assert_eq!(normalize_prefix("!!!"), "br");
+    }
+
+    #[test]
+    fn test_abbreviate_prefix_handles_mixed_case_and_underscores() {
+        assert_eq!(abbreviate_prefix("My_Project-Name"), "mpn");
+        assert_eq!(abbreviate_prefix("superlongname"), "sup");
     }
 
     #[test]

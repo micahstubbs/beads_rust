@@ -18,8 +18,8 @@ depends=('gcc-libs')
 source_x86_64=("${pkgname}-${pkgver}-x86_64.tar.gz::https://github.com/Dicklesworthstone/beads_rust/releases/download/v${pkgver}/br-v${pkgver}-linux_amd64.tar.gz")
 source_aarch64=("${pkgname}-${pkgver}-aarch64.tar.gz::https://github.com/Dicklesworthstone/beads_rust/releases/download/v${pkgver}/br-v${pkgver}-linux_arm64.tar.gz")
 
-sha256sums_x86_64=('364181c9d8d72f290ed8a9c1a6b2547ae943c6526a2862a09dcb82215cf57ada')
-sha256sums_aarch64=('235e65c009b7064f3c9d68a6fc57806a399c6cbb783ca3bf9dc74db8652c732e')
+sha256sums_x86_64=('PLACEHOLDER_LINUX_AMD64_SHA256')
+sha256sums_aarch64=('PLACEHOLDER_LINUX_ARM64_SHA256')
 
 package() {
     install -Dm755 "${srcdir}/br" "${pkgdir}/usr/bin/br"

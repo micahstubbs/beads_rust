@@ -453,3 +453,28 @@ fn e2e_config_list_rejects_project_and_user_together() {
         list.stderr
     );
 }
+
+#[test]
+fn e2e_create_normalizes_runtime_issue_prefix_from_project_config() {
+    let _log = common::test_log("e2e_create_normalizes_runtime_issue_prefix_from_project_config");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let project_config = workspace.root.join(".beads").join("config.yaml");
+    fs::write(&project_config, "issue_prefix: \"Project-Name!\"\n").expect("write project config");
+
+    let create = run_br(
+        &workspace,
+        ["create", "Normalize prefix"],
+        "create_with_mixed_prefix",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    assert!(
+        create.stdout.contains("Created project-name-"),
+        "expected normalized lowercase prefix, got stdout='{}', stderr='{}'",
+        create.stdout,
+        create.stderr
+    );
+}
