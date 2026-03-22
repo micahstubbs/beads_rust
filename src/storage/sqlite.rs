@@ -6,7 +6,7 @@ use crate::model::{Comment, DependencyType, Event, EventType, Issue, IssueType, 
 use crate::storage::events::get_events;
 use crate::storage::schema::CURRENT_SCHEMA_VERSION;
 use crate::storage::schema::{
-    apply_runtime_compatible_schema, apply_schema, runtime_schema_compatible,
+    apply_runtime_compatible_schema, apply_schema, execute_batch, runtime_schema_compatible,
 };
 use crate::util::id::{normalize_prefix, parse_id};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
@@ -2920,9 +2920,10 @@ impl SqliteStorage {
     fn rebuild_blocked_cache_impl(conn: &Connection) -> Result<usize> {
         let blocked_issues_map = Self::compute_blocked_issues_map_impl(conn)?;
 
-        // Atomic update: Clear and Re-insert
-        // Since we are within a BEGIN IMMEDIATE transaction, this is safe and efficient.
-        conn.execute("DELETE FROM blocked_issues_cache")?;
+        // `fsqlite` can surface false UNIQUE conflicts while repopulating the
+        // blocked-cache index after a full-table DELETE. Recreate the cache
+        // table instead so the subsequent inserts start from a fresh btree.
+        Self::reset_blocked_cache_table(conn)?;
 
         let mut entries = Vec::with_capacity(blocked_issues_map.len());
 
@@ -2944,6 +2945,23 @@ impl SqliteStorage {
         let count = Self::insert_blocked_cache_entries(conn, &entries)?;
         tracing::debug!(blocked_count = count, "Rebuilt blocked issues cache");
         Ok(count)
+    }
+
+    fn reset_blocked_cache_table(conn: &Connection) -> Result<()> {
+        execute_batch(
+            conn,
+            r"
+            DROP TABLE IF EXISTS blocked_issues_cache;
+            CREATE TABLE blocked_issues_cache (
+                issue_id TEXT PRIMARY KEY,
+                blocked_by TEXT NOT NULL,
+                blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_blocked_cache_blocked_at
+                ON blocked_issues_cache(blocked_at);
+            ",
+        )
     }
 
     /// Incremental blocked-cache update: recompute only the entries for the
@@ -8901,6 +8919,42 @@ mod tests {
             storage.get_blockers("bd-unrelated").unwrap(),
             vec!["bd-unrelated-blocker".to_string()]
         );
+    }
+
+    #[test]
+    fn test_rebuild_blocked_cache_impl_recreates_table_and_repopulates_entries() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let now = Utc::now();
+
+        let blocker = make_issue("bd-reset-b1", "Blocker", Status::Open, 2, None, now, None);
+        let blocked = make_issue("bd-reset-c1", "Blocked", Status::Open, 2, None, now, None);
+
+        storage.create_issue(&blocker, "tester").unwrap();
+        storage.create_issue(&blocked, "tester").unwrap();
+        storage
+            .add_dependency(&blocked.id, &blocker.id, "blocks", "tester")
+            .unwrap();
+
+        storage
+            .conn
+            .execute("DELETE FROM blocked_issues_cache")
+            .unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO blocked_issues_cache (issue_id, blocked_by, blocked_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                &[
+                    SqliteValue::from(blocked.id.as_str()),
+                    SqliteValue::from("[\"bd-old:open\"]"),
+                ],
+            )
+            .unwrap();
+
+        let rebuilt = SqliteStorage::rebuild_blocked_cache_impl(&storage.conn).unwrap();
+        assert_eq!(rebuilt, 1);
+        assert_eq!(storage.get_blockers(&blocked.id).unwrap(), vec![blocker.id]);
     }
 
     #[test]
