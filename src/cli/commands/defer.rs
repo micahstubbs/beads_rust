@@ -726,30 +726,10 @@ mod tests {
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use chrono::{Datelike, Duration, Local, Utc};
-    use std::env;
-    use std::path::PathBuf;
     use std::sync::Mutex;
     use tempfile::TempDir;
 
     static TEST_DIR_LOCK: Mutex<()> = Mutex::new(());
-
-    struct DirGuard {
-        previous: PathBuf,
-    }
-
-    impl DirGuard {
-        fn new(target: &std::path::Path) -> Self {
-            let previous = env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
-            env::set_current_dir(target).expect("set current dir");
-            Self { previous }
-        }
-    }
-
-    impl Drop for DirGuard {
-        fn drop(&mut self) {
-            let _ = env::set_current_dir(&self.previous);
-        }
-    }
 
     fn make_issue(id: &str, title: &str) -> Issue {
         let now = Utc::now();
@@ -903,18 +883,28 @@ mod tests {
 
         let beads_dir = temp.path().join(".beads");
         let mut storage = SqliteStorage::open(&beads_dir.join("beads.db")).expect("storage");
-        let issue = make_issue("bd-defer-1", "Defer me");
+        let issue_id = format!(
+            "{}-defer-1",
+            storage
+                .get_config("issue_prefix")
+                .expect("prefix config")
+                .expect("workspace prefix")
+        );
+        let issue = make_issue(&issue_id, "Defer me");
         storage.create_issue(&issue, "tester").expect("create");
 
-        let _guard = DirGuard::new(temp.path());
+        let cli = CliOverrides {
+            db: Some(beads_dir.join("beads.db")),
+            ..CliOverrides::default()
+        };
         let args = DeferArgs {
-            ids: vec!["bd-defer-1".to_string()],
+            ids: vec![issue_id.clone()],
             until: Some("+1d".to_string()),
             robot: true,
         };
-        execute_defer(&args, true, &CliOverrides::default(), &ctx).expect("defer");
+        execute_defer(&args, true, &cli, &ctx).expect("defer");
 
-        let updated = storage.get_issue("bd-defer-1").expect("get").unwrap();
+        let updated = storage.get_issue(&issue_id).expect("get").unwrap();
         assert_eq!(updated.status, Status::Deferred);
         assert!(updated.defer_until.is_some());
     }
@@ -930,18 +920,28 @@ mod tests {
 
         let beads_dir = temp.path().join(".beads");
         let mut storage = SqliteStorage::open(&beads_dir.join("beads.db")).expect("storage");
-        let issue = make_issue("bd-defer-2", "Defer me later");
+        let issue_id = format!(
+            "{}-defer-2",
+            storage
+                .get_config("issue_prefix")
+                .expect("prefix config")
+                .expect("workspace prefix")
+        );
+        let issue = make_issue(&issue_id, "Defer me later");
         storage.create_issue(&issue, "tester").expect("create");
 
-        let _guard = DirGuard::new(temp.path());
+        let cli = CliOverrides {
+            db: Some(beads_dir.join("beads.db")),
+            ..CliOverrides::default()
+        };
         let args = DeferArgs {
-            ids: vec!["bd-defer-2".to_string()],
+            ids: vec![issue_id.clone()],
             until: None,
             robot: true,
         };
-        execute_defer(&args, true, &CliOverrides::default(), &ctx).expect("defer");
+        execute_defer(&args, true, &cli, &ctx).expect("defer");
 
-        let updated = storage.get_issue("bd-defer-2").expect("get").unwrap();
+        let updated = storage.get_issue(&issue_id).expect("get").unwrap();
         assert_eq!(updated.status, Status::Deferred);
         assert!(updated.defer_until.is_none());
     }
@@ -956,28 +956,41 @@ mod tests {
         commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
+        let issue_id = {
+            let storage = SqliteStorage::open(&beads_dir.join("beads.db")).expect("storage");
+            format!(
+                "{}-defer-3",
+                storage
+                    .get_config("issue_prefix")
+                    .expect("prefix config")
+                    .expect("workspace prefix")
+            )
+        };
         {
             let mut storage = SqliteStorage::open(&beads_dir.join("beads.db")).expect("storage");
-            let issue = make_issue("bd-defer-3", "Undefer me");
+            let issue = make_issue(&issue_id, "Undefer me");
             storage.create_issue(&issue, "tester").expect("create");
         }
 
-        let _guard = DirGuard::new(temp.path());
+        let cli = CliOverrides {
+            db: Some(beads_dir.join("beads.db")),
+            ..CliOverrides::default()
+        };
         let defer_args = DeferArgs {
-            ids: vec!["bd-defer-3".to_string()],
+            ids: vec![issue_id.clone()],
             until: Some("+1d".to_string()),
             robot: true,
         };
-        execute_defer(&defer_args, true, &CliOverrides::default(), &ctx).expect("defer");
+        execute_defer(&defer_args, true, &cli, &ctx).expect("defer");
 
         let undefer_args = UndeferArgs {
-            ids: vec!["bd-defer-3".to_string()],
+            ids: vec![issue_id.clone()],
             robot: true,
         };
-        execute_undefer(&undefer_args, true, &CliOverrides::default(), &ctx).expect("undefer");
+        execute_undefer(&undefer_args, true, &cli, &ctx).expect("undefer");
 
         let storage = SqliteStorage::open(&beads_dir.join("beads.db")).expect("reopen");
-        let updated = storage.get_issue("bd-defer-3").expect("get").unwrap();
+        let updated = storage.get_issue(&issue_id).expect("get").unwrap();
         assert_eq!(updated.status, Status::Open);
         assert!(updated.defer_until.is_none());
     }
@@ -993,19 +1006,29 @@ mod tests {
 
         let beads_dir = temp.path().join(".beads");
         let mut storage = SqliteStorage::open(&beads_dir.join("beads.db")).expect("storage");
-        let mut issue = make_issue("bd-soft-defer-1", "Soft defer in progress");
+        let issue_id = format!(
+            "{}-soft-defer-1",
+            storage
+                .get_config("issue_prefix")
+                .expect("prefix config")
+                .expect("workspace prefix")
+        );
+        let mut issue = make_issue(&issue_id, "Soft defer in progress");
         issue.status = Status::InProgress;
         issue.defer_until = Some(Utc::now() + Duration::days(1));
         storage.create_issue(&issue, "tester").expect("create");
 
-        let _guard = DirGuard::new(temp.path());
+        let cli = CliOverrides {
+            db: Some(beads_dir.join("beads.db")),
+            ..CliOverrides::default()
+        };
         let undefer_args = UndeferArgs {
-            ids: vec!["bd-soft-defer-1".to_string()],
+            ids: vec![issue_id.clone()],
             robot: true,
         };
-        execute_undefer(&undefer_args, true, &CliOverrides::default(), &ctx).expect("undefer");
+        execute_undefer(&undefer_args, true, &cli, &ctx).expect("undefer");
 
-        let updated = storage.get_issue("bd-soft-defer-1").expect("get").unwrap();
+        let updated = storage.get_issue(&issue_id).expect("get").unwrap();
         assert_eq!(updated.status, Status::InProgress);
         assert!(updated.defer_until.is_none());
     }

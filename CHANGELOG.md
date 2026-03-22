@@ -16,9 +16,28 @@ Bead links below use GitHub code search scoped to the checked-in `.beads/issues.
 
 ## Unreleased
 
-- Replaced the placeholder changelog with a full-project, feature-oriented history.
-- Added direct release links, direct commit links, and linked beads/workstreams.
-- Clarified release automation so CI generates `RELEASE_NOTES.md` instead of pretending a temporary release-body file is the repo's canonical changelog.
+### Added
+- Comprehensive CHANGELOG.md generated from full git history (replaces placeholder).
+- `doctor` warns when root `.gitignore` hides `.beads/.gitignore`.
+- Concurrent close/update/reopen blocked-cache integrity stress test (e2e).
+
+### Changed
+- Release automation now generates `RELEASE_NOTES.md` instead of pretending a temporary release-body file is the repo's canonical changelog.
+- Centralized ID resolution into `resolve_issue_id(s)` helpers across CLI commands.
+- Lazy config loading to reduce sync lock contention; checkpoint-on-close opt-out.
+- Downgraded auto-import `SyncConflict` to warning for concurrent writes.
+- Storage schema: removed redundant index, simplified event inserts, added dependency thread index.
+- Switched schema temp tables from `:memory:` to temp files with debug logging.
+- Atomic config writes using PID-scoped temp files.
+
+### Fixed
+- `INSERT OR REPLACE` for `blocked_issues_cache` to prevent UNIQUE constraint errors during concurrent cache rebuilds.
+- `INSERT OR REPLACE` for `export_hashes` and `child_counters` (defense-in-depth against concurrent races on PRIMARY KEY columns).
+- Graceful fallback for missing dependencies in graph rendering instead of crashing.
+- Graceful fallback for all blocked-cache read operations.
+- Single-row blocked-cache inserts with deferred invalidation and large-batch regression test.
+- `LazyLock` regex in agents; defer-first blocked-cache invalidation.
+- JSONL validation improvements for sync and show commands.
 
 * * *
 

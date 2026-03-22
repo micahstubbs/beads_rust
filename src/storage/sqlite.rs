@@ -669,7 +669,7 @@ impl SqliteStorage {
             // insert isolated after the chunk delete.
             for (issue_id, content_hash) in chunk {
                 self.conn.execute_with_params(
-                    "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
+                    "INSERT OR REPLACE INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
                     &[
                         SqliteValue::from(issue_id.as_str()),
                         SqliteValue::from(content_hash.as_str()),
@@ -2689,7 +2689,7 @@ impl SqliteStorage {
         let mut count = 0;
         for (parent_id, last_child) in max_children {
             conn.execute_with_params(
-                "INSERT INTO child_counters (parent_id, last_child) VALUES (?, ?)",
+                "INSERT OR REPLACE INTO child_counters (parent_id, last_child) VALUES (?, ?)",
                 &[
                     SqliteValue::from(parent_id.as_str()),
                     SqliteValue::from(i64::from(last_child)),
@@ -2889,7 +2889,7 @@ impl SqliteStorage {
         let mut count = 0;
         for (issue_id, blockers_json) in entries {
             conn.execute_with_params(
-                "INSERT INTO blocked_issues_cache (issue_id, blocked_by, blocked_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                "INSERT OR REPLACE INTO blocked_issues_cache (issue_id, blocked_by, blocked_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
                 &[
                     SqliteValue::from(issue_id.as_str()),
                     SqliteValue::from(blockers_json.as_str()),
@@ -4834,7 +4834,7 @@ impl SqliteStorage {
                 &[SqliteValue::from(parent_id)],
             )?;
             conn.execute_with_params(
-                "INSERT INTO child_counters (parent_id, last_child) VALUES (?, ?)",
+                "INSERT OR REPLACE INTO child_counters (parent_id, last_child) VALUES (?, ?)",
                 &[
                     SqliteValue::from(parent_id),
                     SqliteValue::from(i64::from(child_number)),
@@ -5352,7 +5352,7 @@ impl SqliteStorage {
                 &[SqliteValue::from(issue_id)],
             )?;
             storage.conn.execute_with_params(
-                "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
+                "INSERT OR REPLACE INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
                 &[
                     SqliteValue::from(issue_id),
                     SqliteValue::from(content_hash),
