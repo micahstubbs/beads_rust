@@ -57,6 +57,8 @@ jobs:
         run: cargo build --release
 
       - name: Clone and build bd (Go beads)
+        id: build_bd
+        continue-on-error: true
         run: |
           git clone --depth 1 https://github.com/Dicklesworthstone/beads.git ../beads-go
           cd ../beads-go
@@ -64,6 +66,7 @@ jobs:
           echo "BD_BINARY=$(pwd)/bd" >> $GITHUB_ENV
 
       - name: Verify binaries
+        if: steps.build_bd.outcome == 'success'
         run: |
           echo "=== br version ==="
           ./target/release/br --version
@@ -72,6 +75,7 @@ jobs:
           $BD_BINARY version || true
 
       - name: Run conformance tests
+        if: steps.build_bd.outcome == 'success'
         run: |
           VERBOSE_FLAG=""
           if [ "${{ inputs.verbose }}" = "true" ]; then

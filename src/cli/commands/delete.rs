@@ -133,7 +133,7 @@ pub fn execute(
             if ctx.is_json() || ctx.is_toon() {
                 let preview = DeletePreviewResult {
                     preview: true,
-                    would_delete: ids.clone(),
+                    would_delete: ids,
                     cascade_delete: full_cascade,
                     blocked_dependents,
                     orphaned_issues: Vec::new(),
@@ -198,7 +198,7 @@ pub fn execute(
                 };
                 let preview = DeletePreviewResult {
                     preview: true,
-                    would_delete: ids.clone(),
+                    would_delete: ids,
                     cascade_delete: cascade_ids,
                     blocked_dependents: Vec::new(),
                     orphaned_issues,
@@ -358,6 +358,7 @@ pub fn execute(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute_routed(
     args: &DeleteArgs,
     cli: &config::CliOverrides,
@@ -409,11 +410,11 @@ fn execute_routed(
     if !blocked_dependents.is_empty() && !args.force && !args.cascade {
         render_routed_delete_preview(
             ctx,
-            DeletePreviewResult {
+            &DeletePreviewResult {
                 preview: true,
                 would_delete,
-                cascade_delete: cascade_delete.clone(),
-                blocked_dependents: blocked_dependents.clone(),
+                cascade_delete,
+                blocked_dependents,
                 orphaned_issues: Vec::new(),
             },
         );
@@ -428,7 +429,7 @@ fn execute_routed(
         };
         render_routed_delete_preview(
             ctx,
-            DeletePreviewResult {
+            &DeletePreviewResult {
                 preview: true,
                 would_delete,
                 cascade_delete,
@@ -597,7 +598,7 @@ fn apply_delete_route(args: &DeleteArgs, route: &PreparedDeleteRoute) -> Result<
     Ok(result)
 }
 
-fn render_routed_delete_preview(ctx: &OutputContext, preview: DeletePreviewResult) {
+fn render_routed_delete_preview(ctx: &OutputContext, preview: &DeletePreviewResult) {
     if ctx.is_json() || ctx.is_toon() {
         if ctx.is_toon() {
             ctx.toon(&preview);

@@ -1197,10 +1197,10 @@ impl ToolHandler for CreateIssueTool {
         // Attach labels
         if let Some(labels) = args.get("labels").and_then(|v| v.as_array()) {
             for label_val in labels {
-                if let Some(label) = label_val.as_str() {
-                    if let Err(e) = storage.add_label(&id, label, &self.0.actor) {
-                        warnings.push(format!("failed to add label '{label}': {e}"));
-                    }
+                if let Some(label) = label_val.as_str()
+                    && let Err(e) = storage.add_label(&id, label, &self.0.actor)
+                {
+                    warnings.push(format!("failed to add label '{label}': {e}"));
                 }
             }
         }
@@ -1412,19 +1412,19 @@ impl ToolHandler for UpdateIssueTool {
         // Handle label mutations
         if let Some(labels) = args.get("labels_add").and_then(|v| v.as_array()) {
             for label_val in labels {
-                if let Some(label) = label_val.as_str() {
-                    if let Err(e) = storage.add_label(id, label, &self.0.actor) {
-                        warnings.push(format!("failed to add label '{label}': {e}"));
-                    }
+                if let Some(label) = label_val.as_str()
+                    && let Err(e) = storage.add_label(id, label, &self.0.actor)
+                {
+                    warnings.push(format!("failed to add label '{label}': {e}"));
                 }
             }
         }
         if let Some(labels) = args.get("labels_remove").and_then(|v| v.as_array()) {
             for label_val in labels {
-                if let Some(label) = label_val.as_str() {
-                    if let Err(e) = storage.remove_label(id, label, &self.0.actor) {
-                        warnings.push(format!("failed to remove label '{label}': {e}"));
-                    }
+                if let Some(label) = label_val.as_str()
+                    && let Err(e) = storage.remove_label(id, label, &self.0.actor)
+                {
+                    warnings.push(format!("failed to remove label '{label}': {e}"));
                 }
             }
         }
@@ -1432,10 +1432,9 @@ impl ToolHandler for UpdateIssueTool {
         // Add comment if provided
         if let Some(comment) = args.get("comment").and_then(|v| v.as_str())
             && !comment.is_empty()
+            && let Err(e) = storage.add_comment(id, &self.0.actor, comment)
         {
-            if let Err(e) = storage.add_comment(id, &self.0.actor, comment) {
-                warnings.push(format!("failed to add comment: {e}"));
-            }
+            warnings.push(format!("failed to add comment: {e}"));
         }
 
         let mut result = json!({
