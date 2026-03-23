@@ -1318,6 +1318,15 @@ impl SqliteStorage {
                         issue.closed_at = Some(now);
                         add_update("closed_at", SqliteValue::from(now.to_rfc3339()));
                     }
+
+                    if issue.deleted_at.is_some() {
+                        issue.deleted_at = None;
+                        issue.deleted_by = None;
+                        issue.delete_reason = None;
+                        add_update("deleted_at", SqliteValue::Null);
+                        add_update("deleted_by", SqliteValue::Null);
+                        add_update("delete_reason", SqliteValue::Null);
+                    }
                 } else if *status == Status::Tombstone {
                     let reason = updates.close_reason.as_ref().and_then(Clone::clone);
 

@@ -15,6 +15,34 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
+## [v0.1.32](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.1.32) -- 2026-03-23 (Release)
+
+This release extends cross-project routing coverage, hardens storage for frankensqlite compatibility, and tightens the release pipeline around version and installer correctness.
+
+### Cross-Project Routing
+
+- **Route-aware dependency operations** now auto-flush correctly and enforce cross-project guards when adding or removing dependencies ([`4682499`](https://github.com/Dicklesworthstone/beads_rust/commit/4682499)).
+- **Graph, delete, audit log, and lint** now respect external workspace routing instead of assuming the main project database only ([`5a983bc`](https://github.com/Dicklesworthstone/beads_rust/commit/5a983bc), [`d63f56c`](https://github.com/Dicklesworthstone/beads_rust/commit/d63f56c), [`4f232bb`](https://github.com/Dicklesworthstone/beads_rust/commit/4f232bb), [`d231bce`](https://github.com/Dicklesworthstone/beads_rust/commit/d231bce), [`d4df28f`](https://github.com/Dicklesworthstone/beads_rust/commit/d4df28f)).
+- **Auto-import propagation** now reaches all routing callsites, fixing path normalization and reducing stale cross-workspace reads ([`506b6cf`](https://github.com/Dicklesworthstone/beads_rust/commit/506b6cf), [`911b793`](https://github.com/Dicklesworthstone/beads_rust/commit/911b793)).
+
+### Storage and Config Hardening
+
+- **Prefix normalization** is now integrated through config, storage, and ID handling so runtime issue prefix mismatches resolve consistently ([`bdc0243`](https://github.com/Dicklesworthstone/beads_rust/commit/bdc0243), [`0575380`](https://github.com/Dicklesworthstone/beads_rust/commit/0575380)).
+- **Normalized prefixes** now drop trailing separator characters before ID generation, preventing malformed runtime prefixes from producing awkward double-separator IDs.
+- **Frankensqlite compatibility** improved again: batched `DELETE` and other remaining batched `IN`-clause operations were replaced with row-by-row queries to avoid engine-specific breakage ([`ba71494`](https://github.com/Dicklesworthstone/beads_rust/commit/ba71494), [`b9a0f25`](https://github.com/Dicklesworthstone/beads_rust/commit/b9a0f25), [`45b2a4e`](https://github.com/Dicklesworthstone/beads_rust/commit/45b2a4e)).
+- **Tombstone state handling** now keeps `closed_at` separate from `deleted_at`, records delete metadata when creating or importing tombstoned issues, and clears delete fields when an issue leaves tombstone state.
+- **Doctor** now gives better guidance around root `.gitignore` conflicts and partial-index repair behavior ([`44d47e6`](https://github.com/Dicklesworthstone/beads_rust/commit/44d47e6), [`e6ef576`](https://github.com/Dicklesworthstone/beads_rust/commit/e6ef576)).
+- **Agents command** handling is more robust for marker-block parsing, project-scoped search, and JSON output on mutating operations ([`1cf1aa9`](https://github.com/Dicklesworthstone/beads_rust/commit/1cf1aa9)).
+
+### Release and CI
+
+- **Release verification** now asserts that the built binary version exactly matches the release tag, closing a class of silent mis-versioning failures ([`3315bf5`](https://github.com/Dicklesworthstone/beads_rust/commit/3315bf5), [`b2a9ef5`](https://github.com/Dicklesworthstone/beads_rust/commit/b2a9ef5)).
+- Packaging metadata and cache pinning were refreshed for release automation, and the Intel macOS build moved to the correct runner label ([`e137852`](https://github.com/Dicklesworthstone/beads_rust/commit/e137852), [`9f9f183`](https://github.com/Dicklesworthstone/beads_rust/commit/9f9f183)).
+
+### Testing
+
+- Added fresh regression coverage around blocked-cache close behavior, fresh-db behavior, custom status snapshots, lint routing, and the CI fixes required to keep those suites green ([`9869aca`](https://github.com/Dicklesworthstone/beads_rust/commit/9869aca), [`86f9c98`](https://github.com/Dicklesworthstone/beads_rust/commit/86f9c98), [`b657c0e`](https://github.com/Dicklesworthstone/beads_rust/commit/b657c0e), [`a1e893e`](https://github.com/Dicklesworthstone/beads_rust/commit/a1e893e), [`4cec0bb`](https://github.com/Dicklesworthstone/beads_rust/commit/4cec0bb), [`fe2ae0a`](https://github.com/Dicklesworthstone/beads_rust/commit/fe2ae0a)).
+
 ## [v0.1.31](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.1.31) -- 2026-03-21 (Release)
 
 Focused hardening for concurrent agent workflows, plus a release-process cleanup pass.

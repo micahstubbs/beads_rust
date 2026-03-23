@@ -497,6 +497,11 @@ pub fn normalize_prefix(prefix: &str) -> String {
         .take(MAX_ID_PREFIX_LEN)
         .collect();
 
+    // Strip trailing separator chars to prevent double-hyphens during ID generation
+    let normalized = normalized
+        .trim_end_matches(['_', '-', '.', ':', '#'])
+        .to_string();
+
     if normalized.is_empty() {
         "br".to_string()
     } else {
@@ -1139,10 +1144,10 @@ mod tests {
         assert_eq!(parsed.hash, "3e9");
         assert!(parsed.child_path.is_empty());
 
-        let child = parse_id("document-intelligence-0sa.2").unwrap();
-        assert_eq!(child.prefix, "document-intelligence");
-        assert_eq!(child.hash, "0sa");
-        assert_eq!(child.child_path, vec![2]);
+        let parsed2 = parse_id("document-intelligence-0sa.2").unwrap();
+        assert_eq!(parsed2.prefix, "document-intelligence");
+        assert_eq!(parsed2.hash, "0sa");
+        assert_eq!(parsed2.child_path, vec![2]);
     }
 
     #[test]

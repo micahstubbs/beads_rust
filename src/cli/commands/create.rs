@@ -203,8 +203,14 @@ pub fn create_issue_impl(
         };
         let id = generate_new_id(storage, resolved_parent.as_deref(), &id_input)?;
 
-        // Set closed_at if status is Closed or Tombstone
-        let closed_at = if matches!(status, Status::Closed | Status::Tombstone) {
+        // Set closed_at if status is Closed
+        let closed_at = if matches!(status, Status::Closed) {
+            Some(now)
+        } else {
+            None
+        };
+
+        let deleted_at = if matches!(status, Status::Tombstone) {
             Some(now)
         } else {
             None
@@ -238,8 +244,12 @@ pub fn create_issue_impl(
             closed_by_session: None,
             source_system: None,
             source_repo: None,
-            deleted_at: None,
-            deleted_by: None,
+            deleted_at,
+            deleted_by: if deleted_at.is_some() {
+                Some(config.actor.clone())
+            } else {
+                None
+            },
             delete_reason: None,
             original_type: None,
             compaction_level: None,
@@ -539,8 +549,14 @@ fn execute_import(
         Status::Open
     };
 
-    // Set closed_at if status is Closed or Tombstone
-    let import_closed_at = if matches!(import_status, Status::Closed | Status::Tombstone) {
+    // Set closed_at if status is Closed
+    let import_closed_at = if matches!(import_status, Status::Closed) {
+        Some(now)
+    } else {
+        None
+    };
+
+    let import_deleted_at = if matches!(import_status, Status::Tombstone) {
         Some(now)
     } else {
         None
@@ -647,8 +663,12 @@ fn execute_import(
                 closed_by_session: None,
                 source_system: None,
                 source_repo: None,
-                deleted_at: None,
-                deleted_by: None,
+                deleted_at: import_deleted_at,
+                deleted_by: if import_deleted_at.is_some() {
+                    Some(actor.clone())
+                } else {
+                    None
+                },
                 delete_reason: None,
                 original_type: None,
                 compaction_level: None,

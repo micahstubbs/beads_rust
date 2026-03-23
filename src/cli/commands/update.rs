@@ -717,7 +717,7 @@ fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result
     let defer_until = optional_date_field(args.defer.as_deref())?;
 
     let closed_at = match &status {
-        Some(Status::Closed | Status::Tombstone) => Some(Some(Utc::now())),
+        Some(Status::Closed) => Some(Some(Utc::now())),
         Some(_) => Some(None),
         None => None,
     };
