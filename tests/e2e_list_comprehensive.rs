@@ -1099,8 +1099,9 @@ fn e2e_list_custom_status() {
         "list with custom status should succeed (custom statuses are allowed)"
     );
     assert!(
-        list.stdout.contains("Issues (0)"),
-        "list with unknown custom status should return 0 issues"
+        list.stdout.trim().is_empty(),
+        "list with unknown custom status should return an empty plain-text result: {}",
+        list.stdout
     );
 }
 

@@ -520,24 +520,36 @@ fn collect_single_graph(
 ) -> Result<SingleGraphTraversal> {
     // For single graph (dependents), we want to show all paths from the root.
     // However, to prevent infinite loops in case of cycles, we track the current path.
-    // We also want traversal_order to contain each node at most once for node metadata lookup.
+    // We also want traversal_order to reflect first-visit DFS order so rendered subtrees stay
+    // contiguous in the human-readable graph output.
     let mut traversal_order: Vec<String> = Vec::new();
     let mut issues_by_id: HashMap<String, Issue> = HashMap::new();
     let mut edges: Vec<(String, String)> = Vec::new();
     let mut seen_edges: HashSet<(String, String)> = HashSet::new();
-    let mut discovered_nodes: HashSet<String> = HashSet::new();
+    let mut ordered_nodes: HashSet<String> = HashSet::new();
+    let mut expanded_nodes: HashSet<String> = HashSet::new();
+    let mut queued_nodes: HashSet<String> = HashSet::new();
 
     // Optimization: Prefetch active issue metadata to avoid N+1 queries during traversal
     let metadata_cache = storage.get_active_issues_metadata()?;
 
     // Stack stores (current_id, path_to_this_node)
     let mut stack: Vec<(String, Vec<String>)> = vec![(root_id.to_string(), vec![])];
+    queued_nodes.insert(root_id.to_string());
 
-    traversal_order.push(root_id.to_string());
     issues_by_id.insert(root_id.to_string(), root_issue.clone());
-    discovered_nodes.insert(root_id.to_string());
 
     while let Some((current_id, path)) = stack.pop() {
+        queued_nodes.remove(&current_id);
+
+        if ordered_nodes.insert(current_id.clone()) {
+            traversal_order.push(current_id.clone());
+        }
+
+        if !expanded_nodes.insert(current_id.clone()) {
+            continue;
+        }
+
         let mut dependents = storage.get_dependents_with_metadata(&current_id)?;
         dependents.retain(|dep| {
             dep.dep_type
@@ -554,7 +566,7 @@ fn collect_single_graph(
                 edges.push(edge);
             }
 
-            if !discovered_nodes.contains(&dep.id) {
+            if !issues_by_id.contains_key(&dep.id) {
                 // Use cache if available, otherwise preserve the dependency metadata
                 // placeholder instead of turning a missing issue back into a hard error.
                 let issue = if let Some(meta) = metadata_cache.get(&dep.id) {
@@ -575,13 +587,15 @@ fn collect_single_graph(
                     }
                 };
 
-                traversal_order.push(dep.id.clone());
                 issues_by_id.insert(dep.id.clone(), issue);
-                discovered_nodes.insert(dep.id.clone());
             }
 
             // Cycle prevention: only descend if the child isn't already in the path to here
-            if !path.contains(&dep.id) && dep.id != current_id {
+            if !path.contains(&dep.id)
+                && dep.id != current_id
+                && !expanded_nodes.contains(&dep.id)
+                && queued_nodes.insert(dep.id.clone())
+            {
                 let mut new_path = path.clone();
                 new_path.push(current_id.clone());
                 stack.push((dep.id.clone(), new_path));
@@ -619,13 +633,9 @@ fn build_graph_nodes(
 }
 
 fn sort_single_graph_nodes(nodes: &mut [GraphNode], root_id: &str) {
-    nodes.sort_by(|left, right| {
-        (left.id != root_id)
-            .cmp(&(right.id != root_id))
-            .then(left.depth.cmp(&right.depth))
-            .then(left.priority.cmp(&right.priority))
-            .then(left.id.cmp(&right.id))
-    });
+    if let Some(root_index) = nodes.iter().position(|node| node.id == root_id) {
+        nodes[..=root_index].rotate_right(1);
+    }
 }
 
 fn calculate_depths_from_dependency_edges(
@@ -1709,6 +1719,60 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_single_graph_uses_first_visit_dfs_order() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = chrono::Utc::now();
+
+        for (id, title) in [
+            ("bd-root", "Root"),
+            ("bd-a", "A"),
+            ("bd-b", "B"),
+            ("bd-c", "C"),
+        ] {
+            let issue = Issue {
+                id: id.to_string(),
+                title: title.to_string(),
+                status: Status::Open,
+                priority: crate::model::Priority::MEDIUM,
+                issue_type: crate::model::IssueType::Task,
+                created_at: t1,
+                updated_at: t1,
+                ..Default::default()
+            };
+            storage.create_issue(&issue, "test").unwrap();
+        }
+
+        let created_at = t1.to_rfc3339();
+        storage
+            .execute_test_sql(&format!(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('bd-a', 'bd-root', 'blocks', '{created_at}', 'test');
+                 INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('bd-b', 'bd-root', 'blocks', '{created_at}', 'test');
+                 INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('bd-c', 'bd-a', 'blocks', '{created_at}', 'test');"
+            ))
+            .unwrap();
+
+        let root = storage
+            .get_issue("bd-root")
+            .unwrap()
+            .expect("root issue should exist");
+        let traversal =
+            collect_single_graph(&storage, "bd-root", &root).expect("graph traversal should work");
+
+        assert_eq!(
+            traversal.traversal_order,
+            vec![
+                "bd-root".to_string(),
+                "bd-a".to_string(),
+                "bd-c".to_string(),
+                "bd-b".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn test_calculate_depths_from_dependency_edges_uses_longest_path() {
         let nodes = vec![
             "root".to_string(),
@@ -1786,8 +1850,22 @@ mod tests {
     }
 
     #[test]
-    fn test_sort_single_graph_nodes_keeps_root_first_then_depth() {
+    fn test_sort_single_graph_nodes_keeps_root_first_without_reordering_subtrees() {
         let mut nodes = vec![
+            GraphNode {
+                id: "branch-a".to_string(),
+                title: "branch-a".to_string(),
+                status: "open".to_string(),
+                priority: 1,
+                depth: 1,
+            },
+            GraphNode {
+                id: "middle".to_string(),
+                title: "middle".to_string(),
+                status: "open".to_string(),
+                priority: 0,
+                depth: 2,
+            },
             GraphNode {
                 id: "leaf".to_string(),
                 title: "leaf".to_string(),
@@ -1809,20 +1887,6 @@ mod tests {
                 priority: 4,
                 depth: 0,
             },
-            GraphNode {
-                id: "branch-a".to_string(),
-                title: "branch-a".to_string(),
-                status: "open".to_string(),
-                priority: 1,
-                depth: 1,
-            },
-            GraphNode {
-                id: "middle".to_string(),
-                title: "middle".to_string(),
-                status: "open".to_string(),
-                priority: 0,
-                depth: 2,
-            },
         ];
 
         sort_single_graph_nodes(&mut nodes, "root");
@@ -1830,7 +1894,7 @@ mod tests {
         let ordered_ids: Vec<&str> = nodes.iter().map(|node| node.id.as_str()).collect();
         assert_eq!(
             ordered_ids,
-            vec!["root", "branch-a", "branch-b", "middle", "leaf"]
+            vec!["root", "branch-a", "middle", "leaf", "branch-b"]
         );
     }
 }
