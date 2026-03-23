@@ -76,8 +76,39 @@ enum HumanGraphRenderMode {
 /// Returns an error if database operations fail or if inputs are invalid.
 pub fn execute(args: &GraphArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    execute_with_storage_ctx(args, cli, ctx, &storage_ctx)
+    let route_cli = routed_cli_for_graph(cli, args, &beads_dir)?;
+    let storage_ctx = open_storage_for_graph(args, &route_cli, &beads_dir)?;
+    execute_with_storage_ctx(args, &route_cli, ctx, &storage_ctx)
+}
+
+fn routed_cli_for_graph(
+    cli: &config::CliOverrides,
+    args: &GraphArgs,
+    local_beads_dir: &std::path::Path,
+) -> Result<config::CliOverrides> {
+    let mut route_cli = cli.clone();
+    if let Some(issue_input) = args.issue.as_deref()
+        && !args.all
+        && config::routing::resolve_route(issue_input, local_beads_dir)?.is_external
+    {
+        route_cli.db = None;
+    }
+    Ok(route_cli)
+}
+
+fn open_storage_for_graph(
+    args: &GraphArgs,
+    cli: &config::CliOverrides,
+    local_beads_dir: &std::path::Path,
+) -> Result<config::OpenStorageResult> {
+    if let Some(issue_input) = args.issue.as_deref()
+        && !args.all
+    {
+        let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
+        return config::open_storage_with_cli(&route.beads_dir, cli);
+    }
+
+    config::open_storage_with_cli(local_beads_dir, cli)
 }
 
 /// Execute the graph command using storage that was already opened by the caller.

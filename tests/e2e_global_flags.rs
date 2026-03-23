@@ -220,7 +220,10 @@ fn e2e_robot_flag_list() {
     let payload = extract_json_payload(&list.stdout);
     let json: Value = serde_json::from_str(&payload).expect("json mode should output valid JSON");
     assert!(json.is_object(), "list should be JSON object envelope");
-    assert!(json.get("issues").is_some(), "list envelope should contain 'issues'");
+    assert!(
+        json.get("issues").is_some(),
+        "list envelope should contain 'issues'"
+    );
 }
 
 #[test]

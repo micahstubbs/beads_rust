@@ -191,7 +191,10 @@ fn e2e_graph_single_issue_honors_toon_env_mode() {
     let json = Value::from(decoded);
     assert_eq!(json["root"].as_str(), Some(blocker_id.as_str()));
     assert_eq!(
-        json["count"].as_f64().map(|f| f as u64).or(json["count"].as_u64()),
+        json["count"]
+            .as_f64()
+            .map(|f| f as u64)
+            .or(json["count"].as_u64()),
         Some(2)
     );
     assert_eq!(json["nodes"].as_array().map(Vec::len), Some(2));

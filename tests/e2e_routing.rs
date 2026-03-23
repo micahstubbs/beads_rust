@@ -1646,6 +1646,61 @@ fn e2e_routing_dep_add_rejects_direct_cross_project_target() {
 }
 
 #[test]
+fn e2e_routing_graph_external_issue_via_main_workspace() {
+    let _log = common::test_log("e2e_routing_graph_external_issue_via_main_workspace");
+
+    let main_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+
+    init_workspace(&main_workspace, "init_main");
+    init_workspace(&external_workspace, "init_external");
+    configure_external_route(&main_workspace, &external_workspace);
+
+    let parent_id = create_issue_and_get_id(
+        &external_workspace,
+        "External graph root",
+        "create_external_graph_root",
+    );
+    let child_id = create_issue_and_get_id(
+        &external_workspace,
+        "External graph child",
+        "create_external_graph_child",
+    );
+
+    let dep_add = run_br(
+        &external_workspace,
+        ["dep", "add", &child_id, &parent_id, "--json"],
+        "external_dep_add_for_graph",
+    );
+    assert!(
+        dep_add.status.success(),
+        "dep add failed: {}",
+        dep_add.stderr
+    );
+
+    let routed_parent = routed_partial_id(&parent_id);
+    let graph = run_br(
+        &main_workspace,
+        ["graph", &routed_parent, "--json"],
+        "graph_external_via_route",
+    );
+    assert!(graph.status.success(), "graph failed: {}", graph.stderr);
+    let payload = extract_json_payload(&graph.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("graph json");
+
+    assert_eq!(json["root"].as_str(), Some(parent_id.as_str()));
+    let nodes = json["nodes"].as_array().expect("graph nodes array");
+    assert!(
+        nodes.iter().any(|node| node["id"] == parent_id),
+        "graph should contain routed root"
+    );
+    assert!(
+        nodes.iter().any(|node| node["id"] == child_id),
+        "graph should contain routed dependent"
+    );
+}
+
+#[test]
 fn e2e_routing_label_add_failure_does_not_mutate_earlier_batches() {
     let _log = common::test_log("e2e_routing_label_add_failure_does_not_mutate_earlier_batches");
 
