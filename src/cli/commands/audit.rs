@@ -1,11 +1,13 @@
 //! Audit command implementation.
 
+use super::resolve_issue_id;
 use crate::cli::{AuditCommands, AuditLabelArgs, AuditLogArgs, AuditRecordArgs, AuditSummaryArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::EventType;
 use crate::output::{OutputContext, Theme};
 use crate::sync::require_valid_sync_path;
+use crate::util::id::{IdResolver, ResolverConfig};
 use chrono::{DateTime, Utc};
 use rich_rust::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -144,9 +146,8 @@ fn execute_log(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
-    let issue_id = &args.id;
-    let events = storage_ctx.storage.get_events(issue_id, 0)?;
+    let (storage_ctx, issue_id) = open_routed_storage_for_issue_input(beads_dir, cli, &args.id)?;
+    let events = storage_ctx.storage.get_events(&issue_id, 0)?;
 
     if ctx.is_quiet() {
         return Ok(());
@@ -171,12 +172,32 @@ fn execute_log(
     }
 
     if ctx.is_rich() {
-        render_audit_log_rich(issue_id, &events, ctx);
+        render_audit_log_rich(&issue_id, &events, ctx);
     } else {
-        render_audit_log_plain(issue_id, &events);
+        render_audit_log_plain(&issue_id, &events);
     }
 
     Ok(())
+}
+
+fn open_routed_storage_for_issue_input(
+    local_beads_dir: &Path,
+    cli: &config::CliOverrides,
+    issue_input: &str,
+) -> Result<(config::OpenStorageResult, String)> {
+    let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
+    let mut route_cli = cli.clone();
+    if route.is_external {
+        route_cli.db = None;
+    }
+
+    let storage_ctx = config::open_storage_with_cli(&route.beads_dir, &route_cli)?;
+    let config_layer = storage_ctx.load_config(&route_cli)?;
+    let id_config = config::id_config_from_layer(&config_layer);
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let issue_id = resolve_issue_id(&storage_ctx.storage, &resolver, issue_input)?;
+
+    Ok((storage_ctx, issue_id))
 }
 
 fn execute_summary(

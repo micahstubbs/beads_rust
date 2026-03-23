@@ -1734,6 +1734,48 @@ fn e2e_routing_delete_external_issue_via_main_workspace() {
 }
 
 #[test]
+fn e2e_routing_audit_log_external_issue_via_main_workspace() {
+    let _log = common::test_log("e2e_routing_audit_log_external_issue_via_main_workspace");
+
+    let main_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+
+    init_workspace(&main_workspace, "init_main");
+    init_workspace(&external_workspace, "init_external");
+    configure_external_route(&main_workspace, &external_workspace);
+
+    let issue_id = create_issue_and_get_id(
+        &external_workspace,
+        "External audit target",
+        "create_external_audit_target",
+    );
+    let update = run_br(
+        &external_workspace,
+        ["update", &issue_id, "--priority", "0"],
+        "update_external_audit_target",
+    );
+    assert!(update.status.success(), "update failed: {}", update.stderr);
+
+    let routed_issue = routed_partial_id(&issue_id);
+    let log = run_br(
+        &main_workspace,
+        ["audit", "log", &routed_issue, "--json"],
+        "audit_log_external_via_route",
+    );
+    assert!(log.status.success(), "audit log failed: {}", log.stderr);
+
+    let json: Value =
+        serde_json::from_str(&extract_json_payload(&log.stdout)).expect("audit log json");
+    assert_eq!(json["issue_id"].as_str(), Some(issue_id.as_str()));
+    assert!(
+        json["events"]
+            .as_array()
+            .is_some_and(|events| events.len() >= 2),
+        "routed audit log should include external issue events: {json}"
+    );
+}
+
+#[test]
 fn e2e_routing_delete_preview_does_not_mutate_earlier_local_batch() {
     let _log = common::test_log("e2e_routing_delete_preview_does_not_mutate_earlier_local_batch");
 
