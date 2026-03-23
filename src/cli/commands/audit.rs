@@ -1,6 +1,6 @@
 //! Audit command implementation.
 
-use super::resolve_issue_id;
+use super::{auto_import_storage_ctx_if_stale, resolve_issue_id};
 use crate::cli::{AuditCommands, AuditLabelArgs, AuditLogArgs, AuditRecordArgs, AuditSummaryArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -155,7 +155,7 @@ fn execute_log(
 
     if ctx.is_toon() {
         let output = AuditLogOutput {
-            issue_id: issue_id.clone(),
+            issue_id,
             events: events.iter().map(map_event_to_output).collect(),
         };
         ctx.toon(&output);
@@ -164,7 +164,7 @@ fn execute_log(
 
     if ctx.is_json() {
         let output = AuditLogOutput {
-            issue_id: issue_id.clone(),
+            issue_id,
             events: events.iter().map(map_event_to_output).collect(),
         };
         ctx.json_pretty(&output);
@@ -191,7 +191,8 @@ fn open_routed_storage_for_issue_input(
         route_cli.db = None;
     }
 
-    let storage_ctx = config::open_storage_with_cli(&route.beads_dir, &route_cli)?;
+    let mut storage_ctx = config::open_storage_with_cli(&route.beads_dir, &route_cli)?;
+    auto_import_storage_ctx_if_stale(&mut storage_ctx, &route_cli)?;
     let config_layer = storage_ctx.load_config(&route_cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
