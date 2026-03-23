@@ -1046,7 +1046,7 @@ impl SqliteStorage {
                 Self::ensure_dependency_target_exists_in_tx(conn, &dep.depends_on_id)?;
                 // Check cycle if blocking
                 if dep.dep_type.is_blocking()
-                    && Self::check_cycle(conn, &issue.id, &dep.depends_on_id, true)?
+                    && Self::check_cycle(conn, &issue.id, &dep.depends_on_id, Some(dep.dep_type.as_str()), true)?
                 {
                     return Err(BeadsError::DependencyCycle {
                         path: format!(
@@ -1132,25 +1132,29 @@ impl SqliteStorage {
         conn: &Connection,
         issue_id: &str,
         depends_on_id: &str,
+        dep_type: Option<&str>,
         blocking_only: bool,
     ) -> Result<bool> {
-        // Build the per-node neighbor query.  We UNION two directions:
-        //   (a) standard deps: given node as issue_id, follow to depends_on_id
-        //   (b) parent-child reversed: given node as depends_on_id (parent),
-        //       follow to issue_id (child) -- because parent is blocked by child
+        let (from_node, to_node) = if matches!(dep_type, Some("waits-for")) {
+            (depends_on_id, issue_id)
+        } else {
+            (issue_id, depends_on_id)
+        };
+
+        // Build the per-node neighbor query. We only follow Must-Finish-Before (MFB) edges.
         let neighbor_sql = if blocking_only {
             "SELECT depends_on_id FROM dependencies \
-             WHERE issue_id = ? AND type IN ('blocks', 'conditional-blocks', 'waits-for') \
+             WHERE issue_id = ? AND type IN ('blocks', 'conditional-blocks', 'parent-child') \
              UNION \
              SELECT issue_id FROM dependencies \
-             WHERE depends_on_id = ? AND type = 'parent-child'"
+             WHERE depends_on_id = ? AND type = 'waits-for'"
                 .to_string()
         } else {
             "SELECT depends_on_id FROM dependencies \
-             WHERE issue_id = ? AND type != 'parent-child' \
+             WHERE issue_id = ? AND type != 'waits-for' \
              UNION \
              SELECT issue_id FROM dependencies \
-             WHERE depends_on_id = ? AND type = 'parent-child'"
+             WHERE depends_on_id = ? AND type = 'waits-for'"
                 .to_string()
         };
 
@@ -1159,8 +1163,10 @@ impl SqliteStorage {
         let mut visited = HashSet::new();
         // Level-synchronous BFS: process all nodes at one depth before moving
         // to the next, so we can enforce a depth cap cleanly.
-        let mut frontier: Vec<String> = vec![depends_on_id.to_string()];
-        visited.insert(depends_on_id.to_string());
+        // We are adding an edge `from_node -> to_node`. A cycle exists if
+        // there is already a path `to_node -> ... -> from_node`.
+        let mut frontier: Vec<String> = vec![to_node.to_string()];
+        visited.insert(to_node.to_string());
 
         for _depth in 0..DEPENDENCY_TRAVERSAL_MAX_DEPTH {
             if frontier.is_empty() {
@@ -1177,7 +1183,7 @@ impl SqliteStorage {
 
                 for row in &rows {
                     if let Some(neighbor) = row.get(0).and_then(SqliteValue::as_text) {
-                        if neighbor == issue_id {
+                        if neighbor == from_node {
                             return Ok(true); // Cycle detected -- early exit
                         }
                         if visited.insert(neighbor.to_string()) {
@@ -1600,6 +1606,10 @@ impl SqliteStorage {
         let timestamp = deleted_at.unwrap_or_else(Utc::now);
         let mut tombstone_issue = issue;
         tombstone_issue.status = Status::Tombstone;
+        // Zero out closed fields when tombstoning
+        tombstone_issue.closed_at = None;
+        tombstone_issue.close_reason = None;
+        tombstone_issue.closed_by_session = None;
         let tombstone_hash = crate::util::content_hash(&tombstone_issue);
 
         self.mutate("delete_issue", actor, |conn, ctx| {
@@ -1611,7 +1621,10 @@ impl SqliteStorage {
                     deleted_by = ?,
                     delete_reason = ?,
                     original_type = ?,
-                    updated_at = ?
+                    updated_at = ?,
+                    closed_at = NULL,
+                    close_reason = NULL,
+                    closed_by_session = NULL
                  WHERE id = ?",
                 &[
                     SqliteValue::from(tombstone_hash.as_str()),
@@ -3858,7 +3871,7 @@ impl SqliteStorage {
             // edge between our check and our INSERT.
             if let Ok(dt) = dep_type.parse::<DependencyType>()
                 && dt.is_blocking()
-                && Self::check_cycle(conn, issue_id, depends_on_id, true)?
+                && Self::check_cycle(conn, issue_id, depends_on_id, Some(dep_type), true)?
             {
                 return Err(BeadsError::DependencyCycle {
                     path: format!(
@@ -4125,7 +4138,7 @@ impl SqliteStorage {
                 Self::validate_parent_child_endpoints(issue_id, pid, "parent-child")?;
                 Self::ensure_dependency_target_exists_in_tx(conn, pid)?;
 
-                if Self::check_cycle(conn, issue_id, pid, true)? {
+                if Self::check_cycle(conn, issue_id, pid, Some("parent-child"), true)? {
                     return Err(BeadsError::DependencyCycle {
                         path: format!("Setting parent of {issue_id} to {pid} would create a cycle"),
                     });
@@ -6677,9 +6690,10 @@ impl SqliteStorage {
         &self,
         issue_id: &str,
         depends_on_id: &str,
+        dep_type: Option<&str>,
         blocking_only: bool,
     ) -> Result<bool> {
-        Self::check_cycle(&self.conn, issue_id, depends_on_id, blocking_only)
+        Self::check_cycle(&self.conn, issue_id, depends_on_id, dep_type, blocking_only)
     }
 
     /// Detect all cycles in the dependency graph.
@@ -7133,7 +7147,7 @@ impl crate::validation::DependencyStore for SqliteStorage {
         issue_id: &str,
         depends_on_id: &str,
     ) -> std::result::Result<bool, crate::error::BeadsError> {
-        Self::check_cycle(&self.conn, issue_id, depends_on_id, true)
+        Self::check_cycle(&self.conn, issue_id, depends_on_id, None, true)
     }
 }
 

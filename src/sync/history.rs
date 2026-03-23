@@ -449,7 +449,7 @@ pub fn backup_before_export(
     // Check if the content is identical to the most recent backup (deduplication)
     // We match by full target identity so similarly named exports do not
     // collapse each other's history.
-    if let Some(latest) = get_latest_backup(&history_dir, &target_key)?
+    if let Some(latest) = get_latest_backup(&history_dir, &target_key, file_stem)?
         && files_are_identical(target_path, &latest.path)?
     {
         tracing::debug!(
@@ -471,7 +471,7 @@ pub fn backup_before_export(
     tracing::debug!("Created backup: {}", backup_path.display());
 
     // Rotate history for this specific target
-    rotate_history(&history_dir, config, &target_key)?;
+    rotate_history(&history_dir, config, &target_key, file_stem)?;
 
     Ok(())
 }
@@ -481,8 +481,9 @@ pub fn backup_before_export(
 /// # Errors
 ///
 /// Returns an error if listing or deleting backups fails.
-fn rotate_history(history_dir: &Path, config: &HistoryConfig, target_key: &str) -> Result<()> {
-    let mut backups: Vec<_> = list_backups(history_dir, None)?
+fn rotate_history(history_dir: &Path, config: &HistoryConfig, target_key: &str, file_stem: &str) -> Result<()> {
+    let prefix = format!("{file_stem}.");
+    let mut backups: Vec<_> = list_backups(history_dir, Some(&prefix))?
         .into_iter()
         .filter(|entry| entry.target_key == target_key)
         .collect();
@@ -591,8 +592,9 @@ pub fn list_backups(history_dir: &Path, filter_prefix: Option<&str>) -> Result<V
     Ok(backups)
 }
 
-fn get_latest_backup(history_dir: &Path, target_key: &str) -> Result<Option<BackupEntry>> {
-    Ok(list_backups(history_dir, None)?
+fn get_latest_backup(history_dir: &Path, target_key: &str, file_stem: &str) -> Result<Option<BackupEntry>> {
+    let prefix = format!("{file_stem}.");
+    Ok(list_backups(history_dir, Some(&prefix))?
         .into_iter()
         .find(|entry| entry.target_key == target_key))
 }
@@ -734,7 +736,7 @@ mod tests {
 
         // Run rotation for "issues" stem
         let target_key = target_key_for_path(&beads_dir, &beads_dir.join("issues.jsonl"));
-        rotate_history(&history_dir, &config, &target_key).unwrap();
+        rotate_history(&history_dir, &config, &target_key, "issues").unwrap();
 
         // Should keep only max_count (2) newest files
         let remaining = list_backups(&history_dir, None).unwrap();

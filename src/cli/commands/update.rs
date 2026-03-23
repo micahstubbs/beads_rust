@@ -699,7 +699,14 @@ fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result
     let status = if args.claim {
         Some(Status::InProgress)
     } else {
-        args.status.as_ref().map(|s| s.parse()).transpose()?
+        let parsed = args.status.as_ref().map(|s| s.parse::<Status>()).transpose()?;
+        if let Some(Status::Tombstone) = parsed {
+            return Err(BeadsError::validation(
+                "status",
+                "cannot manually update status to tombstone; use 'br delete' instead",
+            ));
+        }
+        parsed
     };
 
     let priority = args.priority.as_ref().map(|p| p.parse()).transpose()?;

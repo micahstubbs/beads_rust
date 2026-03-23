@@ -182,7 +182,14 @@ pub fn create_issue_impl(
 
     // Parse status (default to Open if not provided)
     let status = if let Some(s) = &args.status {
-        Status::from_str(s)?
+        let parsed = Status::from_str(s)?;
+        if parsed == Status::Tombstone {
+            return Err(BeadsError::validation(
+                "status",
+                "cannot manually create issues in tombstone state; use 'br delete' instead",
+            ));
+        }
+        parsed
     } else {
         Status::Open
     };

@@ -20,7 +20,7 @@ use chrono::{DateTime, Duration, Local, NaiveDate, NaiveTime, TimeZone, Utc};
 ///
 /// # Panics
 ///
-/// This function does not panic. The internal `unwrap()` calls on `from_hms_opt(9, 0, 0)`
+/// This function does not panic. The internal `expect()` calls on `from_hms_opt(9, 0, 0)`
 /// are safe because 9:00:00 is always a valid time.
 pub fn parse_flexible_timestamp(s: &str, field_name: &str) -> Result<DateTime<Utc>> {
     let s = s.trim();
@@ -32,7 +32,7 @@ pub fn parse_flexible_timestamp(s: &str, field_name: &str) -> Result<DateTime<Ut
 
     // Try simple date (YYYY-MM-DD) - default to 9:00 AM local time
     if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        let time = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+        let time = NaiveTime::from_hms_opt(9, 0, 0).expect("9 AM is a valid time");
         let naive_dt = date.and_time(time);
         return local_to_utc(&naive_dt, field_name);
     }
@@ -69,25 +69,25 @@ pub fn parse_flexible_timestamp(s: &str, field_name: &str) -> Result<DateTime<Ut
     let now = Local::now();
     match s.to_lowercase().as_str() {
         "today" => {
-            let time = NaiveTime::from_hms_opt(17, 0, 0).unwrap();
+            let time = NaiveTime::from_hms_opt(17, 0, 0).expect("5 PM is a valid time");
             let naive_dt = now.date_naive().and_time(time);
             Ok(local_to_utc(&naive_dt, field_name)?)
         }
         "yesterday" => {
             let yesterday = now.date_naive() - Duration::days(1);
-            let time = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+            let time = NaiveTime::from_hms_opt(9, 0, 0).expect("9 AM is a valid time");
             let naive_dt = yesterday.and_time(time);
             Ok(local_to_utc(&naive_dt, field_name)?)
         }
         "tomorrow" => {
             let tomorrow = now.date_naive() + Duration::days(1);
-            let time = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+            let time = NaiveTime::from_hms_opt(9, 0, 0).expect("9 AM is a valid time");
             let naive_dt = tomorrow.and_time(time);
             Ok(local_to_utc(&naive_dt, field_name)?)
         }
         "next-week" | "nextweek" => {
             let next_week = now.date_naive() + Duration::weeks(1);
-            let time = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+            let time = NaiveTime::from_hms_opt(9, 0, 0).expect("9 AM is a valid time");
             let naive_dt = next_week.and_time(time);
             Ok(local_to_utc(&naive_dt, field_name)?)
         }

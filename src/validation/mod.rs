@@ -50,7 +50,7 @@ impl IssueValidator {
         if issue.title.trim().is_empty() {
             errors.push(ValidationError::new("title", "cannot be empty"));
         }
-        if issue.title.len() > 500 {
+        if issue.title.chars().count() > 500 {
             errors.push(ValidationError::new("title", "exceeds 500 characters"));
         }
 
@@ -117,7 +117,7 @@ impl IssueValidator {
 
         // External reference: Optional, max 200 chars, no whitespace.
         if let Some(external_ref) = issue.external_ref.as_ref() {
-            if external_ref.len() > 200 {
+            if external_ref.chars().count() > 200 {
                 errors.push(ValidationError::new(
                     "external_ref",
                     "exceeds 200 characters",
@@ -229,7 +229,7 @@ impl LabelValidator {
             return Err(ValidationError::new("label", "cannot be empty"));
         }
 
-        if label.len() > 50 {
+        if label.chars().count() > 50 {
             return Err(ValidationError::new("label", "exceeds 50 characters"));
         }
 
@@ -279,7 +279,7 @@ impl CommentValidator {
             errors.push(ValidationError::new("author", "cannot be empty"));
         }
 
-        if comment.author.len() > 200 {
+        if comment.author.chars().count() > 200 {
             errors.push(ValidationError::new("author", "exceeds 200 characters"));
         }
 
@@ -374,17 +374,52 @@ impl SyncSafetyValidator {
             return Ok(());
         }
 
-        // Canonicalize if possible, otherwise use the path as-is
-        let canonical_path = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        // Canonicalize the beads directory
         let canonical_beads =
             dunce::canonicalize(beads_dir).unwrap_or_else(|_| beads_dir.to_path_buf());
 
-        // Check if path starts with beads_dir
+        // Find the deepest existing ancestor for canonicalization
+        let mut path_to_check = path.to_path_buf();
+        while !path_to_check.exists() {
+            if let Some(parent) = path_to_check.parent() {
+                path_to_check = parent.to_path_buf();
+            } else {
+                break;
+            }
+        }
+
+        let canonical_path = dunce::canonicalize(&path_to_check).unwrap_or_else(|_| path_to_check);
+
+        // Check if the closest existing ancestor is under beads_dir
         if !canonical_path.starts_with(&canonical_beads) {
             return Err(ValidationError::new(
                 "path",
                 format!(
                     "path '{}' is outside allowed directory '{}' \
+                     (use --allow-external-jsonl to override)",
+                    path.display(),
+                    beads_dir.display()
+                ),
+            ));
+        }
+
+        // Additionally, lexically normalize the full path to catch any non-existent `..` escapes
+        let mut normalized = std::path::PathBuf::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::ParentDir => {
+                    normalized.pop();
+                }
+                std::path::Component::CurDir => {}
+                _ => normalized.push(component),
+            }
+        }
+
+        if !normalized.starts_with(&canonical_beads) && !normalized.starts_with(beads_dir) {
+             return Err(ValidationError::new(
+                "path",
+                format!(
+                    "path '{}' traverses outside allowed directory '{}' \
                      (use --allow-external-jsonl to override)",
                     path.display(),
                     beads_dir.display()

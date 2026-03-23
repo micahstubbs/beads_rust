@@ -477,7 +477,7 @@ fn parse_timestamp(s: &str) -> McpResult<(chrono::DateTime<chrono::Utc>, Option<
 
     // Try parsing date-only (YYYY-MM-DD → start of day UTC)
     if let Ok(date) = chrono::NaiveDate::parse_from_str(&normalized, "%Y-%m-%d") {
-        let dt = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let dt = date.and_hms_opt(0, 0, 0).expect("midnight is always a valid time").and_utc();
         return Ok((
             dt,
             Some(format!("'{s}' interpreted as '{}'", dt.to_rfc3339())),
@@ -547,7 +547,7 @@ fn parse_update_fields(
     let mut updates = IssueUpdate::default();
 
     if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
-        if title.is_empty() || title.len() > 500 {
+        if title.is_empty() || title.chars().count() > 500 {
             return Err(McpError::invalid_params("Title must be 1-500 characters"));
         }
         updates.title = Some(title.to_string());
@@ -1125,7 +1125,7 @@ impl ToolHandler for CreateIssueTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| McpError::invalid_params("'title' is required"))?;
 
-        if title.is_empty() || title.len() > 500 {
+        if title.is_empty() || title.chars().count() > 500 {
             return Err(McpError::invalid_params("Title must be 1-500 characters"));
         }
 

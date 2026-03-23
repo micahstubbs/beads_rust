@@ -293,7 +293,7 @@ fn render_comment_added_rich(issue_id: &str, comment: &Comment, ctx: &OutputCont
     console.print_renderable(&comment_text);
 }
 
-const MAX_STDIN_COMMENT_BYTES: usize = 10 * 1024 * 1024;
+const MAX_STDIN_COMMENT_BYTES: usize = 51_200; // 50KB to match CommentValidator
 
 fn read_limited_string<R: Read>(reader: &mut R, byte_limit: usize, field: &str) -> Result<String> {
     let max_bytes = byte_limit

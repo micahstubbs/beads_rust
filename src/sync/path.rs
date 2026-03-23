@@ -188,17 +188,19 @@ pub fn validate_no_git_path(path: &Path) -> PathValidation {
     }
 
     // Resolve the canonical path when possible (catches symlinks to .git)
-    if let Ok(canonical) = dunce::canonicalize(path) {
-        if has_git_component(&canonical) {
-            return PathValidation::GitPathAttempt { path: canonical };
+    let mut current = path.to_path_buf();
+    loop {
+        if let Ok(canonical) = dunce::canonicalize(&current) {
+            if has_git_component(&canonical) {
+                return PathValidation::GitPathAttempt { path: canonical };
+            }
+            break;
         }
-    } else if let Some(parent) = path.parent()
-        && let Ok(canonical_parent) = dunce::canonicalize(parent)
-        && has_git_component(&canonical_parent)
-    {
-        return PathValidation::GitPathAttempt {
-            path: canonical_parent,
-        };
+        if let Some(parent) = current.parent() {
+            current = parent.to_path_buf();
+        } else {
+            break;
+        }
     }
 
     PathValidation::Allowed
@@ -292,39 +294,19 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
     }
 
     // For new files that don't exist yet, we check the parent directory
-    let path_to_check = if normalized_path.exists() {
-        normalized_path.clone()
-    } else {
-        // For non-existent files, verify the parent exists and is valid
-        match normalized_path.parent() {
-            Some(parent) if parent.exists() => parent.to_path_buf(),
-            _ => {
-                // If parent doesn't exist, just check if the path would be under beads_dir
-                if let Ok(relative) = normalized_path.strip_prefix(&canonical_beads) {
-                    // Path is specified relative to beads_dir
-                    if !relative.to_string_lossy().contains("..") {
-                        return validate_extension_and_name(&normalized_path);
-                    }
-                }
-                // Otherwise, try to check as-is
-                normalized_path.clone()
-            }
+    let mut path_to_check = normalized_path.clone();
+    while !path_to_check.exists() {
+        if let Some(parent) = path_to_check.parent() {
+            path_to_check = parent.to_path_buf();
+        } else {
+            break;
         }
-    };
+    }
 
-    // Canonicalize the path (or its parent for new files)
+    // Canonicalize the path (or its deepest existing ancestor for new files)
     let canonical_path = match dunce::canonicalize(&path_to_check) {
         Ok(p) => p,
         Err(e) => {
-            // For non-existent files, we can't canonicalize, so check prefix
-            if !normalized_path.exists() {
-                // Check if the path starts with the beads directory
-                if normalized_path.starts_with(beads_dir)
-                    || normalized_path.starts_with(&canonical_beads)
-                {
-                    return validate_extension_and_name(&normalized_path);
-                }
-            }
             let result = PathValidation::CanonicalizationFailed {
                 path: path.to_path_buf(),
                 error: e.to_string(),
@@ -387,14 +369,8 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
     }
 
     // Verify the path is under the beads directory
-    // For existing files, use the canonical path; for new files, use the parent's canonical + filename
-    let effective_canonical = if normalized_path.exists() {
-        canonical_path
-    } else {
-        canonical_path.join(normalized_path.file_name().unwrap_or_default())
-    };
-
-    if !effective_canonical.starts_with(&canonical_beads) {
+    // If the deepest existing ancestor is under beads_dir, the lexically normalized path is safe.
+    if !canonical_path.starts_with(&canonical_beads) {
         let result = PathValidation::OutsideBeadsDir {
             path: path.to_path_buf(),
             beads_dir: canonical_beads,

@@ -2693,29 +2693,21 @@ pub fn read_issues_from_jsonl(path: &Path) -> Result<Vec<Issue>> {
     let file = File::open(path)?;
     let file_size = file.metadata().map_or(0, |m| m.len());
     let estimated_count = (file_size / 500) as usize;
-    let mut reader = BufReader::new(file);
+    let reader = BufReader::new(file);
     let mut issues = Vec::with_capacity(estimated_count);
-    let mut line = String::new();
-    let mut line_num = 0;
 
-    loop {
-        line.clear();
-        let bytes_read = reader.read_line(&mut line)?;
-        if bytes_read == 0 {
-            break;
+    let iter = serde_json::Deserializer::from_reader(reader).into_iter::<Issue>();
+    for result in iter {
+        match result {
+            Ok(issue) => issues.push(issue),
+            Err(e) => {
+                return Err(BeadsError::Config(format!(
+                    "Invalid JSON at line {}: {}",
+                    e.line(),
+                    e
+                )));
+            }
         }
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            line_num += 1;
-            continue;
-        }
-
-        let issue: Issue = serde_json::from_str(trimmed).map_err(|e| {
-            BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num + 1, e))
-        })?;
-        issues.push(issue);
-        line_num += 1;
     }
 
     Ok(issues)
