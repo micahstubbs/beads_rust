@@ -1043,7 +1043,7 @@ fn e2e_error_multiple_errors_same_exit_code() {
 
     let create = run_br(&workspace, ["create", "Test issue"], "create");
     assert!(create.status.success());
-    let id = parse_created_id(&create.stdout);
+    let _id = parse_created_id(&create.stdout);
 
     // Validation errors should return exit code 4
     // Note: invalid type is NOT tested here because custom types are allowed

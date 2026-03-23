@@ -112,19 +112,10 @@ impl SchemaWorkspace {
     }
 }
 
-/// Check if both br (release binary) and bd are available for schema comparison tests
+/// Check if both br and bd are available for schema comparison tests
 fn binaries_available() -> bool {
-    // Check br release binary exists
-    let target_dir = std::env::var("CARGO_TARGET_DIR")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let manifest_dir =
-                std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-            PathBuf::from(manifest_dir).join("target")
-        });
-    let br_path = target_dir.join("release").join("br");
-    let br_exists = br_path.exists();
+    // Check br binary exists
+    let br_exists = assert_cmd::cargo::cargo_bin!("br").exists();
 
     // Check bd is available
     let bd_available = Command::new("bd")
@@ -146,17 +137,9 @@ macro_rules! skip_if_no_binaries {
 }
 
 fn run_binary(binary: &str, cwd: &PathBuf, args: &[&str]) -> CmdOutput {
-    let cmd_path = if binary == "br" {
-        // Use cargo-built binary, respecting CARGO_TARGET_DIR if set
-        let target_dir = std::env::var("CARGO_TARGET_DIR")
-            .ok()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                let manifest_dir =
-                    std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-                PathBuf::from(manifest_dir).join("target")
-            });
-        target_dir.join("release").join("br")
+    let cmd_path: PathBuf = if binary == "br" {
+        // Use cargo-built binary
+        assert_cmd::cargo::cargo_bin!("br").to_path_buf()
     } else {
         // Use system bd
         PathBuf::from(binary)

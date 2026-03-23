@@ -8,6 +8,7 @@
 //! - Clear errors for missing/invalid routes
 
 use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
 
 mod common;
@@ -73,6 +74,10 @@ fn issue_from_jsonl(workspace: &BrWorkspace, issue_id: &str) -> Value {
         .map(|line| serde_json::from_str::<Value>(line).expect("parse issue jsonl line"))
         .find(|issue| issue["id"].as_str() == Some(issue_id))
         .expect("issue should exist in issues.jsonl")
+}
+
+fn last_touched_path(workspace: &BrWorkspace) -> PathBuf {
+    beads_rust::util::last_touched_path(&workspace.root.join(".beads"))
 }
 
 fn switch_workspace_to_custom_database(workspace: &BrWorkspace, database_name: &str) {
@@ -1346,6 +1351,12 @@ fn e2e_routing_comments_add_and_list_external_issue_via_main_workspace() {
         shown[0]["comments"][0]["text"].as_str(),
         Some("Routed comment")
     );
+
+    let jsonl_issue = issue_from_jsonl(&external_workspace, &external_id);
+    assert_eq!(
+        jsonl_issue["comments"][0]["text"].as_str(),
+        Some("Routed comment")
+    );
 }
 
 #[test]
@@ -1433,6 +1444,208 @@ fn e2e_routing_comments_add_sets_invoking_workspace_last_touched_for_follow_up_u
 }
 
 #[test]
+fn e2e_routing_dep_add_remove_and_list_external_issue_via_main_workspace() {
+    let _log =
+        common::test_log("e2e_routing_dep_add_remove_and_list_external_issue_via_main_workspace");
+
+    let main_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+
+    init_workspace(&main_workspace, "init_main");
+    init_workspace(&external_workspace, "init_external");
+    configure_external_route(&main_workspace, &external_workspace);
+
+    let parent_id = create_issue_and_get_id(
+        &external_workspace,
+        "External dep parent",
+        "create_external_dep_parent",
+    );
+    let child_id = create_issue_and_get_id(
+        &external_workspace,
+        "External dep child",
+        "create_external_dep_child",
+    );
+    let routed_parent = routed_partial_id(&parent_id);
+    let routed_child = routed_partial_id(&child_id);
+
+    let dep_add = run_br(
+        &main_workspace,
+        ["dep", "add", &routed_child, &routed_parent, "--json"],
+        "dep_add_external_via_route",
+    );
+    assert!(
+        dep_add.status.success(),
+        "dep add failed: {}",
+        dep_add.stderr
+    );
+    let added: Value =
+        serde_json::from_str(&extract_json_payload(&dep_add.stdout)).expect("dep add json");
+    assert_eq!(added["issue_id"].as_str(), Some(child_id.as_str()));
+    assert_eq!(added["depends_on_id"].as_str(), Some(parent_id.as_str()));
+    assert_eq!(added["action"].as_str(), Some("added"));
+
+    let dep_list = run_br(
+        &main_workspace,
+        ["dep", "list", &routed_child, "--json"],
+        "dep_list_external_via_route",
+    );
+    assert!(
+        dep_list.status.success(),
+        "dep list failed: {}",
+        dep_list.stderr
+    );
+    let list_json: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&dep_list.stdout)).expect("dep list json");
+    assert!(
+        list_json
+            .iter()
+            .any(|item| item["issue_id"] == child_id && item["depends_on_id"] == parent_id),
+        "routed dependency not listed"
+    );
+
+    let jsonl_issue = issue_from_jsonl(&external_workspace, &child_id);
+    assert_eq!(
+        jsonl_issue["dependencies"][0]["depends_on_id"].as_str(),
+        Some(parent_id.as_str())
+    );
+
+    let dep_remove = run_br(
+        &main_workspace,
+        ["dep", "remove", &routed_child, &routed_parent, "--json"],
+        "dep_remove_external_via_route",
+    );
+    assert!(
+        dep_remove.status.success(),
+        "dep remove failed: {}",
+        dep_remove.stderr
+    );
+    let removed: Value =
+        serde_json::from_str(&extract_json_payload(&dep_remove.stdout)).expect("dep remove json");
+    assert_eq!(removed["issue_id"].as_str(), Some(child_id.as_str()));
+    assert_eq!(removed["depends_on_id"].as_str(), Some(parent_id.as_str()));
+    assert_eq!(removed["action"].as_str(), Some("removed"));
+
+    let dep_list_after = run_br(
+        &main_workspace,
+        ["dep", "list", &routed_child, "--json"],
+        "dep_list_external_after_remove",
+    );
+    assert!(
+        dep_list_after.status.success(),
+        "dep list after remove failed: {}",
+        dep_list_after.stderr
+    );
+    let list_after_json: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&dep_list_after.stdout))
+            .expect("dep list after remove json");
+    assert!(
+        !list_after_json
+            .iter()
+            .any(|item| item["issue_id"] == child_id && item["depends_on_id"] == parent_id),
+        "removed routed dependency still listed"
+    );
+
+    let jsonl_issue_after = issue_from_jsonl(&external_workspace, &child_id);
+    assert_eq!(
+        jsonl_issue_after["dependencies"]
+            .as_array()
+            .map_or(0, Vec::len),
+        0
+    );
+}
+
+#[test]
+fn e2e_routing_dep_add_sets_invoking_workspace_last_touched_for_follow_up_update() {
+    let _log = common::test_log(
+        "e2e_routing_dep_add_sets_invoking_workspace_last_touched_for_follow_up_update",
+    );
+
+    let main_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+
+    init_workspace(&main_workspace, "init_main");
+    init_workspace(&external_workspace, "init_external");
+    configure_external_route(&main_workspace, &external_workspace);
+
+    let parent_id = create_issue_and_get_id(
+        &external_workspace,
+        "External follow-up dep parent",
+        "create_external_follow_up_dep_parent",
+    );
+    let child_id = create_issue_and_get_id(
+        &external_workspace,
+        "External follow-up dep child",
+        "create_external_follow_up_dep_child",
+    );
+    let routed_parent = routed_partial_id(&parent_id);
+    let routed_child = routed_partial_id(&child_id);
+
+    let dep_add = run_br(
+        &main_workspace,
+        ["dep", "add", &routed_child, &routed_parent, "--json"],
+        "dep_add_before_follow_up_update",
+    );
+    assert!(
+        dep_add.status.success(),
+        "dep add failed: {}",
+        dep_add.stderr
+    );
+
+    let update = run_br(
+        &main_workspace,
+        ["update", "--title", "Updated after routed dep", "--json"],
+        "update_follow_up_using_dep_last_touched",
+    );
+    assert!(update.status.success(), "update failed: {}", update.stderr);
+    let updated: Value =
+        serde_json::from_str(&extract_json_payload(&update.stdout)).expect("update json");
+    let updated_array = updated.as_array().expect("update array");
+    assert_eq!(updated_array.len(), 1);
+    assert_eq!(updated_array[0]["id"].as_str(), Some(child_id.as_str()));
+
+    let shown = show_issue_json(
+        &external_workspace,
+        &child_id,
+        "show_external_after_dep_context_update",
+    );
+    assert_eq!(shown[0]["title"].as_str(), Some("Updated after routed dep"));
+}
+
+#[test]
+fn e2e_routing_dep_add_rejects_direct_cross_project_target() {
+    let _log = common::test_log("e2e_routing_dep_add_rejects_direct_cross_project_target");
+
+    let main_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+
+    init_workspace(&main_workspace, "init_main");
+    init_workspace(&external_workspace, "init_external");
+    configure_external_route(&main_workspace, &external_workspace);
+
+    let local_id = create_issue_and_get_id(&main_workspace, "Local dep issue", "create_local_dep");
+    let external_id = create_issue_and_get_id(
+        &external_workspace,
+        "External direct target",
+        "create_external_direct_target",
+    );
+
+    let dep_add = run_br(
+        &main_workspace,
+        ["dep", "add", &local_id, &external_id, "--json"],
+        "dep_add_direct_cross_project_target",
+    );
+    assert!(
+        !dep_add.status.success(),
+        "dep add should reject bare cross-project targets"
+    );
+    assert!(
+        dep_add.stderr.contains("different projects") && dep_add.stderr.contains("external:"),
+        "unexpected stderr: {}",
+        dep_add.stderr
+    );
+}
+
+#[test]
 fn e2e_routing_label_add_failure_does_not_mutate_earlier_batches() {
     let _log = common::test_log("e2e_routing_label_add_failure_does_not_mutate_earlier_batches");
 
@@ -1483,7 +1696,7 @@ fn e2e_routing_label_add_failure_does_not_mutate_earlier_batches() {
         "sentinel create failed: {}",
         create_other.stderr
     );
-    let last_touched_path = main_workspace.root.join(".beads").join("last_touched");
+    let last_touched_path = last_touched_path(&main_workspace);
     let last_touched_before = fs::read_to_string(&last_touched_path).ok();
 
     let label_add = run_br(
@@ -1895,7 +2108,7 @@ fn e2e_routing_update_failure_does_not_print_partial_success() {
         .as_str()
         .expect("local issue id")
         .to_string();
-    let last_touched_path = main_workspace.root.join(".beads").join("last_touched");
+    let last_touched_path = last_touched_path(&main_workspace);
     let last_touched_before = fs::read_to_string(&last_touched_path).ok();
 
     let update = run_br(

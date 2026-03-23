@@ -15,7 +15,7 @@ use crate::util::id::{IdResolver, ResolverConfig};
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Execute the dep command.
 ///
@@ -29,45 +29,156 @@ pub fn execute(
     ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    match command {
+        DepCommands::Add(args) => execute_dep_add(args, json, cli, ctx, &beads_dir),
+        DepCommands::Remove(args) => execute_dep_remove(args, json, cli, ctx, &beads_dir),
+        DepCommands::List(args) => execute_dep_list(args, cli, ctx, &beads_dir),
+        DepCommands::Tree(args) => execute_dep_tree(args, json, cli, ctx, &beads_dir),
+        DepCommands::Cycles(args) => {
+            let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+            dep_cycles(args, &storage_ctx.storage, json, ctx)
+        }
+    }
+}
 
-    let config_layer = storage_ctx.load_config(cli)?;
-    let use_color = config::should_use_color(&config_layer);
-    let quiet = cli.quiet.unwrap_or(false);
+fn execute_dep_add(
+    args: &DepAddArgs,
+    _json: bool,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    local_beads_dir: &Path,
+) -> Result<()> {
+    validate_dependency_target_route(local_beads_dir, &args.issue, &args.depends_on)?;
+    let (mut storage_ctx, route_cli, auto_flush_external) =
+        open_routed_storage_for_input(local_beads_dir, cli, &args.issue)?;
+    let config_layer = storage_ctx.load_config(&route_cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-
     let actor = config::resolve_actor(&config_layer);
+    dep_add(
+        args,
+        &mut storage_ctx,
+        &resolver,
+        &actor,
+        ctx,
+        local_beads_dir,
+        auto_flush_external,
+    )
+}
 
-    let external_db_paths = config::external_project_db_paths(&config_layer, &beads_dir);
+fn execute_dep_remove(
+    args: &DepRemoveArgs,
+    _json: bool,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    local_beads_dir: &Path,
+) -> Result<()> {
+    validate_dependency_target_route(local_beads_dir, &args.issue, &args.depends_on)?;
+    let (mut storage_ctx, route_cli, auto_flush_external) =
+        open_routed_storage_for_input(local_beads_dir, cli, &args.issue)?;
+    let config_layer = storage_ctx.load_config(&route_cli)?;
+    let id_config = config::id_config_from_layer(&config_layer);
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let actor = config::resolve_actor(&config_layer);
+    dep_remove(
+        args,
+        &mut storage_ctx,
+        &resolver,
+        &actor,
+        ctx,
+        local_beads_dir,
+        auto_flush_external,
+    )
+}
 
-    match command {
-        DepCommands::Add(args) => dep_add(args, &mut storage_ctx, &resolver, &actor, json, ctx),
-        DepCommands::Remove(args) => {
-            dep_remove(args, &mut storage_ctx, &resolver, &actor, json, ctx)
-        }
-        DepCommands::List(args) => dep_list(
-            args,
-            &storage_ctx.storage,
-            &resolver,
-            &external_db_paths,
-            ctx,
-            quiet,
-            !use_color,
+fn execute_dep_list(
+    args: &DepListArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    local_beads_dir: &Path,
+) -> Result<()> {
+    let (storage_ctx, route_cli, _) =
+        open_routed_storage_for_input(local_beads_dir, cli, &args.issue)?;
+    let config_layer = storage_ctx.load_config(&route_cli)?;
+    let use_color = config::should_use_color(&config_layer);
+    let quiet = route_cli.quiet.unwrap_or(false);
+    let id_config = config::id_config_from_layer(&config_layer);
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let external_db_paths =
+        config::external_project_db_paths(&config_layer, &storage_ctx.paths.beads_dir);
+
+    dep_list(
+        args,
+        &storage_ctx.storage,
+        &resolver,
+        &external_db_paths,
+        ctx,
+        quiet,
+        !use_color,
+    )
+}
+
+fn execute_dep_tree(
+    args: &DepTreeArgs,
+    _json: bool,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    local_beads_dir: &Path,
+) -> Result<()> {
+    let (storage_ctx, route_cli, _) =
+        open_routed_storage_for_input(local_beads_dir, cli, &args.issue)?;
+    let config_layer = storage_ctx.load_config(&route_cli)?;
+    let id_config = config::id_config_from_layer(&config_layer);
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let external_db_paths =
+        config::external_project_db_paths(&config_layer, &storage_ctx.paths.beads_dir);
+
+    dep_tree(
+        args,
+        &storage_ctx.storage,
+        &resolver,
+        &external_db_paths,
+        false,
+        ctx,
+    )
+}
+
+fn open_routed_storage_for_input(
+    local_beads_dir: &Path,
+    cli: &config::CliOverrides,
+    issue_input: &str,
+) -> Result<(config::OpenStorageResult, config::CliOverrides, bool)> {
+    let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
+    let mut route_cli = cli.clone();
+    if route.is_external {
+        route_cli.db = None;
+    }
+    let storage_ctx = config::open_storage_with_cli(&route.beads_dir, &route_cli)?;
+    Ok((storage_ctx, route_cli, route.is_external))
+}
+
+fn validate_dependency_target_route(
+    local_beads_dir: &Path,
+    issue_input: &str,
+    depends_on_input: &str,
+) -> Result<()> {
+    if depends_on_input.starts_with("external:") {
+        return Ok(());
+    }
+
+    let issue_route = config::routing::resolve_route(issue_input, local_beads_dir)?;
+    let depends_on_route = config::routing::resolve_route(depends_on_input, local_beads_dir)?;
+
+    if issue_route.beads_dir == depends_on_route.beads_dir {
+        return Ok(());
+    }
+
+    Err(BeadsError::validation(
+        "depends_on",
+        format!(
+            "issue '{issue_input}' and dependency target '{depends_on_input}' resolve to different projects; use an explicit external:... dependency for cross-project links"
         ),
-        DepCommands::Tree(args) => dep_tree(
-            args,
-            &storage_ctx.storage,
-            &resolver,
-            &external_db_paths,
-            json,
-            ctx,
-        ),
-        DepCommands::Cycles(args) => dep_cycles(args, &storage_ctx.storage, json, ctx),
-    }?;
-
-    storage_ctx.flush_no_db_if_dirty()?;
-    Ok(())
+    ))
 }
 
 /// JSON output for dep add/remove operations
@@ -121,8 +232,9 @@ fn dep_add(
     storage_ctx: &mut config::OpenStorageResult,
     resolver: &IdResolver,
     actor: &str,
-    _json: bool,
     ctx: &OutputContext,
+    local_beads_dir: &Path,
+    auto_flush_external: bool,
 ) -> Result<()> {
     let issue_id = resolve_issue_id(&storage_ctx.storage, resolver, &args.issue)?;
 
@@ -133,28 +245,7 @@ fn dep_add(
         resolve_issue_id(&storage_ctx.storage, resolver, &args.depends_on)?
     };
 
-    // Parse and validate dependency type
-    let dep_type_str = &args.dep_type;
-    let dep_type: DependencyType = dep_type_str.parse().map_err(|_| BeadsError::Validation {
-        field: "type".to_string(),
-        reason: format!("Invalid dependency type: {dep_type_str}"),
-    })?;
-
-    // Disallow accidental custom types from typos
-    if let DependencyType::Custom(_) = dep_type {
-        // We enforce standard types for reliability unless it looks like a deliberate custom type
-        // For now, let's strictly enforce known types to prevent typos like "parent_child"
-        // which would otherwise be accepted as a non-blocking custom type.
-        return Err(BeadsError::Validation {
-            field: "type".to_string(),
-            reason: format!(
-                "Unknown dependency type: '{dep_type_str}'. \
-                 Allowed types: blocks, parent-child, conditional-blocks, waits-for, \
-                 related, discovered-from, replies-to, relates-to, duplicates, \
-                 supersedes, caused-by"
-            ),
-        });
-    }
+    let dep_type = parse_dependency_type(&args.dep_type)?;
 
     // Self-dependency check
     if issue_id == depends_on_id {
@@ -189,10 +280,15 @@ fn dep_add(
         },
     )?;
 
-    storage_ctx.flush_no_db_then(|ctx| {
-        crate::util::set_last_touched_id(&ctx.paths.beads_dir, &issue_id);
-        Ok(())
-    })?;
+    storage_ctx.flush_no_db_if_dirty()?;
+    if auto_flush_external && let Err(error) = storage_ctx.auto_flush_if_enabled() {
+        tracing::debug!(
+            beads_dir = %storage_ctx.paths.beads_dir.display(),
+            error = %error,
+            "Routed auto-flush failed (non-fatal)"
+        );
+    }
+    crate::util::set_last_touched_id(local_beads_dir, &issue_id);
 
     if ctx.is_json() || ctx.is_toon() {
         let result = DepActionResult {
@@ -249,8 +345,9 @@ fn dep_remove(
     storage_ctx: &mut config::OpenStorageResult,
     resolver: &IdResolver,
     actor: &str,
-    _json: bool,
     ctx: &OutputContext,
+    local_beads_dir: &Path,
+    auto_flush_external: bool,
 ) -> Result<()> {
     let issue_id = resolve_issue_id(&storage_ctx.storage, resolver, &args.issue)?;
 
@@ -271,10 +368,15 @@ fn dep_remove(
         |storage| storage.remove_dependency(&issue_id, &depends_on_id, actor),
     )?;
 
-    storage_ctx.flush_no_db_then(|ctx| {
-        crate::util::set_last_touched_id(&ctx.paths.beads_dir, &issue_id);
-        Ok(())
-    })?;
+    storage_ctx.flush_no_db_if_dirty()?;
+    if auto_flush_external && let Err(error) = storage_ctx.auto_flush_if_enabled() {
+        tracing::debug!(
+            beads_dir = %storage_ctx.paths.beads_dir.display(),
+            error = %error,
+            "Routed auto-flush failed (non-fatal)"
+        );
+    }
+    crate::util::set_last_touched_id(local_beads_dir, &issue_id);
 
     if ctx.is_json() || ctx.is_toon() {
         let result = DepActionResult {
@@ -327,7 +429,7 @@ fn dependency_type_for_pair(
         .map(|dep| dep.dep_type.as_str().to_string()))
 }
 
-fn normalize_dep_type_filter(dep_type: &str) -> Result<String> {
+fn parse_dependency_type(dep_type: &str) -> Result<DependencyType> {
     let parsed: DependencyType = dep_type.parse().map_err(|_| BeadsError::Validation {
         field: "type".to_string(),
         reason: format!("Invalid dependency type: {dep_type}"),
@@ -345,7 +447,11 @@ fn normalize_dep_type_filter(dep_type: &str) -> Result<String> {
         });
     }
 
-    Ok(parsed.as_str().to_string())
+    Ok(parsed)
+}
+
+fn normalize_dep_type_filter(dep_type: &str) -> Result<String> {
+    Ok(parse_dependency_type(dep_type)?.as_str().to_string())
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]

@@ -155,7 +155,7 @@ fn assert_config_error(run: &BrRun, needle: &str, context: &str) {
 }
 
 fn first_issue_id(list_json: &Value) -> String {
-    list_json
+    list_json["issues"]
         .as_array()
         .and_then(|issues| issues.first())
         .and_then(|issue| issue["id"].as_str())
@@ -338,7 +338,7 @@ fn assert_surface_outcome(
             assert_config_error(&run, "Merge conflict markers detected", &context);
         }
         WorkspaceFailureCommandOutcome::FailsInvalidJson => {
-            assert_config_error(&run, "Invalid JSON", &context);
+            assert_config_error(&run, "invalid issue record", &context);
         }
     }
 }

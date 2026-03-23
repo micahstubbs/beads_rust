@@ -49,7 +49,8 @@ fn execute_add(
     ctx: &OutputContext,
     beads_dir: &Path,
 ) -> Result<()> {
-    let (mut storage_ctx, route_cli) = open_routed_storage_for_input(beads_dir, cli, &args.id)?;
+    let (mut storage_ctx, route_cli, auto_flush_external) =
+        open_routed_storage_for_input(beads_dir, cli, &args.id)?;
     let config_layer = storage_ctx.load_config(&route_cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
@@ -65,6 +66,13 @@ fn execute_add(
         |storage| storage.add_comment(&issue_id, &author, &text),
     )?;
     storage_ctx.flush_no_db_if_dirty()?;
+    if auto_flush_external && let Err(error) = storage_ctx.auto_flush_if_enabled() {
+        tracing::debug!(
+            beads_dir = %storage_ctx.paths.beads_dir.display(),
+            error = %error,
+            "Routed auto-flush failed (non-fatal)"
+        );
+    }
     crate::util::set_last_touched_id(beads_dir, &issue_id);
 
     if matches!(ctx.mode(), OutputMode::Quiet) {
@@ -92,7 +100,7 @@ fn execute_list(
     beads_dir: &Path,
     wrap: bool,
 ) -> Result<()> {
-    let (storage_ctx, route_cli) = open_routed_storage_for_input(beads_dir, cli, issue_input)?;
+    let (storage_ctx, route_cli, _) = open_routed_storage_for_input(beads_dir, cli, issue_input)?;
     let config_layer = storage_ctx.load_config(&route_cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
@@ -111,14 +119,14 @@ fn open_routed_storage_for_input(
     local_beads_dir: &Path,
     cli: &config::CliOverrides,
     issue_input: &str,
-) -> Result<(config::OpenStorageResult, config::CliOverrides)> {
+) -> Result<(config::OpenStorageResult, config::CliOverrides, bool)> {
     let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
     let mut route_cli = cli.clone();
     if route.is_external {
         route_cli.db = None;
     }
     let storage_ctx = config::open_storage_with_cli(&route.beads_dir, &route_cli)?;
-    Ok((storage_ctx, route_cli))
+    Ok((storage_ctx, route_cli, route.is_external))
 }
 
 fn prepare_comment_add(

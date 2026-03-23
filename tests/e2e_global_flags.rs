@@ -219,7 +219,8 @@ fn e2e_robot_flag_list() {
     // JSON mode should output valid JSON to stdout
     let payload = extract_json_payload(&list.stdout);
     let json: Value = serde_json::from_str(&payload).expect("json mode should output valid JSON");
-    assert!(json.is_array(), "list should be JSON array");
+    assert!(json.is_object(), "list should be JSON object envelope");
+    assert!(json.get("issues").is_some(), "list envelope should contain 'issues'");
 }
 
 #[test]
@@ -1257,7 +1258,7 @@ fn e2e_quiet_flag_count_and_where() {
     );
     assert_quiet_command(
         &workspace,
-        ["--quiet", "stale", "0"],
+        ["--quiet", "stale", "--days", "0"],
         "stale_quiet",
         "stale --quiet",
     );
