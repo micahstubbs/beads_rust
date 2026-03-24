@@ -1138,14 +1138,25 @@ impl SqliteStorage {
         let from_node = issue_id;
         let to_node = depends_on_id;
 
-        // Build the per-node neighbor query. We only follow Must-Finish-Before (MFB) edges.
+        // Build the per-node neighbor query. We follow edges in the
+        // "blocking" direction which, for standard deps, is forward
+        // (issue_id -> depends_on_id) and for parent-child is reverse
+        // (depends_on_id -> issue_id, because a child blocks its parent
+        // from completing). This matches the graph model used by
+        // `detect_all_cycles`.
         let neighbor_sql = if blocking_only {
             "SELECT depends_on_id FROM dependencies \
-             WHERE issue_id = ? AND type IN ('blocks', 'conditional-blocks', 'waits-for', 'parent-child')"
+             WHERE issue_id = ? AND type IN ('blocks', 'conditional-blocks', 'waits-for') \
+             UNION \
+             SELECT issue_id FROM dependencies \
+             WHERE depends_on_id = ? AND type = 'parent-child'"
                 .to_string()
         } else {
             "SELECT depends_on_id FROM dependencies \
-             WHERE issue_id = ?"
+             WHERE issue_id = ? AND type != 'parent-child' \
+             UNION \
+             SELECT issue_id FROM dependencies \
+             WHERE depends_on_id = ? AND type = 'parent-child'"
                 .to_string()
         };
 
