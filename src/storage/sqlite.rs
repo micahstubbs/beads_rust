@@ -6,7 +6,7 @@ use crate::model::{Comment, DependencyType, Event, EventType, Issue, IssueType, 
 use crate::storage::events::get_events;
 use crate::storage::schema::CURRENT_SCHEMA_VERSION;
 use crate::storage::schema::{
-    apply_runtime_compatible_schema, apply_schema, execute_batch, runtime_schema_compatible,
+    apply_runtime_compatible_schema, apply_schema, runtime_schema_compatible,
 };
 use crate::util::id::{normalize_prefix, parse_id};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
@@ -1135,26 +1135,17 @@ impl SqliteStorage {
         dep_type: Option<&str>,
         blocking_only: bool,
     ) -> Result<bool> {
-        let (from_node, to_node) = if matches!(dep_type, Some("parent-child")) {
-            (depends_on_id, issue_id)
-        } else {
-            (issue_id, depends_on_id)
-        };
+        let from_node = issue_id;
+        let to_node = depends_on_id;
 
         // Build the per-node neighbor query. We only follow Must-Finish-Before (MFB) edges.
         let neighbor_sql = if blocking_only {
             "SELECT depends_on_id FROM dependencies \
-             WHERE issue_id = ? AND type IN ('blocks', 'conditional-blocks', 'waits-for') \
-             UNION \
-             SELECT issue_id FROM dependencies \
-             WHERE depends_on_id = ? AND type = 'parent-child'"
+             WHERE issue_id = ? AND type IN ('blocks', 'conditional-blocks', 'waits-for', 'parent-child')"
                 .to_string()
         } else {
             "SELECT depends_on_id FROM dependencies \
-             WHERE issue_id = ? AND type != 'parent-child' \
-             UNION \
-             SELECT issue_id FROM dependencies \
-             WHERE depends_on_id = ? AND type = 'parent-child'"
+             WHERE issue_id = ?"
                 .to_string()
         };
 
@@ -1669,6 +1660,15 @@ impl SqliteStorage {
         }
 
         self.mutate("purge_issue", actor, |conn, ctx| {
+            let affected_rows = conn.query_with_params(
+                "SELECT DISTINCT issue_id FROM dependencies WHERE depends_on_id = ?",
+                &[SqliteValue::from(id)],
+            )?;
+            let affected: Vec<String> = affected_rows
+                .iter()
+                .filter_map(|r| r.get(0).and_then(SqliteValue::as_text).map(String::from))
+                .collect();
+
             conn.execute_with_params(
                 "DELETE FROM comments WHERE issue_id = ?",
                 &[SqliteValue::from(id)],
@@ -1706,6 +1706,22 @@ impl SqliteStorage {
                 &[SqliteValue::from(id)],
             )?;
             conn.execute_with_params("DELETE FROM issues WHERE id = ?", &[SqliteValue::from(id)])?;
+
+            if !affected.is_empty() {
+                let now = Utc::now().to_rfc3339();
+                for chunk in affected.chunks(400) {
+                    for affected_id in chunk {
+                        conn.execute_with_params(
+                            "UPDATE issues SET updated_at = ? WHERE id = ?",
+                            &[
+                                SqliteValue::from(now.as_str()),
+                                SqliteValue::from(affected_id.as_str()),
+                            ],
+                        )?;
+                        ctx.mark_dirty(affected_id);
+                    }
+                }
+            }
 
             ctx.invalidate_cache();
             ctx.force_flush = true;
@@ -2930,10 +2946,21 @@ impl SqliteStorage {
     fn rebuild_blocked_cache_impl(conn: &Connection) -> Result<usize> {
         let blocked_issues_map = Self::compute_blocked_issues_map_impl(conn)?;
 
-        // `fsqlite` can surface false UNIQUE conflicts while repopulating the
-        // blocked-cache index after a full-table DELETE. Recreate the cache
-        // table instead so the subsequent inserts start from a fresh btree.
-        Self::reset_blocked_cache_table(conn)?;
+        // Avoid DROP TABLE (which causes "database schema has changed" for concurrent readers).
+        // Instead, find entries that are no longer blocked and delete them individually.
+        let existing_rows = conn.query("SELECT issue_id FROM blocked_issues_cache")?;
+        for row in &existing_rows {
+            if let Some(id) = row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .filter(|id| !blocked_issues_map.contains_key(*id))
+            {
+                conn.execute_with_params(
+                    "DELETE FROM blocked_issues_cache WHERE issue_id = ?",
+                    &[SqliteValue::from(id)],
+                )?;
+            }
+        }
 
         let mut entries = Vec::with_capacity(blocked_issues_map.len());
 
@@ -2957,28 +2984,6 @@ impl SqliteStorage {
         Ok(count)
     }
 
-    fn reset_blocked_cache_table(conn: &Connection) -> Result<()> {
-        execute_batch(
-            conn,
-            r"
-            DROP TABLE IF EXISTS blocked_issues_cache;
-            CREATE TABLE blocked_issues_cache (
-                issue_id TEXT PRIMARY KEY,
-                blocked_by TEXT NOT NULL,
-                blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS idx_blocked_cache_blocked_at
-                ON blocked_issues_cache(blocked_at);
-            ",
-        )
-    }
-
-    /// Incremental blocked-cache update: recompute only the entries for the
-    /// given seed issue IDs and their transitive parent-child descendants.
-    ///
-    /// This avoids the full DELETE + INSERT cycle of `rebuild_blocked_cache_impl`
-    /// when only a small number of dependency edges changed.
     fn incremental_blocked_cache_update(
         conn: &Connection,
         seed_ids: &HashSet<String>,
