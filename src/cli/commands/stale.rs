@@ -1,4 +1,5 @@
 use crate::cli::StaleArgs;
+use crate::cli::commands::open_storage_ctx_with_auto_import;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::StaleIssue;
@@ -21,7 +22,7 @@ pub fn execute(args: &StaleArgs, cli: &config::CliOverrides, ctx: &OutputContext
     }
 
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    let storage_ctx = open_storage_ctx_with_auto_import(&beads_dir, cli)?;
     execute_inner(args, ctx, &storage_ctx.storage)
 }
 

@@ -222,6 +222,20 @@ pub(super) fn auto_import_storage_ctx_if_stale(
     .map(|_| ())
 }
 
+/// Open storage and apply the standard stale-JSONL auto-import policy.
+///
+/// Command modules that manage their own storage context need this so direct
+/// entry-point execution matches the main bootstrap path and does not miss
+/// fresher JSONL state when reopening storage.
+pub(super) fn open_storage_ctx_with_auto_import(
+    beads_dir: &std::path::Path,
+    cli: &crate::config::CliOverrides,
+) -> crate::Result<OpenStorageResult> {
+    let mut storage_ctx = crate::config::open_storage_with_cli(beads_dir, cli)?;
+    auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
+    Ok(storage_ctx)
+}
+
 pub(super) fn retry_mutation_with_jsonl_recovery<T, F>(
     storage_ctx: &mut OpenStorageResult,
     allow_recovery: bool,
@@ -300,8 +314,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
-        rebuild_blocked_cache_after_partial_mutation, retry_mutation_with_jsonl_recovery,
+        finalize_batched_blocked_cache_refresh, open_storage_ctx_with_auto_import,
+        preserve_blocked_cache_on_error, rebuild_blocked_cache_after_partial_mutation,
+        retry_mutation_with_jsonl_recovery,
     };
     use crate::config::{CliOverrides, open_storage_with_cli};
     use crate::error::BeadsError;
@@ -311,6 +326,8 @@ mod tests {
     use fsqlite::Connection;
     use fsqlite_error::FrankenError;
     use std::fs;
+    use std::thread;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     #[test]
@@ -469,6 +486,66 @@ mod tests {
                 .get_issue("bd-1")
                 .expect("load issue")
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn open_storage_with_auto_import_imports_newer_jsonl_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        {
+            let storage_ctx =
+                open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage ctx");
+            assert!(
+                storage_ctx
+                    .storage
+                    .get_issue("bd-1")
+                    .expect("probe issue")
+                    .is_none()
+            );
+        }
+
+        thread::sleep(Duration::from_millis(5));
+
+        let issue = Issue {
+            id: "bd-1".to_string(),
+            title: "Imported from JSONL".to_string(),
+            ..Issue::default()
+        };
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&issue).expect("serialize test issue")
+            ),
+        )
+        .expect("write jsonl");
+
+        let plain_storage_ctx =
+            open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("plain storage");
+        assert!(
+            plain_storage_ctx
+                .storage
+                .get_issue("bd-1")
+                .expect("plain probe")
+                .is_none(),
+            "plain open should not auto-import newer JSONL"
+        );
+        drop(plain_storage_ctx);
+
+        let imported_storage_ctx =
+            open_storage_ctx_with_auto_import(&beads_dir, &CliOverrides::default())
+                .expect("auto-import storage");
+        assert!(
+            imported_storage_ctx
+                .storage
+                .get_issue("bd-1")
+                .expect("imported probe")
+                .is_some(),
+            "helper open should import fresher JSONL state"
         );
     }
 }

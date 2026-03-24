@@ -1,7 +1,8 @@
 //! Dependency command implementation.
 
 use super::{
-    auto_import_storage_ctx_if_stale, resolve_issue_id, retry_mutation_with_jsonl_recovery,
+    auto_import_storage_ctx_if_stale, open_storage_ctx_with_auto_import, resolve_issue_id,
+    retry_mutation_with_jsonl_recovery,
 };
 use crate::cli::{
     DepAddArgs, DepCommands, DepCyclesArgs, DepDirection, DepListArgs, DepRemoveArgs, DepTreeArgs,
@@ -37,7 +38,7 @@ pub fn execute(
         DepCommands::List(args) => execute_dep_list(args, cli, ctx, &beads_dir),
         DepCommands::Tree(args) => execute_dep_tree(args, json, cli, ctx, &beads_dir),
         DepCommands::Cycles(args) => {
-            let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+            let storage_ctx = open_storage_ctx_with_auto_import(&beads_dir, cli)?;
             dep_cycles(args, &storage_ctx.storage, json, ctx)
         }
     }

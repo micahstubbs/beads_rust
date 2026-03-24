@@ -5,7 +5,8 @@
 
 use crate::cli::DeleteArgs;
 use crate::cli::commands::{
-    auto_import_storage_ctx_if_stale, resolve_issue_ids, retry_mutation_with_jsonl_recovery,
+    auto_import_storage_ctx_if_stale, open_storage_ctx_with_auto_import, resolve_issue_ids,
+    retry_mutation_with_jsonl_recovery,
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -108,7 +109,7 @@ pub fn execute(
     }
 
     // 2. Open storage
-    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    let mut storage_ctx = open_storage_ctx_with_auto_import(&beads_dir, cli)?;
     let config_layer = storage_ctx.load_config(cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));

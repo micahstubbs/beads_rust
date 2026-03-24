@@ -2,7 +2,9 @@
 //!
 //! Checks issues for missing recommended template sections based on issue type.
 
-use super::{auto_import_storage_ctx_if_stale, resolve_issue_id};
+use super::{
+    auto_import_storage_ctx_if_stale, open_storage_ctx_with_auto_import, resolve_issue_id,
+};
 use crate::cli::LintArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -92,7 +94,7 @@ pub fn execute(
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
 
     let issues = if args.ids.is_empty() {
-        let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+        let storage_ctx = open_storage_ctx_with_auto_import(&beads_dir, cli)?;
         let storage = &storage_ctx.storage;
         let filters = build_filters(args)?;
         storage.list_issues(&filters)?

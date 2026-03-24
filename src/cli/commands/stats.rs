@@ -3,6 +3,7 @@
 //! Shows project statistics including issue counts by status, type, priority,
 //! assignee, and label. Also supports recent activity tracking via git.
 
+use crate::cli::commands::open_storage_ctx_with_auto_import;
 use crate::cli::{OutputFormat, StatsArgs, resolve_output_format_basic_with_outer_mode};
 use crate::config;
 use crate::error::Result;
@@ -77,7 +78,7 @@ fn execute_inner(
     let owned_storage_ctx = if preloaded_storage.is_some() || preloaded_storage_ctx.is_some() {
         None
     } else {
-        Some(config::open_storage_with_cli(beads_dir, cli)?)
+        Some(open_storage_ctx_with_auto_import(beads_dir, cli)?)
     };
     let storage = preloaded_storage
         .or_else(|| preloaded_storage_ctx.map(|ctx| &ctx.storage))

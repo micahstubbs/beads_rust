@@ -2,10 +2,10 @@
 //!
 //! Lists blocked issues from the `blocked_issues_cache`.
 
+use crate::cli::commands::open_storage_ctx_with_auto_import;
 use crate::cli::{BlockedArgs, OutputFormat, resolve_output_format_basic_with_outer_mode};
 use crate::config::{
-    CliOverrides, discover_beads_dir_with_cli, external_project_db_paths, open_storage_with_cli,
-    should_use_color,
+    CliOverrides, discover_beads_dir_with_cli, external_project_db_paths, should_use_color,
 };
 use crate::error::Result;
 use crate::format::{BlockedIssue, BlockedIssueOutput};
@@ -85,7 +85,7 @@ fn execute_inner(
     let owned_storage_ctx = if preloaded_storage.is_some() || preloaded_storage_ctx.is_some() {
         None
     } else {
-        Some(open_storage_with_cli(beads_dir, overrides)?)
+        Some(open_storage_ctx_with_auto_import(beads_dir, overrides)?)
     };
     let storage = preloaded_storage
         .or_else(|| preloaded_storage_ctx.map(|ctx| &ctx.storage))

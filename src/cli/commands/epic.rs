@@ -1,5 +1,6 @@
 //! Epic command implementation.
 
+use crate::cli::commands::open_storage_ctx_with_auto_import;
 use crate::cli::{EpicCloseEligibleArgs, EpicCommands, EpicStatusArgs};
 use crate::config;
 use crate::error::Result;
@@ -36,7 +37,7 @@ fn execute_status(
     ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    let storage_ctx = open_storage_ctx_with_auto_import(&beads_dir, cli)?;
     let storage = &storage_ctx.storage;
     let config_layer = storage_ctx.load_config(cli)?;
     let use_color = config::should_use_color(&config_layer);
@@ -93,7 +94,7 @@ fn execute_close_eligible(
     ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    let mut storage_ctx = open_storage_ctx_with_auto_import(&beads_dir, cli)?;
     let config_layer = storage_ctx.load_config(cli)?;
     let actor = config::resolve_actor(&config_layer);
 

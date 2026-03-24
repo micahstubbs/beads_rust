@@ -3,7 +3,7 @@
 //! Shows issues ready to work on next: open, unblocked, not deferred, not pinned,
 //! not ephemeral.
 
-use super::resolve_issue_id;
+use super::{open_storage_ctx_with_auto_import, resolve_issue_id};
 use crate::cli::{
     OutputFormat, ReadyArgs, SortPolicy, resolve_output_format_basic_with_outer_mode,
 };
@@ -78,7 +78,7 @@ fn execute_inner(
     let owned_storage_ctx = if preloaded_storage.is_some() || preloaded_storage_ctx.is_some() {
         None
     } else {
-        Some(config::open_storage_with_cli(beads_dir, cli)?)
+        Some(open_storage_ctx_with_auto_import(beads_dir, cli)?)
     };
     let storage = preloaded_storage
         .or_else(|| preloaded_storage_ctx.map(|ctx| &ctx.storage))

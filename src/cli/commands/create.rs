@@ -1,4 +1,6 @@
-use super::{resolve_issue_id, retry_mutation_with_jsonl_recovery};
+use super::{
+    open_storage_ctx_with_auto_import, resolve_issue_id, retry_mutation_with_jsonl_recovery,
+};
 use crate::cli::CreateArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -57,7 +59,7 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContex
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
 
     // We open storage even for dry-run to check ID collisions.
-    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    let mut storage_ctx = open_storage_ctx_with_auto_import(&beads_dir, cli)?;
     let layer = storage_ctx.load_config(cli)?;
 
     let config = CreateConfig {
@@ -537,7 +539,7 @@ fn execute_import(
     }
 
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    let mut storage_ctx = open_storage_ctx_with_auto_import(&beads_dir, cli)?;
     let layer = storage_ctx.load_config(cli)?;
 
     let id_config = config::id_config_from_layer(&layer);

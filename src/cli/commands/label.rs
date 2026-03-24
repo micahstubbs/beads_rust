@@ -3,7 +3,8 @@
 //! Provides label management: add, remove, list, list-all, and rename.
 
 use super::{
-    auto_import_storage_ctx_if_stale, resolve_issue_id, retry_mutation_with_jsonl_recovery,
+    auto_import_storage_ctx_if_stale, open_storage_ctx_with_auto_import, resolve_issue_id,
+    retry_mutation_with_jsonl_recovery,
 };
 use crate::cli::{LabelAddArgs, LabelCommands, LabelListArgs, LabelRemoveArgs, LabelRenameArgs};
 use crate::config;
@@ -36,11 +37,11 @@ pub fn execute(
         LabelCommands::Remove(args) => execute_routed_label_remove(args, cli, ctx, &beads_dir),
         LabelCommands::List(args) => execute_label_list_command(args, json, cli, ctx, &beads_dir),
         LabelCommands::ListAll => {
-            let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+            let storage_ctx = open_storage_ctx_with_auto_import(&beads_dir, cli)?;
             label_list_all(&storage_ctx.storage, json, ctx)
         }
         LabelCommands::Rename(args) => {
-            let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+            let mut storage_ctx = open_storage_ctx_with_auto_import(&beads_dir, cli)?;
             let config_layer = storage_ctx.load_config(cli)?;
             let actor = config::resolve_actor(&config_layer);
             label_rename(args, &mut storage_ctx, &actor, json, ctx)
@@ -280,7 +281,7 @@ fn execute_label_list_command(
         let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
         label_list(args, &storage_ctx.storage, &resolver, json, ctx)
     } else {
-        let storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
+        let storage_ctx = open_storage_ctx_with_auto_import(beads_dir, cli)?;
         let config_layer = storage_ctx.load_config(cli)?;
         let id_config = config::id_config_from_layer(&config_layer);
         let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
