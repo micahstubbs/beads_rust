@@ -64,7 +64,7 @@ struct InfoSnapshot {
 /// # Errors
 ///
 /// Returns an error if configuration or storage access fails.
-pub fn execute(args: &InfoArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
+pub fn execute(args: &InfoArgs, ctx: &OutputContext, cli: &config::CliOverrides) -> Result<()> {
     if args.whats_new {
         return print_message(ctx, "No whats-new data available for br.", "whats_new");
     }
@@ -76,11 +76,7 @@ pub fn execute(args: &InfoArgs, cli: &config::CliOverrides, ctx: &OutputContext)
         );
     }
 
-    let output = collect_info_output(args, cli)?;
-
-    if matches!(ctx.mode(), OutputMode::Quiet) {
-        return Ok(());
-    }
+    let output = collect_info_output(args, cli, None)?;
 
     if ctx.is_json() {
         ctx.json_pretty(&output);
@@ -101,8 +97,12 @@ pub fn execute(args: &InfoArgs, cli: &config::CliOverrides, ctx: &OutputContext)
     Ok(())
 }
 
-fn collect_info_output(args: &InfoArgs, cli: &config::CliOverrides) -> Result<InfoOutput> {
-    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+fn collect_info_output(
+    args: &InfoArgs,
+    cli: &config::CliOverrides,
+    start: Option<&std::path::Path>,
+) -> Result<InfoOutput> {
+    let beads_dir = config::discover_beads_dir_with_cli_and_start(start, cli)?;
     let startup = config::load_startup_config_with_paths(&beads_dir, cli.db.as_ref())?;
     let snapshot = load_info_snapshot_without_recovery(args, &startup.paths);
     let resolved_prefix = config::configured_issue_prefix_from_map(&startup.merged_config.runtime)
@@ -475,32 +475,11 @@ mod tests {
     use crate::cli::InfoArgs;
     use crate::config::CliOverrides;
     use crate::storage::SqliteStorage;
-    use crate::storage::schema::CURRENT_SCHEMA_VERSION;
+    use crate::storage::sqlite::CURRENT_SCHEMA_VERSION;
     use std::env;
-    use std::path::Path;
-    use std::path::PathBuf;
-    use std::sync::{LazyLock, Mutex};
+    use std::fs;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
-
-    static TEST_DIR_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    struct DirGuard {
-        previous: PathBuf,
-    }
-
-    impl DirGuard {
-        fn new(target: &Path) -> Self {
-            let previous = env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
-            env::set_current_dir(target).expect("set current dir");
-            Self { previous }
-        }
-    }
-
-    impl Drop for DirGuard {
-        fn drop(&mut self) {
-            let _ = env::set_current_dir(&self.previous);
-        }
-    }
 
     #[test]
     fn test_format_bytes_small() {
@@ -527,9 +506,6 @@ mod tests {
 
     #[test]
     fn test_collect_info_output_does_not_create_missing_db() {
-        let _lock = TEST_DIR_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).unwrap();
@@ -539,9 +515,9 @@ mod tests {
         )
         .unwrap();
 
-        let _guard = DirGuard::new(temp.path());
-
-        let output = collect_info_output(&InfoArgs::default(), &CliOverrides::default()).unwrap();
+        let output =
+            collect_info_output(&InfoArgs::default(), &CliOverrides::default(), Some(&temp))
+                .unwrap();
 
         assert!(
             !beads_dir.join("beads.db").exists(),
@@ -556,9 +532,6 @@ mod tests {
 
     #[test]
     fn test_collect_info_output_reads_existing_db_without_recovery() {
-        let _lock = TEST_DIR_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).unwrap();
@@ -580,14 +553,13 @@ mod tests {
         };
         storage.create_issue(&issue, "test").unwrap();
 
-        let _guard = DirGuard::new(temp.path());
-
         let output = collect_info_output(
             &InfoArgs {
                 schema: true,
                 ..InfoArgs::default()
             },
             &CliOverrides::default(),
+            Some(&temp),
         )
         .unwrap();
 
@@ -639,9 +611,6 @@ mod tests {
 
     #[test]
     fn test_collect_info_output_reports_actual_schema_snapshot() {
-        let _lock = TEST_DIR_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).unwrap();
@@ -657,14 +626,13 @@ mod tests {
             .unwrap();
         conn.execute("PRAGMA user_version = 1").unwrap();
 
-        let _guard = DirGuard::new(temp.path());
-
         let output = collect_info_output(
             &InfoArgs {
                 schema: true,
                 ..InfoArgs::default()
             },
             &CliOverrides::default(),
+            Some(&temp),
         )
         .unwrap();
 
@@ -677,9 +645,6 @@ mod tests {
 
     #[test]
     fn test_collect_info_output_prefers_startup_issue_prefix_over_db_config() {
-        let _lock = TEST_DIR_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).unwrap();
@@ -694,9 +659,9 @@ mod tests {
         let mut storage = SqliteStorage::open(&db_path).unwrap();
         storage.set_config("issue_prefix", "bd").unwrap();
 
-        let _guard = DirGuard::new(temp.path());
-
-        let output = collect_info_output(&InfoArgs::default(), &CliOverrides::default()).unwrap();
+        let output =
+            collect_info_output(&InfoArgs::default(), &CliOverrides::default(), Some(&temp))
+                .unwrap();
 
         assert_eq!(output.resolved_prefix.as_deref(), Some("proj"));
         assert_eq!(
@@ -712,9 +677,6 @@ mod tests {
 
     #[test]
     fn test_collect_info_output_detects_prefix_without_schema_flag() {
-        let _lock = TEST_DIR_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).unwrap();
@@ -737,9 +699,9 @@ mod tests {
         storage.create_issue(&issue, "test").unwrap();
         storage.delete_config("issue_prefix").unwrap();
 
-        let _guard = DirGuard::new(temp.path());
-
-        let output = collect_info_output(&InfoArgs::default(), &CliOverrides::default()).unwrap();
+        let output =
+            collect_info_output(&InfoArgs::default(), &CliOverrides::default(), Some(&temp))
+                .unwrap();
 
         assert_eq!(output.resolved_prefix.as_deref(), Some("proj"));
         assert!(output.schema.is_none());
@@ -754,9 +716,6 @@ mod tests {
 
     #[test]
     fn test_collect_info_output_uses_jsonl_prefix_when_db_is_missing() {
-        let _lock = TEST_DIR_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).unwrap();
@@ -771,9 +730,9 @@ mod tests {
         )
         .unwrap();
 
-        let _guard = DirGuard::new(temp.path());
-
-        let output = collect_info_output(&InfoArgs::default(), &CliOverrides::default()).unwrap();
+        let output =
+            collect_info_output(&InfoArgs::default(), &CliOverrides::default(), Some(&temp))
+                .unwrap();
 
         assert_eq!(output.resolved_prefix.as_deref(), Some("proj"));
         assert!(output.issue_count.is_none());
@@ -783,9 +742,6 @@ mod tests {
 
     #[test]
     fn test_collect_info_output_accepts_startup_prefix_alias() {
-        let _lock = TEST_DIR_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).unwrap();
@@ -796,18 +752,15 @@ mod tests {
         .unwrap();
         std::fs::write(beads_dir.join("config.yaml"), "prefix: proj\n").unwrap();
 
-        let _guard = DirGuard::new(temp.path());
-
-        let output = collect_info_output(&InfoArgs::default(), &CliOverrides::default()).unwrap();
+        let output =
+            collect_info_output(&InfoArgs::default(), &CliOverrides::default(), Some(&temp))
+                .unwrap();
 
         assert_eq!(output.resolved_prefix.as_deref(), Some("proj"));
     }
 
     #[test]
     fn test_collect_info_output_accepts_db_prefix_alias() {
-        let _lock = TEST_DIR_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).unwrap();
@@ -821,9 +774,9 @@ mod tests {
         let mut storage = SqliteStorage::open(&db_path).unwrap();
         storage.set_config("prefix", "proj").unwrap();
 
-        let _guard = DirGuard::new(temp.path());
-
-        let output = collect_info_output(&InfoArgs::default(), &CliOverrides::default()).unwrap();
+        let output =
+            collect_info_output(&InfoArgs::default(), &CliOverrides::default(), Some(&temp))
+                .unwrap();
 
         assert_eq!(output.resolved_prefix.as_deref(), Some("proj"));
         assert_eq!(

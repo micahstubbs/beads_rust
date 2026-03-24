@@ -609,14 +609,14 @@ pub fn execute(args: &AgentsArgs, ctx: &OutputContext) -> Result<()> {
     // from the current state so the user sees what *would* happen.
     if args.dry_run && is_check {
         if ctx.is_json() {
-            return execute_json(&detection, args, ctx);
+            return execute_json(&detection, &work_dir, args, ctx);
         }
         return execute_dry_run_inferred(&detection, &work_dir, ctx);
     }
 
     if is_check || args.check {
         if ctx.is_json() {
-            return execute_json(&detection, args, ctx);
+            return execute_json(&detection, &work_dir, args, ctx);
         }
         return execute_check(&detection, &work_dir, ctx);
     }
@@ -753,17 +753,17 @@ fn execute_dry_run_inferred(
 #[allow(clippy::unnecessary_wraps)]
 fn execute_json(
     detection: &AgentFileDetection,
+    work_dir: &Path,
     args: &AgentsArgs,
     ctx: &OutputContext,
 ) -> Result<()> {
     if args.dry_run {
         let would_action = inferred_dry_run_action(detection);
 
-        let work_dir = std::env::current_dir().unwrap_or_default();
         let target_path = if detection.found() {
             detection.file_path.clone()
         } else {
-            Some(get_preferred_agent_file_path(&work_dir))
+            Some(get_preferred_agent_file_path(work_dir))
         };
 
         let output = serde_json::json!({
@@ -1464,36 +1464,13 @@ fn render_update_success_rich(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output::OutputContext;
     use std::env;
-    use std::sync::Mutex;
     use tempfile::TempDir;
-
-    static TEST_DIR_LOCK: Mutex<()> = Mutex::new(());
-
-    struct DirGuard {
-        previous: PathBuf,
-    }
-
-    impl DirGuard {
-        fn new(target: &Path) -> Self {
-            let previous = env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
-            env::set_current_dir(target).expect("set current dir");
-            Self { previous }
-        }
-    }
-
-    impl Drop for DirGuard {
-        fn drop(&mut self) {
-            let _ = env::set_current_dir(&self.previous);
-        }
-    }
 
     #[test]
     fn test_contains_blurb() {
-        let content = "Some text\n<!-- br-agent-instructions-v1 -->\nblurb\n<!-- end-br-agent-instructions -->";
-        assert!(contains_blurb(content));
-        assert!(!contains_legacy_blurb(content));
+        let blurb = generate_agent_blurb("claude-code");
+        assert!(contains_blurb(&blurb, "claude-code"));
     }
 
     #[test]

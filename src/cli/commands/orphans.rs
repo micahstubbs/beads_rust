@@ -286,7 +286,7 @@ fn execute_inner(
                         suggest_next: false,
                     };
 
-                    if let Err(e) = close::execute_with_args(&close_args, false, cli, ctx) {
+                    if let Err(e) = close::execute_with_args(&close_args, false, cli, ctx, None) {
                         eprintln!("  Failed to close {}: {}", orphan.issue_id, e);
                     }
                 } else {

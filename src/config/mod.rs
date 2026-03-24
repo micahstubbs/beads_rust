@@ -286,6 +286,13 @@ pub fn discover_beads_dir_with_cli(cli: &CliOverrides) -> Result<PathBuf> {
     discover_beads_dir_with_cli_from(None, cli, None, None)
 }
 
+pub(crate) fn discover_beads_dir_with_cli_and_start(
+    start: Option<&Path>,
+    cli: &CliOverrides,
+) -> Result<PathBuf> {
+    discover_beads_dir_with_cli_from(start, cli, None, None)
+}
+
 /// Discover the active `.beads` directory, but allow "no workspace" when no
 /// explicit `--db` target was provided.
 ///

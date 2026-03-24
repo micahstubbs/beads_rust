@@ -203,7 +203,7 @@ fn main() {
         }
         Commands::Sync(args) => commands::sync::execute(&args, cli.json, &overrides, &output_ctx),
         Commands::Doctor(args) => commands::doctor::execute(&args, &overrides, &output_ctx),
-        Commands::Info(args) => commands::info::execute(&args, &overrides, &output_ctx),
+        Commands::Info(args) => commands::info::execute(&args, &output_ctx, &overrides),
         Commands::Schema(args) => commands::schema::execute(&args, &overrides, &output_ctx),
         Commands::Where => commands::r#where::execute(&overrides, &output_ctx),
         Commands::Version(args) => commands::version::execute(&args, &output_ctx),
