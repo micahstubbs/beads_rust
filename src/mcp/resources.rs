@@ -283,6 +283,7 @@ impl ResourceHandler for SchemaResource {
             ],
             "issue_fields": {
                 "id": "string — unique ID (e.g. br-abc123)",
+                // Must match validation::MAX_TITLE_CHARS
                 "title": "string — 1-500 characters",
                 "description": "string|null — detailed description",
                 "status": "string — see statuses above",

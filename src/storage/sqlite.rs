@@ -3046,8 +3046,9 @@ impl SqliteStorage {
         conn: &Connection,
         entries: &[(String, String)],
     ) -> Result<usize> {
+        let unique_entries = Self::dedupe_blocked_cache_batch(entries);
         let mut count = 0;
-        for (issue_id, blockers_json) in entries {
+        for (issue_id, blockers_json) in &unique_entries {
             // Explicit DELETE + INSERT instead of INSERT OR REPLACE because
             // fsqlite does not reliably support UNIQUE constraint upserts.
             conn.execute_with_params(
@@ -3064,6 +3065,22 @@ impl SqliteStorage {
             count += 1;
         }
         Ok(count)
+    }
+
+    fn dedupe_blocked_cache_batch(entries: &[(String, String)]) -> Vec<(String, String)> {
+        let mut deduped: Vec<(String, String)> = Vec::with_capacity(entries.len());
+        let mut positions: HashMap<String, usize> = HashMap::with_capacity(entries.len());
+
+        for (issue_id, blockers_json) in entries {
+            if let Some(position) = positions.get(issue_id).copied() {
+                deduped[position].1.clone_from(blockers_json);
+            } else {
+                positions.insert(issue_id.clone(), deduped.len());
+                deduped.push((issue_id.clone(), blockers_json.clone()));
+            }
+        }
+
+        deduped
     }
 
     fn load_direct_blockers_impl(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {
@@ -9356,6 +9373,48 @@ mod tests {
         let rebuilt = SqliteStorage::rebuild_blocked_cache_impl(&storage.conn).unwrap();
         assert_eq!(rebuilt, 1);
         assert_eq!(storage.get_blockers(&blocked.id).unwrap(), vec![blocker.id]);
+    }
+
+    #[test]
+    fn test_insert_blocked_cache_entries_deduplicates_duplicate_issue_ids_last_value_wins() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = make_issue(
+            "bd-cache-dup",
+            "Cache target",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let inserted = SqliteStorage::insert_blocked_cache_entries(
+            &storage.conn,
+            &[
+                (issue.id.clone(), "[\"bd-blocker-old:open\"]".to_string()),
+                (issue.id.clone(), "[\"bd-blocker-new:open\"]".to_string()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            inserted, 1,
+            "duplicate blocked-cache rows should collapse to one write"
+        );
+
+        let blocked_by = storage
+            .conn
+            .query_row_with_params(
+                "SELECT blocked_by FROM blocked_issues_cache WHERE issue_id = ?",
+                &[SqliteValue::from(issue.id.as_str())],
+            )
+            .unwrap()
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .unwrap()
+            .to_string();
+        assert_eq!(blocked_by, "[\"bd-blocker-new:open\"]");
     }
 
     #[test]
