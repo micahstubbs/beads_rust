@@ -90,8 +90,6 @@ fn execute_routed(
         false,
     );
     let quiet = cli.quiet.unwrap_or(false);
-    let normalized_local_beads_dir =
-        dunce::canonicalize(beads_dir).unwrap_or_else(|_| beads_dir.to_path_buf());
 
     if matches!(
         output_format,
@@ -103,11 +101,13 @@ fn execute_routed(
             batch_args.ids.clone_from(&batch.issue_inputs);
 
             let batch_beads_dir = batch.beads_dir;
-            let normalized_batch_beads_dir =
-                dunce::canonicalize(&batch_beads_dir).unwrap_or_else(|_| batch_beads_dir.clone());
-            let use_preloaded = normalized_batch_beads_dir == normalized_local_beads_dir;
-            let mut batch_cli = cli.clone();
-            batch_cli.db = if use_preloaded { cli.db.clone() } else { None };
+            let use_preloaded = batch_uses_preloaded_storage(
+                &batch_beads_dir,
+                beads_dir,
+                preloaded_storage,
+                preloaded_storage_ctx,
+            );
+            let batch_cli = routed_cli_for_batch(cli, batch.is_external);
             let (batch_details, _) = load_issue_details_for_route(
                 &batch_args,
                 &batch_cli,
@@ -144,11 +144,13 @@ fn execute_routed(
         let mut batch_args = args.clone();
         batch_args.ids.clone_from(&batch.issue_inputs);
 
-        let normalized_batch_beads_dir =
-            dunce::canonicalize(&batch.beads_dir).unwrap_or_else(|_| batch.beads_dir.clone());
-        let use_preloaded = normalized_batch_beads_dir == normalized_local_beads_dir;
-        let mut batch_cli = cli.clone();
-        batch_cli.db = if use_preloaded { cli.db.clone() } else { None };
+        let use_preloaded = batch_uses_preloaded_storage(
+            &batch.beads_dir,
+            beads_dir,
+            preloaded_storage,
+            preloaded_storage_ctx,
+        );
+        let batch_cli = routed_cli_for_batch(cli, batch.is_external);
         let (batch_details, use_color) = load_issue_details_for_route(
             &batch_args,
             &batch_cli,
@@ -317,6 +319,33 @@ fn reorder_routed_items_by_requested_inputs<T>(
             })
         })
         .collect()
+}
+
+fn batch_uses_preloaded_storage(
+    batch_beads_dir: &Path,
+    local_beads_dir: &Path,
+    preloaded_storage: Option<&SqliteStorage>,
+    preloaded_storage_ctx: Option<&config::OpenStorageResult>,
+) -> bool {
+    if let Some(storage_ctx) = preloaded_storage_ctx {
+        return normalize_beads_dir(batch_beads_dir)
+            == normalize_beads_dir(&storage_ctx.paths.beads_dir);
+    }
+
+    preloaded_storage.is_some()
+        && normalize_beads_dir(batch_beads_dir) == normalize_beads_dir(local_beads_dir)
+}
+
+fn normalize_beads_dir(path: &Path) -> PathBuf {
+    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn routed_cli_for_batch(cli: &config::CliOverrides, is_external: bool) -> config::CliOverrides {
+    let mut batch_cli = cli.clone();
+    if is_external {
+        batch_cli.db = None;
+    }
+    batch_cli
 }
 
 fn load_issue_details_for_route(
@@ -809,15 +838,20 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_external_dependency_metadata, build_issue_details_from_jsonl, format_issue_details,
-        reorder_details_by_requested_inputs,
+        apply_external_dependency_metadata, batch_uses_preloaded_storage,
+        build_issue_details_from_jsonl, format_issue_details, reorder_details_by_requested_inputs,
+        routed_cli_for_batch,
     };
+    use crate::config;
     use crate::format::{IssueDetails, IssueWithDependencyMetadata};
     use crate::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use crate::util::id::{IdResolver, ResolverConfig};
     use chrono::{TimeZone, Utc};
     use std::collections::HashMap;
+    use std::fs;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
     use tracing::info;
 
     fn init_logging() {
@@ -1226,5 +1260,59 @@ mod tests {
         info!(
             "test_reorder_details_by_requested_inputs_restores_mixed_route_order: assertions passed"
         );
+    }
+
+    #[test]
+    fn test_batch_uses_preloaded_storage_matches_storage_ctx_target_beads_dir() {
+        let dir = TempDir::new().expect("tempdir");
+        let local_beads = dir.path().join("current/.beads");
+        let external_beads = dir.path().join("external/.beads");
+        fs::create_dir_all(&local_beads).expect("create local beads");
+        fs::create_dir_all(&external_beads).expect("create external beads");
+
+        let storage_ctx =
+            config::open_storage_with_cli(&external_beads, &config::CliOverrides::default())
+                .expect("open external storage");
+
+        assert!(batch_uses_preloaded_storage(
+            &external_beads,
+            &local_beads,
+            None,
+            Some(&storage_ctx),
+        ));
+    }
+
+    #[test]
+    fn test_batch_uses_preloaded_storage_rejects_mismatched_storage_ctx_target() {
+        let dir = TempDir::new().expect("tempdir");
+        let local_beads = dir.path().join("current/.beads");
+        let external_beads = dir.path().join("external/.beads");
+        fs::create_dir_all(&local_beads).expect("create local beads");
+        fs::create_dir_all(&external_beads).expect("create external beads");
+
+        let storage_ctx =
+            config::open_storage_with_cli(&local_beads, &config::CliOverrides::default())
+                .expect("open local storage");
+
+        assert!(!batch_uses_preloaded_storage(
+            &external_beads,
+            &local_beads,
+            None,
+            Some(&storage_ctx),
+        ));
+    }
+
+    #[test]
+    fn test_routed_cli_for_batch_clears_db_override_for_external_routes() {
+        let cli = config::CliOverrides {
+            db: Some(PathBuf::from("/tmp/local.db")),
+            ..Default::default()
+        };
+
+        let local_batch_cli = routed_cli_for_batch(&cli, false);
+        assert_eq!(local_batch_cli.db, cli.db);
+
+        let external_batch_cli = routed_cli_for_batch(&cli, true);
+        assert!(external_batch_cli.db.is_none());
     }
 }
