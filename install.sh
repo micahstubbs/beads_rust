@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Wrap entire script in { } so bash buffers the whole file before executing.
+# This prevents "command not found" errors when run via curl|bash, where bash
+# would otherwise parse and execute function definitions incrementally from stdin.
+{
 #
 # br (beads_rust) installer - Ultra-robust multi-platform installer with beautiful output
 #
@@ -1357,8 +1361,7 @@ main() {
 # Run main only when executed directly (not when sourced for tests).
 # When piped (curl | bash), BASH_SOURCE[0] is empty - we want to run in that case too.
 # The :- syntax provides a default empty string to avoid "unbound variable" with set -u.
-# The outer { ... } ensures bash buffers the call before executing, protecting against
-# truncated downloads in curl|bash pipelines (see PR #126 follow-up).
 if [[ "${BASH_SOURCE[0]:-}" == "${0:-}" ]] || [[ -z "${BASH_SOURCE[0]:-}" ]]; then
-    { main "$@"; }
+    main "$@"
 fi
+} # end of curl|bash safety block — ensures entire script is buffered before execution
