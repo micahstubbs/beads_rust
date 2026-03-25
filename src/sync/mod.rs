@@ -636,9 +636,7 @@ pub fn preflight_export(
     // Check 2: Output path validation (PC-1, PC-2, PC-3, NGI-3)
     if let Some(ref beads_dir) = config.beads_dir {
         // Determine if the path is external (outside .beads/)
-        let canonical_beads = dunce::canonicalize(beads_dir).unwrap_or_else(|_| beads_dir.clone());
-        let is_external =
-            !output_path.starts_with(beads_dir) && !output_path.starts_with(&canonical_beads);
+        let is_external = crate::config::resolved_jsonl_path_is_external(beads_dir, output_path);
 
         match validate_sync_path_with_external(output_path, beads_dir, config.allow_external_jsonl)
         {
@@ -863,9 +861,7 @@ pub fn preflight_import(
     // Check 2: Input path validation (PC-1, PC-2, PC-3, NGI-3)
     if let Some(ref beads_dir) = config.beads_dir {
         // Determine if the path is external (outside .beads/)
-        let canonical_beads = dunce::canonicalize(beads_dir).unwrap_or_else(|_| beads_dir.clone());
-        let is_external =
-            !input_path.starts_with(beads_dir) && !input_path.starts_with(&canonical_beads);
+        let is_external = crate::config::resolved_jsonl_path_is_external(beads_dir, input_path);
 
         match validate_sync_path_with_external(input_path, beads_dir, config.allow_external_jsonl) {
             Ok(()) => {
@@ -2236,6 +2232,34 @@ fn normalize_issue_for_export(issue: &mut Issue) {
                 .then_with(|| left.metadata.cmp(&right.metadata))
                 .then_with(|| left.thread_id.cmp(&right.thread_id))
         });
+
+        // Deduplicate dependencies on export to match import normalization.
+        // Keep the entry with the latest created_at for each (issue_id, depends_on_id) pair.
+        if issue.dependencies.len() > 1 {
+            use std::collections::HashMap;
+            let mut best: HashMap<(&str, &str), usize> = HashMap::new();
+            for (i, dep) in issue.dependencies.iter().enumerate() {
+                let key = (dep.issue_id.as_str(), dep.depends_on_id.as_str());
+                match best.get(&key) {
+                    Some(&prev_idx)
+                        if issue.dependencies[prev_idx].created_at >= dep.created_at =>
+                    {
+                        // existing entry is newer or equal, skip
+                    }
+                    _ => {
+                        best.insert(key, i);
+                    }
+                }
+            }
+            if best.len() < issue.dependencies.len() {
+                let mut keep_indices: Vec<usize> = best.into_values().collect();
+                keep_indices.sort_unstable();
+                issue.dependencies = keep_indices
+                    .into_iter()
+                    .map(|i| issue.dependencies[i].clone())
+                    .collect();
+            }
+        }
     }
 
     if !issue.comments.is_empty() {
@@ -6047,6 +6071,34 @@ mod tests {
         assert!(result.failures().is_empty());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_preflight_import_treats_symlinked_internal_target_as_internal() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+
+        let real_target = beads_dir.join("issues.jsonl");
+        let issue = make_test_issue("bd-001", "Test Issue");
+        let json = serde_json::to_string(&issue).unwrap();
+        std::fs::write(&real_target, format!("{json}\n")).unwrap();
+
+        let symlink_target = temp.path().join("linked-issues.jsonl");
+        symlink(&real_target, &symlink_target).unwrap();
+
+        let config = ImportConfig {
+            beads_dir: Some(beads_dir),
+            allow_external_jsonl: true,
+            ..Default::default()
+        };
+
+        let result = preflight_import(&symlink_target, &config, None).unwrap();
+
+        assert_eq!(result.overall_status, PreflightCheckStatus::Pass);
+        assert!(result.warnings().is_empty());
+        assert!(result.failures().is_empty());
+    }
+
     #[test]
     fn test_preflight_export_passes_with_valid_setup() {
         let temp = TempDir::new().unwrap();
@@ -6069,6 +6121,32 @@ mod tests {
             result.overall_status,
             result.failures()
         );
+        assert!(result.failures().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_preflight_export_treats_symlinked_internal_target_as_internal() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+
+        let real_target = beads_dir.join("issues.jsonl");
+        std::fs::write(&real_target, "").unwrap();
+        let symlink_target = temp.path().join("linked-issues.jsonl");
+        symlink(&real_target, &symlink_target).unwrap();
+
+        let storage = SqliteStorage::open_memory().unwrap();
+        let config = ExportConfig {
+            beads_dir: Some(beads_dir),
+            allow_external_jsonl: true,
+            ..Default::default()
+        };
+
+        let result = preflight_export(&storage, &symlink_target, &config).unwrap();
+
+        assert_eq!(result.overall_status, PreflightCheckStatus::Pass);
+        assert!(result.warnings().is_empty());
         assert!(result.failures().is_empty());
     }
 
