@@ -2278,6 +2278,11 @@ impl SqliteStorage {
             && limit > 0
         {
             let _ = write!(sql, " LIMIT {limit}");
+            if let Some(offset) = filters.offset
+                && offset > 0
+            {
+                let _ = write!(sql, " OFFSET {offset}");
+            }
         }
 
         let rows = self.conn.query_with_params(&sql, &params)?;
@@ -5816,7 +5821,7 @@ impl SqliteStorage {
             closed_by_session: get_non_empty_str(18),
             due_at: get_opt_datetime(19)?,
             defer_until: get_opt_datetime(20)?,
-            external_ref: get_opt_str(21),
+            external_ref: get_non_empty_str(21),
             source_system: get_non_empty_str(22),
             source_repo: get_non_empty_str(23),
             deleted_at: get_opt_datetime(24)?,
