@@ -88,11 +88,26 @@ fn detect_prefix(
     jsonl_path: &Path,
     cli: &config::CliOverrides,
 ) -> Option<String> {
-    if let Ok(startup) = config::load_startup_config_with_paths(beads_dir, cli.db.as_ref())
-        && let Some(prefix) =
-            config::configured_issue_prefix_from_map(&startup.merged_config.runtime)
+    let no_db = if let Ok(startup) =
+        config::load_startup_config_with_paths(beads_dir, cli.db.as_ref())
     {
-        return Some(prefix);
+        let mut effective_startup = startup.merged_config;
+        effective_startup.merge_from(&cli.as_layer());
+
+        if let Some(prefix) = config::configured_issue_prefix_from_map(&effective_startup.runtime) {
+            return Some(prefix);
+        }
+
+        config::no_db_from_layer(&effective_startup).unwrap_or(false)
+    } else {
+        matches!(cli.no_db, Some(true))
+    };
+
+    if no_db {
+        return match inspect_jsonl_prefix(jsonl_path) {
+            JsonlPrefixState::Detected(prefix) => Some(prefix),
+            JsonlPrefixState::Missing | JsonlPrefixState::Mixed => None,
+        };
     }
 
     match inspect_jsonl_prefix(jsonl_path) {
@@ -627,6 +642,30 @@ mod tests {
         assert_eq!(
             detect_prefix(&beads_dir, &db_path, &jsonl_path, &CliOverrides::default()),
             Some("dbpref".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_prefix_prefers_jsonl_prefix_when_cli_no_db_is_true() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("open db");
+        storage.set_config("prefix", "dbpref").expect("set prefix");
+
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::write(&jsonl_path, r#"{"id":"jsonl-abc12","title":"Example"}"#).expect("write jsonl");
+
+        let cli = CliOverrides {
+            no_db: Some(true),
+            ..CliOverrides::default()
+        };
+
+        assert_eq!(
+            detect_prefix(&beads_dir, &db_path, &jsonl_path, &cli),
+            Some("jsonl".to_string())
         );
     }
 }

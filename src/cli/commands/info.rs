@@ -104,9 +104,22 @@ fn collect_info_output(
 ) -> Result<InfoOutput> {
     let beads_dir = config::discover_beads_dir_with_cli_and_start(start, cli)?;
     let startup = config::load_startup_config_with_paths(&beads_dir, cli.db.as_ref())?;
-    let snapshot = load_info_snapshot_without_recovery(args, &startup.paths);
-    let resolved_prefix = config::configured_issue_prefix_from_map(&startup.merged_config.runtime)
-        .or_else(|| snapshot.detected_prefix.clone())
+    let mut effective_startup = startup.merged_config.clone();
+    effective_startup.merge_from(&cli.as_layer());
+    let no_db = config::no_db_from_layer(&effective_startup).unwrap_or(false);
+    let snapshot = if no_db {
+        InfoSnapshot::default()
+    } else {
+        load_info_snapshot_without_recovery(args, &startup.paths)
+    };
+    let resolved_prefix = config::configured_issue_prefix_from_map(&effective_startup.runtime)
+        .or_else(|| {
+            if no_db {
+                None
+            } else {
+                snapshot.detected_prefix.clone()
+            }
+        })
         .or_else(|| {
             config::first_prefix_from_jsonl(&startup.paths.jsonl_path)
                 .ok()
@@ -802,5 +815,92 @@ mod tests {
                 .map(String::as_str),
             Some("proj")
         );
+    }
+
+    #[test]
+    fn test_collect_info_output_prefers_jsonl_prefix_when_startup_no_db_is_true() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        std::fs::write(
+            beads_dir.join("metadata.json"),
+            r#"{"database":"beads.db","jsonl_export":"issues.jsonl"}"#,
+        )
+        .unwrap();
+        std::fs::write(beads_dir.join("config.yaml"), "no-db: true\n").unwrap();
+        std::fs::write(
+            beads_dir.join("issues.jsonl"),
+            r#"{"id":"jsonl-abc12","title":"Example"}"#,
+        )
+        .unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage.set_config("prefix", "dbpref").unwrap();
+
+        let output = collect_info_output(
+            &InfoArgs::default(),
+            &CliOverrides::default(),
+            Some(temp.path()),
+        )
+        .unwrap();
+
+        assert_eq!(output.resolved_prefix.as_deref(), Some("jsonl"));
+        assert_eq!(
+            output
+                .config
+                .as_ref()
+                .and_then(|config| config.get("prefix"))
+                .map(String::as_str),
+            Some("dbpref"),
+            "serialized DB details remain informative even when no-db is active"
+        );
+    }
+
+    #[test]
+    fn test_collect_info_output_omits_db_snapshot_fields_when_cli_no_db_is_true() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        std::fs::write(
+            beads_dir.join("metadata.json"),
+            r#"{"database":"beads.db","jsonl_export":"issues.jsonl"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            beads_dir.join("issues.jsonl"),
+            r#"{"id":"jsonl-abc12","title":"Example"}"#,
+        )
+        .unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage.set_config("prefix", "dbpref").unwrap();
+        let issue = crate::model::Issue {
+            id: "dbpref-abc12".to_string(),
+            title: "Example from DB".to_string(),
+            issue_type: crate::model::IssueType::Task,
+            priority: crate::model::Priority::LOW,
+            ..crate::model::Issue::default()
+        };
+        storage.create_issue(&issue, "test").unwrap();
+
+        let output = collect_info_output(
+            &InfoArgs {
+                schema: true,
+                ..InfoArgs::default()
+            },
+            &CliOverrides {
+                no_db: Some(true),
+                ..CliOverrides::default()
+            },
+            Some(temp.path()),
+        )
+        .unwrap();
+
+        assert_eq!(output.resolved_prefix.as_deref(), Some("jsonl"));
+        assert!(output.issue_count.is_none());
+        assert!(output.config.is_none());
+        assert!(output.schema.is_none());
     }
 }
