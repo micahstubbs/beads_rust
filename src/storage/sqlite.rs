@@ -626,6 +626,12 @@ impl SqliteStorage {
                 Ok(result) => {
                     match self.conn.execute("COMMIT") {
                         Ok(_) => {
+                            // Force fsqlite to refresh its memdb read snapshot so
+                            // subsequent reads on this connection see the committed
+                            // data.  Without this probe, auto-flush after close can
+                            // export stale pre-mutation values (issue #204).
+                            let _ = self.conn.query("SELECT 1 FROM metadata LIMIT 1");
+
                             // Periodic WAL checkpoint to prevent unbounded WAL growth
                             self.mutation_count += 1;
                             if self.mutation_count >= WAL_CHECKPOINT_INTERVAL {
