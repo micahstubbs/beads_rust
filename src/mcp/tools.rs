@@ -19,7 +19,9 @@ use crate::config::OpenStorageResult;
 use crate::error::{ErrorCode, StructuredError};
 use crate::model::{Issue, IssueType, Priority, Status};
 use crate::storage::{IssueUpdate, ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
-use crate::validation::MAX_TITLE_CHARS;
+use crate::validation::{
+    MAX_DESCRIPTION_BYTES, MAX_ESTIMATED_MINUTES, MAX_EXTERNAL_REF_CHARS, MAX_TITLE_CHARS,
+};
 
 use super::{BeadsState, persist_mcp_mutation};
 
@@ -585,6 +587,13 @@ fn parse_update_fields(
         updates.title = Some(title.to_string());
     }
     updates.description = nullable_str(args, "description")?;
+    if let Some(Some(ref desc)) = updates.description
+        && desc.len() > MAX_DESCRIPTION_BYTES
+    {
+        return Err(McpError::invalid_params(format!(
+            "description exceeds maximum size of {MAX_DESCRIPTION_BYTES} bytes"
+        )));
+    }
     if let Some(s) = args.get("status").and_then(|v| v.as_str()) {
         let (status, warning) = parse_status(s)?;
 
@@ -662,6 +671,11 @@ fn parse_update_fields(
         } else if let Some(n) = v.as_i64() {
             let mins = i32::try_from(n)
                 .map_err(|_| McpError::invalid_params("estimated_minutes must fit in i32"))?;
+            if !(0..=MAX_ESTIMATED_MINUTES).contains(&mins) {
+                return Err(McpError::invalid_params(format!(
+                    "estimated_minutes must be 0-{MAX_ESTIMATED_MINUTES}"
+                )));
+            }
             updates.estimated_minutes = Some(Some(mins));
         } else if let Some(s) = v.as_str() {
             // Forgive by Default: coerce string → integer
@@ -670,6 +684,11 @@ fn parse_update_fields(
                     "'estimated_minutes' must be an integer, got string '{s}'"
                 ))
             })?;
+            if !(0..=MAX_ESTIMATED_MINUTES).contains(&mins) {
+                return Err(McpError::invalid_params(format!(
+                    "estimated_minutes must be 0-{MAX_ESTIMATED_MINUTES}"
+                )));
+            }
             coercions.push(format!(
                 "estimated_minutes: string '{s}' coerced to integer {mins}"
             ));
@@ -681,6 +700,18 @@ fn parse_update_fields(
         }
     }
     updates.external_ref = nullable_str(args, "external_ref")?;
+    if let Some(Some(ref ext_ref)) = updates.external_ref {
+        if ext_ref.chars().count() > MAX_EXTERNAL_REF_CHARS {
+            return Err(McpError::invalid_params(format!(
+                "external_ref exceeds {MAX_EXTERNAL_REF_CHARS} characters"
+            )));
+        }
+        if ext_ref.chars().any(char::is_whitespace) {
+            return Err(McpError::invalid_params(
+                "external_ref cannot contain whitespace",
+            ));
+        }
+    }
 
     Ok((updates, coercions))
 }
@@ -1165,6 +1196,14 @@ impl ToolHandler for CreateIssueTool {
         if title.is_empty() || title.chars().count() > MAX_TITLE_CHARS {
             return Err(McpError::invalid_params(format!(
                 "Title must be 1-{MAX_TITLE_CHARS} characters",
+            )));
+        }
+
+        if let Some(desc) = args.get("description").and_then(|v| v.as_str())
+            && desc.len() > MAX_DESCRIPTION_BYTES
+        {
+            return Err(McpError::invalid_params(format!(
+                "description exceeds maximum size of {MAX_DESCRIPTION_BYTES} bytes"
             )));
         }
 
