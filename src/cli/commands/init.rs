@@ -2,13 +2,15 @@ use crate::error::{BeadsError, Result};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
 use crate::util::db_path;
+use crate::util::id::DEFAULT_ID_PREFIX;
 use rich_rust::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Resolve the beads directory for init.
 ///
-/// Honors `BEADS_DIR` env var if set, otherwise falls back to `base_dir/.beads`.
+/// Honors `BEADS_DIR` env var if set, otherwise reuses an existing workspace
+/// directory (`.beads` or `_beads`) before falling back to `base_dir/.beads`.
 fn resolve_init_beads_dir(base_dir: &Path) -> PathBuf {
     if let Ok(value) = std::env::var("BEADS_DIR") {
         let trimmed = value.trim();
@@ -16,7 +18,22 @@ fn resolve_init_beads_dir(base_dir: &Path) -> PathBuf {
             return PathBuf::from(trimmed);
         }
     }
+
+    for candidate in [base_dir.join(".beads"), base_dir.join("_beads")] {
+        if candidate.is_dir() {
+            return candidate;
+        }
+    }
+
     base_dir.join(".beads")
+}
+
+fn beads_dir_label(beads_dir: &Path) -> String {
+    beads_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map_or_else(|| ".beads".to_string(), str::to_string)
 }
 
 /// Execute the init command.
@@ -62,7 +79,7 @@ pub fn execute(
     // Set prefix in config table if provided, otherwise derive from directory name
     // Normalize to lowercase since ID validation requires lowercase prefixes
     let actual_prefix = prefix.unwrap_or_else(|| {
-        let mut dir_name = "br".to_string();
+        let mut dir_name = DEFAULT_ID_PREFIX.to_string();
         if let Ok(canon) = dunce::canonicalize(base_dir)
             && let Some(name) = canon.file_name().and_then(|n| n.to_str())
         {
@@ -167,6 +184,7 @@ redirect
 
     if matches!(ctx.mode(), OutputMode::Rich) {
         let steps = build_init_steps(
+            &beads_dir_label(&beads_dir),
             created_dir,
             db_existed,
             metadata_existed,
@@ -201,6 +219,7 @@ struct InitStep {
 
 #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
 fn build_init_steps(
+    beads_dir_name: &str,
     created_dir: bool,
     db_existed: bool,
     metadata_existed: bool,
@@ -213,7 +232,7 @@ fn build_init_steps(
     let mut steps = Vec::new();
 
     steps.push(InitStep {
-        label: ".beads/ directory".to_string(),
+        label: format!("{beads_dir_name}/ directory"),
         status: if created_dir {
             InitStepStatus::Created
         } else {
@@ -286,6 +305,7 @@ fn render_init_rich(
     ctx: &OutputContext,
 ) {
     let theme = ctx.theme();
+    let beads_dir_name = beads_dir_label(beads_dir);
     let mut content = Text::new("");
 
     content.append_styled("Workspace initialized\n", theme.emphasis.clone());
@@ -302,7 +322,7 @@ fn render_init_rich(
 
     content.append("\n");
     content.append_styled("Layout:\n", theme.emphasis.clone());
-    content.append("  .beads/\n");
+    content.append(&format!("  {beads_dir_name}/\n"));
     content.append("    |-- beads.db\n");
     content.append("    |-- metadata.json\n");
     content.append("    |-- config.yaml\n");
@@ -477,5 +497,21 @@ mod tests {
         assert!(content.contains("*.db-shm"));
         assert!(content.contains("*.lock"));
         info!("test_gitignore_excludes_db_files: assertions passed");
+    }
+
+    #[test]
+    fn test_init_reuses_existing_underscore_beads_directory() {
+        init_logging();
+        info!("test_init_reuses_existing_underscore_beads_directory: starting");
+        let temp_dir = TempDir::new().unwrap();
+        fs::create_dir(temp_dir.path().join("_beads")).unwrap();
+
+        let ctx = OutputContext::from_flags(false, false, true);
+        let result = execute(None, false, Some(temp_dir.path()), &ctx);
+
+        assert!(result.is_ok());
+        assert!(temp_dir.path().join("_beads/beads.db").exists());
+        assert!(!temp_dir.path().join(".beads").exists());
+        info!("test_init_reuses_existing_underscore_beads_directory: assertions passed");
     }
 }

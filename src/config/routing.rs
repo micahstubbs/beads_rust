@@ -268,6 +268,26 @@ fn canonicalize_redirect_path(path: &Path) -> PathBuf {
     dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn project_beads_dir(root: &Path, preferred_name: Option<&std::ffi::OsStr>) -> PathBuf {
+    let preferred_name = preferred_name.filter(|name| super::is_beads_dir_name(name));
+    let preferred = preferred_name.unwrap_or_else(|| std::ffi::OsStr::new(".beads"));
+    let preferred_path = root.join(preferred);
+    if preferred_path.is_dir() {
+        return preferred_path;
+    }
+
+    let alternate_path = if preferred == std::ffi::OsStr::new(".beads") {
+        root.join("_beads")
+    } else {
+        root.join(".beads")
+    };
+    if alternate_path.is_dir() {
+        return alternate_path;
+    }
+
+    preferred_path
+}
+
 /// Resolve the target beads directory for an issue ID.
 ///
 /// # Resolution Process
@@ -302,7 +322,7 @@ pub fn resolve_route(issue_id: &str, local_beads_dir: &Path) -> Result<RoutingRe
 
     // Find and search town root if different
     if let Some(town_root) = find_town_root(project_root) {
-        let town_beads_dir = town_root.join(".beads");
+        let town_beads_dir = project_beads_dir(&town_root, local_beads_dir.file_name());
         if town_beads_dir != *local_beads_dir && town_beads_dir.is_dir() {
             let town_routes_path = town_beads_dir.join("routes.jsonl");
             let town_routes = load_routes(&town_routes_path)?;
@@ -357,7 +377,7 @@ fn resolve_route_entry(
 ) -> Result<RoutingResult> {
     let target_path = if route.path == "." {
         // Town-level beads
-        base_dir.join(".beads")
+        project_beads_dir(base_dir, local_beads_dir.file_name())
     } else {
         let path = PathBuf::from(&route.path);
         let resolved = if path.is_absolute() {
@@ -370,12 +390,12 @@ fn resolve_route_entry(
         if resolved.file_name().is_some_and(super::is_beads_dir_name) {
             resolved
         } else {
-            resolved.join(".beads")
+            project_beads_dir(&resolved, local_beads_dir.file_name())
         }
     };
 
     // Follow redirects
-    let final_path = follow_redirects(&target_path, 10)?;
+    let final_path = follow_redirects(&target_path, super::MAX_REDIRECT_DEPTH)?;
     let normalized_final_path =
         dunce::canonicalize(&final_path).unwrap_or_else(|_| final_path.clone());
     let normalized_local_beads_dir =
@@ -644,6 +664,30 @@ mod tests {
     }
 
     #[test]
+    fn resolve_route_with_local_route_supports_underscore_beads_project_roots() {
+        let dir = TempDir::new().unwrap();
+
+        let local_beads = dir.path().join("current/_beads");
+        fs::create_dir_all(&local_beads).unwrap();
+
+        let target_beads = dir.path().join("frontend/_beads");
+        fs::create_dir_all(&target_beads).unwrap();
+
+        fs::write(
+            local_beads.join("routes.jsonl"),
+            r#"{"prefix":"fe-","path":"../frontend"}"#,
+        )
+        .unwrap();
+
+        let result = resolve_route("fe-abc", &local_beads).unwrap();
+        assert_eq!(
+            result.beads_dir,
+            dunce::canonicalize(&target_beads).unwrap()
+        );
+        assert!(result.is_external);
+    }
+
+    #[test]
     fn group_issue_inputs_by_route_preserves_first_seen_batch_order() {
         let dir = TempDir::new().unwrap();
         let local_beads = dir.path().join("current/.beads");
@@ -755,5 +799,33 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let result = find_town_root(dir.path());
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_route_reads_town_routes_from_underscore_beads_dir() {
+        let dir = TempDir::new().unwrap();
+
+        let town_root = dir.path().join("town");
+        fs::create_dir_all(town_root.join("mayor")).unwrap();
+        fs::write(town_root.join("mayor/town.json"), "{}").unwrap();
+        fs::create_dir_all(town_root.join("_beads")).unwrap();
+
+        let local_beads = town_root.join("projects/current/_beads");
+        let target_beads = town_root.join("frontend/_beads");
+        fs::create_dir_all(&local_beads).unwrap();
+        fs::create_dir_all(&target_beads).unwrap();
+
+        fs::write(
+            town_root.join("_beads").join("routes.jsonl"),
+            r#"{"prefix":"fe-","path":"frontend"}"#,
+        )
+        .unwrap();
+
+        let result = resolve_route("fe-abc", &local_beads).unwrap();
+        assert_eq!(
+            result.beads_dir,
+            dunce::canonicalize(&target_beads).unwrap()
+        );
+        assert!(result.is_external);
     }
 }

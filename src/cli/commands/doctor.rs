@@ -69,20 +69,6 @@ struct LocalRepairResult {
 }
 
 const BLOCKED_CACHE_STALE_FINDING: &str = "blocked_issues_cache is marked stale and needs rebuild";
-const ROOT_GITIGNORE_OFFENDING_PATTERNS: &[&str] = &[
-    ".beads",
-    ".beads/",
-    ".beads/*",
-    ".beads/**",
-    ".beads/.gitignore",
-    "/.beads",
-    "/.beads/",
-    "/.beads/*",
-    "/.beads/**",
-    "/.beads/.gitignore",
-];
-const ROOT_GITIGNORE_REPAIR_MESSAGE: &str =
-    "Removed offending .beads ignore pattern(s) from root .gitignore";
 const NO_OP_REPAIR_MESSAGE: &str = "No errors detected; nothing to repair.";
 const REINDEX_INCOMPLETE_MESSAGE: &str = "REINDEX was attempted but did not complete.";
 
@@ -233,15 +219,110 @@ fn local_repair_message(local_repair: &LocalRepairResult) -> String {
     }
 }
 
-fn is_offending_root_gitignore_pattern(line: &str) -> bool {
+fn beads_dir_marker(beads_dir: &Path) -> String {
+    beads_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| *name == ".beads" || *name == "_beads")
+        .map_or_else(|| ".beads".to_string(), str::to_string)
+}
+
+fn root_gitignore_offending_patterns(beads_dir: &Path) -> Vec<String> {
+    let marker = beads_dir_marker(beads_dir);
+    vec![
+        marker.clone(),
+        format!("{marker}/"),
+        format!("{marker}/*"),
+        format!("{marker}/**"),
+        format!("{marker}/.gitignore"),
+        format!("/{marker}"),
+        format!("/{marker}/"),
+        format!("/{marker}/*"),
+        format!("/{marker}/**"),
+        format!("/{marker}/.gitignore"),
+    ]
+}
+
+fn root_gitignore_repair_message(beads_dir: &Path) -> String {
+    format!(
+        "Removed offending {} ignore pattern(s) from root .gitignore",
+        beads_dir_marker(beads_dir)
+    )
+}
+
+fn beads_workspace_label(beads_dir: &Path) -> String {
+    format!("{}/", beads_dir_marker(beads_dir))
+}
+
+fn merge_artifacts_message(beads_dir: &Path) -> String {
+    format!(
+        "Merge artifacts detected in {}",
+        beads_workspace_label(beads_dir)
+    )
+}
+
+fn jsonl_inside_workspace_remediation(beads_dir: &Path) -> String {
+    format!(
+        "Move JSONL file inside {} directory",
+        beads_workspace_label(beads_dir)
+    )
+}
+
+fn jsonl_external_path_remediation(beads_dir: &Path) -> String {
+    format!(
+        "Use --allow-external-jsonl flag or move JSONL inside {}",
+        beads_workspace_label(beads_dir)
+    )
+}
+
+fn jsonl_external_manual_sync_remediation(beads_dir: &Path) -> String {
+    format!(
+        "Move JSONL inside {}, place the database beside it, or pass --allow-external-jsonl for manual sync commands",
+        beads_workspace_label(beads_dir)
+    )
+}
+
+fn jsonl_symlink_remediation(beads_dir: &Path) -> String {
+    format!(
+        "Remove symlink and use a regular file inside {}",
+        beads_workspace_label(beads_dir)
+    )
+}
+
+fn jsonl_outside_workspace_message(beads_dir: &Path) -> String {
+    format!(
+        "JSONL path is outside {} directory",
+        beads_workspace_label(beads_dir)
+    )
+}
+
+fn jsonl_symlink_escape_message(beads_dir: &Path) -> String {
+    format!(
+        "JSONL path is a symlink pointing outside {}",
+        beads_workspace_label(beads_dir)
+    )
+}
+
+fn missing_jsonl_message(beads_dir: &Path) -> String {
+    let workspace = beads_workspace_label(beads_dir);
+    format!(
+        "No JSONL file found ({}issues.jsonl or {}beads.jsonl)",
+        workspace, workspace
+    )
+}
+
+fn is_offending_root_gitignore_pattern(line: &str, beads_dir: &Path) -> bool {
     let trimmed = line.trim();
     !trimmed.is_empty()
         && !trimmed.starts_with('#')
         && !trimmed.starts_with('!')
-        && ROOT_GITIGNORE_OFFENDING_PATTERNS.contains(&trimmed)
+        && root_gitignore_offending_patterns(beads_dir)
+            .iter()
+            .any(|pattern| pattern == trimmed)
 }
 
 fn repair_outcome_message(
+    beads_dir: &Path,
     gitignore_repaired: bool,
     local_repair: Option<&LocalRepairResult>,
     incomplete_attempt_message: Option<&str>,
@@ -249,7 +330,7 @@ fn repair_outcome_message(
     let mut messages = Vec::new();
 
     if gitignore_repaired {
-        messages.push(ROOT_GITIGNORE_REPAIR_MESSAGE.to_string());
+        messages.push(root_gitignore_repair_message(beads_dir));
     }
 
     if let Some(repair) = local_repair {
@@ -1430,7 +1511,7 @@ fn check_merge_artifacts(beads_dir: &Path, checks: &mut Vec<CheckResult>) -> Res
             checks,
             "jsonl.merge_artifacts",
             CheckStatus::Warn,
-            Some("Merge artifacts detected in .beads/".to_string()),
+            Some(merge_artifacts_message(beads_dir)),
             Some(serde_json::json!({ "files": artifacts })),
         );
     }
@@ -1438,13 +1519,14 @@ fn check_merge_artifacts(beads_dir: &Path, checks: &mut Vec<CheckResult>) -> Res
 }
 
 /// Check whether the project root `.gitignore` contains a pattern that would
-/// hide `.beads/.gitignore`, preventing git from reading br's ignore rules.
-/// This commonly happens during bd-to-br migration where the old `.gitignore`
-/// included patterns like `.beads/`, `.beads/*`, or `.beads/.gitignore`.
+/// hide the workspace-local `.gitignore`, preventing git from reading br's
+/// ignore rules. This commonly happens during bd-to-br migration where the old
+/// root `.gitignore` still excludes the workspace directory directly.
 fn check_root_gitignore(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     let Some(project_root) = beads_dir.parent() else {
         return;
     };
+    let beads_dir_name = beads_dir_marker(beads_dir);
     let gitignore_path = project_root.join(".gitignore");
     let Ok(content) = fs::read_to_string(&gitignore_path) else {
         // No .gitignore is fine — nothing to warn about.
@@ -1453,7 +1535,7 @@ fn check_root_gitignore(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
 
     let offending: Vec<String> = content
         .lines()
-        .filter(|line| is_offending_root_gitignore_pattern(line))
+        .filter(|line| is_offending_root_gitignore_pattern(line, beads_dir))
         .map(String::from)
         .collect();
 
@@ -1465,7 +1547,7 @@ fn check_root_gitignore(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
             "gitignore.beads_inner",
             CheckStatus::Warn,
             Some(format!(
-                "Root .gitignore excludes .beads/.gitignore — br's ignore rules are ineffective. \
+                "Root .gitignore excludes {beads_dir_name}/.gitignore — br's ignore rules are ineffective. \
                  Remove the offending line(s) from .gitignore to fix: {}",
                 offending.join(", ")
             )),
@@ -1501,7 +1583,7 @@ fn fix_root_gitignore_if_warned(
 
     let filtered: Vec<&str> = content
         .lines()
-        .filter(|line| !is_offending_root_gitignore_pattern(line))
+        .filter(|line| !is_offending_root_gitignore_pattern(line, beads_dir))
         .collect();
     let mut new_content = filtered.join("\n");
     if content.ends_with('\n') {
@@ -1515,7 +1597,7 @@ fn fix_root_gitignore_if_warned(
         false
     } else {
         if !ctx.is_json() {
-            ctx.info(ROOT_GITIGNORE_REPAIR_MESSAGE);
+            ctx.info(&root_gitignore_repair_message(beads_dir));
         }
         true
     }
@@ -1661,7 +1743,12 @@ fn check_db_count(
 /// 2. Is within the .beads directory, or passes the configured external-path policy
 /// 3. Has an allowed extension
 #[allow(clippy::too_many_lines)]
-fn check_sync_jsonl_path(jsonl_path: &Path, beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+fn check_sync_jsonl_path(
+    jsonl_path: &Path,
+    beads_dir: &Path,
+    db_path: &Path,
+    checks: &mut Vec<CheckResult>,
+) {
     let check_name = "sync_jsonl_path";
 
     // 1. Check if path is valid UTF-8
@@ -1678,7 +1765,7 @@ fn check_sync_jsonl_path(jsonl_path: &Path, beads_dir: &Path, checks: &mut Vec<C
                 Some(serde_json::json!({
                     "path": jsonl_path.display().to_string(),
                     "reason": reason,
-                    "remediation": "Move JSONL file inside .beads/ directory"
+                    "remediation": jsonl_inside_workspace_remediation(beads_dir)
                 })),
             );
             return;
@@ -1686,8 +1773,10 @@ fn check_sync_jsonl_path(jsonl_path: &Path, beads_dir: &Path, checks: &mut Vec<C
 
         let is_external = config::resolved_jsonl_path_is_external(beads_dir, jsonl_path);
         if is_external {
+            let implicit_external =
+                config::implicit_external_jsonl_allowed(beads_dir, db_path, jsonl_path);
             match validate_sync_path_with_external(jsonl_path, beads_dir, true) {
-                Ok(()) => {
+                Ok(()) if implicit_external => {
                     push_check(
                         checks,
                         check_name,
@@ -1696,7 +1785,28 @@ fn check_sync_jsonl_path(jsonl_path: &Path, beads_dir: &Path, checks: &mut Vec<C
                         Some(serde_json::json!({
                             "path": jsonl_path.display().to_string(),
                             "beads_dir": beads_dir.display().to_string(),
-                            "external": true
+                            "db_path": db_path.display().to_string(),
+                            "external": true,
+                            "implicit_allow_external_jsonl": true
+                        })),
+                    );
+                }
+                Ok(()) => {
+                    push_check(
+                        checks,
+                        check_name,
+                        CheckStatus::Warn,
+                        Some(
+                            "Configured JSONL path is external and requires --allow-external-jsonl or an external sibling database"
+                                .to_string(),
+                        ),
+                        Some(serde_json::json!({
+                            "path": jsonl_path.display().to_string(),
+                            "beads_dir": beads_dir.display().to_string(),
+                            "db_path": db_path.display().to_string(),
+                            "external": true,
+                            "implicit_allow_external_jsonl": false,
+                            "remediation": jsonl_external_manual_sync_remediation(beads_dir)
                         })),
                     );
                 }
@@ -1709,7 +1819,9 @@ fn check_sync_jsonl_path(jsonl_path: &Path, beads_dir: &Path, checks: &mut Vec<C
                         Some(serde_json::json!({
                             "path": jsonl_path.display().to_string(),
                             "beads_dir": beads_dir.display().to_string(),
-                            "external": true
+                            "db_path": db_path.display().to_string(),
+                            "external": true,
+                            "implicit_allow_external_jsonl": implicit_external
                         })),
                     );
                 }
@@ -1740,11 +1852,11 @@ fn check_sync_jsonl_path(jsonl_path: &Path, beads_dir: &Path, checks: &mut Vec<C
                     checks,
                     check_name,
                     CheckStatus::Warn,
-                    Some("JSONL path is outside .beads/ directory".to_string()),
+                    Some(jsonl_outside_workspace_message(beads_dir)),
                     Some(serde_json::json!({
                         "path": path.display().to_string(),
                         "beads_dir": bd.display().to_string(),
-                        "remediation": "Use --allow-external-jsonl flag or move JSONL inside .beads/"
+                        "remediation": jsonl_external_path_remediation(beads_dir)
                     })),
                 );
             }
@@ -1778,11 +1890,11 @@ fn check_sync_jsonl_path(jsonl_path: &Path, beads_dir: &Path, checks: &mut Vec<C
                     checks,
                     check_name,
                     CheckStatus::Error,
-                    Some("JSONL path is a symlink pointing outside .beads/".to_string()),
+                    Some(jsonl_symlink_escape_message(beads_dir)),
                     Some(serde_json::json!({
                         "symlink": path.display().to_string(),
                         "target": target.display().to_string(),
-                        "remediation": "Remove symlink and use a regular file inside .beads/"
+                        "remediation": jsonl_symlink_remediation(beads_dir)
                     })),
                 );
             }
@@ -1819,7 +1931,7 @@ fn check_sync_jsonl_path(jsonl_path: &Path, beads_dir: &Path, checks: &mut Vec<C
                     Some("JSONL path targets git internals".to_string()),
                     Some(serde_json::json!({
                         "path": path.display().to_string(),
-                        "remediation": "Move JSONL file inside .beads/ directory"
+                        "remediation": jsonl_inside_workspace_remediation(beads_dir)
                     })),
                 );
             }
@@ -2055,7 +2167,7 @@ fn inspect_doctor_jsonl(
 ) -> (Option<PathBuf>, Option<usize>) {
     let jsonl_path = select_doctor_jsonl_path(beads_dir, paths);
     let jsonl_count = if let Some(path) = jsonl_path.as_ref() {
-        check_sync_jsonl_path(path, beads_dir, checks);
+        check_sync_jsonl_path(path, beads_dir, &paths.db_path, checks);
         check_sync_conflict_markers(path, checks);
 
         match check_jsonl(path, checks) {
@@ -2076,7 +2188,7 @@ fn inspect_doctor_jsonl(
             checks,
             "jsonl.parse",
             CheckStatus::Warn,
-            Some("No JSONL file found (.beads/issues.jsonl or .beads/beads.jsonl)".to_string()),
+            Some(missing_jsonl_message(beads_dir)),
             None,
         );
         None
@@ -2250,6 +2362,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             repair_partial_indexes(&paths.db_path, &mut repair);
             let post_reindex = collect_doctor_report(&beads_dir, &paths)?;
             let repair_message = repair_outcome_message(
+                &beads_dir,
                 gitignore_repaired,
                 Some(&repair),
                 Some(REINDEX_INCOMPLETE_MESSAGE),
@@ -2273,11 +2386,16 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             ctx.json(&serde_json::json!({
                 "report": initial.report,
                 "repaired": gitignore_repaired,
-                "message": repair_outcome_message(gitignore_repaired, None, None)
+                "message": repair_outcome_message(&beads_dir, gitignore_repaired, None, None)
             }));
         } else {
             print_report(&initial.report, ctx)?;
-            ctx.info(&repair_outcome_message(gitignore_repaired, None, None));
+            ctx.info(&repair_outcome_message(
+                &beads_dir,
+                gitignore_repaired,
+                None,
+                None,
+            ));
         }
         return Ok(());
     }
@@ -2301,7 +2419,8 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     };
 
     if after_local_repair.report.ok {
-        let repair_message = repair_outcome_message(gitignore_repaired, Some(&local_repair), None);
+        let repair_message =
+            repair_outcome_message(&beads_dir, gitignore_repaired, Some(&local_repair), None);
         if ctx.is_json() {
             ctx.json(&serde_json::json!({
                 "report": initial.report,
@@ -2518,15 +2637,122 @@ mod tests {
     }
 
     #[test]
+    fn test_check_root_gitignore_warns_for_underscore_beads_patterns() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join("_beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(
+            temp.path().join(".gitignore"),
+            "_beads/\n/_beads/.gitignore\n!_beads/.gitignore\nkeep-me\n",
+        )
+        .unwrap();
+
+        let mut checks = Vec::new();
+        check_root_gitignore(&beads_dir, &mut checks);
+
+        let check = find_check(&checks, "gitignore.beads_inner").expect("gitignore check");
+        assert!(matches!(check.status, CheckStatus::Warn));
+
+        let offending = check
+            .details
+            .as_ref()
+            .and_then(|details| details.get("offending_patterns"))
+            .and_then(serde_json::Value::as_array)
+            .expect("offending patterns");
+
+        assert_eq!(
+            offending,
+            &vec![
+                serde_json::Value::String("_beads/".to_string()),
+                serde_json::Value::String("/_beads/.gitignore".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_fix_root_gitignore_if_warned_removes_underscore_beads_patterns() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join("_beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let gitignore_path = temp.path().join(".gitignore");
+        fs::write(
+            &gitignore_path,
+            "_beads/\nkeep-me\n/_beads/.gitignore\n!_beads/.gitignore\n",
+        )
+        .unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&sample_issue("bd-test02", "Valid issue")).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let paths = config::ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path,
+            jsonl_path,
+            metadata: config::Metadata::default(),
+        };
+
+        let report_before = collect_doctor_report(&beads_dir, &paths).expect("doctor report");
+        let before_check =
+            find_check(&report_before.report.checks, "gitignore.beads_inner").expect("warning");
+        assert!(matches!(before_check.status, CheckStatus::Warn));
+
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Json, false, true);
+        assert!(fix_root_gitignore_if_warned(
+            &beads_dir,
+            &report_before.report,
+            &ctx
+        ));
+        assert_eq!(
+            fs::read_to_string(&gitignore_path).unwrap(),
+            "keep-me\n!_beads/.gitignore\n"
+        );
+
+        let report_after = collect_doctor_report(&beads_dir, &paths).expect("doctor report");
+        let after_check =
+            find_check(&report_after.report.checks, "gitignore.beads_inner").expect("status");
+        assert!(matches!(after_check.status, CheckStatus::Ok));
+    }
+
+    #[test]
     fn test_repair_outcome_message_combines_gitignore_and_incomplete_reindex() {
+        let beads_dir = Path::new("_beads");
         let message = repair_outcome_message(
+            beads_dir,
             true,
             Some(&LocalRepairResult::default()),
             Some(REINDEX_INCOMPLETE_MESSAGE),
         );
 
-        assert!(message.contains(ROOT_GITIGNORE_REPAIR_MESSAGE));
+        assert!(message.contains(&root_gitignore_repair_message(beads_dir)));
         assert!(message.contains(REINDEX_INCOMPLETE_MESSAGE));
+    }
+
+    #[test]
+    fn test_check_merge_artifacts_message_uses_underscore_beads_workspace() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join("_beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(beads_dir.join("issues.base.jsonl"), "").unwrap();
+
+        let mut checks = Vec::new();
+        check_merge_artifacts(&beads_dir, &mut checks).unwrap();
+
+        let check = find_check(&checks, "jsonl.merge_artifacts").expect("merge artifacts check");
+        assert!(matches!(check.status, CheckStatus::Warn));
+        assert_eq!(
+            check.message.as_deref(),
+            Some("Merge artifacts detected in _beads/")
+        );
     }
 
     #[test]
@@ -2697,7 +2923,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_doctor_report_accepts_configured_external_jsonl() {
+    fn test_collect_doctor_report_warns_for_external_jsonl_without_implicit_allow() {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         let external_dir = temp.path().join("external");
@@ -2725,7 +2951,13 @@ mod tests {
         let sync_path_check =
             find_check(&report.report.checks, "sync_jsonl_path").expect("sync path check");
 
-        assert!(matches!(sync_path_check.status, CheckStatus::Ok));
+        assert!(matches!(sync_path_check.status, CheckStatus::Warn));
+        assert!(
+            sync_path_check
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("--allow-external-jsonl"))
+        );
         assert_eq!(
             sync_path_check
                 .details
@@ -2738,7 +2970,122 @@ mod tests {
             sync_path_check
                 .details
                 .as_ref()
+                .and_then(|details| details.get("implicit_allow_external_jsonl"))
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_collect_doctor_report_warns_with_underscore_beads_remediation() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join("_beads");
+        let external_dir = temp.path().join("external");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&external_dir).unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let external_jsonl = external_dir.join("issues.jsonl");
+        fs::write(&external_jsonl, "{\"id\":\"bd-external\"}\n").unwrap();
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+
+        let paths = config::ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path,
+            jsonl_path: external_jsonl.clone(),
+            metadata: config::Metadata {
+                database: "beads.db".to_string(),
+                jsonl_export: external_jsonl.to_string_lossy().into_owned(),
+                backend: None,
+                deletions_retention_days: None,
+            },
+        };
+
+        let report = collect_doctor_report(&beads_dir, &paths).expect("doctor report");
+        let sync_path_check =
+            find_check(&report.report.checks, "sync_jsonl_path").expect("sync path check");
+
+        assert!(matches!(sync_path_check.status, CheckStatus::Warn));
+        assert_eq!(
+            sync_path_check.message.as_deref(),
+            Some("JSONL path is outside _beads/ directory")
+        );
+        assert_eq!(
+            sync_path_check
+                .details
+                .as_ref()
+                .and_then(|details| details.get("remediation"))
+                .and_then(serde_json::Value::as_str),
+            Some("Use --allow-external-jsonl flag or move JSONL inside _beads/")
+        );
+    }
+
+    #[test]
+    fn test_collect_doctor_report_missing_jsonl_message_uses_underscore_beads_workspace() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join("_beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let paths = config::ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path: beads_dir.join("beads.db"),
+            jsonl_path: beads_dir.join("issues.jsonl"),
+            metadata: config::Metadata::default(),
+        };
+
+        let report = collect_doctor_report(&beads_dir, &paths).expect("doctor report");
+        let parse_check = find_check(&report.report.checks, "jsonl.parse").expect("jsonl parse");
+
+        assert!(matches!(parse_check.status, CheckStatus::Warn));
+        assert_eq!(
+            parse_check.message.as_deref(),
+            Some("No JSONL file found (_beads/issues.jsonl or _beads/beads.jsonl)")
+        );
+    }
+
+    #[test]
+    fn test_collect_doctor_report_accepts_external_jsonl_for_external_db_family() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let external_dir = temp.path().join("external");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&external_dir).unwrap();
+
+        let db_path = external_dir.join("beads.db");
+        let external_jsonl = external_dir.join("issues.jsonl");
+        fs::write(&external_jsonl, "{\"id\":\"bd-external\"}\n").unwrap();
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+
+        let paths = config::ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path: db_path.clone(),
+            jsonl_path: external_jsonl.clone(),
+            metadata: config::Metadata {
+                database: db_path.to_string_lossy().into_owned(),
+                jsonl_export: external_jsonl.to_string_lossy().into_owned(),
+                backend: None,
+                deletions_retention_days: None,
+            },
+        };
+
+        let report = collect_doctor_report(&beads_dir, &paths).expect("doctor report");
+        let sync_path_check =
+            find_check(&report.report.checks, "sync_jsonl_path").expect("sync path check");
+
+        assert!(matches!(sync_path_check.status, CheckStatus::Ok));
+        assert_eq!(
+            sync_path_check
+                .details
+                .as_ref()
                 .and_then(|details| details.get("external"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            sync_path_check
+                .details
+                .as_ref()
+                .and_then(|details| details.get("implicit_allow_external_jsonl"))
                 .and_then(serde_json::Value::as_bool),
             Some(true)
         );

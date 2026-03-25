@@ -35,7 +35,7 @@ pub static AGENT_BLURB: std::sync::LazyLock<String> = std::sync::LazyLock::new(|
 
 ## Beads Workflow Integration
 
-This project uses [beads_rust]({repo_url}) (`br`/`bd`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
+This project uses [beads_rust]({repo_url}) (`br`/`bd`) for issue tracking. Issues are stored in the project beads workspace and tracked in git.
 
 ### Essential Commands
 
@@ -1503,6 +1503,12 @@ mod tests {
     #[test]
     fn test_contains_blurb() {
         assert!(contains_blurb(agent_blurb()));
+    }
+
+    #[test]
+    fn test_agent_blurb_uses_workspace_neutral_storage_language() {
+        assert!(agent_blurb().contains("project beads workspace"));
+        assert!(!agent_blurb().contains("stored in `.beads/`"));
     }
 
     #[test]

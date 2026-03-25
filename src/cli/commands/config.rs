@@ -50,7 +50,7 @@ impl ConfigSource {
             Self::Db => "db",
             Self::LegacyUser => "legacy user",
             Self::User => "user config",
-            Self::Project => ".beads/config",
+            Self::Project => "project config",
             Self::Environment => "environment",
             Self::Cli => "cli",
         }
@@ -937,7 +937,7 @@ fn show_config(
             return Ok(());
         } else if ctx.is_rich() {
             let theme = ctx.theme();
-            let panel = Panel::from_text("No project config (no .beads directory found).")
+            let panel = Panel::from_text("No project config (no beads workspace found).")
                 .title(Text::styled(
                     "Project Configuration",
                     theme.panel_title.clone(),
@@ -946,7 +946,7 @@ fn show_config(
                 .border_style(theme.panel_border.clone());
             ctx.render(&panel);
         } else {
-            println!("No project config (no .beads directory found)");
+            println!("No project config (no beads workspace found)");
         }
         return Ok(());
     }
@@ -1177,6 +1177,11 @@ mod tests {
         let ctx = OutputContext::from_flags(false, false, true);
         let result = set_config_value(&args, false, &CliOverrides::default(), &ctx);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_project_config_source_label_is_workspace_neutral() {
+        assert_eq!(ConfigSource::Project.label(), "project config");
     }
 
     #[test]
