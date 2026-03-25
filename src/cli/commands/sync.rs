@@ -12,11 +12,11 @@ use crate::sync::history::HistoryConfig;
 use crate::sync::{
     ConflictResolution, ExportConfig, ExportEntityType, ExportError, ExportErrorPolicy,
     ImportConfig, METADATA_JSONL_CONTENT_HASH, METADATA_LAST_EXPORT_TIME,
-    METADATA_LAST_IMPORT_TIME, MergeContext, OrphanMode, compute_jsonl_hash, compute_staleness,
-    count_issues_in_jsonl, export_temp_path, export_to_jsonl_with_policy, finalize_export,
-    get_issue_ids_from_jsonl, import_from_jsonl, load_base_snapshot, read_issues_from_jsonl,
-    require_safe_sync_overwrite_path, save_base_snapshot, three_way_merge,
-    validate_sync_path_with_external,
+    METADATA_LAST_IMPORT_TIME, MISSING_IDS_PREVIEW_LIMIT, MergeContext, OrphanMode,
+    compute_jsonl_hash, compute_staleness, count_issues_in_jsonl, export_temp_path,
+    export_to_jsonl_with_policy, finalize_export, get_issue_ids_from_jsonl, import_from_jsonl,
+    load_base_snapshot, read_issues_from_jsonl, require_safe_sync_overwrite_path,
+    save_base_snapshot, three_way_merge, validate_sync_path_with_external,
 };
 use crate::util::id::split_prefix_remainder;
 use rich_rust::prelude::*;
@@ -26,6 +26,9 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, IsTerminal};
 use std::path::{Component, Path, PathBuf};
 use tracing::{debug, info, warn};
+
+/// Number of hex characters to show when truncating SHA-256 content hashes.
+const HASH_DISPLAY_TRUNCATION_LEN: usize = 12;
 
 /// Result of a flush (export) operation.
 #[derive(Debug, Serialize)]
@@ -440,8 +443,8 @@ fn render_status_rich(status: &SyncStatus, ctx: &OutputContext) {
     // Content hash (truncated)
     if let Some(ref hash) = status.jsonl_content_hash {
         text.append_styled("Content hash: ", theme.dimmed.clone());
-        let display_hash = if hash.len() > 12 {
-            format!("{}…", &hash[..12])
+        let display_hash = if hash.len() > HASH_DISPLAY_TRUNCATION_LEN {
+            format!("{}…", &hash[..HASH_DISPLAY_TRUNCATION_LEN])
         } else {
             hash.clone()
         };
@@ -509,15 +512,18 @@ fn execute_flush(
 
             if !missing_list.is_empty() {
                 missing_list.sort();
-                let display_count = missing_list.len().min(10);
+                let display_count = missing_list.len().min(MISSING_IDS_PREVIEW_LIMIT);
                 let preview = missing_list
                     .iter()
                     .take(display_count)
                     .map(String::as_str)
                     .collect::<Vec<_>>()
                     .join(", ");
-                let more = if missing_list.len() > 10 {
-                    format!(" ... and {} more", missing_list.len() - 10)
+                let more = if missing_list.len() > MISSING_IDS_PREVIEW_LIMIT {
+                    format!(
+                        " ... and {} more",
+                        missing_list.len() - MISSING_IDS_PREVIEW_LIMIT
+                    )
                 } else {
                     String::new()
                 };
@@ -748,8 +754,8 @@ fn render_flush_result_rich(result: &FlushResult, errors: &[ExportError], ctx: &
     if !result.content_hash.is_empty() {
         text.append("\n");
         text.append_styled("Content hash  ", theme.dimmed.clone());
-        let display_hash = if result.content_hash.len() > 12 {
-            format!("{}…", &result.content_hash[..12])
+        let display_hash = if result.content_hash.len() > HASH_DISPLAY_TRUNCATION_LEN {
+            format!("{}…", &result.content_hash[..HASH_DISPLAY_TRUNCATION_LEN])
         } else {
             result.content_hash.clone()
         };

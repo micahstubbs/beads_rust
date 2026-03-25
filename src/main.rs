@@ -12,6 +12,8 @@ use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use tracing::debug;
 
+const SYNC_LOCK_FILENAME: &str = ".sync.lock";
+
 #[allow(clippy::too_many_lines)]
 fn main() {
     CompleteEnv::with_factory(Cli::command).complete();
@@ -330,7 +332,7 @@ fn main() {
 /// `None` (non-blocking).
 #[allow(clippy::incompatible_msrv)]
 fn try_sync_lock(beads_dir: &Path) -> Option<File> {
-    let lock_path = beads_dir.join(".sync.lock");
+    let lock_path = beads_dir.join(SYNC_LOCK_FILENAME);
     let file = OpenOptions::new()
         .read(true)
         .write(true)

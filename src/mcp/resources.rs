@@ -20,6 +20,20 @@ use super::{BeadsState, to_mcp};
 
 const IN_PROGRESS_RESOURCE_LIMIT: usize = 50;
 const DEFERRED_RESOURCE_LIMIT: usize = 50;
+const BOTTLENECK_ISSUES_DISPLAY_LIMIT: usize = 15;
+
+/// Issues blocking this many or more others are considered high-fan-out.
+const HIGH_FAN_OUT_THRESHOLD: usize = 3;
+/// Issues not updated in this many days are considered stale.
+const STALE_THRESHOLD_DAYS: i64 = 30;
+/// Graph density above this is considered very high (heavily coupled).
+const DENSITY_VERY_HIGH: f64 = 0.5;
+/// Graph density above this is considered moderate.
+const DENSITY_MODERATE: f64 = 0.2;
+/// Chain depth above this is deep (hard to parallelize).
+const CHAIN_DEPTH_DEEP: usize = 5;
+/// Chain depth above this is moderate.
+const CHAIN_DEPTH_MODERATE: usize = 2;
 
 /// Build a structured "issue not found" error with fuzzy suggestions,
 /// mirroring the tools.rs pattern for consistent agent UX.
@@ -755,12 +769,12 @@ fn compute_graph_health(storage: &SqliteStorage) -> McpResult<serde_json::Value>
     // High-fan-out issues (block 3+ others)
     let high_fan_out: Vec<_> = adj
         .iter()
-        .filter(|(_, targets)| targets.len() >= 3)
+        .filter(|(_, targets)| targets.len() >= HIGH_FAN_OUT_THRESHOLD)
         .map(|(id, targets)| json!({"id": id, "blocks_count": targets.len()}))
         .collect();
 
     // Stale issues (not updated in 30+ days)
-    let thirty_days_ago = chrono::Utc::now() - chrono::Duration::days(30);
+    let thirty_days_ago = chrono::Utc::now() - chrono::Duration::days(STALE_THRESHOLD_DAYS);
     let stale_filters = ListFilters {
         include_closed: false,
         updated_before: Some(thirty_days_ago),
@@ -778,9 +792,9 @@ fn compute_graph_health(storage: &SqliteStorage) -> McpResult<serde_json::Value>
         "open_issue_count": node_count,
         "dependency_edge_count": edge_count,
         "density": density,
-        "density_interpretation": if density > 0.5 {
+        "density_interpretation": if density > DENSITY_VERY_HIGH {
             "Very high — issues are heavily coupled, hard to parallelize"
-        } else if density > 0.2 {
+        } else if density > DENSITY_MODERATE {
             "Moderate — some coupling, review if all deps are necessary"
         } else if density > 0.0 {
             "Healthy — dependencies are focused"
@@ -788,9 +802,9 @@ fn compute_graph_health(storage: &SqliteStorage) -> McpResult<serde_json::Value>
             "No dependencies — issues are fully independent"
         },
         "max_chain_depth": max_chain_depth,
-        "max_chain_interpretation": if max_chain_depth > 5 {
+        "max_chain_interpretation": if max_chain_depth > CHAIN_DEPTH_DEEP {
             "Deep chain — critical path is long, hard to parallelize"
-        } else if max_chain_depth > 2 {
+        } else if max_chain_depth > CHAIN_DEPTH_MODERATE {
             "Moderate chain depth"
         } else {
             "Shallow — good parallelization potential"
@@ -798,7 +812,7 @@ fn compute_graph_health(storage: &SqliteStorage) -> McpResult<serde_json::Value>
         "high_fan_out_issues": high_fan_out,
         "cycle_detected": has_cycles,
         "stale_issue_count": stale_issues.len(),
-        "stale_threshold_days": 30,
+        "stale_threshold_days": STALE_THRESHOLD_DAYS,
     }))
 }
 
@@ -871,7 +885,7 @@ fn compute_bottlenecks(storage: &SqliteStorage) -> McpResult<serde_json::Value> 
 
     let bottlenecks: Vec<_> = ranked
         .iter()
-        .take(15)
+        .take(BOTTLENECK_ISSUES_DISPLAY_LIMIT)
         .filter_map(|(id, count)| {
             open_map.get(id).map(|issue| {
                 json!({

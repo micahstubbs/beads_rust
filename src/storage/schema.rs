@@ -6,6 +6,8 @@ use fsqlite_types::SqliteValue;
 use crate::error::{BeadsError, Result};
 
 pub const CURRENT_SCHEMA_VERSION: i32 = 4;
+/// SQLite page cache size in KB (negative = KB). -8000 = 8 MB.
+const SQLITE_CACHE_SIZE_KB: &str = "-8000";
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -15,6 +17,7 @@ pub const SCHEMA_SQL: &str = r"
     -- Note: TEXT fields use DEFAULT '' for bd (Go) compatibility.
     -- bd's sql.Scan doesn't handle NULL well when scanning into string fields.
     -- Closed-at invariant is enforced by the CHECK clause below.
+    -- Title limit must match validation::MAX_TITLE_CHARS (500).
     CREATE TABLE IF NOT EXISTS issues (
         id TEXT PRIMARY KEY,
         content_hash TEXT,
@@ -437,8 +440,8 @@ pub(crate) fn apply_runtime_pragmas(conn: &Connection) -> Result<()> {
     conn.execute("PRAGMA synchronous = NORMAL")?;
     // Use memory for temp tables/indexes instead of disk
     conn.execute("PRAGMA temp_store = MEMORY")?;
-    // 8MB page cache (default is ~2MB), improves read-heavy workloads
-    conn.execute("PRAGMA cache_size = -8000")?;
+    // 8 MB page cache (default is ~2 MB), improves read-heavy workloads
+    conn.execute(&format!("PRAGMA cache_size = {SQLITE_CACHE_SIZE_KB}"))?;
 
     Ok(())
 }
@@ -744,6 +747,7 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
         .chain(std::iter::once(("content_hash", "TEXT")))
         .chain(std::iter::once((
             "title",
+            // Must match validation::MAX_TITLE_CHARS
             "TEXT NOT NULL CHECK(length(title) <= 500)",
         )))
         .chain(

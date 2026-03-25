@@ -18,7 +18,9 @@ use crate::sync::{
     ExportConfig, ImportConfig, ImportResult, auto_flush, compute_jsonl_hash,
     export_to_jsonl_with_policy, finalize_export, import_from_jsonl, preflight_import,
 };
-use crate::util::id::{IdConfig, abbreviate_prefix, normalize_prefix, split_prefix_remainder};
+use crate::util::id::{
+    DEFAULT_ID_PREFIX, IdConfig, abbreviate_prefix, normalize_prefix, split_prefix_remainder,
+};
 use chrono::Utc;
 use fsqlite_error::FrankenError;
 use serde::{Deserialize, Serialize};
@@ -30,6 +32,9 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use tempfile::tempdir;
 use tracing::warn;
+
+/// Maximum number of redirect hops to follow when resolving `.beads` routing.
+const MAX_REDIRECT_DEPTH: usize = 10;
 
 /// Check whether a directory name is a valid beads directory name.
 ///
@@ -228,7 +233,7 @@ fn discover_beads_dir_with_env(
     }
 
     let candidate = discover_beads_dir_candidate_with_env(start, None)?;
-    routing::follow_redirects(&candidate, 10)
+    routing::follow_redirects(&candidate, MAX_REDIRECT_DEPTH)
 }
 
 fn discover_beads_dir_candidate_with_env(
@@ -460,9 +465,11 @@ fn validate_explicit_beads_dir(path: &Path, source: &str) -> Result<PathBuf> {
 
 fn resolve_explicit_beads_dir(path: &Path, source: &str) -> Result<PathBuf> {
     let candidate = validate_explicit_beads_dir(path, source)?;
-    routing::follow_redirects(&candidate, 10).map_err(|err| BeadsError::WithContext {
-        context: format!("{source} is invalid"),
-        source: Box::new(err),
+    routing::follow_redirects(&candidate, MAX_REDIRECT_DEPTH).map_err(|err| {
+        BeadsError::WithContext {
+            context: format!("{source} is invalid"),
+            source: Box::new(err),
+        }
     })
 }
 
@@ -1389,7 +1396,7 @@ fn resolve_bootstrap_issue_prefix(
         return Ok(abbreviate_prefix(name));
     }
 
-    Ok("br".to_string())
+    Ok(DEFAULT_ID_PREFIX.to_string())
 }
 
 fn import_config_for_resolved_jsonl(
@@ -1813,7 +1820,7 @@ pub fn default_config_layer() -> ConfigLayer {
     let mut layer = ConfigLayer::default();
     layer
         .runtime
-        .insert("issue_prefix".to_string(), "br".to_string());
+        .insert("issue_prefix".to_string(), DEFAULT_ID_PREFIX.to_string());
     layer
 }
 
@@ -1929,7 +1936,10 @@ pub fn id_config_from_layer(layer: &ConfigLayer) -> IdConfig {
     let prefix = get_value(layer, &["issue_prefix", "issue-prefix", "prefix"])
         .cloned()
         .filter(|p| !p.trim().is_empty())
-        .map_or_else(|| "br".to_string(), |prefix| normalize_prefix(&prefix));
+        .map_or_else(
+            || DEFAULT_ID_PREFIX.to_string(),
+            |prefix| normalize_prefix(&prefix),
+        );
 
     let min_hash_length = parse_usize(layer, &["min_hash_length", "min-hash-length"]).unwrap_or(3);
     let max_hash_length = parse_usize(layer, &["max_hash_length", "max-hash-length"]).unwrap_or(8);

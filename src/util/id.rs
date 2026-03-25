@@ -6,9 +6,23 @@
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
+pub const DEFAULT_ID_PREFIX: &str = "br";
 pub const MAX_ID_PREFIX_LEN: usize = 64;
 pub const MAX_ID_HASH_LEN: usize = 40;
 pub const MAX_ID_LENGTH: usize = MAX_ID_PREFIX_LEN + 1 + MAX_ID_HASH_LEN;
+
+/// Number of nonce values to try at each hash length before increasing length.
+const NONCE_RETRIES_PER_LENGTH: u32 = 10;
+/// Hash length used in the fallback path when normal lengths are exhausted.
+const FALLBACK_HASH_LENGTH: usize = 12;
+/// After this many fallback collisions, append the nonce to force uniqueness.
+const SAFETY_BREAK_THRESHOLD: u32 = 1000;
+/// Absolute upper bound on fallback nonce to prevent infinite loops.
+const HARD_STOP_LIMIT: u32 = 2000;
+/// Prefixes at or below this length are kept as-is by `abbreviate_prefix`.
+const ABBREVIATION_THRESHOLD: usize = 6;
+/// Number of leading alphanumeric chars used as a last-resort abbreviation.
+const FALLBACK_ABBREVIATION_LENGTH: usize = 3;
 
 /// Default ID generation configuration.
 #[derive(Debug, Clone)]
@@ -26,7 +40,7 @@ pub struct IdConfig {
 impl Default for IdConfig {
     fn default() -> Self {
         Self {
-            prefix: "br".to_string(),
+            prefix: DEFAULT_ID_PREFIX.to_string(),
             min_hash_length: 3,
             max_hash_length: 8,
             max_collision_prob: 0.25,
@@ -129,8 +143,8 @@ impl IdGenerator {
         let mut length = self.optimal_length(issue_count);
 
         loop {
-            // Try nonces 0..10 at this length
-            for nonce in 0..10 {
+            // Try nonces at this length
+            for nonce in 0..NONCE_RETRIES_PER_LENGTH {
                 let id =
                     self.generate_candidate(title, description, creator, created_at, nonce, length);
                 if !exists(&id) {
@@ -147,7 +161,7 @@ impl IdGenerator {
                 let mut nonce = 0;
                 loop {
                     let seed = generate_id_seed(title, description, creator, created_at, nonce);
-                    let hash_str = compute_id_hash(&seed, 12);
+                    let hash_str = compute_id_hash(&seed, FALLBACK_HASH_LENGTH);
                     let id = format!("{}-{hash_str}", self.config.prefix);
 
                     if !exists(&id) {
@@ -156,17 +170,17 @@ impl IdGenerator {
 
                     nonce += 1;
 
-                    // Safety break: if we hit 1000 collisions even with 12-char hashes,
+                    // Safety break: if we hit many collisions even with long hashes,
                     // append the nonce to force uniqueness.
-                    if nonce > 1000 {
+                    if nonce > SAFETY_BREAK_THRESHOLD {
                         let desperate_id = format!("{}-{hash_str}{nonce}", self.config.prefix);
                         if !exists(&desperate_id) {
                             return desperate_id;
                         }
                     }
 
-                    // Hard stop at 2000 to prevent infinite loop if exists() is broken
-                    if nonce > 2000 {
+                    // Hard stop to prevent infinite loop if exists() is broken
+                    if nonce > HARD_STOP_LIMIT {
                         return format!("{}-{hash_str}{nonce}", self.config.prefix);
                     }
                 }
@@ -503,7 +517,7 @@ pub fn normalize_prefix(prefix: &str) -> String {
         .to_string();
 
     if normalized.is_empty() {
-        "br".to_string()
+        DEFAULT_ID_PREFIX.to_string()
     } else {
         normalized
     }
@@ -517,7 +531,7 @@ pub fn normalize_prefix(prefix: &str) -> String {
 #[must_use]
 pub fn abbreviate_prefix(prefix: &str) -> String {
     let normalized = normalize_prefix(prefix);
-    if normalized.len() <= 6 {
+    if normalized.len() <= ABBREVIATION_THRESHOLD {
         return normalized;
     }
 
@@ -539,7 +553,7 @@ pub fn abbreviate_prefix(prefix: &str) -> String {
     let fallback: String = normalized
         .chars()
         .filter(char::is_ascii_alphanumeric)
-        .take(3)
+        .take(FALLBACK_ABBREVIATION_LENGTH)
         .collect();
     if fallback.is_empty() {
         normalized
@@ -572,7 +586,7 @@ pub struct ResolverConfig {
 impl Default for ResolverConfig {
     fn default() -> Self {
         Self {
-            default_prefix: "br".to_string(),
+            default_prefix: DEFAULT_ID_PREFIX.to_string(),
             allowed_prefixes: Vec::new(),
             allow_substring_match: true,
         }

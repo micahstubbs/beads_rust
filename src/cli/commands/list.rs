@@ -73,6 +73,7 @@ fn execute_inner(
     let is_json_output = matches!(output_format, OutputFormat::Json | OutputFormat::Toon);
 
     // The effective limit and offset from the user's request.
+    // Default must match mcp/tools.rs DEFAULT_LIST_LIMIT (50).
     let user_limit = args.limit.unwrap_or(50);
     let user_offset = args.offset.unwrap_or(0);
 

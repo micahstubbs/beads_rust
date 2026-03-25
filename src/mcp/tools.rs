@@ -85,6 +85,23 @@ const PLACEHOLDER_EXACT: &[&str] = &[
 ];
 
 // ---------------------------------------------------------------------------
+// Display and query limits
+// ---------------------------------------------------------------------------
+
+/// Default number of issues returned by list_issues.
+const DEFAULT_LIST_LIMIT: u64 = 50;
+/// Maximum number of issues a single list_issues call may return.
+const MAX_LIST_LIMIT: u64 = 500;
+/// Recent events shown in issue detail responses.
+const RECENT_EVENTS_DISPLAY_LIMIT: usize = 10;
+/// Top labels shown in project overview.
+const TOP_LABELS_DISPLAY_LIMIT: usize = 15;
+/// Blocked issues shown in project overview.
+const BLOCKED_ISSUES_DISPLAY_LIMIT: usize = 10;
+/// Ready issues shown in project overview.
+const READY_ISSUES_DISPLAY_LIMIT: usize = 10;
+
+// ---------------------------------------------------------------------------
 // Placeholder detection
 // ---------------------------------------------------------------------------
 
@@ -731,8 +748,8 @@ fn build_list_filters(
     let raw_limit = args
         .get("limit")
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(50);
-    let limit = Some(raw_limit.min(500) as usize);
+        .unwrap_or(DEFAULT_LIST_LIMIT);
+    let limit = Some(raw_limit.min(MAX_LIST_LIMIT) as usize);
 
     let sort = args.get("sort").and_then(|v| v.as_str()).map(String::from);
 
@@ -1013,7 +1030,7 @@ impl ToolHandler for ShowIssueTool {
                     details
                         .events
                         .iter()
-                        .take(10)
+                        .take(RECENT_EVENTS_DISPLAY_LIMIT)
                         .map(|e| {
                             json!({
                                 "type": e.event_type,
@@ -1947,17 +1964,17 @@ impl ToolHandler for ProjectOverviewTool {
                 "deferred": deferred.len(),
                 "dirty_unsaved": dirty,
             },
-            "top_labels": labels.iter().take(15).map(|(name, count)| {
+            "top_labels": labels.iter().take(TOP_LABELS_DISPLAY_LIMIT).map(|(name, count)| {
                 json!({"label": name, "count": count})
             }).collect::<Vec<_>>(),
-            "blocked_issues": blocked.iter().take(10).map(|(issue, blockers)| {
+            "blocked_issues": blocked.iter().take(BLOCKED_ISSUES_DISPLAY_LIMIT).map(|(issue, blockers)| {
                 json!({
                     "id": issue.id,
                     "title": issue.title,
                     "blocked_by": blockers,
                 })
             }).collect::<Vec<_>>(),
-            "ready_issues": ready.iter().take(10).map(|issue| {
+            "ready_issues": ready.iter().take(READY_ISSUES_DISPLAY_LIMIT).map(|issue| {
                 json!({
                     "id": issue.id,
                     "title": issue.title,
