@@ -11,6 +11,7 @@ use crate::output::{OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
 use crate::util::id::{IdResolver, ResolverConfig};
 use crate::util::time::format_relative_time;
+use crate::validation::MAX_COMMENT_BODY_BYTES;
 use chrono::Utc;
 use rich_rust::prelude::*;
 use std::fs;
@@ -293,8 +294,6 @@ fn render_comment_added_rich(issue_id: &str, comment: &Comment, ctx: &OutputCont
     console.print_renderable(&comment_text);
 }
 
-const MAX_STDIN_COMMENT_BYTES: usize = 51_200; // 50KB to match CommentValidator
-
 fn read_limited_string<R: Read>(reader: &mut R, byte_limit: usize, field: &str) -> Result<String> {
     let max_bytes = byte_limit
         .checked_add(1)
@@ -315,15 +314,15 @@ fn read_comment_text(args: &CommentAddArgs) -> Result<String> {
     if let Some(path) = &args.file {
         if path.as_os_str() == "-" {
             let mut stdin = std::io::stdin();
-            return read_limited_string(&mut stdin, MAX_STDIN_COMMENT_BYTES, "text");
+            return read_limited_string(&mut stdin, MAX_COMMENT_BODY_BYTES, "text");
         }
         let metadata = fs::metadata(path)?;
-        if metadata.len() > MAX_STDIN_COMMENT_BYTES as u64 {
+        if metadata.len() > MAX_COMMENT_BODY_BYTES as u64 {
             return Err(BeadsError::validation(
                 "file",
                 format!(
                     "file exceeds maximum comment size of {} bytes",
-                    MAX_STDIN_COMMENT_BYTES
+                    MAX_COMMENT_BODY_BYTES
                 ),
             ));
         }

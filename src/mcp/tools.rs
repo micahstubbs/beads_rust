@@ -18,6 +18,7 @@ use serde_json::json;
 use crate::error::{ErrorCode, StructuredError};
 use crate::model::{Issue, IssueType, Priority, Status};
 use crate::storage::{IssueUpdate, ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
+use crate::validation::MAX_TITLE_CHARS;
 
 use super::BeadsState;
 
@@ -550,8 +551,10 @@ fn parse_update_fields(
     let mut updates = IssueUpdate::default();
 
     if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
-        if title.is_empty() || title.chars().count() > 500 {
-            return Err(McpError::invalid_params("Title must be 1-500 characters"));
+        if title.is_empty() || title.chars().count() > MAX_TITLE_CHARS {
+            return Err(McpError::invalid_params(format!(
+                "Title must be 1-{MAX_TITLE_CHARS} characters",
+            )));
         }
         updates.title = Some(title.to_string());
     }
@@ -847,6 +850,7 @@ impl ToolHandler for ListIssuesTool {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
         let storage = open(&self.0)?;
         let mut coercions: Vec<String> = Vec::new();
@@ -1067,7 +1071,7 @@ impl ToolHandler for CreateIssueTool {
                  Discovery: See beads://schema for valid types/priorities, beads://labels for labels.\n\
                  When to use: Recording a new bug, feature, task, or work item.\n\
                  NOT for: Updating existing issues — use update_issue instead.\n\
-                 Do: Provide a clear title (1-500 chars). Search with list_issues first to avoid dupes.\n\
+                 Do: Provide a clear title (1-500 chars, see validation::MAX_TITLE_CHARS). Search with list_issues first to avoid dupes.\n\
                  Don't: Create duplicate issues — search first.\n\
                  Inputs auto-corrected: 'urgent' → critical, 'feat' → feature, etc.\n\
                  Idempotency: NOT idempotent — each call creates a new issue."
@@ -1078,6 +1082,7 @@ impl ToolHandler for CreateIssueTool {
                 "properties": {
                     "title": {
                         "type": "string",
+                        // Must match validation::MAX_TITLE_CHARS
                         "description": "Issue title (1-500 chars). REQUIRED."
                     },
                     "description": {
@@ -1122,14 +1127,17 @@ impl ToolHandler for CreateIssueTool {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
         let title = args
             .get("title")
             .and_then(|v| v.as_str())
             .ok_or_else(|| McpError::invalid_params("'title' is required"))?;
 
-        if title.is_empty() || title.chars().count() > 500 {
-            return Err(McpError::invalid_params("Title must be 1-500 characters"));
+        if title.is_empty() || title.chars().count() > MAX_TITLE_CHARS {
+            return Err(McpError::invalid_params(format!(
+                "Title must be 1-{MAX_TITLE_CHARS} characters",
+            )));
         }
 
         let mut coercions: Vec<String> = Vec::new();
@@ -1177,7 +1185,9 @@ impl ToolHandler for CreateIssueTool {
                 num += 1;
                 candidate = crate::util::id::child_id(pid, num);
                 if num > next_num + 100 {
-                    return Err(McpError::internal("Could not find available child ID"));
+                    return Err(McpError::internal_error(
+                        "Could not find available child ID",
+                    ));
                 }
             }
             candidate
@@ -1187,7 +1197,7 @@ impl ToolHandler for CreateIssueTool {
             })
         };
 
-        let issue = Issue {
+        let mut issue = Issue {
             id: id.clone(),
             title: title.to_string(),
             description: args
@@ -1206,15 +1216,6 @@ impl ToolHandler for CreateIssueTool {
             updated_at: now,
             ..Issue::default()
         };
-
-        // Validate parent exists BEFORE creating the issue to avoid orphans
-        let parent_id = args
-            .get("parent")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        if let Some(ref pid) = parent_id {
-            require_valid_issue(&storage, pid)?;
-        }
 
         // Compute content hash
         issue.content_hash = Some(issue.compute_content_hash());
@@ -1309,6 +1310,7 @@ impl ToolHandler for UpdateIssueTool {
                     },
                     "title": {
                         "type": "string",
+                        // Must match validation::MAX_TITLE_CHARS
                         "description": "New title (1-500 chars)"
                     },
                     "description": {
@@ -1657,7 +1659,7 @@ fn dep_add(
         .parse::<crate::model::DependencyType>()
         .is_ok_and(|dep_type| dep_type.is_blocking())
         && storage
-            .would_create_cycle(id, depends_on, Some(dep_type_str), true)
+            .would_create_cycle(id, depends_on, Some(dep_type_str.as_str()), true)
             .map_err(beads_to_mcp)?
     {
         return Err(McpError::with_data(

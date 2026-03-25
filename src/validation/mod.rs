@@ -17,6 +17,28 @@ use crate::model::{Comment, Dependency, Issue, Priority, Status};
 use crate::util::id::MAX_ID_LENGTH;
 use std::{collections::HashSet, path::Path};
 
+// ---------------------------------------------------------------------------
+// Validation limit constants — single source of truth
+// ---------------------------------------------------------------------------
+
+/// Maximum title length in characters.
+pub const MAX_TITLE_CHARS: usize = 500;
+
+/// Maximum description size in bytes (~100 KB).
+pub const MAX_DESCRIPTION_BYTES: usize = 102_400;
+
+/// Maximum estimated effort in minutes (~1 year: 365.25 × 24 × 60).
+pub const MAX_ESTIMATED_MINUTES: i32 = 525_960;
+
+/// Maximum external reference length in characters (e.g. "JIRA-12345").
+pub const MAX_EXTERNAL_REF_CHARS: usize = 200;
+
+/// Maximum label length in characters.
+pub const MAX_LABEL_CHARS: usize = 50;
+
+/// Maximum comment author name length in characters.
+pub const MAX_AUTHOR_CHARS: usize = 200;
+
 /// Validates issue fields and invariants.
 pub struct IssueValidator;
 
@@ -46,17 +68,20 @@ impl IssueValidator {
             ));
         }
 
-        // Title: Required, max 500 chars.
+        // Title: Required, max length.
         if issue.title.trim().is_empty() {
             errors.push(ValidationError::new("title", "cannot be empty"));
         }
-        if issue.title.chars().count() > 500 {
-            errors.push(ValidationError::new("title", "exceeds 500 characters"));
+        if issue.title.chars().count() > MAX_TITLE_CHARS {
+            errors.push(ValidationError::new(
+                "title",
+                format!("exceeds {MAX_TITLE_CHARS} characters"),
+            ));
         }
 
-        // Description: Optional, max 100KB.
+        // Description: Optional, max size.
         if let Some(description) = issue.description.as_ref()
-            && description.len() > 102_400
+            && description.len() > MAX_DESCRIPTION_BYTES
         {
             errors.push(ValidationError::new("description", "exceeds 100KB"));
         }
@@ -81,11 +106,10 @@ impl IssueValidator {
                     "estimated_minutes",
                     "cannot be negative",
                 ));
-            } else if minutes > 525_960 {
-                // ~1 year in minutes
+            } else if minutes > MAX_ESTIMATED_MINUTES {
                 errors.push(ValidationError::new(
                     "estimated_minutes",
-                    "exceeds maximum (525960 minutes / ~1 year)",
+                    format!("exceeds maximum ({MAX_ESTIMATED_MINUTES} minutes / ~1 year)"),
                 ));
             }
         }
@@ -117,10 +141,10 @@ impl IssueValidator {
 
         // External reference: Optional, max 200 chars, no whitespace.
         if let Some(external_ref) = issue.external_ref.as_ref() {
-            if external_ref.chars().count() > 200 {
+            if external_ref.chars().count() > MAX_EXTERNAL_REF_CHARS {
                 errors.push(ValidationError::new(
                     "external_ref",
-                    "exceeds 200 characters",
+                    format!("exceeds {MAX_EXTERNAL_REF_CHARS} characters"),
                 ));
             }
             if external_ref.chars().any(char::is_whitespace) {
@@ -131,6 +155,7 @@ impl IssueValidator {
             }
         }
 
+        Self::validate_embedded_dependencies(issue, &mut errors);
         Self::validate_embedded_labels(issue, &mut errors);
         Self::validate_embedded_comments(issue, &mut errors);
 
@@ -147,6 +172,49 @@ impl IssueValidator {
                 errors.push(ValidationError::new(
                     format!("labels[{index}]"),
                     err.message,
+                ));
+            }
+        }
+    }
+
+    fn validate_embedded_dependencies(issue: &Issue, errors: &mut Vec<ValidationError>) {
+        for (index, dep) in issue.dependencies.iter().enumerate() {
+            if dep.issue_id != issue.id {
+                errors.push(ValidationError::new(
+                    format!("dependencies[{index}].issue_id"),
+                    format!("must match parent issue id '{}'", issue.id),
+                ));
+            }
+
+            if dep.depends_on_id.trim().is_empty() {
+                errors.push(ValidationError::new(
+                    format!("dependencies[{index}].depends_on_id"),
+                    "cannot be empty",
+                ));
+            } else if dep.depends_on_id == issue.id {
+                errors.push(ValidationError::new(
+                    format!("dependencies[{index}].depends_on_id"),
+                    "issue cannot depend on itself",
+                ));
+            }
+
+            if dep.dep_type.as_str().eq_ignore_ascii_case("parent-child")
+                && (dep.issue_id.starts_with("external:")
+                    || dep.depends_on_id.starts_with("external:"))
+            {
+                let field = if dep.issue_id.starts_with("external:") {
+                    format!("dependencies[{index}].issue_id")
+                } else {
+                    format!("dependencies[{index}].depends_on_id")
+                };
+                let endpoint = if dep.issue_id.starts_with("external:") {
+                    dep.issue_id.as_str()
+                } else {
+                    dep.depends_on_id.as_str()
+                };
+                errors.push(ValidationError::new(
+                    field,
+                    format!("parent-child dependencies must link local issues: {endpoint}"),
                 ));
             }
         }
@@ -281,8 +349,11 @@ impl LabelValidator {
             return Err(ValidationError::new("label", "cannot be empty"));
         }
 
-        if label.chars().count() > 50 {
-            return Err(ValidationError::new("label", "exceeds 50 characters"));
+        if label.chars().count() > MAX_LABEL_CHARS {
+            return Err(ValidationError::new(
+                "label",
+                format!("exceeds {MAX_LABEL_CHARS} characters"),
+            ));
         }
 
         if !label
@@ -301,6 +372,9 @@ impl LabelValidator {
 
 /// Validates comment fields.
 pub struct CommentValidator;
+
+/// Single source of truth for maximum accepted comment body size.
+pub const MAX_COMMENT_BODY_BYTES: usize = 51_200;
 
 impl CommentValidator {
     /// Validate a comment and return all validation errors found.
@@ -323,7 +397,7 @@ impl CommentValidator {
             errors.push(ValidationError::new("content", "cannot be empty"));
         }
 
-        if comment.body.len() > 51_200 {
+        if comment.body.len() > MAX_COMMENT_BODY_BYTES {
             errors.push(ValidationError::new("content", "exceeds 50KB"));
         }
 
@@ -331,8 +405,11 @@ impl CommentValidator {
             errors.push(ValidationError::new("author", "cannot be empty"));
         }
 
-        if comment.author.chars().count() > 200 {
-            errors.push(ValidationError::new("author", "exceeds 200 characters"));
+        if comment.author.chars().count() > MAX_AUTHOR_CHARS {
+            errors.push(ValidationError::new(
+                "author",
+                format!("exceeds {MAX_AUTHOR_CHARS} characters"),
+            ));
         }
 
         if errors.is_empty() {
@@ -808,6 +885,26 @@ mod tests {
 
         let errors = IssueValidator::validate(&issue).unwrap_err();
         assert!(errors.iter().any(|err| err.field == "labels[0]"));
+    }
+
+    #[test]
+    fn issue_validation_rejects_invalid_embedded_dependency() {
+        let mut issue = base_issue();
+        issue.dependencies = vec![Dependency {
+            issue_id: issue.id.clone(),
+            depends_on_id: issue.id.clone(),
+            dep_type: DependencyType::Blocks,
+            created_at: issue.created_at,
+            created_by: Some("tester".to_string()),
+            metadata: None,
+            thread_id: None,
+        }];
+
+        let errors = IssueValidator::validate(&issue).unwrap_err();
+        assert!(errors.iter().any(|err| {
+            err.field == "dependencies[0].depends_on_id"
+                && err.message.contains("cannot depend on itself")
+        }));
     }
 
     #[test]
