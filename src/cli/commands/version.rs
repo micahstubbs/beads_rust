@@ -3,6 +3,7 @@
 use crate::cli::VersionArgs;
 use crate::error::Result;
 use crate::output::{OutputContext, OutputMode};
+use crate::{REPO_NAME, REPO_OWNER};
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::fmt::Write as _;
@@ -279,11 +280,11 @@ fn fetch_latest_version() -> Result<String> {
     use std::io::Read;
 
     // Use GitHub API to get latest release
-    let url = "https://api.github.com/repos/Dicklesworthstone/beads_rust/releases/latest";
+    let url = format!("https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases/latest");
 
     // Build request with User-Agent (required by GitHub)
     let mut handle = std::process::Command::new("curl")
-        .args(["-sS", "-H", "User-Agent: br-cli", url])
+        .args(["-sS", "-H", "User-Agent: br-cli", &url])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()

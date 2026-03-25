@@ -5,6 +5,7 @@
 
 use crate::error::{BeadsError, Result};
 use crate::output::{OutputContext, OutputMode};
+use crate::{REPO_NAME, REPO_OWNER};
 use regex::Regex;
 use rich_rust::prelude::*;
 use std::fs;
@@ -25,13 +26,16 @@ pub const BLURB_END_MARKER: &str = "<!-- end-br-agent-instructions -->";
 pub const SUPPORTED_AGENT_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md", "agents.md", "claude.md"];
 
 /// The agent instructions blurb to append to AGENTS.md files.
-pub const AGENT_BLURB: &str = r#"<!-- br-agent-instructions-v1 -->
+pub static AGENT_BLURB: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let repo_url = format!("https://github.com/{REPO_OWNER}/{REPO_NAME}");
+    format!(
+        r#"<!-- br-agent-instructions-v1 -->
 
 ---
 
 ## Beads Workflow Integration
 
-This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`/`bd`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
+This project uses [beads_rust]({repo_url}) (`br`/`bd`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
 
 ### Essential Commands
 
@@ -90,7 +94,14 @@ git push                # Push to remote
 - Use descriptive titles and set appropriate priority/type
 - Always sync before ending session
 
-<!-- end-br-agent-instructions -->"#;
+<!-- end-br-agent-instructions -->"#
+    )
+});
+
+#[must_use]
+pub fn agent_blurb() -> &'static str {
+    AGENT_BLURB.as_str()
+}
 
 /// Result of detecting an agent config file.
 #[derive(Debug, Clone, Default)]
@@ -355,7 +366,7 @@ pub fn detect_agent_file_in_project(work_dir: &Path) -> AgentFileDetection {
 #[must_use]
 pub fn append_blurb(content: &str) -> String {
     if content.is_empty() {
-        return format!("{AGENT_BLURB}\n");
+        return format!("{}\n", agent_blurb());
     }
 
     let mut result = content.to_string();
@@ -363,7 +374,7 @@ pub fn append_blurb(content: &str) -> String {
         result.push('\n');
     }
     result.push('\n');
-    result.push_str(AGENT_BLURB);
+    result.push_str(agent_blurb());
     result.push('\n');
     result
 }
@@ -661,13 +672,13 @@ fn execute_dry_run_inferred(
                 theme.dimmed.clone(),
             );
             // Show a truncated preview (first few lines)
-            for line in AGENT_BLURB.lines().take(12) {
+            for line in agent_blurb().lines().take(12) {
                 content.append_styled(line, theme.dimmed.clone());
                 content.append("\n");
             }
             content.append_styled("  ... (", theme.dimmed.clone());
             content.append_styled(
-                &format!("{} lines total", AGENT_BLURB.lines().count()),
+                &format!("{} lines total", agent_blurb().lines().count()),
                 theme.emphasis.clone(),
             );
             content.append_styled(")\n", theme.dimmed.clone());
@@ -682,7 +693,7 @@ fn execute_dry_run_inferred(
                 target_path.display()
             );
             println!("\n--- Preview ---");
-            println!("{AGENT_BLURB}");
+            println!("{}", agent_blurb());
         }
         return Ok(());
     }
@@ -733,7 +744,7 @@ fn execute_dry_run_inferred(
                 file_path.display()
             );
             println!("\n--- Preview ---");
-            println!("{AGENT_BLURB}");
+            println!("{}", agent_blurb());
         }
         return Ok(());
     }
@@ -930,7 +941,7 @@ fn execute_add(
                 file_path.display()
             );
             println!("\n--- Preview ---");
-            println!("{AGENT_BLURB}");
+            println!("{}", agent_blurb());
         }
         return Ok(());
     }
@@ -1491,7 +1502,7 @@ mod tests {
 
     #[test]
     fn test_contains_blurb() {
-        assert!(contains_blurb(AGENT_BLURB));
+        assert!(contains_blurb(agent_blurb()));
     }
 
     #[test]
@@ -1504,8 +1515,10 @@ mod tests {
 
     #[test]
     fn test_contains_blurb_skips_incomplete_marker_before_valid_block() {
-        let content =
-            format!("Example start marker: <!-- br-agent-instructions-v9 -->\n\n{AGENT_BLURB}");
+        let content = format!(
+            "Example start marker: <!-- br-agent-instructions-v9 -->\n\n{}",
+            agent_blurb()
+        );
 
         assert!(contains_blurb(&content));
         assert_eq!(get_blurb_version(&content), 1);
@@ -1564,7 +1577,7 @@ mod tests {
     #[test]
     fn test_detect_agent_file_with_blurb() {
         let temp_dir = TempDir::new().unwrap();
-        let content = format!("# Agents\n\n{AGENT_BLURB}\n");
+        let content = format!("# Agents\n\n{}\n", agent_blurb());
         let agents_path = temp_dir.path().join("AGENTS.md");
         fs::write(&agents_path, content).unwrap();
 
@@ -1639,12 +1652,12 @@ mod tests {
         let result = append_blurb("");
 
         assert!(result.starts_with(BLURB_START_MARKER));
-        assert_eq!(result, format!("{AGENT_BLURB}\n"));
+        assert_eq!(result, format!("{}\n", agent_blurb()));
     }
 
     #[test]
     fn test_remove_blurb() {
-        let content = format!("# Agents\n\n{AGENT_BLURB}\n\nMore content.");
+        let content = format!("# Agents\n\n{}\n\nMore content.", agent_blurb());
         let result = remove_blurb(&content);
         assert!(!result.contains(BLURB_START_MARKER));
         assert!(result.contains("# Agents"));
@@ -1654,7 +1667,8 @@ mod tests {
     #[test]
     fn test_remove_blurb_ignores_earlier_end_marker_text() {
         let content = format!(
-            "# Agents\n\nLiteral marker: {BLURB_END_MARKER}\n\n{AGENT_BLURB}\n\nMore content."
+            "# Agents\n\nLiteral marker: {BLURB_END_MARKER}\n\n{}\n\nMore content.",
+            agent_blurb()
         );
 
         let result = remove_blurb(&content);
@@ -1668,7 +1682,8 @@ mod tests {
     #[test]
     fn test_remove_blurb_skips_incomplete_marker_before_valid_block() {
         let content = format!(
-            "# Agents\n\nBroken example: <!-- br-agent-instructions-v9 -->\n\n{AGENT_BLURB}\n\nMore content."
+            "# Agents\n\nBroken example: <!-- br-agent-instructions-v9 -->\n\n{}\n\nMore content.",
+            agent_blurb()
         );
 
         let result = remove_blurb(&content);

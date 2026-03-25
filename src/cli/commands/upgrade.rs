@@ -5,21 +5,13 @@
 use crate::cli::UpgradeArgs;
 use crate::error::{BeadsError, Result};
 use crate::output::{OutputContext, OutputMode};
+use crate::{BIN_NAME, REPO_NAME, REPO_OWNER};
 use rich_rust::prelude::*;
 use self_update::backends::github;
 use self_update::cargo_crate_version;
 use self_update::update::ReleaseUpdate;
 use serde::Serialize;
 use std::env;
-
-/// Repo owner for GitHub releases.
-const REPO_OWNER: &str = "Dicklesworthstone";
-
-/// Repo name for GitHub releases.
-const REPO_NAME: &str = "beads_rust";
-
-/// Binary name.
-const BIN_NAME: &str = "br";
 
 /// Update check result.
 #[derive(Serialize)]
@@ -221,9 +213,9 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, ctx: &OutputContex
                  This binary was built without archive support for the required format (e.g., .tar.gz).\n\
                  This is a known issue in some older versions (e.g., 0.1.21 - 0.1.26). Version 0.1.27 and later include the correct 'archive-tar' linkage.\n\n\
                  Please upgrade manually by running:\n\n  \
-                 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/beads_rust/main/install.sh | bash\n\n\
+                 curl -fsSL https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/install.sh | bash\n\n\
                  Or by downloading the release from:\n  \
-                 https://github.com/Dicklesworthstone/beads_rust/releases\n\n\
+                 https://github.com/{REPO_OWNER}/{REPO_NAME}/releases\n\n\
                  After that, `br upgrade` will work correctly for future updates."
             ))
         } else {

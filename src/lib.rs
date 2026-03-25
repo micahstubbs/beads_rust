@@ -37,6 +37,18 @@ pub mod mcp;
 
 pub use error::{BeadsError, ErrorCode, Result, StructuredError};
 
+/// Canonical GitHub repository owner for `br` metadata and URLs.
+///
+/// These constants live outside `cli::commands::upgrade` so commands compiled
+/// without the `self_update` feature can still construct repository URLs.
+pub const REPO_OWNER: &str = "Dicklesworthstone";
+
+/// Canonical GitHub repository name for `br` metadata and URLs.
+pub const REPO_NAME: &str = "beads_rust";
+
+/// Canonical distributed binary name.
+pub const BIN_NAME: &str = "br";
+
 /// Run the CLI application.
 ///
 /// This is the main entry point called from `main()`.
@@ -68,6 +80,13 @@ mod tests {
         let structured = StructuredError::from_error(&err);
         assert_eq!(structured.code, ErrorCode::IssueNotFound);
         assert_eq!(structured.code.exit_code(), 3);
+    }
+
+    #[test]
+    fn repository_identity_constants_match_expected_values() {
+        assert_eq!(REPO_OWNER, "Dicklesworthstone");
+        assert_eq!(REPO_NAME, "beads_rust");
+        assert_eq!(BIN_NAME, "br");
     }
 
     #[cfg(feature = "self_update")]
