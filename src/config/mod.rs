@@ -1401,7 +1401,7 @@ pub fn no_auto_import_from_layer(layer: &ConfigLayer) -> Option<bool> {
     .and_then(|value| parse_bool(value))
 }
 
-fn resolve_bootstrap_issue_prefix(
+pub(crate) fn resolve_bootstrap_issue_prefix(
     bootstrap_layer: &ConfigLayer,
     beads_dir: &Path,
     jsonl_path: &Path,

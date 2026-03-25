@@ -88,26 +88,22 @@ fn detect_prefix(
     jsonl_path: &Path,
     cli: &config::CliOverrides,
 ) -> Option<String> {
-    let no_db = if let Ok(startup) =
-        config::load_startup_config_with_paths(beads_dir, cli.db.as_ref())
-    {
-        let mut effective_startup = startup.merged_config;
-        effective_startup.merge_from(&cli.as_layer());
-
-        if let Some(prefix) = config::configured_issue_prefix_from_map(&effective_startup.runtime) {
-            return Some(prefix);
-        }
-
-        config::no_db_from_layer(&effective_startup).unwrap_or(false)
-    } else {
-        matches!(cli.no_db, Some(true))
-    };
-
-    if no_db {
-        return match inspect_jsonl_prefix(jsonl_path) {
-            JsonlPrefixState::Detected(prefix) => Some(prefix),
-            JsonlPrefixState::Missing | JsonlPrefixState::Mixed => None,
+    let effective_startup =
+        if let Ok(startup) = config::load_startup_config_with_paths(beads_dir, cli.db.as_ref()) {
+            let mut effective_startup = startup.merged_config;
+            effective_startup.merge_from(&cli.as_layer());
+            effective_startup
+        } else {
+            cli.as_layer()
         };
+
+    if let Some(prefix) = config::configured_issue_prefix_from_map(&effective_startup.runtime) {
+        return Some(prefix);
+    }
+
+    if config::no_db_from_layer(&effective_startup).unwrap_or(false) {
+        return config::resolve_bootstrap_issue_prefix(&effective_startup, beads_dir, jsonl_path)
+            .ok();
     }
 
     match inspect_jsonl_prefix(jsonl_path) {
@@ -666,6 +662,29 @@ mod tests {
         assert_eq!(
             detect_prefix(&beads_dir, &db_path, &jsonl_path, &cli),
             Some("jsonl".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_prefix_uses_bootstrap_prefix_when_cli_no_db_and_jsonl_missing() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace_root = temp.path().join("workspace-name");
+        let beads_dir = workspace_root.join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let cli = CliOverrides {
+            no_db: Some(true),
+            ..CliOverrides::default()
+        };
+
+        assert_eq!(
+            detect_prefix(
+                &beads_dir,
+                &beads_dir.join("beads.db"),
+                &beads_dir.join("issues.jsonl"),
+                &cli
+            ),
+            Some(crate::util::id::abbreviate_prefix("workspace-name"))
         );
     }
 }

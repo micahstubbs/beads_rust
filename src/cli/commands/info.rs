@@ -112,19 +112,22 @@ fn collect_info_output(
     } else {
         load_info_snapshot_without_recovery(args, &startup.paths)
     };
-    let resolved_prefix = config::configured_issue_prefix_from_map(&effective_startup.runtime)
-        .or_else(|| {
-            if no_db {
-                None
-            } else {
-                snapshot.detected_prefix.clone()
-            }
-        })
-        .or_else(|| {
-            config::first_prefix_from_jsonl(&startup.paths.jsonl_path)
-                .ok()
-                .flatten()
-        });
+    let resolved_prefix = if no_db {
+        config::resolve_bootstrap_issue_prefix(
+            &effective_startup,
+            &beads_dir,
+            &startup.paths.jsonl_path,
+        )
+        .ok()
+    } else {
+        config::configured_issue_prefix_from_map(&effective_startup.runtime)
+            .or_else(|| snapshot.detected_prefix.clone())
+            .or_else(|| {
+                config::first_prefix_from_jsonl(&startup.paths.jsonl_path)
+                    .ok()
+                    .flatten()
+            })
+    };
 
     let db_path = canonicalize_lossy(&startup.paths.db_path);
     let db_size = std::fs::metadata(&startup.paths.db_path)
@@ -893,6 +896,37 @@ mod tests {
         .unwrap();
 
         assert_eq!(output.resolved_prefix.as_deref(), Some("jsonl"));
+        assert!(output.issue_count.is_none());
+        assert!(output.config.is_none());
+        assert!(output.schema.is_none());
+    }
+
+    #[test]
+    fn test_collect_info_output_uses_bootstrap_prefix_when_cli_no_db_and_jsonl_missing() {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace-name");
+        let beads_dir = workspace_root.join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        std::fs::write(
+            beads_dir.join("metadata.json"),
+            r#"{"database":"beads.db","jsonl_export":"issues.jsonl"}"#,
+        )
+        .unwrap();
+
+        let output = collect_info_output(
+            &InfoArgs::default(),
+            &CliOverrides {
+                no_db: Some(true),
+                ..CliOverrides::default()
+            },
+            Some(&workspace_root),
+        )
+        .unwrap();
+
+        assert_eq!(
+            output.resolved_prefix.as_deref(),
+            Some(crate::util::id::abbreviate_prefix("workspace-name").as_str())
+        );
         assert!(output.issue_count.is_none());
         assert!(output.config.is_none());
         assert!(output.schema.is_none());
