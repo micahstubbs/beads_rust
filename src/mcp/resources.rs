@@ -18,6 +18,9 @@ use crate::storage::{ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
 
 use super::{BeadsState, to_mcp};
 
+const IN_PROGRESS_RESOURCE_LIMIT: usize = 50;
+const DEFERRED_RESOURCE_LIMIT: usize = 50;
+
 /// Build a structured "issue not found" error with fuzzy suggestions,
 /// mirroring the tools.rs pattern for consistent agent UX.
 fn issue_not_found_resource(storage: &SqliteStorage, id: &str) -> McpError {
@@ -43,6 +46,19 @@ fn issue_not_found_resource(storage: &SqliteStorage, id: &str) -> McpError {
     data["suggested_tool_calls"] = json!([{"tool": "list_issues", "arguments": {}}]);
 
     McpError::with_data(McpErrorCode::ToolExecutionError, structured.message, data)
+}
+
+fn count_and_sample_issues(
+    storage: &SqliteStorage,
+    mut filters: ListFilters,
+    sample_limit: usize,
+) -> McpResult<(usize, Vec<Issue>)> {
+    let total = storage
+        .count_issues_with_filters(&filters)
+        .map_err(to_mcp)?;
+    filters.limit = Some(sample_limit);
+    let issues = storage.list_issues(&filters).map_err(to_mcp)?;
+    Ok((total, issues))
 }
 
 // ---------------------------------------------------------------------------
@@ -475,13 +491,13 @@ impl ResourceHandler for InProgressResource {
         Resource {
             uri: "beads://issues/in_progress".into(),
             name: "In-Progress Issues".into(),
-            description: Some(
+            description: Some(format!(
                 "Issues currently being worked on (status: in_progress). \
-                 Shows who is working on what with priorities. \
+                 Shows who is working on what with priorities, with an exact total \
+                 count and up to {IN_PROGRESS_RESOURCE_LIMIT} sample issues. \
                  Used by: update_issue to change assignee/status. Use show_issue for \
                  full details."
-                    .into(),
-            ),
+            )),
             mime_type: Some("application/json".into()),
             icon: None,
             version: None,
@@ -494,13 +510,13 @@ impl ResourceHandler for InProgressResource {
         let filters = ListFilters {
             statuses: Some(vec![Status::InProgress]),
             include_closed: false,
-            limit: Some(50),
             ..ListFilters::default()
         };
-        let issues = storage.list_issues(&filters).map_err(to_mcp)?;
+        let (count, issues) =
+            count_and_sample_issues(&storage, filters, IN_PROGRESS_RESOURCE_LIMIT)?;
 
         let result = json!({
-            "count": issues.len(),
+            "count": count,
             "issues": issues.iter().map(|issue| {
                 json!({
                     "id": issue.id,
@@ -594,12 +610,12 @@ impl ResourceHandler for DeferredIssuesResource {
         Resource {
             uri: "beads://issues/deferred".into(),
             name: "Deferred Issues".into(),
-            description: Some(
+            description: Some(format!(
                 "Issues that have been deferred (status: deferred). Useful for triage — \
-                 review what has been postponed and whether it should be revisited. \
+                 review what has been postponed and whether it should be revisited, \
+                 with an exact total count and up to {DEFERRED_RESOURCE_LIMIT} sample issues. \
                  Used by: update_issue to change status. Use show_issue for full details."
-                    .into(),
-            ),
+            )),
             mime_type: Some("application/json".into()),
             icon: None,
             version: None,
@@ -612,13 +628,12 @@ impl ResourceHandler for DeferredIssuesResource {
         let filters = ListFilters {
             statuses: Some(vec![Status::Deferred]),
             include_deferred: true,
-            limit: Some(50),
             ..ListFilters::default()
         };
-        let issues = storage.list_issues(&filters).map_err(to_mcp)?;
+        let (count, issues) = count_and_sample_issues(&storage, filters, DEFERRED_RESOURCE_LIMIT)?;
 
         let result = json!({
-            "count": issues.len(),
+            "count": count,
             "issues": issues.iter().map(|issue| {
                 json!({
                     "id": issue.id,
@@ -670,12 +685,36 @@ fn longest_chain_from(
     depth
 }
 
+fn graph_has_cycle(
+    node: &str,
+    edges: &HashMap<String, Vec<String>>,
+    visiting: &mut std::collections::HashSet<String>,
+    visited: &mut std::collections::HashSet<String>,
+) -> bool {
+    if visited.contains(node) {
+        return false;
+    }
+
+    if !visiting.insert(node.to_string()) {
+        return true;
+    }
+
+    let detected = edges.get(node).is_some_and(|children| {
+        children
+            .iter()
+            .any(|child| graph_has_cycle(child, edges, visiting, visited))
+    });
+
+    visiting.remove(node);
+    visited.insert(node.to_string());
+    detected
+}
+
 /// Compute graph health metrics from the dependency edges.
 fn compute_graph_health(storage: &SqliteStorage) -> McpResult<serde_json::Value> {
     let all_edges = storage.get_blocks_dep_edges().map_err(to_mcp)?;
     let open_filters = ListFilters {
         include_closed: false,
-        limit: Some(10_000),
         ..ListFilters::default()
     };
     let open_issues = storage.list_issues(&open_filters).map_err(to_mcp)?;
@@ -725,20 +764,15 @@ fn compute_graph_health(storage: &SqliteStorage) -> McpResult<serde_json::Value>
     let stale_filters = ListFilters {
         include_closed: false,
         updated_before: Some(thirty_days_ago),
-        limit: Some(100),
         ..ListFilters::default()
     };
     let stale_issues = storage.list_issues(&stale_filters).map_err(to_mcp)?;
 
-    // Cycle check — look for any self-referential paths in open edges
-    let has_cycles = !storage.get_blocked_ids().map_err(to_mcp)?.is_empty()
-        && open_edges.iter().any(|(from, to)| {
-            // Simple heuristic: check if any blocked issue forms a cycle
-            // Full cycle detection would require DFS, but would_create_cycle
-            // is per-pair. We use the presence of mutual edges as a proxy.
-            adj.get(to.as_str())
-                .is_some_and(|targets| targets.iter().any(|t| t == from))
-        });
+    let mut cycle_visiting = std::collections::HashSet::new();
+    let mut cycle_visited = std::collections::HashSet::new();
+    let has_cycles = open_ids
+        .iter()
+        .any(|id| graph_has_cycle(id, &adj, &mut cycle_visiting, &mut cycle_visited));
 
     Ok(json!({
         "open_issue_count": node_count,
@@ -762,7 +796,7 @@ fn compute_graph_health(storage: &SqliteStorage) -> McpResult<serde_json::Value>
             "Shallow — good parallelization potential"
         },
         "high_fan_out_issues": high_fan_out,
-        "mutual_dependency_detected": has_cycles,
+        "cycle_detected": has_cycles,
         "stale_issue_count": stale_issues.len(),
         "stale_threshold_days": 30,
     }))
@@ -818,7 +852,6 @@ fn compute_bottlenecks(storage: &SqliteStorage) -> McpResult<serde_json::Value> 
     let edges = storage.get_blocks_dep_edges().map_err(to_mcp)?;
     let open_filters = ListFilters {
         include_closed: false,
-        limit: Some(10_000),
         ..ListFilters::default()
     };
     let open_issues = storage.list_issues(&open_filters).map_err(to_mcp)?;
@@ -904,5 +937,141 @@ impl ResourceHandler for BottlenecksResource {
             text: Some(bottlenecks.to_string()),
             blob: None,
         }])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Dependency, DependencyType, IssueType, Priority};
+    use chrono::{Duration, Utc};
+
+    fn make_issue(id: &str, updated_at: chrono::DateTime<Utc>) -> Issue {
+        let created_at = updated_at - Duration::minutes(5);
+        Issue {
+            id: id.to_string(),
+            content_hash: None,
+            title: format!("Issue {id}"),
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            notes: None,
+            status: Status::Open,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            assignee: None,
+            owner: None,
+            estimated_minutes: None,
+            created_at,
+            created_by: None,
+            updated_at,
+            closed_at: None,
+            close_reason: None,
+            closed_by_session: None,
+            due_at: None,
+            defer_until: None,
+            external_ref: None,
+            source_system: None,
+            source_repo: None,
+            deleted_at: None,
+            deleted_by: None,
+            delete_reason: None,
+            original_type: None,
+            compaction_level: None,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: None,
+            sender: None,
+            ephemeral: false,
+            pinned: false,
+            is_template: false,
+            labels: vec![],
+            dependencies: vec![],
+            comments: vec![],
+        }
+    }
+
+    fn make_dependency(issue_id: &str, depends_on_id: &str) -> Dependency {
+        Dependency {
+            issue_id: issue_id.to_string(),
+            depends_on_id: depends_on_id.to_string(),
+            dep_type: DependencyType::Blocks,
+            created_at: Utc::now(),
+            created_by: Some("tester".to_string()),
+            metadata: None,
+            thread_id: None,
+        }
+    }
+
+    #[test]
+    fn compute_graph_health_detects_non_mutual_cycles() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+
+        for id in ["bd-a", "bd-b", "bd-c"] {
+            storage
+                .create_issue(&make_issue(id, now), "tester")
+                .unwrap();
+        }
+
+        storage
+            .sync_dependencies_for_import("bd-a", &[make_dependency("bd-a", "bd-b")])
+            .unwrap();
+        storage
+            .sync_dependencies_for_import("bd-b", &[make_dependency("bd-b", "bd-c")])
+            .unwrap();
+        storage
+            .sync_dependencies_for_import("bd-c", &[make_dependency("bd-c", "bd-a")])
+            .unwrap();
+
+        let health = compute_graph_health(&storage).unwrap();
+        assert_eq!(health["cycle_detected"], json!(true));
+    }
+
+    #[test]
+    fn compute_graph_health_counts_all_stale_open_issues() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let stale_time = Utc::now() - Duration::days(31);
+
+        for index in 0..101 {
+            let issue = make_issue(&format!("bd-stale-{index:03}"), stale_time);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        let health = compute_graph_health(&storage).unwrap();
+        assert_eq!(health["stale_issue_count"], json!(101));
+        assert_eq!(health["open_issue_count"], json!(101));
+    }
+
+    #[test]
+    fn resource_sampling_preserves_exact_in_progress_count() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+
+        for index in 0..51 {
+            storage
+                .create_issue(
+                    &Issue {
+                        status: Status::InProgress,
+                        ..make_issue(&format!("bd-ip-{index:02}"), now)
+                    },
+                    "tester",
+                )
+                .unwrap();
+        }
+
+        let (count, issues) = count_and_sample_issues(
+            &storage,
+            ListFilters {
+                statuses: Some(vec![Status::InProgress]),
+                include_closed: false,
+                ..ListFilters::default()
+            },
+            IN_PROGRESS_RESOURCE_LIMIT,
+        )
+        .unwrap();
+
+        assert_eq!(count, 51);
+        assert_eq!(issues.len(), IN_PROGRESS_RESOURCE_LIMIT);
     }
 }

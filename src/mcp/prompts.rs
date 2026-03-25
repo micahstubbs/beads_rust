@@ -22,21 +22,16 @@ use super::{BeadsState, to_mcp};
 // Display limits — extracted from magic numbers for maintainability
 // ---------------------------------------------------------------------------
 
-const UNASSIGNED_FETCH_LIMIT: usize = 50;
 const UNASSIGNED_DISPLAY_LIMIT: usize = 15;
 const READY_DISPLAY_LIMIT: usize = 10;
-const DEFERRED_FETCH_LIMIT: usize = 50;
 const DEFERRED_DISPLAY_LIMIT: usize = 15;
 const STATUS_REPORT_IN_PROGRESS_LIMIT: usize = 20;
 const STATUS_REPORT_BLOCKED_LIMIT: usize = 10;
 const STATUS_REPORT_LABELS_LIMIT: usize = 10;
-const BOTTLENECK_FETCH_LIMIT: usize = 10_000;
 const BOTTLENECK_DISPLAY_LIMIT: usize = 10;
 const QUICK_WINS_DISPLAY_LIMIT: usize = 5;
-const COMPLETENESS_FETCH_LIMIT: usize = 100;
 const QUALITY_SAMPLE_LIMIT: usize = 10;
 const ORPHAN_DISPLAY_LIMIT: usize = 15;
-const DEPENDENCY_HEALTH_FETCH_LIMIT: usize = 500;
 
 /// Validate a prompt argument against known values. Returns the validated value
 /// and an optional warning if the input was unrecognized and defaulted.
@@ -57,6 +52,19 @@ fn validate_prompt_arg<'a>(
             )),
         )
     }
+}
+
+fn count_and_sample_issues(
+    storage: &SqliteStorage,
+    mut filters: ListFilters,
+    sample_limit: usize,
+) -> McpResult<(usize, Vec<Issue>)> {
+    let total = storage
+        .count_issues_with_filters(&filters)
+        .map_err(to_mcp)?;
+    filters.limit = Some(sample_limit);
+    let issues = storage.list_issues(&filters).map_err(to_mcp)?;
+    Ok((total, issues))
 }
 
 /// Gather blocked-issues context as a formatted string.
@@ -88,16 +96,15 @@ fn unassigned_context(storage: &SqliteStorage) -> McpResult<String> {
     let filters = ListFilters {
         include_closed: false,
         unassigned: true,
-        limit: Some(UNASSIGNED_FETCH_LIMIT),
         ..ListFilters::default()
     };
-    let unassigned = storage.list_issues(&filters).map_err(to_mcp)?;
-    if unassigned.is_empty() {
+    let (total_unassigned, unassigned) =
+        count_and_sample_issues(storage, filters, UNASSIGNED_DISPLAY_LIMIT)?;
+    if total_unassigned == 0 {
         return Ok("All open issues are assigned.".into());
     }
     let unassigned_json: Vec<_> = unassigned
         .iter()
-        .take(UNASSIGNED_DISPLAY_LIMIT)
         .map(|issue| {
             json!({
                 "id": issue.id,
@@ -108,8 +115,7 @@ fn unassigned_context(storage: &SqliteStorage) -> McpResult<String> {
         })
         .collect();
     Ok(format!(
-        "Unassigned open issues ({}):\n{}",
-        unassigned.len(),
+        "Unassigned open issues ({total_unassigned}, showing up to {UNASSIGNED_DISPLAY_LIMIT}):\n{}",
         serde_json::to_string_pretty(&unassigned_json).unwrap_or_default()
     ))
 }
@@ -147,16 +153,15 @@ fn deferred_context(storage: &SqliteStorage) -> McpResult<String> {
         statuses: Some(vec![Status::Deferred]),
         include_closed: false,
         include_deferred: true,
-        limit: Some(DEFERRED_FETCH_LIMIT),
         ..ListFilters::default()
     };
-    let deferred = storage.list_issues(&filters).map_err(to_mcp)?;
-    if deferred.is_empty() {
+    let (total_deferred, deferred) =
+        count_and_sample_issues(storage, filters, DEFERRED_DISPLAY_LIMIT)?;
+    if total_deferred == 0 {
         return Ok("No deferred issues.".into());
     }
     let deferred_json: Vec<_> = deferred
         .iter()
-        .take(DEFERRED_DISPLAY_LIMIT)
         .map(|issue| {
             json!({
                 "id": issue.id,
@@ -167,8 +172,7 @@ fn deferred_context(storage: &SqliteStorage) -> McpResult<String> {
         })
         .collect();
     Ok(format!(
-        "Deferred issues ({}):\n{}",
-        deferred.len(),
+        "Deferred issues ({total_deferred}, showing up to {DEFERRED_DISPLAY_LIMIT}):\n{}",
         serde_json::to_string_pretty(&deferred_json).unwrap_or_default()
     ))
 }
@@ -356,10 +360,13 @@ impl PromptHandler for StatusReportPrompt {
         let in_progress_filters = ListFilters {
             statuses: Some(vec![Status::InProgress]),
             include_closed: false,
-            limit: Some(50),
             ..ListFilters::default()
         };
-        let in_progress = storage.list_issues(&in_progress_filters).map_err(to_mcp)?;
+        let (in_progress_count, in_progress) = count_and_sample_issues(
+            &storage,
+            in_progress_filters,
+            STATUS_REPORT_IN_PROGRESS_LIMIT,
+        )?;
 
         let mut data = json!({
             "counts": {
@@ -367,9 +374,9 @@ impl PromptHandler for StatusReportPrompt {
                 "active": active,
                 "blocked": blocked.len(),
                 "ready": ready.len(),
-                "in_progress": in_progress.len(),
+                "in_progress": in_progress_count,
             },
-            "in_progress": in_progress.iter().take(STATUS_REPORT_IN_PROGRESS_LIMIT).map(|i| {
+            "in_progress": in_progress.iter().map(|i| {
                 json!({"id": i.id, "title": i.title, "priority": i.priority, "assignee": i.assignee})
             }).collect::<Vec<_>>(),
             "blocked": blocked.iter().take(STATUS_REPORT_BLOCKED_LIMIT).map(|(i, b)| {
@@ -425,7 +432,6 @@ fn bottleneck_context(storage: &SqliteStorage) -> McpResult<String> {
     let edges = storage.get_blocks_dep_edges().map_err(to_mcp)?;
     let open_filters = ListFilters {
         include_closed: false,
-        limit: Some(BOTTLENECK_FETCH_LIMIT),
         ..ListFilters::default()
     };
     let open_issues = storage.list_issues(&open_filters).map_err(to_mcp)?;
@@ -660,7 +666,6 @@ impl PromptHandler for PlanNextWorkPrompt {
 fn completeness_context(storage: &SqliteStorage) -> McpResult<String> {
     let filters = ListFilters {
         include_closed: false,
-        limit: Some(COMPLETENESS_FETCH_LIMIT),
         ..ListFilters::default()
     };
     let issues = storage.list_issues(&filters).map_err(to_mcp)?;
@@ -735,7 +740,6 @@ fn dependency_health_context(storage: &SqliteStorage) -> McpResult<String> {
     let filters = ListFilters {
         include_closed: false,
         include_deferred: true, // deferred issues are still part of the project
-        limit: Some(DEPENDENCY_HEALTH_FETCH_LIMIT),
         ..ListFilters::default()
     };
     let open_issues = storage.list_issues(&filters).map_err(to_mcp)?;
@@ -753,19 +757,24 @@ fn dependency_health_context(storage: &SqliteStorage) -> McpResult<String> {
         }
     }
 
-    let orphans: Vec<_> = open_issues
+    let orphan_issues: Vec<_> = open_issues
         .iter()
         .filter(|i| !connected.contains(i.id.as_str()))
+        .collect();
+    let orphan_count = orphan_issues.len();
+    let orphan_sample: Vec<_> = orphan_issues
+        .iter()
         .take(ORPHAN_DISPLAY_LIMIT)
         .map(|i| json!({"id": i.id, "title": i.title, "priority": i.priority}))
         .collect();
 
     let mut parts: Vec<String> = Vec::new();
 
-    if !orphans.is_empty() {
+    if orphan_count > 0 {
         parts.push(format!(
-            "Orphan issues (no dependencies — consider linking or are they standalone?):\n{}",
-            serde_json::to_string_pretty(&orphans).unwrap_or_default()
+            "Orphan issues ({orphan_count} total, showing up to {ORPHAN_DISPLAY_LIMIT}) — \
+             no dependencies; consider linking or confirm they are standalone:\n{}",
+            serde_json::to_string_pretty(&orphan_sample).unwrap_or_default()
         ));
     }
 
@@ -779,7 +788,7 @@ fn dependency_health_context(storage: &SqliteStorage) -> McpResult<String> {
         open_issues.len(),
         open_edge_count,
         connected.len(),
-        orphans.len()
+        orphan_count
     ));
 
     Ok(parts.join("\n\n"))
@@ -913,5 +922,121 @@ impl PromptHandler for PolishBacklogPrompt {
                 content: Content::text(instruction.to_string()),
             },
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{IssueType, Priority};
+    use chrono::{Duration, Utc};
+
+    fn make_issue(id: &str, status: Status, updated_at: chrono::DateTime<Utc>) -> Issue {
+        Issue {
+            id: id.to_string(),
+            content_hash: None,
+            title: format!("Issue {id}"),
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            notes: None,
+            status,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            assignee: None,
+            owner: None,
+            estimated_minutes: None,
+            created_at: updated_at - Duration::minutes(5),
+            created_by: None,
+            updated_at,
+            closed_at: None,
+            close_reason: None,
+            closed_by_session: None,
+            due_at: None,
+            defer_until: None,
+            external_ref: None,
+            source_system: None,
+            source_repo: None,
+            deleted_at: None,
+            deleted_by: None,
+            delete_reason: None,
+            original_type: None,
+            compaction_level: None,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: None,
+            sender: None,
+            ephemeral: false,
+            pinned: false,
+            is_template: false,
+            labels: vec![],
+            dependencies: vec![],
+            comments: vec![],
+        }
+    }
+
+    #[test]
+    fn count_and_sample_issues_preserves_exact_count() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for index in 0..21 {
+            storage
+                .create_issue(
+                    &make_issue(&format!("bd-ip-{index:02}"), Status::InProgress, now),
+                    "tester",
+                )
+                .unwrap();
+        }
+
+        let (count, sample) = count_and_sample_issues(
+            &storage,
+            ListFilters {
+                statuses: Some(vec![Status::InProgress]),
+                include_closed: false,
+                ..ListFilters::default()
+            },
+            STATUS_REPORT_IN_PROGRESS_LIMIT,
+        )
+        .unwrap();
+
+        assert_eq!(count, 21);
+        assert_eq!(sample.len(), STATUS_REPORT_IN_PROGRESS_LIMIT);
+    }
+
+    #[test]
+    fn completeness_context_counts_all_matching_open_issues() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for index in 0..101 {
+            storage
+                .create_issue(
+                    &make_issue(&format!("bd-doc-{index:03}"), Status::Open, now),
+                    "tester",
+                )
+                .unwrap();
+        }
+
+        let context = completeness_context(&storage).unwrap();
+        assert!(context.contains("Issues with NO description (101):"));
+    }
+
+    #[test]
+    fn dependency_health_context_reports_full_orphan_count() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for index in 0..20 {
+            storage
+                .create_issue(
+                    &make_issue(&format!("bd-orphan-{index:02}"), Status::Open, now),
+                    "tester",
+                )
+                .unwrap();
+        }
+
+        let context = dependency_health_context(&storage).unwrap();
+        assert!(context.contains(
+            "Dependency coverage: 20 open issues, 0 dependency edges, 0 connected, 20 orphans."
+        ));
+        assert!(context.contains("Orphan issues (20 total, showing up to 15)"));
     }
 }
