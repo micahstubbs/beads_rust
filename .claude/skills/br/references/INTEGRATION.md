@@ -2,19 +2,16 @@
 
 ## bv (Beads Viewer) Integration
 
-bv is a graph-aware triage engine for beads projects.
+bv is a graph-aware triage engine for beads.
 
-**CRITICAL:** Never run bare `bv` -- it launches interactive TUI and blocks the session.
+**CRITICAL:** Never run bare `bv` — it launches interactive TUI and blocks the session.
 
 ```bash
 # Always use --robot-* flags:
 bv --robot-triage        # Full triage with recommendations
-bv --robot-next          # Single top pick + claim command
+bv --robot-next          # Single top pick
 bv --robot-plan          # Parallel execution tracks
 bv --robot-insights      # Graph metrics (PageRank, cycles, etc.)
-bv --robot-priority      # Priority misalignment detection
-bv --robot-alerts        # Stale issues, blocking cascades
-bv --robot-suggest       # Hygiene: duplicates, missing deps
 ```
 
 ### Check Graph Health
@@ -22,15 +19,6 @@ bv --robot-suggest       # Hygiene: duplicates, missing deps
 ```bash
 bv --robot-insights | jq '.Cycles'       # Must be empty
 bv --robot-insights | jq '.bottlenecks'  # Find blocking issues
-```
-
-### Scoping and Filtering
-
-```bash
-bv --robot-plan --label backend              # Scope to label's subgraph
-bv --robot-insights --as-of HEAD~30          # Historical point-in-time
-bv --recipe actionable --robot-plan          # Pre-filter: ready to work
-bv --recipe high-impact --robot-triage       # Pre-filter: top PageRank
 ```
 
 ---
@@ -43,7 +31,7 @@ Use bead IDs as coordination threads for multi-agent work:
 
 | Concept | Value |
 |---------|-------|
-| Mail `thread_id` | `bd-###` (the issue ID) |
+| Mail `thread_id` | `bd-###` |
 | Mail subject | `[bd-###] ...` |
 | File reservation `reason` | `bd-###` |
 | Commit messages | Include `bd-###` for traceability |
@@ -91,26 +79,25 @@ bv --robot-plan
 ## Standard Agent Workflow
 
 ```bash
-ACTOR="${BR_ACTOR:-assistant}"
+# 1. Initialize (one-time per project)
+cd my-project
+br init
 
-# 1. Find work
+# 2. Find work
 br ready --json
 
-# 2. Claim work
-br update --actor "$ACTOR" <id> --status in_progress --claim
-
-# 3. Reserve edit surface (via Agent Mail)
-# file_reservation_paths(..., reason="<id>")
+# 3. Claim work
+br update bd-abc123 --status in_progress --assignee "$(git config user.email)"
 
 # 4. Do work...
 
 # 5. Complete
-br close --actor "$ACTOR" <id> --reason "Implemented feature X"
+br close bd-abc123 --reason "Implemented feature X"
 
 # 6. Sync to git
 br sync --flush-only
 git add .beads/
-git commit -m "feat: implement X (<id>)"
+git commit -m "feat: implement X (bd-abc123)"
 ```
 
 ---
@@ -129,10 +116,10 @@ git status  # MUST show "up to date with origin"
 
 ---
 
-## Creating Good Issues
+## Creating Good Beads
 
 ```bash
-br create --actor "$ACTOR" "Title that explains the task" \
+br create "Title that explains the task" \
   --type task \
   --priority 1 \
   --description "Detailed description with acceptance criteria"
@@ -144,20 +131,13 @@ Include in descriptions:
 - Dependencies (add separately via `br dep add`)
 - Context for "future self"
 
-Bug issues should include:
-- Concise summary
-- Reproduction steps
-- Expected vs actual behavior
-- Environment/context
-- Logs or crash pointers
-
 ---
 
 ## Differences from bd (Go beads)
 
 | Aspect | br (Rust) | bd (Go) |
 |--------|-----------|---------|
-| Git operations | **Never** (explicit sync) | Auto-commit, hooks |
+| Git operations | **Never** (explicit) | Auto-commit, hooks |
 | Storage | SQLite + JSONL | Dolt/SQLite |
 | Background daemon | **No** | Yes |
 | Hook installation | **Manual** | Automatic |
