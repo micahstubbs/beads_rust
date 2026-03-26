@@ -1634,6 +1634,7 @@ dependencies = [
  "bitflags",
  "blake3",
  "fsqlite-error",
+ "memchr",
  "parking_lot",
  "serde",
  "smallvec",
