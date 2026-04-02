@@ -56,10 +56,10 @@ pub struct MutationContext {
     /// descendants) need their blocked-cache entries recomputed.  If `None`
     /// while `invalidate_blocked_cache` is true, the entire cache is rebuilt.
     pub cache_affected_ids: Option<HashSet<String>>,
-    /// When true, skip the eager post-commit cache refresh and rely on the
-    /// lazy `ensure_blocked_cache_fresh` rebuild triggered by the next read.
-    /// This reduces DB write-lock contention for high-frequency mutations like
-    /// dep add/remove where the caller does not immediately read blocked state.
+    /// When true, skip the eager post-commit cache refresh.  Reads will
+    /// compute blocked state in-memory until the next non-deferred write
+    /// rebuilds the cache.  This reduces DB write-lock contention for
+    /// high-frequency mutations like dep add/remove.
     pub defer_cache_refresh: bool,
     pub force_flush: bool,
 }
@@ -69,9 +69,9 @@ enum BlockedCacheRefreshPlan {
     Full,
     Incremental(HashSet<String>),
     /// The stale marker has been set inside the transaction; skip the eager
-    /// post-commit rebuild and let `ensure_blocked_cache_fresh` handle it
-    /// lazily on the next read.  Eliminates a second write transaction per
-    /// dep add/remove, reducing DB lock contention under concurrent agents.
+    /// post-commit rebuild.  Reads will compute blocked state in-memory
+    /// until the next non-deferred write rebuilds the cache.  Eliminates a
+    /// second write transaction per dep add/remove.
     Deferred,
 }
 
@@ -198,7 +198,7 @@ impl MutationContext {
     }
 
     /// Mark the blocked-cache as needing invalidation but defer the actual
-    /// rebuild to the next read that calls `ensure_blocked_cache_fresh`.
+    /// rebuild to the next non-deferred write (reads compute in-memory).
     ///
     /// Use this for high-frequency write operations (dep add/remove) where the
     /// caller does not immediately read blocked state and where eliminating the
@@ -911,10 +911,10 @@ impl SqliteStorage {
 
         match blocked_cache_plan {
             Some(BlockedCacheRefreshPlan::Deferred) => {
-                // Stale marker already set inside the transaction.  The next
-                // read that calls ensure_blocked_cache_fresh will rebuild.
-                // Skipping the eager second write transaction here eliminates
-                // the main source of DB lock contention for dep add/remove.
+                // Stale marker already set inside the transaction.  Reads will
+                // compute blocked state in-memory until the next non-deferred
+                // write rebuilds the cache.  Skipping the eager second write
+                // transaction eliminates DB lock contention for dep add/remove.
                 tracing::debug!(
                     operation = op,
                     "Blocked cache refresh deferred; will rebuild lazily on next read"
