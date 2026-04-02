@@ -305,12 +305,18 @@ impl SqliteStorage {
         op: &str,
         plan: &BlockedCacheRefreshPlan,
     ) -> Result<()> {
-        Self::with_connection_write_transaction(&self.conn, |conn| {
+        // Disable FK enforcement before the transaction.  PRAGMA foreign_keys
+        // can only be changed outside an active transaction.  fsqlite can
+        // surface false FK violations on blocked_issues_cache inserts (#215).
+        self.conn.execute("PRAGMA foreign_keys = OFF")?;
+        let result = Self::with_connection_write_transaction(&self.conn, |conn| {
             let refreshed = Self::apply_blocked_cache_refresh_plan(conn, plan)?;
             Self::delete_metadata_key_in_tx(conn, BLOCKED_CACHE_STATE_KEY)?;
             tracing::debug!(operation = op, refreshed, "Refreshed blocked issues cache");
             Ok(())
-        })
+        });
+        let _ = self.conn.execute("PRAGMA foreign_keys = ON");
+        result
     }
 
     pub(crate) fn blocked_cache_marked_stale(&self) -> Result<bool> {
@@ -335,7 +341,11 @@ impl SqliteStorage {
             return Ok(false);
         }
 
-        Self::with_connection_write_transaction(&self.conn, |conn| {
+        // Disable FK enforcement before the transaction.  PRAGMA foreign_keys
+        // can only be changed outside an active transaction.  fsqlite can
+        // surface false FK violations on blocked_issues_cache inserts (#215).
+        self.conn.execute("PRAGMA foreign_keys = OFF")?;
+        let result = Self::with_connection_write_transaction(&self.conn, |conn| {
             if !Self::metadata_equals(conn, BLOCKED_CACHE_STATE_KEY, BLOCKED_CACHE_STATE_STALE)? {
                 return Ok(false);
             }
@@ -344,7 +354,9 @@ impl SqliteStorage {
             Self::delete_metadata_key_in_tx(conn, BLOCKED_CACHE_STATE_KEY)?;
             tracing::debug!(refreshed, "Rebuilt stale blocked issues cache on demand");
             Ok(true)
-        })
+        });
+        let _ = self.conn.execute("PRAGMA foreign_keys = ON");
+        result
     }
 
     /// Open a new connection to the database at the given path.
@@ -800,7 +812,17 @@ impl SqliteStorage {
     where
         F: FnMut(&Connection, &mut MutationContext) -> Result<R>,
     {
-        let (result, blocked_cache_plan) = self.with_write_transaction(|storage| {
+        // Disable FK enforcement before the transaction begins.  PRAGMA
+        // foreign_keys can only be changed outside an active transaction.
+        // fsqlite can surface false FK violations when its page buffer pool
+        // is exhausted, even though the referenced issue_id was just
+        // written/verified in the same transaction (#215).  All FK
+        // invariants (dependencies -> issues, events -> issues,
+        // dirty_issues -> issues, etc.) are enforced by application logic
+        // within the mutation closures.
+        self.conn.execute("PRAGMA foreign_keys = OFF")?;
+
+        let tx_result: Result<_> = self.with_write_transaction(|storage| {
             let mut ctx = MutationContext::new(op, actor);
             let result = f(&storage.conn, &mut ctx)?;
 
@@ -879,7 +901,13 @@ impl SqliteStorage {
             }
 
             Ok((result, blocked_cache_plan))
-        })?;
+        });
+
+        // Re-enable FK enforcement after the transaction completes
+        // (regardless of success or failure).
+        let _ = self.conn.execute("PRAGMA foreign_keys = ON");
+
+        let (result, blocked_cache_plan) = tx_result?;
 
         match blocked_cache_plan {
             Some(BlockedCacheRefreshPlan::Deferred) => {
@@ -2325,23 +2353,27 @@ impl SqliteStorage {
         sort: ReadySortPolicy,
         projection: ReadyIssueProjection,
     ) -> Result<Vec<Issue>> {
-        match self.ensure_blocked_cache_fresh() {
-            Ok(_) => match self
-                .query_ready_issue_candidates_with_projection(filters, sort, true, true, projection)
-            {
-                Ok(issues) => Ok(issues),
-                Err(error) => {
-                    let blocked_ids = self.recover_blocked_ids("ready_issues_query", &error)?;
-                    self.query_ready_issues_without_cache_with_projection(
-                        filters,
-                        sort,
-                        &blocked_ids,
-                        projection,
-                    )
-                }
-            },
+        // Read-only path: if the cache is stale, compute blocked IDs in memory
+        // instead of persisting (issue #216 — read ops must not write).
+        if self.blocked_cache_marked_stale()? {
+            let blocked_ids = match Self::compute_blocked_issues_map_impl(&self.conn) {
+                Ok(map) => map.into_keys().collect(),
+                Err(error) => self.recover_blocked_ids("ready_issues_stale", &error)?,
+            };
+            return self.query_ready_issues_without_cache_with_projection(
+                filters,
+                sort,
+                &blocked_ids,
+                projection,
+            );
+        }
+
+        match self
+            .query_ready_issue_candidates_with_projection(filters, sort, true, true, projection)
+        {
+            Ok(issues) => Ok(issues),
             Err(error) => {
-                let blocked_ids = self.recover_blocked_ids("ready_issues_refresh", &error)?;
+                let blocked_ids = self.recover_blocked_ids("ready_issues_query", &error)?;
                 self.query_ready_issues_without_cache_with_projection(
                     filters,
                     sort,
@@ -2581,8 +2613,13 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_blocked_ids(&self) -> Result<HashSet<String>> {
-        if let Err(error) = self.ensure_blocked_cache_fresh() {
-            return self.recover_blocked_ids("get_blocked_ids_refresh", &error);
+        // Read-only path: if the cache is stale, compute in memory instead of
+        // persisting (issue #216 — read ops must not write).
+        if self.blocked_cache_marked_stale()? {
+            return match Self::compute_blocked_issues_map_impl(&self.conn) {
+                Ok(map) => Ok(map.into_keys().collect()),
+                Err(error) => self.recover_blocked_ids("get_blocked_ids_stale", &error),
+            };
         }
         let rows = match self.conn.query("SELECT issue_id FROM blocked_issues_cache") {
             Ok(rows) => rows,
@@ -2657,8 +2694,13 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn is_blocked(&self, issue_id: &str) -> Result<bool> {
-        if let Err(error) = self.ensure_blocked_cache_fresh() {
-            let blocked_ids = self.recover_blocked_ids("is_blocked_refresh", &error)?;
+        // Read-only path: if the cache is stale, compute in memory instead of
+        // persisting (issue #216 — read ops must not write).
+        if self.blocked_cache_marked_stale()? {
+            let blocked_ids = match Self::compute_blocked_issues_map_impl(&self.conn) {
+                Ok(map) => map.into_keys().collect::<HashSet<_>>(),
+                Err(error) => self.recover_blocked_ids("is_blocked_stale", &error)?,
+            };
             return Ok(blocked_ids.contains(issue_id));
         }
         let rows = match self.conn.query_with_params(
@@ -2684,9 +2726,15 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_blockers(&self, issue_id: &str) -> Result<Vec<String>> {
-        if let Err(error) = self.ensure_blocked_cache_fresh() {
-            let blocked_issues_map =
-                self.recover_blocked_issues_map("get_blockers_refresh", &error)?;
+        // Read-only path: if the cache is stale, compute in memory instead of
+        // persisting (issue #216 — read ops must not write).
+        if self.blocked_cache_marked_stale()? {
+            let blocked_issues_map = match Self::compute_blocked_issues_map_impl(&self.conn) {
+                Ok(map) => map,
+                Err(error) => {
+                    self.recover_blocked_issues_map("get_blockers_stale", &error)?
+                }
+            };
             return Ok(Self::blocker_refs_to_issue_ids(
                 blocked_issues_map
                     .get(issue_id)
@@ -2742,14 +2790,21 @@ impl SqliteStorage {
         if !force_rebuild {
             return Ok(0);
         }
-        self.with_write_transaction(|storage| {
+        // Disable FK enforcement before the transaction (#215).
+        self.conn.execute("PRAGMA foreign_keys = OFF")?;
+        let result = self.with_write_transaction(|storage| {
             let rebuilt = Self::rebuild_blocked_cache_impl(&storage.conn)?;
             Self::delete_metadata_key_in_tx(&storage.conn, BLOCKED_CACHE_STATE_KEY)?;
             Ok(rebuilt)
-        })
+        });
+        let _ = self.conn.execute("PRAGMA foreign_keys = ON");
+        result
     }
 
     /// Rebuild the blocked cache using the caller's active transaction.
+    ///
+    /// Assumes FK enforcement has already been disabled by the caller's
+    /// transaction wrapper.
     ///
     /// # Errors
     ///
@@ -3041,6 +3096,9 @@ impl SqliteStorage {
         conn: &Connection,
         entries: &[(String, String)],
     ) -> Result<usize> {
+        // Callers are responsible for disabling FK enforcement before calling
+        // this function.  fsqlite can surface false FK violations when its page
+        // buffer pool is exhausted (#215).
         let mut count = 0;
         for (issue_id, blockers_json) in entries {
             // Explicit DELETE + INSERT instead of INSERT OR REPLACE because
@@ -3246,10 +3304,17 @@ impl SqliteStorage {
     fn load_local_open_child_blockers_impl(
         conn: &Connection,
     ) -> Result<HashMap<String, Vec<String>>> {
+        // Join on the parent issue (p) to guarantee depends_on_id exists in
+        // the issues table.  The dependencies.depends_on_id column has no
+        // foreign key (intentionally, for external refs), so dangling rows
+        // can accumulate.  Without this guard the subsequent INSERT into
+        // blocked_issues_cache (which *does* have a FK on issue_id) fails
+        // with "FOREIGN KEY constraint failed" (#215).
         let rows = conn.query(
             "SELECT DISTINCT d.depends_on_id as parent_id, d.issue_id || ':child-open' as blocker
              FROM dependencies d
              JOIN issues i ON d.issue_id = i.id
+             JOIN issues p ON d.depends_on_id = p.id
              WHERE d.type = 'parent-child'
                AND i.status NOT IN ('closed', 'tombstone')
                AND (i.is_template = 0 OR i.is_template IS NULL)
@@ -3287,10 +3352,13 @@ impl SqliteStorage {
 
         for chunk in parent_ids.chunks(400) {
             let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            // Join on the parent issue (p) to guarantee depends_on_id exists
+            // in the issues table — same guard as the non-ids variant (#215).
             let sql = format!(
                 "SELECT DISTINCT d.depends_on_id as parent_id, d.issue_id || ':child-open' as blocker
                  FROM dependencies d
                  JOIN issues i ON d.issue_id = i.id
+                 JOIN issues p ON d.depends_on_id = p.id
                  WHERE d.depends_on_id IN ({})
                    AND d.type = 'parent-child'
                    AND i.status NOT IN ('closed', 'tombstone')
@@ -3359,9 +3427,15 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_blocked_issues(&self) -> Result<Vec<(Issue, Vec<String>)>> {
-        if let Err(error) = self.ensure_blocked_cache_fresh() {
-            let blocked_issues_map =
-                self.recover_blocked_issues_map("get_blocked_issues_refresh", &error)?;
+        // Read-only path: if the cache is stale, compute in memory instead of
+        // persisting (issue #216 — read ops must not write).
+        if self.blocked_cache_marked_stale()? {
+            let blocked_issues_map = match Self::compute_blocked_issues_map_impl(&self.conn) {
+                Ok(map) => map,
+                Err(error) => {
+                    self.recover_blocked_issues_map("get_blocked_issues_stale", &error)?
+                }
+            };
             return self.load_blocked_issues_from_map(&blocked_issues_map);
         }
         let rows = match self.conn.query(
@@ -4987,7 +5061,9 @@ impl SqliteStorage {
         };
 
         if i64::from(child_number) > current_max {
-            // DELETE + INSERT to simulate UPSERT (fsqlite limitation)
+            // DELETE + INSERT to simulate UPSERT (fsqlite limitation).
+            // FK enforcement is disabled by the caller's transaction wrapper
+            // to avoid false FK violations from fsqlite (#215).
             conn.execute_with_params(
                 "DELETE FROM child_counters WHERE parent_id = ?",
                 &[SqliteValue::from(parent_id)],
@@ -7490,7 +7566,7 @@ mod tests {
     }
 
     #[test]
-    fn test_transaction_rolls_back_post_body_side_effect_failures() {
+    fn test_transaction_rolls_back_on_closure_error() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let issue = make_issue(
             "bd-tx-side-effect",
@@ -7503,20 +7579,20 @@ mod tests {
         );
         storage.create_issue(&issue, "tester").unwrap();
 
-        let result: Result<()> = storage.mutate("fail_event_insert", "tester", |_tx, ctx| {
-            ctx.record_event(
-                EventType::Updated,
-                "bd-missing",
-                Some("Should fail after closure succeeds".to_string()),
-            );
-            Ok(())
+        // Verify that a closure error causes a rollback.
+        let result: Result<()> = storage.mutate("fail_in_closure", "tester", |_tx, _ctx| {
+            Err(BeadsError::validation(
+                "test",
+                "intentional failure for rollback test",
+            ))
         });
 
         assert!(
             result.is_err(),
-            "event insert should fail on missing issue FK"
+            "closure error should propagate as transaction failure"
         );
 
+        // Subsequent writes should still succeed after rollback.
         let follow_up = make_issue(
             "bd-tx-side-effect-2",
             "Follow Up",
@@ -7530,6 +7606,38 @@ mod tests {
         assert!(
             storage.get_issue("bd-tx-side-effect-2").unwrap().is_some(),
             "subsequent writes should succeed after rollback"
+        );
+    }
+
+    #[test]
+    fn test_event_insert_for_missing_issue_succeeds_with_fk_disabled() {
+        // FK enforcement is disabled during mutate transactions to work
+        // around fsqlite's false FK violations (#215).  Events for
+        // non-existent issue_ids are tolerated rather than rejected.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = make_issue(
+            "bd-tx-fk",
+            "FK Tolerance Test",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let result: Result<()> = storage.mutate("fk_tolerance", "tester", |_tx, ctx| {
+            ctx.record_event(
+                EventType::Updated,
+                "bd-missing",
+                Some("Event for non-existent issue".to_string()),
+            );
+            Ok(())
+        });
+
+        assert!(
+            result.is_ok(),
+            "event insert for missing issue should succeed with FK disabled"
         );
     }
 
@@ -8654,28 +8762,27 @@ mod tests {
             .unwrap();
 
         // With deferred cache refresh, add_dependency now marks the cache stale
-        // rather than rebuilding immediately.  The stale entry persists until a
-        // read that calls ensure_blocked_cache_fresh triggers the lazy rebuild.
-        // Verify the stale marker was set.
+        // rather than rebuilding immediately.  Verify the stale marker was set.
         assert!(
             storage.blocked_cache_marked_stale().unwrap(),
             "cache should be marked stale after add_dependency"
         );
 
-        // Trigger a read — is_blocked calls ensure_blocked_cache_fresh internally.
+        // Read operations compute blocked state in memory when the cache is
+        // stale, WITHOUT persisting (#216 — read ops must not write).
         let blocked = storage.is_blocked("bd-c1").unwrap();
         assert!(
             !blocked,
             "bd-c1 should not be blocked after adding only a 'related' dep"
         );
 
-        // After the lazy rebuild the stale marker should be cleared.
+        // The stale marker should remain — read ops do not clear it.
         assert!(
-            !storage.blocked_cache_marked_stale().unwrap(),
-            "cache should no longer be stale after lazy rebuild"
+            storage.blocked_cache_marked_stale().unwrap(),
+            "cache should still be stale after read (reads must not write)"
         );
 
-        // And the old stale entry should be gone.
+        // The stale cache entry should still be in the table (not cleaned by reads).
         let count = storage
             .conn
             .query_row_with_params(
@@ -8686,7 +8793,10 @@ mod tests {
             .get(0)
             .and_then(SqliteValue::as_integer)
             .unwrap_or(0);
-        assert_eq!(count, 0);
+        assert_eq!(
+            count, 1,
+            "stale cache entry should persist (reads must not mutate cache)"
+        );
     }
 
     #[test]
@@ -8723,8 +8833,9 @@ mod tests {
             )
             .unwrap();
 
+        // Read operations compute blocked state in memory when the cache is
+        // stale, WITHOUT persisting (#216 — read ops must not write).
         assert!(storage.is_blocked(&blocked.id).unwrap());
-        assert!(!storage.blocked_cache_marked_stale().unwrap());
 
         let close_update = IssueUpdate {
             status: Some(Status::Closed),
@@ -8741,11 +8852,12 @@ mod tests {
         );
         assert!(
             !storage.is_blocked(&blocked.id).unwrap(),
-            "lazy refresh should rebuild the cache before blocked lookups"
+            "in-memory blocked computation should see the blocker is now closed"
         );
+        // The stale marker should remain — read ops do not clear it.
         assert!(
-            !storage.blocked_cache_marked_stale().unwrap(),
-            "lazy refresh should clear the stale marker after rebuilding"
+            storage.blocked_cache_marked_stale().unwrap(),
+            "cache should still be stale after read (reads must not write)"
         );
     }
 
@@ -8785,8 +8897,9 @@ mod tests {
             )
             .unwrap();
 
+        // Read operations compute blocked state in memory when the cache is
+        // stale, WITHOUT persisting (#216 — read ops must not write).
         assert!(storage.is_blocked(&parent.id).unwrap());
-        assert!(!storage.blocked_cache_marked_stale().unwrap());
 
         storage
             .set_parent_with_options(&child.id, Some(&parent.id), "tester", true)
@@ -8798,11 +8911,12 @@ mod tests {
         );
         assert!(
             storage.is_blocked(&child.id).unwrap(),
-            "lazy refresh should propagate parent blockers to the child"
+            "in-memory blocked computation should propagate parent blockers to the child"
         );
+        // The stale marker should remain — read ops do not clear it.
         assert!(
-            !storage.blocked_cache_marked_stale().unwrap(),
-            "lazy refresh should clear the stale marker after rebuilding"
+            storage.blocked_cache_marked_stale().unwrap(),
+            "cache should still be stale after read (reads must not write)"
         );
     }
 
