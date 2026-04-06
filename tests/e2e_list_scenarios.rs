@@ -19,18 +19,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, parse_list_issues, run_br};
-
-fn parse_created_id(stdout: &str) -> String {
-    let line = stdout.lines().next().unwrap_or("");
-    // Handle both formats: "Created bd-xxx: title" and "✓ Created bd-xxx: title"
-    let normalized = line.strip_prefix("✓ ").unwrap_or(line);
-    let id_part = normalized
-        .strip_prefix("Created ")
-        .and_then(|rest| rest.split(':').next())
-        .unwrap_or("");
-    id_part.trim().to_string()
-}
+use common::cli::{BrWorkspace, parse_created_id, parse_list_issues, run_br};
 
 /// Setup a workspace with a diverse set of issues for comprehensive testing.
 fn setup_diverse_workspace() -> (BrWorkspace, Vec<String>) {

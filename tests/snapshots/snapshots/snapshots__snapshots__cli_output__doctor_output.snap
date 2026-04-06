@@ -13,8 +13,8 @@ OK schema.tables
 OK schema.columns
 OK db.recoverable_anomalies
 OK db.null_defaults
-WARN sqlite.integrity_check: database disk image is malformed: page 17 is never used
+OK sqlite.integrity_check
 OK counts.db_vs_jsonl: Both have 0 records
 OK sync.metadata: External changes pending import
 OK db.write_probe: No issues available for ID-REDACTED write probe
-WARN sqlite3.integrity_check: *** in database main ***; Page 17: never used
+OK sqlite3.integrity_check

@@ -34,8 +34,8 @@ fn q_creates_issue_returns_id_only() {
     // Should be just the ID, no other output
     assert_eq!(output.lines().count(), 1, "q should output only one line");
     assert!(
-        output.starts_with("bd-") || output.contains('-'),
-        "output should be an ID format, got: {output}"
+        output.contains('-'),
+        "output should be an issue ID (prefix-hash format), got: {output}"
     );
     // Should not contain "Created" or other verbose text
     assert!(

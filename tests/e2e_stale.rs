@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, parse_created_id, run_br};
 use serde_json::Value;
 
 #[test]
@@ -62,15 +62,10 @@ fn e2e_stale_with_status_filter() {
     run_br(&workspace, ["create", "Open Issue"], "create1");
 
     let create2 = run_br(&workspace, ["create", "InProgress Issue"], "create2");
-    let id2 = create2
-        .stdout
-        .split_whitespace()
-        .find(|w| w.starts_with("bd-"))
-        .unwrap()
-        .trim_end_matches(':');
+    let id2 = parse_created_id(&create2.stdout);
     run_br(
         &workspace,
-        ["update", id2, "--status", "in_progress"],
+        ["update", &id2, "--status", "in_progress"],
         "update2",
     );
 
@@ -104,17 +99,12 @@ fn e2e_stale_with_deferred_status_filter() {
         "create deferred failed: {}",
         deferred.stderr
     );
-    let deferred_id = deferred
-        .stdout
-        .split_whitespace()
-        .find(|w| w.starts_with("bd-"))
-        .unwrap()
-        .trim_end_matches(':');
+    let deferred_id = parse_created_id(&deferred.stdout);
     let defer = run_br(
         &workspace,
         [
             "update",
-            deferred_id,
+            &deferred_id,
             "--status",
             "deferred",
             "--defer",
@@ -150,16 +140,11 @@ fn e2e_stale_default_includes_custom_nonterminal_statuses() {
 
     let create = run_br(&workspace, ["create", "Review Issue"], "create_review");
     assert!(create.status.success(), "create failed: {}", create.stderr);
-    let issue_id = create
-        .stdout
-        .split_whitespace()
-        .find(|w| w.starts_with("bd-"))
-        .unwrap()
-        .trim_end_matches(':');
+    let issue_id = parse_created_id(&create.stdout);
 
     let update = run_br(
         &workspace,
-        ["update", issue_id, "--status", "review"],
+        ["update", &issue_id, "--status", "review"],
         "set_review_status",
     );
     assert!(update.status.success(), "update failed: {}", update.stderr);

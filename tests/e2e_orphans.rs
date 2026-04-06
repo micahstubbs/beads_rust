@@ -88,8 +88,8 @@ fn rewrite_jsonl_issue_as_closed(workspace: &BrWorkspace, issue_id: &str) {
             let mut issue: Value = serde_json::from_str(line).expect("parse issue json");
             if issue["id"].as_str() == Some(issue_id) {
                 issue["status"] = Value::String("closed".to_string());
-                issue["updated_at"] = Value::String("2026-01-01T00:00:00Z".to_string());
-                issue["closed_at"] = Value::String("2026-01-01T00:00:00Z".to_string());
+                issue["updated_at"] = Value::String("2099-01-01T00:00:00Z".to_string());
+                issue["closed_at"] = Value::String("2099-01-01T00:00:00Z".to_string());
                 issue["close_reason"] = Value::String("Closed via JSONL edit".to_string());
             }
             serde_json::to_string(&issue).expect("serialize issue json")

@@ -372,6 +372,13 @@ pub(crate) fn execute_batch(conn: &Connection, sql: &str) -> Result<()> {
 ///
 /// Returns an error if the SQL execution fails or pragmas cannot be set.
 pub fn apply_schema(conn: &Connection) -> Result<()> {
+    // Detect a truly fresh (empty) database before any DDL runs.
+    // On a fresh DB, SCHEMA_SQL creates everything at the current version,
+    // so running migrations is unnecessary and harmful — e.g. the v3/v4
+    // migrations DROP+CREATE idx_issues_ready which orphans a page and
+    // causes doctor integrity warnings.
+    let is_fresh = !table_exists(conn, "issues");
+
     // Run pre-schema migrations first to fix any incompatible old tables
     // This must run BEFORE execute_batch because the batch includes CREATE INDEX
     // statements that will fail if old tables have missing columns
@@ -382,21 +389,31 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
 
     execute_batch(conn, SCHEMA_SQL)?;
 
-    // Run migrations for existing databases.
-    // If the issues table was rebuilt from scratch, skip migration checks
-    // that reference newly-added columns because fsqlite's in-memory schema
-    // cache may not have been updated yet.
-    run_migrations(conn, issues_rebuilt).map_err(|e| {
-        eprintln!("run_migrations failed: {:?}", e);
-        e
-    })?;
-
-    // Mark schema as applied so future opens can skip DDL/migration work.
-    conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
-        .map_err(|e| {
-            eprintln!("PRAGMA user_version failed: {:?}", e);
-            BeadsError::Database(e)
+    if is_fresh {
+        // Fresh database: SCHEMA_SQL already created everything at the
+        // current version. Skip migrations and stamp user_version directly.
+        conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
+            .map_err(|e| {
+                eprintln!("PRAGMA user_version failed: {:?}", e);
+                BeadsError::Database(e)
+            })?;
+    } else {
+        // Existing database: run migrations for schema upgrades.
+        // If the issues table was rebuilt from scratch, skip migration checks
+        // that reference newly-added columns because fsqlite's in-memory schema
+        // cache may not have been updated yet.
+        run_migrations(conn, issues_rebuilt).map_err(|e| {
+            eprintln!("run_migrations failed: {:?}", e);
+            e
         })?;
+
+        // Mark schema as applied so future opens can skip DDL/migration work.
+        conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
+            .map_err(|e| {
+                eprintln!("PRAGMA user_version failed: {:?}", e);
+                BeadsError::Database(e)
+            })?;
+    }
 
     apply_runtime_pragmas(conn).map_err(|e| {
         eprintln!("apply_runtime_pragmas failed: {:?}", e);

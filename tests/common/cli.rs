@@ -225,6 +225,20 @@ where
     }
 }
 
+/// Extract the issue ID from `br create` stdout.
+///
+/// Handles both formats: `"Created pfx-xxx: title"` and `"✓ Created pfx-xxx: title"`.
+pub fn parse_created_id(stdout: &str) -> String {
+    let line = stdout.lines().next().unwrap_or("");
+    let normalized = line.strip_prefix("✓ ").unwrap_or(line);
+    normalized
+        .strip_prefix("Created ")
+        .and_then(|rest| rest.split(':').next())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
 pub fn extract_json_payload(stdout: &str) -> String {
     let lines: Vec<&str> = stdout.lines().collect();
     for (idx, line) in lines.iter().enumerate() {

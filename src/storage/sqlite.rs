@@ -706,17 +706,21 @@ impl SqliteStorage {
         let deterministic = base_ms * 2u64.pow(attempt);
         // Add +-25% jitter using a cheap PRNG seeded from the current time.
         // No need for cryptographic randomness here.
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos() as u64;
+        let nanos = u64::from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos(),
+        );
         let jitter_range = deterministic / 4;
         if jitter_range == 0 {
             return deterministic;
         }
-        // Map nanos into [-jitter_range, +jitter_range) via wrapping arithmetic.
-        let raw = (nanos % (jitter_range * 2)) as i64 - jitter_range as i64;
-        (deterministic as i64 + raw).max(1) as u64
+        // Map nanos into [-jitter_range, +jitter_range) using i128 to avoid
+        // truncation on the u64→i64 boundary.
+        let raw = i128::from(nanos % (jitter_range * 2)) - i128::from(jitter_range);
+        let result = i128::from(deterministic) + raw;
+        u64::try_from(result.max(1)).unwrap_or(u64::MAX)
     }
 
     /// Set export hashes using the caller's active transaction.
