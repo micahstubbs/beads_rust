@@ -215,14 +215,18 @@ impl SqliteStorage {
     where
         F: FnMut(&Connection) -> Result<R>,
     {
-        const MAX_RETRIES: u32 = 5;
-        let base_backoff_ms: u64 = 10;
+        // Issue #219: same retry parameters as with_write_transaction (see
+        // that method for rationale).  This static variant is used for
+        // blocked-cache rebuilds and metadata writes which also contend for
+        // the write lock under parallel agent operations.
+        const MAX_RETRIES: u32 = 8;
+        let base_backoff_ms: u64 = 50;
 
         for attempt in 0..MAX_RETRIES {
             match conn.execute("BEGIN IMMEDIATE") {
                 Ok(_) => {}
                 Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
-                    let backoff = base_backoff_ms * 2u64.pow(attempt);
+                    let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
                     std::thread::sleep(Duration::from_millis(backoff));
                     continue;
                 }
@@ -239,7 +243,7 @@ impl SqliteStorage {
                                 "ROLLBACK failed after transient COMMIT error"
                             );
                         }
-                        let backoff = base_backoff_ms * 2u64.pow(attempt);
+                        let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
                         std::thread::sleep(Duration::from_millis(backoff));
                     }
                     Err(e) => {
@@ -254,7 +258,7 @@ impl SqliteStorage {
                         tracing::warn!(error = %rb_err, "ROLLBACK failed after transaction error");
                     }
                     if e.is_transient() && attempt < MAX_RETRIES - 1 {
-                        let backoff = base_backoff_ms * 2u64.pow(attempt);
+                        let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
                         std::thread::sleep(Duration::from_millis(backoff));
                     } else {
                         return Err(e);
@@ -624,14 +628,25 @@ impl SqliteStorage {
     where
         F: FnMut(&mut Self) -> Result<R>,
     {
-        const MAX_RETRIES: u32 = 5;
-        let base_backoff_ms: u64 = 10;
+        // Issue #219: parallel `br close` from multiple agents caused "database
+        // is busy" errors.  The previous retry loop (5 retries, 10ms base
+        // backoff, max ~310ms additional wait) was too aggressive — after the
+        // PRAGMA busy_timeout exhausts its 30s spin, the tiny inter-retry
+        // sleeps rarely give the competing writer enough time to finish.
+        //
+        // New parameters: 8 retries with 50ms base (50, 100, 200, 400, 800,
+        // 1600, 3200, 6400ms) plus random jitter.  This gives ~12.7s of
+        // inter-retry sleep on top of the per-attempt busy_timeout spin,
+        // and the jitter prevents thundering-herd synchronization when many
+        // agents retry at the same instant.
+        const MAX_RETRIES: u32 = 8;
+        let base_backoff_ms: u64 = 50;
 
         for attempt in 0..MAX_RETRIES {
             match self.conn.execute("BEGIN IMMEDIATE") {
                 Ok(_) => {}
                 Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
-                    let backoff = base_backoff_ms * 2u64.pow(attempt);
+                    let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
                     std::thread::sleep(Duration::from_millis(backoff));
                     continue;
                 }
@@ -642,7 +657,9 @@ impl SqliteStorage {
                 Ok(result) => {
                     match self.conn.execute("COMMIT") {
                         Ok(_) => {
-                            // Periodic WAL checkpoint to prevent unbounded WAL growth
+                            // Periodic WAL checkpoint to prevent unbounded WAL growth.
+                            // Uses PASSIVE mode so it never blocks concurrent readers
+                            // or writers (issue #219).
                             self.mutation_count += 1;
                             if self.mutation_count >= WAL_CHECKPOINT_INTERVAL {
                                 self.mutation_count = 0;
@@ -654,7 +671,7 @@ impl SqliteStorage {
                             if let Err(rb_err) = self.conn.execute("ROLLBACK") {
                                 tracing::warn!(error = %rb_err, "ROLLBACK failed after transient COMMIT error");
                             }
-                            let backoff = base_backoff_ms * 2u64.pow(attempt);
+                            let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
                             std::thread::sleep(Duration::from_millis(backoff));
                             // retry
                         }
@@ -671,7 +688,7 @@ impl SqliteStorage {
                         tracing::warn!(error = %rb_err, "ROLLBACK failed after transaction error");
                     }
                     if e.is_transient() && attempt < MAX_RETRIES - 1 {
-                        let backoff = base_backoff_ms * 2u64.pow(attempt);
+                        let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
                         std::thread::sleep(Duration::from_millis(backoff));
                         // retry
                     } else {
@@ -681,6 +698,24 @@ impl SqliteStorage {
             }
         }
         unreachable!("Retry loop exited without returning")
+    }
+
+    /// Compute exponential backoff with random jitter to prevent
+    /// thundering-herd synchronization across concurrent agents.
+    fn jittered_backoff(base_ms: u64, attempt: u32) -> u64 {
+        let deterministic = base_ms * 2u64.pow(attempt);
+        // Add +-25% jitter using a cheap PRNG seeded from the current time.
+        // No need for cryptographic randomness here.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as u64;
+        let jitter_range = deterministic / 4;
+        if jitter_range == 0 {
+            return deterministic;
+        }
+        let jitter = (nanos % (jitter_range * 2)).saturating_sub(jitter_range);
+        deterministic.saturating_add(jitter)
     }
 
     /// Set export hashes using the caller's active transaction.
@@ -768,11 +803,18 @@ impl SqliteStorage {
         Ok(total_deleted)
     }
 
-    /// Attempt a WAL checkpoint (TRUNCATE mode) to flush WAL back to the main
+    /// Attempt a WAL checkpoint (PASSIVE mode) to flush WAL back to the main
     /// database file. Errors are logged but do not propagate — checkpoint
     /// failure is non-fatal and will be retried on the next interval.
     fn try_wal_checkpoint(&self) {
-        if let Err(e) = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
+        // Issue #219: TRUNCATE mode requires an exclusive lock, which blocks
+        // all concurrent readers and writers.  Under parallel agent operations
+        // this was a major source of "database is busy" errors.  PASSIVE mode
+        // checkpoints only pages that are not currently needed by any reader,
+        // so it never blocks other connections.  The WAL file may grow slightly
+        // larger between checkpoints, but journal_size_limit (set in
+        // apply_runtime_pragmas) caps it.
+        if let Err(e) = self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)") {
             tracing::debug!(error = %e, "WAL checkpoint failed (non-fatal, will retry later)");
         }
     }

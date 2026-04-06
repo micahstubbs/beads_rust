@@ -440,6 +440,19 @@ pub(crate) fn apply_runtime_pragmas(conn: &Connection) -> Result<()> {
     // 8MB page cache (default is ~2MB), improves read-heavy workloads
     conn.execute("PRAGMA cache_size = -8000")?;
 
+    // Issue #219: Limit WAL file size to 32MB.  Without this, concurrent
+    // writers can cause unbounded WAL growth, which slows reads and
+    // increases checkpoint contention.  SQLite will attempt to keep the WAL
+    // file at or below this size after each checkpoint.
+    conn.execute("PRAGMA journal_size_limit = 33554432")?;
+
+    // Issue #219: Disable the automatic WAL checkpoint that fires after
+    // every 1000 pages of WAL growth.  The auto-checkpoint uses PASSIVE
+    // mode internally but can still cause unexpected latency spikes during
+    // write-heavy concurrent operations.  We handle checkpointing manually
+    // in with_write_transaction using PASSIVE mode at a controlled interval.
+    conn.execute("PRAGMA wal_autocheckpoint = 0")?;
+
     Ok(())
 }
 
