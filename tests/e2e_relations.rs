@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_issues_array, extract_json_payload, run_br};
 use serde_json::Value;
 use std::fs;
 use tracing::info;
@@ -75,8 +75,7 @@ fn e2e_relations_labels_comments() {
         "list_label",
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
-    let list_payload = extract_json_payload(&list.stdout);
-    let list_json: Vec<Value> = serde_json::from_str(&list_payload).expect("list json");
+    let list_json = extract_issues_array(&list.stdout);
     assert!(
         list_json.iter().any(|item| item["id"] == child_id),
         "labeled issue missing in list"

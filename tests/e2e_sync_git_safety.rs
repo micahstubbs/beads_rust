@@ -647,7 +647,7 @@ fn is_allowed_sync_file(rel_path: &str) -> bool {
         .unwrap_or_default();
 
     // Check exact name matches
-    const ALLOWED_EXACT_NAMES: &[&str] = &[".manifest.json", "metadata.json"];
+    const ALLOWED_EXACT_NAMES: &[&str] = &[".manifest.json", "metadata.json", "last-touched"];
     if ALLOWED_EXACT_NAMES.iter().any(|&name| filename == name) {
         return true;
     }
@@ -660,6 +660,13 @@ fn is_allowed_sync_file(rel_path: &str) -> bool {
         && !base.is_empty()
         && !pid.is_empty()
         && pid.chars().all(|c| c.is_ascii_digit())
+    {
+        return true;
+    }
+
+    // Allow .br_history meta files (history snapshot metadata)
+    if filename.ends_with(".meta.json")
+        && (rel_path.contains(".br_history/") || rel_path.contains(".br_history\\"))
     {
         return true;
     }

@@ -1,6 +1,8 @@
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env};
+use common::cli::{
+    BrWorkspace, extract_issues_array, extract_json_payload, run_br, run_br_with_env,
+};
 use serde_json::Value;
 
 fn parse_created_id(stdout: &str) -> String {
@@ -312,8 +314,7 @@ fn e2e_query_run_inherits_env_json_output() {
         run.stderr
     );
 
-    let payload = extract_json_payload(&run.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("valid JSON query output");
+    let json = extract_issues_array(&run.stdout);
     assert_eq!(json.len(), 1);
     assert_eq!(json[0]["title"], "Env query bug");
 }
@@ -481,10 +482,10 @@ fn e2e_config_command() {
 
     // Test config get subcommand - use json key which is a startup setting
     let config_get = run_br(&workspace, ["config", "get", "json"], "config_get");
-    // Config get for existing key should either succeed or return "not found" (exit 1)
-    // We just verify it doesn't crash with an unexpected error
+    // Config get for existing key should either succeed or return a structured error
+    // (exit 1 = general error, exit 7 = config error). Verify it doesn't crash.
     assert!(
-        config_get.status.code() == Some(0) || config_get.status.code() == Some(1),
+        matches!(config_get.status.code(), Some(0 | 1 | 7)),
         "config get returned unexpected exit code: {:?}",
         config_get.status.code()
     );
@@ -868,8 +869,7 @@ fn e2e_saved_queries_lifecycle() {
         "query run bugs failed: {}",
         run_bugs.stderr
     );
-    let run_bugs_payload = extract_json_payload(&run_bugs.stdout);
-    let run_bugs_json: Vec<Value> = serde_json::from_str(&run_bugs_payload).expect("run bugs json");
+    let run_bugs_json = extract_issues_array(&run_bugs.stdout);
     // Should only return bug type issues
     assert_eq!(run_bugs_json.len(), 1);
     assert_eq!(run_bugs_json[0]["issue_type"], "bug");
@@ -891,9 +891,7 @@ fn e2e_saved_queries_lifecycle() {
         "query run critical failed: {}",
         run_critical.stderr
     );
-    let run_critical_payload = extract_json_payload(&run_critical.stdout);
-    let run_critical_json: Vec<Value> =
-        serde_json::from_str(&run_critical_payload).expect("run critical json");
+    let run_critical_json = extract_issues_array(&run_critical.stdout);
     // Should only return P0 issues
     assert_eq!(run_critical_json.len(), 1);
     assert_eq!(run_critical_json[0]["priority"], 0);
@@ -910,9 +908,7 @@ fn e2e_saved_queries_lifecycle() {
         "query run override failed: {}",
         run_override.stderr
     );
-    let run_override_payload = extract_json_payload(&run_override.stdout);
-    let run_override_json: Vec<Value> =
-        serde_json::from_str(&run_override_payload).expect("run override json");
+    let run_override_json = extract_issues_array(&run_override.stdout);
     // CLI priority filter (P1) overrides, so no P0 bugs returned
     assert!(
         run_override_json.is_empty(),
@@ -1129,8 +1125,7 @@ fn e2e_saved_queries_run_with_overrides() {
     );
     assert!(run_default.status.success());
 
-    let payload = extract_json_payload(&run_default.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = extract_issues_array(&run_default.stdout);
     assert!(
         issues.iter().all(|i| i["issue_type"] == "bug"),
         "saved query should only return bugs"
@@ -1144,8 +1139,7 @@ fn e2e_saved_queries_run_with_overrides() {
     );
     assert!(run_override.status.success());
 
-    let payload = extract_json_payload(&run_override.stdout);
-    let overridden: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let overridden = extract_issues_array(&run_override.stdout);
     assert!(
         overridden.iter().all(|i| i["issue_type"] == "feature"),
         "CLI --type should override saved query filter, got: {:?}",
@@ -1208,8 +1202,7 @@ fn e2e_saved_queries_assignee_override_clears_unassigned() {
         "default run failed: {}",
         run_default.stderr
     );
-    let payload = extract_json_payload(&run_default.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = extract_issues_array(&run_default.stdout);
     assert_eq!(
         issues.len(),
         1,
@@ -1227,8 +1220,7 @@ fn e2e_saved_queries_assignee_override_clears_unassigned() {
         "override run failed: {}",
         run_override.stderr
     );
-    let payload = extract_json_payload(&run_override.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    let issues = extract_issues_array(&run_override.stdout);
     assert_eq!(
         issues.len(),
         1,

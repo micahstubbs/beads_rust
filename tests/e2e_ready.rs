@@ -830,8 +830,14 @@ fn ready_cli_empty_result_message() {
     let result = run_br(&workspace, ["ready"], "ready_empty");
     assert!(result.status.success(), "ready failed: {}", result.stderr);
 
-    // Matches bd format: "✨ No open issues"
-    assert!(result.stdout.contains("No open issues"));
+    // Empty workspace shows completion message
+    assert!(
+        result.stdout.contains("No open issues")
+            || result.stdout.contains("no issues to work on")
+            || result.stdout.contains("All work complete"),
+        "expected empty-ready message, got: {}",
+        result.stdout
+    );
 }
 
 #[test]

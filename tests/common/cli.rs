@@ -255,6 +255,23 @@ pub fn parse_json_value(stdout: &str) -> Value {
     serde_json::from_str(&payload).expect("valid JSON payload")
 }
 
+/// Extract an issue array from JSON stdout, handling both formats:
+/// - Paginated: `{"issues": [...], "total": N, ...}` → returns the inner array
+/// - Bare array: `[...]` → returns it directly
+pub fn extract_issues_array(stdout: &str) -> Vec<Value> {
+    let json = parse_json_value(stdout);
+    if let Some(arr) = json.as_array() {
+        return arr.clone();
+    }
+    if let Some(issues) = json.get("issues").and_then(Value::as_array) {
+        return issues.clone();
+    }
+    panic!(
+        "JSON output is neither a bare array nor an object with 'issues': {}",
+        &stdout[..stdout.len().min(200)]
+    );
+}
+
 pub fn parse_list_page(stdout: &str) -> Value {
     let json = parse_json_value(stdout);
     assert!(
