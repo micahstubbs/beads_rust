@@ -4588,7 +4588,9 @@ impl SqliteStorage {
         &self,
         issue_ids: &[String],
     ) -> Result<HashMap<String, Vec<String>>> {
-        const SQLITE_VAR_LIMIT: usize = 900;
+        // Keep chunks small to avoid fsqlite MemDatabase root-page collisions
+        // when ephemeral tables from earlier chunks conflict with real pager pages.
+        const SQLITE_VAR_LIMIT: usize = 200;
 
         if issue_ids.is_empty() {
             return Ok(HashMap::new());
@@ -5203,7 +5205,10 @@ impl SqliteStorage {
         &self,
         issue_ids: &[String],
     ) -> Result<(HashMap<String, usize>, HashMap<String, usize>)> {
-        const SQLITE_VAR_LIMIT: usize = 900;
+        // Keep chunks small to avoid fsqlite MemDatabase root-page collisions
+        // when ephemeral tables from earlier chunks conflict with real pager pages.
+        // Also avoid CTE VALUES materialization which is the primary collision trigger.
+        const SQLITE_VAR_LIMIT: usize = 200;
 
         if issue_ids.is_empty() {
             return Ok((HashMap::new(), HashMap::new()));
@@ -5213,53 +5218,47 @@ impl SqliteStorage {
         let mut dependent_counts: HashMap<String, usize> = HashMap::new();
 
         for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
-            let value_rows: Vec<&str> = chunk.iter().map(|_| "(?)").collect();
-            let sql = format!(
-                r"WITH target_ids(id) AS (VALUES {}),
-                  counts AS (
-                      SELECT issue_id AS id, COUNT(*) AS dependency_count, 0 AS dependent_count
-                      FROM dependencies
-                      WHERE issue_id IN (SELECT id FROM target_ids)
-                      GROUP BY issue_id
-                      UNION ALL
-                      SELECT depends_on_id AS id, 0 AS dependency_count, COUNT(*) AS dependent_count
-                      FROM dependencies
-                      WHERE depends_on_id IN (SELECT id FROM target_ids)
-                      GROUP BY depends_on_id
-                  )
-                  SELECT target_ids.id,
-                         COALESCE(SUM(counts.dependency_count), 0),
-                         COALESCE(SUM(counts.dependent_count), 0)
-                  FROM target_ids
-                  LEFT JOIN counts ON counts.id = target_ids.id
-                  GROUP BY target_ids.id",
-                value_rows.join(",")
-            );
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let joined = placeholders.join(",");
 
             let params: Vec<SqliteValue> = chunk
                 .iter()
                 .map(|issue_id| SqliteValue::from(issue_id.as_str()))
                 .collect();
 
-            let rows = self.conn.query_with_params(&sql, &params)?;
+            // Query dependency counts (issue_id = the issue that depends on something)
+            let dep_sql = format!(
+                "SELECT issue_id, COUNT(*) FROM dependencies WHERE issue_id IN ({joined}) GROUP BY issue_id"
+            );
+            let rows = self.conn.query_with_params(&dep_sql, &params)?;
             for row in &rows {
                 let issue_id = row
                     .get(0)
                     .and_then(SqliteValue::as_text)
                     .unwrap_or("")
                     .to_string();
-                let dependency_count = row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0);
-                let dependent_count = row.get(2).and_then(SqliteValue::as_integer).unwrap_or(0);
-
-                if dependency_count > 0 {
-                    dependency_counts.insert(
-                        issue_id.clone(),
-                        usize::try_from(dependency_count).unwrap_or(0),
-                    );
+                let count = row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0);
+                if count > 0 {
+                    *dependency_counts.entry(issue_id).or_insert(0) +=
+                        usize::try_from(count).unwrap_or(0);
                 }
-                if dependent_count > 0 {
-                    dependent_counts
-                        .insert(issue_id, usize::try_from(dependent_count).unwrap_or(0));
+            }
+
+            // Query dependent counts (depends_on_id = the issue that others depend on)
+            let dpt_sql = format!(
+                "SELECT depends_on_id, COUNT(*) FROM dependencies WHERE depends_on_id IN ({joined}) GROUP BY depends_on_id"
+            );
+            let rows = self.conn.query_with_params(&dpt_sql, &params)?;
+            for row in &rows {
+                let issue_id = row
+                    .get(0)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or("")
+                    .to_string();
+                let count = row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0);
+                if count > 0 {
+                    *dependent_counts.entry(issue_id).or_insert(0) +=
+                        usize::try_from(count).unwrap_or(0);
                 }
             }
         }
