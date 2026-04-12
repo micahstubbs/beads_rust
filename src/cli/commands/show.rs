@@ -586,11 +586,28 @@ fn find_ids_by_hash_in_memory(
     issues_by_id: &HashMap<String, Issue>,
     hash_suffix: &str,
 ) -> Vec<String> {
+    // Use the same child-suffix-aware matching as find_matching_ids so that
+    // searching for "64up6.4" matches "bd-64up6.4" consistently.
+    let (search_base, search_child) = match hash_suffix.split_once('.') {
+        Some((base, child)) => (base, Some(child)),
+        None => (hash_suffix, None),
+    };
+
     issues_by_id
         .keys()
         .filter(|id| {
-            id.split_once('-')
-                .is_some_and(|(_, suffix)| suffix.contains(hash_suffix))
+            crate::util::id::split_prefix_remainder(id).is_some_and(|(_, remainder)| {
+                let base_hash = remainder.split('.').next().unwrap_or(remainder);
+                if !base_hash.contains(search_base) {
+                    return false;
+                }
+                match search_child {
+                    Some(child) => remainder
+                        .split_once('.')
+                        .is_some_and(|(_, candidate_child)| candidate_child == child),
+                    None => true,
+                }
+            })
         })
         .cloned()
         .collect()

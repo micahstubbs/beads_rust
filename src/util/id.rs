@@ -874,13 +874,28 @@ impl IdResolver {
 /// of `IdResolver::resolve`. The caller provides the list of all known IDs.
 #[must_use]
 pub fn find_matching_ids(all_ids: &[String], hash_substring: &str) -> Vec<String> {
+    // Split search pattern into base hash and optional child path so that
+    // searching for "64up6.4" correctly matches "bd-64up6.4" instead of
+    // stripping the child suffix from the candidate and failing.
+    let (search_base, search_child) = match hash_substring.split_once('.') {
+        Some((base, child)) => (base, Some(child)),
+        None => (hash_substring, None),
+    };
+
     all_ids
         .iter()
         .filter(|id| {
-            // Extract hash portion (after the last dash)
             split_prefix_remainder(id).is_some_and(|(_, remainder)| {
                 let base_hash = remainder.split('.').next().unwrap_or(remainder);
-                base_hash.contains(hash_substring)
+                if !base_hash.contains(search_base) {
+                    return false;
+                }
+                match search_child {
+                    Some(child) => remainder
+                        .split_once('.')
+                        .is_some_and(|(_, candidate_child)| candidate_child == child),
+                    None => true,
+                }
             })
         })
         .cloned()
