@@ -121,14 +121,7 @@ fn main() {
             force,
             backend: _,
         } => commands::init::execute(prefix, force, None, &output_ctx),
-        Commands::Create(args) => {
-            commands::create::execute_with_storage(
-                &args,
-                &overrides,
-                &output_ctx,
-                storage_result.take(),
-            )
-        }
+        Commands::Create(args) => commands::create::execute(&args, &overrides, &output_ctx),
         Commands::Update(args) => commands::update::execute(&args, &overrides, &output_ctx),
         Commands::Delete(args) => {
             commands::delete::execute(&args, cli.json, &overrides, &output_ctx)
@@ -363,15 +356,15 @@ fn blocking_write_lock(beads_dir: &Path) -> Option<File> {
         return Some(file);
     }
 
-    // Blocking retry with exponential backoff (50ms → 800ms, ~6 attempts in ~3s).
+    // Blocking retry with exponential backoff (50ms → 800ms cap, 12 attempts,
+    // total worst-case ~8s).
     let mut delay = std::time::Duration::from_millis(50);
     for _ in 0..12 {
         std::thread::sleep(delay);
         if file.try_lock().is_ok() {
             return Some(file);
         }
-        delay = delay.min(std::time::Duration::from_millis(800));
-        delay = delay.mul_f32(1.5);
+        delay = delay.mul_f32(1.5).min(std::time::Duration::from_millis(800));
     }
 
     // Last attempt: log a warning and proceed without the lock rather than
