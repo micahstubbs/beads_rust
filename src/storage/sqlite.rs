@@ -9,6 +9,10 @@ use crate::storage::schema::{
     apply_runtime_compatible_schema, apply_schema, execute_batch, runtime_schema_compatible,
     table_exists,
 };
+use crate::sync::{
+    METADATA_JSONL_CONTENT_HASH, METADATA_JSONL_MTIME, METADATA_JSONL_SIZE,
+    METADATA_LAST_EXPORT_TIME, METADATA_LAST_IMPORT_TIME,
+};
 use crate::util::id::{normalize_prefix, parse_id};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use fsqlite::Connection;
@@ -37,6 +41,18 @@ const IMPORT_DEPENDENCY_CHUNK_SIZE: usize = 140;
 const DEPENDENCY_TRAVERSAL_MAX_DEPTH: usize = 500;
 const BLOCKED_CACHE_STATE_KEY: &str = "blocked_cache_state";
 const BLOCKED_CACHE_STATE_STALE: &str = "stale";
+const NEEDS_FLUSH_KEY: &str = "needs_flush";
+const METADATA_EMPTY_VALUE: &str = "";
+const METADATA_FALSE_VALUE: &str = "false";
+const KNOWN_METADATA_DEFAULTS: [(&str, &str); 7] = [
+    (BLOCKED_CACHE_STATE_KEY, METADATA_EMPTY_VALUE),
+    (NEEDS_FLUSH_KEY, METADATA_FALSE_VALUE),
+    (METADATA_JSONL_CONTENT_HASH, METADATA_EMPTY_VALUE),
+    (METADATA_JSONL_MTIME, METADATA_EMPTY_VALUE),
+    (METADATA_JSONL_SIZE, METADATA_EMPTY_VALUE),
+    (METADATA_LAST_EXPORT_TIME, METADATA_EMPTY_VALUE),
+    (METADATA_LAST_IMPORT_TIME, METADATA_EMPTY_VALUE),
+];
 
 /// SQLite-based storage backend.
 #[derive(Debug)]
@@ -271,12 +287,40 @@ impl SqliteStorage {
         unreachable!("Retry loop exited without returning")
     }
 
-    fn delete_metadata_key_in_tx(conn: &Connection, key: &str) -> Result<()> {
-        conn.execute_with_params(
-            "DELETE FROM metadata WHERE key = ?",
+    fn metadata_key_exists(conn: &Connection, key: &str) -> Result<bool> {
+        let rows = conn.query_with_params(
+            "SELECT 1 FROM metadata WHERE key = ? LIMIT 1",
             &[SqliteValue::from(key)],
         )?;
+        Ok(!rows.is_empty())
+    }
+
+    fn upsert_metadata_key_in_tx(conn: &Connection, key: &str, value: &str) -> Result<()> {
+        let updated = conn.execute_with_params(
+            "UPDATE metadata SET value = ? WHERE key = ?",
+            &[SqliteValue::from(value), SqliteValue::from(key)],
+        )?;
+        if updated == 0 {
+            conn.execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[SqliteValue::from(key), SqliteValue::from(value)],
+            )?;
+        }
         Ok(())
+    }
+
+    fn ensure_known_metadata_defaults(conn: &Connection) -> Result<()> {
+        Self::with_connection_write_transaction(conn, |conn| {
+            for (key, default_value) in KNOWN_METADATA_DEFAULTS {
+                if !Self::metadata_key_exists(conn, key)? {
+                    conn.execute_with_params(
+                        "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                        &[SqliteValue::from(key), SqliteValue::from(default_value)],
+                    )?;
+                }
+            }
+            Ok(())
+        })
     }
 
     fn metadata_equals(conn: &Connection, key: &str, expected: &str) -> Result<bool> {
@@ -316,7 +360,7 @@ impl SqliteStorage {
         self.conn.execute("PRAGMA foreign_keys = OFF")?;
         let result = Self::with_connection_write_transaction(&self.conn, |conn| {
             let refreshed = Self::apply_blocked_cache_refresh_plan(conn, plan)?;
-            Self::delete_metadata_key_in_tx(conn, BLOCKED_CACHE_STATE_KEY)?;
+            Self::upsert_metadata_key_in_tx(conn, BLOCKED_CACHE_STATE_KEY, METADATA_EMPTY_VALUE)?;
             tracing::debug!(operation = op, refreshed, "Refreshed blocked issues cache");
             Ok(())
         });
@@ -356,7 +400,7 @@ impl SqliteStorage {
             }
 
             let refreshed = Self::rebuild_blocked_cache_impl(conn)?;
-            Self::delete_metadata_key_in_tx(conn, BLOCKED_CACHE_STATE_KEY)?;
+            Self::upsert_metadata_key_in_tx(conn, BLOCKED_CACHE_STATE_KEY, METADATA_EMPTY_VALUE)?;
             tracing::debug!(refreshed, "Rebuilt stale blocked issues cache on demand");
             Ok(true)
         });
@@ -396,6 +440,7 @@ impl SqliteStorage {
         } else {
             apply_schema(&conn)?;
         }
+        Self::ensure_known_metadata_defaults(&conn)?;
         Ok(Self {
             conn,
             mutation_count: 0,
@@ -419,6 +464,7 @@ impl SqliteStorage {
             eprintln!("apply_schema failed: {:?}", e);
             return Err(e);
         }
+        Self::ensure_known_metadata_defaults(&conn)?;
         Ok(Self {
             conn,
             mutation_count: 0,
@@ -938,14 +984,7 @@ impl SqliteStorage {
             }
 
             if ctx.force_flush {
-                storage.conn.execute_with_params(
-                    "DELETE FROM metadata WHERE key = 'needs_flush'",
-                    &[],
-                )?;
-                storage.conn.execute_with_params(
-                    "INSERT INTO metadata (key, value) VALUES ('needs_flush', 'true')",
-                    &[],
-                )?;
+                Self::upsert_metadata_key_in_tx(&storage.conn, NEEDS_FLUSH_KEY, "true")?;
             }
 
             Ok((result, blocked_cache_plan))
@@ -2852,7 +2891,11 @@ impl SqliteStorage {
         self.conn.execute("PRAGMA foreign_keys = OFF")?;
         let result = self.with_write_transaction(|storage| {
             let rebuilt = Self::rebuild_blocked_cache_impl(&storage.conn)?;
-            Self::delete_metadata_key_in_tx(&storage.conn, BLOCKED_CACHE_STATE_KEY)?;
+            Self::upsert_metadata_key_in_tx(
+                &storage.conn,
+                BLOCKED_CACHE_STATE_KEY,
+                METADATA_EMPTY_VALUE,
+            )?;
             Ok(rebuilt)
         });
         let _ = self.conn.execute("PRAGMA foreign_keys = ON");
@@ -2869,7 +2912,7 @@ impl SqliteStorage {
     /// Returns an error if the rebuild fails.
     pub(crate) fn rebuild_blocked_cache_in_tx(&self) -> Result<usize> {
         let rebuilt = Self::rebuild_blocked_cache_impl(&self.conn)?;
-        Self::delete_metadata_key_in_tx(&self.conn, BLOCKED_CACHE_STATE_KEY)?;
+        Self::upsert_metadata_key_in_tx(&self.conn, BLOCKED_CACHE_STATE_KEY, METADATA_EMPTY_VALUE)?;
         Ok(rebuilt)
     }
 
@@ -5765,7 +5808,11 @@ impl SqliteStorage {
             &[SqliteValue::from(key)],
         )?;
         match rows.into_iter().next() {
-            Some(row) => Ok(row.get(0).and_then(SqliteValue::as_text).map(String::from)),
+            Some(row) => Ok(row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .filter(|value| !value.is_empty())
+                .map(String::from)),
             None => Ok(None),
         }
     }
@@ -5777,14 +5824,7 @@ impl SqliteStorage {
     /// Returns an error if the database update fails.
     pub fn set_metadata(&mut self, key: &str, value: &str) -> Result<()> {
         self.with_write_transaction(|storage| {
-            storage.conn.execute_with_params(
-                "DELETE FROM metadata WHERE key = ?",
-                &[SqliteValue::from(key)],
-            )?;
-            storage.conn.execute_with_params(
-                "INSERT INTO metadata (key, value) VALUES (?, ?)",
-                &[SqliteValue::from(key), SqliteValue::from(value)],
-            )?;
+            Self::upsert_metadata_key_in_tx(&storage.conn, key, value)?;
             Ok(())
         })
     }
@@ -5796,11 +5836,7 @@ impl SqliteStorage {
     /// Returns an error if the database update fails.
     pub(crate) fn set_metadata_shared(&self, key: &str, value: &str) -> Result<()> {
         Self::with_connection_write_transaction(&self.conn, |conn| {
-            Self::delete_metadata_key_in_tx(conn, key)?;
-            conn.execute_with_params(
-                "INSERT INTO metadata (key, value) VALUES (?, ?)",
-                &[SqliteValue::from(key), SqliteValue::from(value)],
-            )?;
+            Self::upsert_metadata_key_in_tx(conn, key, value)?;
             Ok(())
         })
     }
@@ -6124,17 +6160,7 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database operation fails.
     pub(crate) fn set_metadata_in_tx(&self, key: &str, value: &str) -> Result<()> {
-        // Explicit DELETE + INSERT instead of INSERT OR REPLACE because
-        // fsqlite does not enforce UNIQUE constraints on non-rowid columns.
-        self.conn.execute_with_params(
-            "DELETE FROM metadata WHERE key = ?",
-            &[SqliteValue::from(key)],
-        )?;
-        self.conn.execute_with_params(
-            "INSERT INTO metadata (key, value) VALUES (?, ?)",
-            &[SqliteValue::from(key), SqliteValue::from(value)],
-        )?;
-        Ok(())
+        Self::upsert_metadata_key_in_tx(&self.conn, key, value)
     }
 
     /// Clear all export hashes (in tx).
@@ -11483,5 +11509,102 @@ mod tests {
         let issue2 = make_issue("test-2", "Issue 2", Status::Open, 2, None, t1, None);
         storage.create_issue(&issue2, "tester").unwrap();
         assert!(storage.get_issue("test-2").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_open_seeds_known_metadata_defaults() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("seeded-metadata.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let rows = storage
+            .conn
+            .query("SELECT key, value FROM metadata ORDER BY key ASC")
+            .unwrap();
+        let mut entries = HashMap::new();
+        for row in rows {
+            let key = row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string();
+            let value = row
+                .get(1)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string();
+            entries.insert(key, value);
+        }
+
+        for (key, default_value) in KNOWN_METADATA_DEFAULTS {
+            assert_eq!(
+                entries.get(key).map(String::as_str),
+                Some(default_value),
+                "expected seeded metadata default for key '{key}'"
+            );
+        }
+
+        assert_eq!(
+            storage.get_metadata(BLOCKED_CACHE_STATE_KEY).unwrap(),
+            None,
+            "empty blocked-cache seed should read as missing"
+        );
+        assert_eq!(
+            storage.get_metadata(METADATA_JSONL_CONTENT_HASH).unwrap(),
+            None,
+            "empty sync hash seed should read as missing"
+        );
+        assert_eq!(
+            storage.get_metadata(METADATA_LAST_EXPORT_TIME).unwrap(),
+            None,
+            "empty export timestamp seed should read as missing"
+        );
+        assert_eq!(
+            storage.get_metadata(METADATA_LAST_IMPORT_TIME).unwrap(),
+            None,
+            "empty import timestamp seed should read as missing"
+        );
+    }
+
+    #[test]
+    fn test_metadata_state_updates_keep_single_seeded_row() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("metadata-state.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+
+        storage.set_metadata(NEEDS_FLUSH_KEY, "true").unwrap();
+        storage.set_metadata(NEEDS_FLUSH_KEY, "false").unwrap();
+        storage.mark_blocked_cache_stale().unwrap();
+        storage.rebuild_blocked_cache(true).unwrap();
+
+        let needs_flush_count = storage
+            .conn
+            .query_row_with_params(
+                "SELECT count(*) FROM metadata WHERE key = ?",
+                &[SqliteValue::from(NEEDS_FLUSH_KEY)],
+            )
+            .unwrap()
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or_default();
+        assert_eq!(needs_flush_count, 1);
+
+        let blocked_cache_count = storage
+            .conn
+            .query_row_with_params(
+                "SELECT count(*) FROM metadata WHERE key = ?",
+                &[SqliteValue::from(BLOCKED_CACHE_STATE_KEY)],
+            )
+            .unwrap()
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or_default();
+        assert_eq!(blocked_cache_count, 1);
+
+        assert_eq!(
+            storage.get_metadata(NEEDS_FLUSH_KEY).unwrap(),
+            Some("false".to_string())
+        );
+        assert_eq!(storage.get_metadata(BLOCKED_CACHE_STATE_KEY).unwrap(), None);
     }
 }

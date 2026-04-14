@@ -432,9 +432,7 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
     // corruption" — issue #237) are addressed via VACUUM in the rebuild
     // path and `br doctor --repair`, not here.  Running VACUUM here would
     // conflict with connections opened immediately after init.
-    if is_fresh
-        && let Err(e) = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    {
+    if is_fresh && let Err(e) = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
         tracing::debug!(
             error = %e,
             "wal_checkpoint(TRUNCATE) after fresh bootstrap failed (non-fatal)"

@@ -1974,17 +1974,32 @@ fn check_sync_metadata(
     let last_import: Option<String> = conn
         .query_row("SELECT value FROM metadata WHERE key = 'last_import_time'")
         .ok()
-        .and_then(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from));
+        .and_then(|row| {
+            row.get(0)
+                .and_then(SqliteValue::as_text)
+                .filter(|value| !value.is_empty())
+                .map(String::from)
+        });
 
     let last_export: Option<String> = conn
         .query_row("SELECT value FROM metadata WHERE key = 'last_export_time'")
         .ok()
-        .and_then(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from));
+        .and_then(|row| {
+            row.get(0)
+                .and_then(SqliteValue::as_text)
+                .filter(|value| !value.is_empty())
+                .map(String::from)
+        });
 
     let jsonl_hash: Option<String> = conn
         .query_row("SELECT value FROM metadata WHERE key = 'jsonl_content_hash'")
         .ok()
-        .and_then(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from));
+        .and_then(|row| {
+            row.get(0)
+                .and_then(SqliteValue::as_text)
+                .filter(|value| !value.is_empty())
+                .map(String::from)
+        });
 
     // Check dirty issues count
     let dirty_count: i64 = conn

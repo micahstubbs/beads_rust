@@ -2203,8 +2203,9 @@ pub fn finalize_export(
         storage.set_metadata_in_tx(METADATA_LAST_EXPORT_TIME, &Utc::now().to_rfc3339())?;
         record_jsonl_witness_in_tx(storage, jsonl_path)?;
 
-        // Clear force-flush flag if it was set
-        storage.execute_raw("DELETE FROM metadata WHERE key = 'needs_flush'")?;
+        // Keep the row stable and clear the flag in place so ordinary export
+        // cycles avoid delete+insert churn on the metadata B-tree.
+        storage.set_metadata_in_tx("needs_flush", "false")?;
 
         Ok(())
     })?;
@@ -2368,7 +2369,7 @@ fn finalize_incremental_auto_flush(
             })?;
             record_jsonl_witness_in_tx(storage, jsonl_path)?;
         }
-        storage.execute_raw("DELETE FROM metadata WHERE key = 'needs_flush'")?;
+        storage.set_metadata_in_tx("needs_flush", "false")?;
         Ok(())
     })?;
 
