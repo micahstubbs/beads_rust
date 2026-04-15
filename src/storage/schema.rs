@@ -5,7 +5,7 @@ use fsqlite_types::SqliteValue;
 
 use crate::error::{BeadsError, Result};
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 4;
+pub const CURRENT_SCHEMA_VERSION: i32 = 5;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -88,9 +88,12 @@ pub const SCHEMA_SQL: &str = r"
         AND pinned = 0
         AND is_template = 0;
 
-    -- Common active list path: non-terminal issues sorted by priority/created_at
+    -- Common active list path: non-terminal issues sorted by priority/created_at.
+    -- Uses ASC on created_at (not DESC) to avoid frankensqlite B-tree ordering
+    -- divergence with C sqlite3 integrity_check.  SQLite reverse-scans the ASC
+    -- index efficiently for ORDER BY ... created_at DESC queries.
     CREATE INDEX IF NOT EXISTS idx_issues_list_active_order
-        ON issues(priority, created_at DESC)
+        ON issues(priority, created_at)
         WHERE status NOT IN ('closed', 'tombstone')
         AND (is_template = 0 OR is_template IS NULL);
 
@@ -1150,6 +1153,21 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
                  AND is_template = 0",
             )?;
         }
+
+        // v5: Drop the old DESC index so the idempotent CREATE INDEX IF NOT
+        // EXISTS below recreates it without DESC.  Frankensqlite's B-tree
+        // implementation stores DESC index entries in a different physical
+        // order than C sqlite3 expects, causing `PRAGMA integrity_check` to
+        // report "entries are out of order for their declared key directions".
+        // Removing DESC eliminates the false positive while SQLite's query
+        // planner still reverse-scans the ASC index efficiently for
+        // ORDER BY ... created_at DESC queries.
+        if user_version < 5 {
+            tracing::info!(
+                "Migrating database to schema version 5 (remove DESC from active list index)"
+            );
+            conn.execute("DROP INDEX IF EXISTS idx_issues_list_active_order")?;
+        }
     }
 
     // Note: source_repo and is_template column backfills are handled in
@@ -1184,7 +1202,7 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
 
         -- Common active list path: non-terminal issues sorted by priority/created_at
         CREATE INDEX IF NOT EXISTS idx_issues_list_active_order
-            ON issues(priority, created_at DESC)
+            ON issues(priority, created_at)
             WHERE status NOT IN ('closed', 'tombstone')
             AND (is_template = 0 OR is_template IS NULL);
 
