@@ -339,7 +339,7 @@ fn main() {
 ///
 /// This serializes all mutating `br` operations across processes, preventing
 /// the frankensqlite concurrent-write deadlock (#243). The lock blocks (with
-/// exponential backoff) until it is acquired or 10 seconds elapse.
+/// exponential backoff, 12 attempts over ~6 seconds) until acquired.
 /// Returns `Some(File)` on success; the lock is held until the File drops.
 fn blocking_write_lock(beads_dir: &Path) -> Option<File> {
     let lock_path = beads_dir.join(".write.lock");

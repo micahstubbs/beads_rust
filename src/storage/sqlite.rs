@@ -319,20 +319,29 @@ impl SqliteStorage {
     }
 
     fn ensure_known_metadata_defaults(conn: &Connection) -> Result<()> {
-        // Each INSERT is atomic (auto-commit) and idempotent via the WHERE
-        // NOT EXISTS guard. This avoids an explicit BEGIN IMMEDIATE that would
-        // hold the write lock across all keys and block concurrent openers
-        // under multi-agent workloads (#243).
+        // Read-first, write-only-if-missing pattern (#243).  The read
+        // (`metadata_key_exists`) needs no write lock, so it works even when
+        // another process holds the WAL write lock.  If the key IS missing,
+        // the INSERT may fail with SQLITE_BUSY under concurrency; that's
+        // benign — the key either already exists from a racing writer or
+        // will be inserted on the next run.  This avoids the old explicit
+        // BEGIN IMMEDIATE wrapper that would block concurrent openers.
         for (key, default_value) in KNOWN_METADATA_DEFAULTS {
-            conn.execute_with_params(
-                "INSERT INTO metadata (key, value) \
-                 SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM metadata WHERE key = ?)",
-                &[
-                    SqliteValue::from(key),
-                    SqliteValue::from(default_value),
-                    SqliteValue::from(key),
-                ],
-            )?;
+            if Self::metadata_key_exists(conn, key)? {
+                continue;
+            }
+            match conn.execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[SqliteValue::from(key), SqliteValue::from(default_value)],
+            ) {
+                Ok(_) => {}
+                Err(e) if e.is_transient() => {
+                    // BUSY — another writer is active. The default will be
+                    // present once their transaction commits, or we'll seed
+                    // it on the next open.
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
         Ok(())
     }
@@ -439,8 +448,10 @@ impl SqliteStorage {
     pub fn open_with_timeout(path: &Path, lock_timeout_ms: Option<u64>) -> Result<Self> {
         let conn = Connection::open(path.to_string_lossy().into_owned())?;
 
-        // Configure busy_timeout so that BEGIN IMMEDIATE retries instead of
-        // failing instantly when another writer holds the lock (issue #109).
+        // Set busy_timeout. Default is 0 (#243) — frankensqlite's busy
+        // handler hot-spins, so we rely on application-level retry (see
+        // `with_write_transaction`). The `.write.lock` flock serializes
+        // concurrent mutating processes before they reach this point.
         if let Some(timeout_ms) = lock_timeout_ms {
             conn.execute(&format!("PRAGMA busy_timeout={timeout_ms}"))?;
         }
