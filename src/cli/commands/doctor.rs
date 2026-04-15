@@ -2439,9 +2439,9 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     }
 
     // VACUUM to fix page-level anomalies (free space corruption, malformed
-    // B-tree pages, out-of-order index entries) caused by frankensqlite's
-    // B-tree layer differences with C sqlite3 (#237, #245).  VACUUM rewrites
-    // every page from scratch, so it fixes both index and table corruption.
+    // B-tree pages) caused by frankensqlite's B-tree layer differences with
+    // C sqlite3 (#237, #245).  VACUUM rewrites every page from scratch, so
+    // it fixes both index and table corruption.
     if report_has_page_corruption(&initial.report) {
         repair_via_vacuum(&paths.db_path, &mut local_repair);
     }
