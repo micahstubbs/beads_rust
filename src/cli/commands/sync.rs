@@ -962,16 +962,18 @@ fn execute_import(
         None
     };
 
-    let preserved_tombstones = if args.force {
+    let preserved_tombstones = if args.force || args.rebuild {
         snapshot_tombstones(storage)?
     } else {
         Vec::new()
     };
 
-    // For force imports, drop and recreate data tables to avoid fsqlite btree
-    // cursor bugs on DELETE operations in large tables. Config/metadata are preserved.
-    if args.force {
-        debug!("Force import: resetting data tables to avoid btree DELETE bugs");
+    // For force imports and rebuilds, drop and recreate data tables to avoid
+    // fsqlite btree cursor bugs on DELETE operations in large tables.
+    // Config/metadata are preserved.  Without this, --rebuild on a corrupt DB
+    // can hang indefinitely during orphan deletion (#245).
+    if args.force || args.rebuild {
+        debug!("Force/rebuild import: resetting data tables to avoid btree DELETE bugs");
         storage.reset_data_tables()?;
         restore_tombstones(storage, &preserved_tombstones)?;
     }

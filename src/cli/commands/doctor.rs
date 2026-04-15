@@ -203,17 +203,20 @@ fn report_has_page_corruption(report: &DoctorReport) -> bool {
         if check.name != "sqlite.integrity_check" && check.name != "sqlite3.integrity_check" {
             return false;
         }
-        check
-            .message
-            .as_deref()
-            .is_some_and(|msg| msg.to_lowercase().contains("free space corruption"))
+        check.message.as_deref().is_some_and(|msg| {
+            let lower = msg.to_lowercase();
+            lower.contains("free space corruption")
+                || lower.contains("malformed")
+                || lower.contains("out of order")
+                || lower.contains("disk image")
+        })
     })
 }
 
 /// Compact the database via VACUUM to fix page-level anomalies (free space
-/// corruption, freeblock chain inconsistencies) that arise from frankensqlite's
-/// B-tree layer.  VACUUM rewrites every page from scratch, eliminating any
-/// internal accounting discrepancies.
+/// corruption, B-tree malformation, out-of-order index entries) that arise
+/// from frankensqlite's B-tree layer.  VACUUM rewrites every page from
+/// scratch, eliminating any internal accounting discrepancies.
 fn repair_via_vacuum(db_path: &Path, repair: &mut LocalRepairResult) {
     if !db_path.is_file() {
         tracing::debug!(
@@ -238,6 +241,75 @@ fn repair_via_vacuum(db_path: &Path, repair: &mut LocalRepairResult) {
                 error = %err,
                 "Skipping VACUUM because the database could not be opened"
             );
+        }
+    }
+}
+
+/// Write probe: verify the database can actually perform writes after repair.
+///
+/// Issue #245: REINDEX can fix index ordering so `PRAGMA integrity_check`
+/// passes, but the underlying B-tree corruption may silently cause writes to
+/// fail (reads work, writes get ISSUE_NOT_FOUND).  This probe creates a
+/// temporary row, reads it back, and deletes it inside a single transaction
+/// to confirm the full read/write cycle works.
+fn write_probe_after_repair(db_path: &Path) -> bool {
+    let Ok(conn) = Connection::open(db_path.to_string_lossy().into_owned()) else {
+        return false;
+    };
+    let _ = conn.execute("PRAGMA busy_timeout=5000");
+
+    // Use a probe ID that cannot collide with real issues.
+    let probe_id = "__doctor_write_probe__";
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let probe = (|| -> std::result::Result<(), Box<dyn std::error::Error>> {
+        conn.execute("BEGIN IMMEDIATE")?;
+
+        conn.execute_with_params(
+            "INSERT OR REPLACE INTO issues (id, title, status, priority, created_at, updated_at) \
+             VALUES (?, ?, 'open', 'medium', ?, ?)",
+            &[
+                SqliteValue::from(probe_id),
+                SqliteValue::from("doctor write probe"),
+                SqliteValue::from(now.as_str()),
+                SqliteValue::from(now.as_str()),
+            ],
+        )?;
+
+        // Read it back inside the same transaction to verify the read path
+        // agrees with what we just wrote.
+        let rows = conn.query_with_params(
+            "SELECT id FROM issues WHERE id = ?",
+            &[SqliteValue::from(probe_id)],
+        )?;
+        if rows.is_empty() {
+            conn.execute("ROLLBACK")?;
+            tracing::warn!("Write probe: INSERT succeeded but SELECT returned no rows");
+            return Err("read-after-write divergence".into());
+        }
+
+        conn.execute_with_params(
+            "DELETE FROM issues WHERE id = ?",
+            &[SqliteValue::from(probe_id)],
+        )?;
+        conn.execute("COMMIT")?;
+        Ok(())
+    })();
+
+    match probe {
+        Ok(()) => {
+            tracing::info!("Write probe passed");
+            true
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "Write probe failed — DB may still be corrupt");
+            // Best-effort cleanup in case we're stuck mid-transaction.
+            let _ = conn.execute("ROLLBACK");
+            let _ = conn.execute_with_params(
+                "DELETE FROM issues WHERE id = ?",
+                &[SqliteValue::from(probe_id)],
+            );
+            false
         }
     }
 }
@@ -2364,10 +2436,10 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         repair_partial_indexes(&paths.db_path, &mut local_repair);
     }
 
-    // VACUUM to fix page-level anomalies (free space corruption) caused by
-    // frankensqlite freeblock accounting differences with C sqlite3 (#237).
-    // This is much faster than a full JSONL rebuild and fixes the page
-    // structures in-place.
+    // VACUUM to fix page-level anomalies (free space corruption, malformed
+    // B-tree pages, out-of-order index entries) caused by frankensqlite's
+    // B-tree layer differences with C sqlite3 (#237, #245).  VACUUM rewrites
+    // every page from scratch, so it fixes both index and table corruption.
     if report_has_page_corruption(&initial.report) {
         repair_via_vacuum(&paths.db_path, &mut local_repair);
     }
@@ -2379,23 +2451,38 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     };
 
     if after_local_repair.report.ok {
-        let repair_message = repair_outcome_message(gitignore_repaired, Some(&local_repair), None);
-        if ctx.is_json() {
-            ctx.json(&serde_json::json!({
-                "report": initial.report,
-                "repaired": gitignore_repaired || local_repair.applied(),
-                "local_repair": local_repair,
-                "message": repair_message,
-                "post_repair": after_local_repair.report,
-                "verified": true,
-            }));
+        // Issue #245: REINDEX can fix index ordering so integrity_check
+        // passes, but the underlying B-tree corruption may still cause
+        // writes to fail (reads work, writes get ISSUE_NOT_FOUND).  Run a
+        // write probe to confirm that the DB is truly healthy before
+        // declaring success.
+        let write_probe_ok = write_probe_after_repair(&paths.db_path);
+        if !write_probe_ok {
+            tracing::warn!(
+                "Post-repair write probe failed — local repair insufficient, \
+                 falling through to full JSONL rebuild"
+            );
+            // Don't return early — fall through to JSONL rebuild below.
         } else {
-            print_report(&initial.report, ctx)?;
-            ctx.info(&repair_message);
-            ctx.info("Post-repair verification:");
-            print_report(&after_local_repair.report, ctx)?;
+            let repair_message =
+                repair_outcome_message(gitignore_repaired, Some(&local_repair), None);
+            if ctx.is_json() {
+                ctx.json(&serde_json::json!({
+                    "report": initial.report,
+                    "repaired": gitignore_repaired || local_repair.applied(),
+                    "local_repair": local_repair,
+                    "message": repair_message,
+                    "post_repair": after_local_repair.report,
+                    "verified": true,
+                }));
+            } else {
+                print_report(&initial.report, ctx)?;
+                ctx.info(&repair_message);
+                ctx.info("Post-repair verification:");
+                print_report(&after_local_repair.report, ctx)?;
+            }
+            return Ok(());
         }
-        return Ok(());
     }
 
     let Some(jsonl_path) = initial.jsonl_path.as_ref() else {

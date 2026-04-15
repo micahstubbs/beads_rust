@@ -1342,8 +1342,18 @@ impl SqliteStorage {
         }
 
         self.mutate("update_issue", actor, |conn, ctx| {
-            let mut issue = Self::get_issue_from_conn(conn, id)?
-                .ok_or_else(|| BeadsError::IssueNotFound { id: id.to_string() })?;
+            let mut issue = Self::get_issue_from_conn(conn, id)?.ok_or_else(|| {
+                // Issue #245: if `get_issue` (read path) can find the row but
+                // `get_issue_from_conn` inside a write transaction cannot, the
+                // database is likely corrupt (B-tree or index malformation).
+                // Surface a more helpful error than bare ISSUE_NOT_FOUND.
+                tracing::warn!(
+                    id = %id,
+                    "update_issue: row not found inside write transaction \
+                     (possible DB corruption — run `br doctor --repair`)"
+                );
+                BeadsError::IssueNotFound { id: id.to_string() }
+            })?;
 
             // Atomic claim guard: check assignee INSIDE the CONCURRENT transaction
             // to prevent TOCTOU races where two agents both see "unassigned".
