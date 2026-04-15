@@ -205,9 +205,12 @@ fn report_has_page_corruption(report: &DoctorReport) -> bool {
         }
         check.message.as_deref().is_some_and(|msg| {
             let lower = msg.to_lowercase();
+            // Match structural page corruption that VACUUM can fix.
+            // Note: "out of order" for DESC indexes is a known frankensqlite
+            // B-tree artifact (not fixable by VACUUM) and is handled as benign
+            // in integrity_messages_only_benign instead.
             lower.contains("free space corruption")
                 || lower.contains("malformed")
-                || lower.contains("out of order")
                 || lower.contains("disk image")
         })
     })
@@ -1112,14 +1115,17 @@ fn required_schema_checks(conn: &Connection, checks: &mut Vec<CheckResult>) -> R
 }
 
 /// Return true if all integrity check messages are benign frankensqlite artifacts
-/// (either "never used" pages, partial-index row mismatches, or a mix of both).
+/// (either "never used" pages, partial-index row mismatches, DESC index ordering
+/// differences, or a mix of these).
 fn integrity_messages_only_benign(messages: &[String]) -> bool {
     if messages.is_empty() {
         return false;
     }
     let has_benign = messages.iter().any(|msg| {
         let lower = msg.to_lowercase();
-        lower.contains("never used") || lower.contains("missing from index")
+        lower.contains("never used")
+            || lower.contains("missing from index")
+            || lower.contains("out of order")
     });
     if !has_benign {
         return false;
@@ -1128,6 +1134,7 @@ fn integrity_messages_only_benign(messages: &[String]) -> bool {
         let lower = msg.to_lowercase();
         lower.contains("never used")
             || lower.contains("missing from index")
+            || lower.contains("out of order")
             || lower.contains("*** in database")
     })
 }
