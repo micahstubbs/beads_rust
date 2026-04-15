@@ -547,3 +547,118 @@ fn test_markdown_import_whitespace_separated_typed_dependencies() {
             .any(|dep| dep["depends_on_id"].as_str() == Some("external:github#123"))
     );
 }
+
+#[test]
+fn test_markdown_import_standin_id_dependency_resolution() {
+    let workspace = BrWorkspace::new();
+
+    let output = run_br(&workspace, ["init"], "init_standin");
+    assert!(output.status.success(), "init failed");
+
+    // Create a markdown file where issues reference each other via stand-in IDs
+    let md_path = workspace.root.join("issues.md");
+    let content = r"## Build Database Schema
+### ID
+db-1
+### Type
+task
+### Priority
+0
+
+## Build API Endpoints
+### Type
+feature
+### Dependencies
+- db-1
+";
+    fs::write(&md_path, content).expect("write md");
+
+    let output = run_br(
+        &workspace,
+        ["create", "--file", "issues.md", "--json"],
+        "create_standin_deps_json",
+    );
+    assert!(
+        output.status.success(),
+        "create --file --json failed: {}",
+        output.stderr
+    );
+
+    let payload = extract_json_payload(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&payload).expect("json parse");
+    let issues = json.as_array().expect("json array");
+    assert_eq!(issues.len(), 2);
+
+    // The second issue (API Endpoints) should depend on the first (Database Schema)
+    let db_id = issues[0]["id"].as_str().expect("db issue id");
+    let api_deps = issues[1]["dependencies"]
+        .as_array()
+        .expect("api dependencies array");
+    assert_eq!(
+        api_deps.len(),
+        1,
+        "expected 1 dependency, got {}: {api_deps:?}",
+        api_deps.len()
+    );
+    assert_eq!(
+        api_deps[0]["depends_on_id"].as_str(),
+        Some(db_id),
+        "dependency should resolve stand-in 'db-1' to the generated ID of Database Schema"
+    );
+}
+
+#[test]
+fn test_markdown_import_title_based_dependency_resolution() {
+    let workspace = BrWorkspace::new();
+
+    let output = run_br(&workspace, ["init"], "init_title_dep");
+    assert!(output.status.success(), "init failed");
+
+    // Create a markdown file where issues reference each other by title (bulleted)
+    let md_path = workspace.root.join("issues.md");
+    let content = r"## Build API Endpoints
+### Type
+feature
+### Dependencies
+- Build Database Schema
+
+## Build Database Schema
+### Type
+task
+";
+    fs::write(&md_path, content).expect("write md");
+
+    let output = run_br(
+        &workspace,
+        ["create", "--file", "issues.md", "--json"],
+        "create_title_deps_json",
+    );
+    assert!(
+        output.status.success(),
+        "create --file --json failed: {}",
+        output.stderr
+    );
+
+    let payload = extract_json_payload(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&payload).expect("json parse");
+    let issues = json.as_array().expect("json array");
+    assert_eq!(issues.len(), 2);
+
+    // The first issue (API Endpoints) should depend on the second (Database Schema)
+    // This tests forward-reference resolution (dep target defined later in file)
+    let db_id = issues[1]["id"].as_str().expect("db issue id");
+    let api_deps = issues[0]["dependencies"]
+        .as_array()
+        .expect("api dependencies array");
+    assert_eq!(
+        api_deps.len(),
+        1,
+        "expected 1 dependency, got {}: {api_deps:?}",
+        api_deps.len()
+    );
+    assert_eq!(
+        api_deps[0]["depends_on_id"].as_str(),
+        Some(db_id),
+        "dependency should resolve title 'Build Database Schema' to the generated ID"
+    );
+}

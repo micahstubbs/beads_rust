@@ -7,9 +7,19 @@
 //! - Each issue starts with an H2 line: `## Issue Title`
 //! - Per-issue sections are H3 lines: `### Section Name`
 //! - Recognized sections (case-insensitive):
-//!   - Priority, Type, Description, Design, Acceptance Criteria (alias Acceptance),
+//!   - ID, Priority, Type, Description, Design, Acceptance Criteria (alias Acceptance),
 //!     Assignee, Labels, Dependencies (alias Deps)
 //! - Unknown sections are ignored
+//!
+//! # Intra-file Dependency References
+//!
+//! Dependencies can reference other issues in the same import file by:
+//! - **Title**: use the exact H2 title text (e.g., `Build Database Schema`)
+//! - **Stand-in ID**: assign `### ID` to an issue, then reference that ID from
+//!   other issues' `### Dependencies` section (e.g., `db-1`)
+//!
+//! These symbolic references are resolved to real generated IDs during import.
+//! References to pre-existing issues in storage still work via normal ID resolution.
 //!
 //! # Known Quirk (matches bd behavior)
 //!
@@ -27,6 +37,10 @@ use std::str::FromStr;
 pub struct ParsedIssue {
     /// Issue title from the H2 header.
     pub title: String,
+    /// Optional stand-in ID for intra-file dependency references (e.g. "db-1").
+    /// This ID is NOT used as the actual issue ID — it only serves as a symbolic
+    /// handle so other issues in the same import file can reference this one.
+    pub stand_in_id: Option<String>,
     /// Parent issue ID (e.g. "bd-123").
     pub parent: Option<String>,
     /// Priority string (e.g., "0", "P1", "2").
@@ -52,6 +66,7 @@ pub struct ParsedIssue {
 enum Section {
     /// Before any H3, capturing implicit description
     BeforeH3,
+    Id,
     Parent,
     Priority,
     Type,
@@ -68,6 +83,7 @@ impl Section {
     fn from_header(header: &str) -> Self {
         let normalized = header.trim().to_lowercase();
         match normalized.as_str() {
+            "id" => Self::Id,
             "parent" => Self::Parent,
             "priority" => Self::Priority,
             "type" => Self::Type,
@@ -235,6 +251,9 @@ fn apply_section_to_issue(issue: &mut ParsedIssue, section: Section, lines: &[St
                 issue.description = Some(content);
             }
         }
+        Section::Id => {
+            issue.stand_in_id = Some(content);
+        }
         Section::Parent => {
             issue.parent = Some(content);
         }
@@ -260,12 +279,48 @@ fn apply_section_to_issue(issue: &mut ParsedIssue, section: Section, lines: &[St
             issue.labels = split_list_content(&content);
         }
         Section::Dependencies => {
-            issue.dependencies = split_list_content(&content);
+            issue.dependencies = split_dependency_content(&content);
         }
         Section::Unknown => {
             // Ignore unknown sections
         }
     }
+}
+
+/// Split dependency content, preserving bulleted lines as whole items.
+///
+/// Bulleted lines (`- `, `* `, `+ `) are treated as single dependency references
+/// to support title-based and multi-word stand-in ID references. Non-bulleted
+/// lines are split on commas or whitespace (preserving `type:id` pairs).
+fn split_dependency_content(content: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    for raw_line in content.lines() {
+        let trimmed = raw_line.trim_start();
+        let is_bulleted = trimmed.starts_with("- ")
+            || trimmed.starts_with("* ")
+            || trimmed.starts_with("+ ");
+        let line = strip_markdown_list_prefix(raw_line).trim();
+        if line.is_empty() || is_marker_only_token(line) {
+            continue;
+        }
+        if is_bulleted {
+            // Treat the whole stripped line as a single dependency reference.
+            // This allows title-based refs like "- Build Database Schema".
+            let stripped = strip_markdown_checkbox_prefix(line).trim();
+            if !stripped.is_empty() {
+                result.push(stripped.to_string());
+            }
+        } else if line.contains(',') {
+            result.extend(
+                line.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty() && !is_marker_only_token(s)),
+            );
+        } else {
+            result.extend(split_whitespace_items_preserving_colon_pairs(line));
+        }
+    }
+    result
 }
 
 /// Split content on commas or whitespace for labels/deps.
@@ -603,6 +658,62 @@ This is the actual description.
     fn test_parse_markdown_content_rejects_non_empty_content_without_issue_headers() {
         let err = parse_markdown_content("### Description\nNo issue header here.\n").unwrap_err();
         assert!(matches!(err, BeadsError::Validation { field, .. } if field == "file"));
+    }
+
+    #[test]
+    fn test_stand_in_id_section() {
+        let content = r"## Build Database Schema
+### ID
+db-1
+### Type
+task
+
+## Build API Endpoints
+### Type
+feature
+### Dependencies
+db-1
+";
+        let issues = parse_markdown_content(content).unwrap();
+        assert_eq!(issues.len(), 2);
+        assert_eq!(
+            issues[0].stand_in_id,
+            Some("db-1".to_string())
+        );
+        assert_eq!(issues[0].title, "Build Database Schema");
+        assert_eq!(issues[1].dependencies, vec!["db-1"]);
+    }
+
+    #[test]
+    fn test_title_based_dependencies_bulleted() {
+        let content = r"## Build API Endpoints
+### Type
+feature
+### Dependencies
+- Build Database Schema
+
+## Build Database Schema
+### Type
+task
+";
+        let issues = parse_markdown_content(content).unwrap();
+        assert_eq!(issues.len(), 2);
+        // Bulleted line is preserved as a single dependency reference
+        assert_eq!(
+            issues[0].dependencies,
+            vec!["Build Database Schema"]
+        );
+    }
+
+    #[test]
+    fn test_non_bulleted_deps_still_split_on_whitespace() {
+        let content = r"## Test Issue
+### Dependencies
+bd-123 bd-456
+";
+        let issues = parse_markdown_content(content).unwrap();
+        // Non-bulleted, space-separated: split on whitespace (existing behavior)
+        assert_eq!(issues[0].dependencies, vec!["bd-123", "bd-456"]);
     }
 
     #[test]

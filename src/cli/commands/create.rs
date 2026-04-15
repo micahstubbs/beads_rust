@@ -10,6 +10,7 @@ use crate::util::markdown_import::{parse_dependency, parse_markdown_file};
 use crate::util::time::parse_flexible_timestamp;
 use crate::validation::{IssueValidator, LabelValidator};
 use chrono::{DateTime, Utc};
+use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -587,7 +588,14 @@ fn execute_import(
 
     let id_resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix.clone()));
 
-    'outer: for parsed in parsed_issues {
+    // Phase 1: Create all issues, deferring intra-file dependency resolution.
+    // Maps for resolving symbolic references between issues in the same import.
+    let mut title_to_id: HashMap<String, String> = HashMap::new();
+    let mut standin_to_id: HashMap<String, String> = HashMap::new();
+    // Deferred deps: (issue_id, raw_dep_strings, dep_types_from_cli)
+    let mut deferred_deps: Vec<(String, Vec<String>)> = Vec::new();
+
+    for parsed in parsed_issues {
         let title = parsed.title.trim().to_string();
         if title.is_empty() {
             eprintln!("✗ Failed to create issue: title cannot be empty");
@@ -727,12 +735,7 @@ fn execute_import(
                 }
             }
 
-            // Populate Dependencies (with validation)
-            let mut deps = parsed.dependencies.clone();
-            deps.extend(args.deps.clone());
-            let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix.clone()));
-            let mut dependency_error = None;
-
+            // Parent dependency is wired inline (parent must pre-exist or be CLI-provided).
             if let Some(parent_id) = resolved_parent.as_deref() {
                 issue.dependencies.push(Dependency {
                     issue_id: id.clone(),
@@ -745,55 +748,12 @@ fn execute_import(
                 });
             }
 
-            for dep_str in deps {
-                let (mut type_str, dep_id, valid) = parse_dependency(&dep_str);
-                if !valid {
-                    eprintln!(
-                        "warning: skipping invalid dependency type '{type_str}' for issue {id}"
-                    );
-                    continue;
-                }
-                if type_str.eq_ignore_ascii_case("blocked-by") {
-                    type_str = "blocks".to_string();
-                }
-
-                let resolved_dep_id = match resolve_dependency_id(&resolver, storage, &dep_id) {
-                    Ok(resolved_dep) => resolved_dep,
-                    Err(err) => {
-                        dependency_error = Some(format!(
-                            "unresolved dependency '{dep_id}' for issue {id}: {err}"
-                        ));
-                        break;
-                    }
-                };
-
-                if resolved_dep_id == id {
-                    eprintln!("warning: skipping self-dependency for issue {id}");
-                    continue;
-                }
-                if is_marker_only_dependency(&resolved_dep_id) {
-                    eprintln!(
-                        "warning: skipping invalid dependency '{resolved_dep_id}' for issue {id}"
-                    );
-                    continue;
-                }
-
-                let dep_type: DependencyType = type_str.parse().expect("from_str is infallible");
-
-                issue.dependencies.push(Dependency {
-                    issue_id: id.clone(),
-                    depends_on_id: resolved_dep_id,
-                    dep_type,
-                    created_at: now,
-                    created_by: Some(actor.clone()),
-                    metadata: None,
-                    thread_id: None,
-                });
-            }
-
-            if let Some(message) = dependency_error {
-                eprintln!("✗ Failed to create {title}: {message}");
-                continue 'outer;
+            // Collect dependencies for deferred resolution (Phase 2).
+            // This allows intra-file references by title or stand-in ID.
+            let mut deps = parsed.dependencies.clone();
+            deps.extend(args.deps.clone());
+            if !deps.is_empty() {
+                deferred_deps.push((id.clone(), deps));
             }
 
             match storage.create_issue(&issue, &actor) {
@@ -822,10 +782,82 @@ fn execute_import(
         }
         let id = final_id;
 
+        // Register this issue for intra-file dependency resolution.
+        title_to_id.insert(title.to_lowercase(), id.clone());
+        if let Some(ref sid) = parsed.stand_in_id {
+            let sid_trimmed = sid.trim().to_string();
+            if !sid_trimmed.is_empty() {
+                standin_to_id.insert(sid_trimmed, id.clone());
+            }
+        }
+
         // Increment count for next ID generation in the loop
         count += 1;
         last_created_id = Some(id.clone());
         created_ids.push((id, title));
+    }
+
+    // Phase 2: Resolve and wire up deferred dependencies.
+    // Now that all issues exist in storage, we can resolve intra-file references
+    // by title or stand-in ID, as well as references to pre-existing issues.
+    if !deferred_deps.is_empty() && !args.dry_run {
+        let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix.clone()));
+
+        for (issue_id, deps) in &deferred_deps {
+            for dep_str in deps {
+                let (mut type_str, dep_id, valid) = parse_dependency(dep_str);
+                if !valid {
+                    eprintln!(
+                        "warning: skipping invalid dependency type '{type_str}' for issue {issue_id}"
+                    );
+                    continue;
+                }
+                if type_str.eq_ignore_ascii_case("blocked-by") {
+                    type_str = "blocks".to_string();
+                }
+
+                // Resolution order: stand-in ID → title → storage ID
+                let resolved_dep_id = if let Some(id) = standin_to_id.get(&dep_id) {
+                    id.clone()
+                } else if let Some(id) = title_to_id.get(&dep_id.to_lowercase()) {
+                    id.clone()
+                } else {
+                    match resolve_dependency_id(&resolver, storage, &dep_id) {
+                        Ok(resolved) => resolved,
+                        Err(err) => {
+                            eprintln!(
+                                "warning: unresolved dependency '{dep_id}' for issue {issue_id}: {err}"
+                            );
+                            continue;
+                        }
+                    }
+                };
+
+                if resolved_dep_id == *issue_id {
+                    eprintln!("warning: skipping self-dependency for issue {issue_id}");
+                    continue;
+                }
+                if is_marker_only_dependency(&resolved_dep_id) {
+                    eprintln!(
+                        "warning: skipping invalid dependency '{resolved_dep_id}' for issue {issue_id}"
+                    );
+                    continue;
+                }
+
+                let dep_type_str = if type_str.eq_ignore_ascii_case("blocked-by") {
+                    "blocks"
+                } else {
+                    &type_str
+                };
+                if let Err(err) =
+                    storage.add_dependency(issue_id, &resolved_dep_id, dep_type_str, &actor)
+                {
+                    eprintln!(
+                        "warning: failed to add dependency {issue_id} → {resolved_dep_id}: {err}"
+                    );
+                }
+            }
+        }
     }
 
     if ctx.is_json() || ctx.is_toon() {
