@@ -217,9 +217,9 @@ fn report_has_page_corruption(report: &DoctorReport) -> bool {
 }
 
 /// Compact the database via VACUUM to fix page-level anomalies (free space
-/// corruption, B-tree malformation, out-of-order index entries) that arise
-/// from frankensqlite's B-tree layer.  VACUUM rewrites every page from
-/// scratch, eliminating any internal accounting discrepancies.
+/// corruption, B-tree malformation) that arise from frankensqlite's B-tree
+/// layer.  VACUUM rewrites every page from scratch, eliminating any internal
+/// accounting discrepancies.
 fn repair_via_vacuum(db_path: &Path, repair: &mut LocalRepairResult) {
     if !db_path.is_file() {
         tracing::debug!(
@@ -252,9 +252,10 @@ fn repair_via_vacuum(db_path: &Path, repair: &mut LocalRepairResult) {
 ///
 /// Issue #245: REINDEX can fix index ordering so `PRAGMA integrity_check`
 /// passes, but the underlying B-tree corruption may silently cause writes to
-/// fail (reads work, writes get ISSUE_NOT_FOUND).  This probe creates a
-/// temporary row, reads it back, and deletes it inside a single transaction
-/// to confirm the full read/write cycle works.
+/// fail (reads work, writes get ISSUE_NOT_FOUND).  This probe inserts a row,
+/// reads it back, then ROLLS BACK the entire transaction so no data is
+/// persisted.  The insert-then-read pattern catches read-after-write
+/// divergence that a simple no-op UPDATE would miss.
 fn write_probe_after_repair(db_path: &Path) -> bool {
     let Ok(conn) = Connection::open(db_path.to_string_lossy().into_owned()) else {
         return false;
@@ -270,7 +271,7 @@ fn write_probe_after_repair(db_path: &Path) -> bool {
 
         conn.execute_with_params(
             "INSERT OR REPLACE INTO issues (id, title, status, priority, created_at, updated_at) \
-             VALUES (?, ?, 'open', 'medium', ?, ?)",
+             VALUES (?, ?, 'open', 2, ?, ?)",
             &[
                 SqliteValue::from(probe_id),
                 SqliteValue::from("doctor write probe"),
@@ -291,27 +292,21 @@ fn write_probe_after_repair(db_path: &Path) -> bool {
             return Err("read-after-write divergence".into());
         }
 
-        conn.execute_with_params(
-            "DELETE FROM issues WHERE id = ?",
-            &[SqliteValue::from(probe_id)],
-        )?;
-        conn.execute("COMMIT")?;
+        // Always ROLLBACK — the probe is non-destructive.  No data is
+        // persisted, so JSONL export state stays clean.
+        conn.execute("ROLLBACK")?;
         Ok(())
     })();
 
     match probe {
         Ok(()) => {
-            tracing::info!("Write probe passed");
+            tracing::info!("Post-repair write probe passed");
             true
         }
         Err(err) => {
-            tracing::warn!(error = %err, "Write probe failed — DB may still be corrupt");
-            // Best-effort cleanup in case we're stuck mid-transaction.
+            tracing::warn!(error = %err, "Post-repair write probe failed — DB may still be corrupt");
+            // Best-effort rollback in case we're stuck mid-transaction.
             let _ = conn.execute("ROLLBACK");
-            let _ = conn.execute_with_params(
-                "DELETE FROM issues WHERE id = ?",
-                &[SqliteValue::from(probe_id)],
-            );
             false
         }
     }
