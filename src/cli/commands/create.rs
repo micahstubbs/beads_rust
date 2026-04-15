@@ -748,14 +748,6 @@ fn execute_import(
                 });
             }
 
-            // Collect dependencies for deferred resolution (Phase 2).
-            // This allows intra-file references by title or stand-in ID.
-            let mut deps = parsed.dependencies.clone();
-            deps.extend(args.deps.clone());
-            if !deps.is_empty() {
-                deferred_deps.push((id.clone(), deps));
-            }
-
             match storage.create_issue(&issue, &actor) {
                 Ok(()) => {
                     final_id = id;
@@ -781,6 +773,14 @@ fn execute_import(
             continue;
         }
         let id = final_id;
+
+        // Collect dependencies for deferred resolution (Phase 2).
+        // Must be OUTSIDE the retry loop so we only record the final (non-colliding) ID.
+        let mut deps = parsed.dependencies.clone();
+        deps.extend(args.deps.clone());
+        if !deps.is_empty() {
+            deferred_deps.push((id.clone(), deps));
+        }
 
         // Register this issue for intra-file dependency resolution.
         title_to_id.insert(title.to_lowercase(), id.clone());
@@ -844,13 +844,8 @@ fn execute_import(
                     continue;
                 }
 
-                let dep_type_str = if type_str.eq_ignore_ascii_case("blocked-by") {
-                    "blocks"
-                } else {
-                    &type_str
-                };
                 if let Err(err) =
-                    storage.add_dependency(issue_id, &resolved_dep_id, dep_type_str, &actor)
+                    storage.add_dependency(issue_id, &resolved_dep_id, &type_str, &actor)
                 {
                     eprintln!(
                         "warning: failed to add dependency {issue_id} → {resolved_dep_id}: {err}"
