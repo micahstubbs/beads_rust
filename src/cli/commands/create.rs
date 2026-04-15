@@ -806,33 +806,45 @@ fn execute_import(
 
         for (issue_id, deps) in &deferred_deps {
             for dep_str in deps {
-                let (mut type_str, dep_id, valid) = parse_dependency(dep_str);
-                if !valid {
-                    eprintln!(
-                        "warning: skipping invalid dependency type '{type_str}' for issue {issue_id}"
-                    );
-                    continue;
-                }
-                if type_str.eq_ignore_ascii_case("blocked-by") {
-                    type_str = "blocks".to_string();
-                }
-
-                // Resolution order: stand-in ID → title → storage ID
-                // All intra-file lookups are case-insensitive.
-                let resolved_dep_id = if let Some(id) = standin_to_id.get(&dep_id.to_lowercase()) {
-                    id.clone()
-                } else if let Some(id) = title_to_id.get(&dep_id.to_lowercase()) {
-                    id.clone()
+                // First, check the raw string against intra-file maps before parsing.
+                // This handles titles containing colons (e.g., "Step 1: Setup Database")
+                // that would otherwise be misinterpreted as typed dependencies.
+                let raw_lower = dep_str.to_lowercase();
+                let (type_str, resolved_dep_id) = if let Some(id) =
+                    standin_to_id.get(&raw_lower).or_else(|| title_to_id.get(&raw_lower))
+                {
+                    ("blocks".to_string(), id.clone())
                 } else {
-                    match resolve_dependency_id(&resolver, storage, &dep_id) {
-                        Ok(resolved) => resolved,
-                        Err(err) => {
-                            eprintln!(
-                                "warning: unresolved dependency '{dep_id}' for issue {issue_id}: {err}"
-                            );
-                            continue;
-                        }
+                    // No raw match — parse as type:id or bare id.
+                    let (mut t, dep_id, valid) = parse_dependency(dep_str);
+                    if !valid {
+                        eprintln!(
+                            "warning: skipping invalid dependency type '{t}' for issue {issue_id}"
+                        );
+                        continue;
                     }
+                    if t.eq_ignore_ascii_case("blocked-by") {
+                        t = "blocks".to_string();
+                    }
+
+                    // Resolution order: stand-in ID → title → storage ID
+                    // All intra-file lookups are case-insensitive.
+                    let resolved = if let Some(id) = standin_to_id.get(&dep_id.to_lowercase()) {
+                        id.clone()
+                    } else if let Some(id) = title_to_id.get(&dep_id.to_lowercase()) {
+                        id.clone()
+                    } else {
+                        match resolve_dependency_id(&resolver, storage, &dep_id) {
+                            Ok(r) => r,
+                            Err(err) => {
+                                eprintln!(
+                                    "warning: unresolved dependency '{dep_id}' for issue {issue_id}: {err}"
+                                );
+                                continue;
+                            }
+                        }
+                    };
+                    (t, resolved)
                 };
 
                 if resolved_dep_id == *issue_id {

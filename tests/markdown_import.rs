@@ -662,3 +662,57 @@ task
         "dependency should resolve title 'Build Database Schema' to the generated ID"
     );
 }
+
+#[test]
+fn test_markdown_import_title_with_colon_dependency_resolution() {
+    let workspace = BrWorkspace::new();
+
+    let output = run_br(&workspace, ["init"], "init_colon_title");
+    assert!(output.status.success(), "init failed");
+
+    // Titles containing colons must not be misinterpreted as typed deps
+    let md_path = workspace.root.join("issues.md");
+    let content = r"## Step 1: Setup Database
+### Type
+task
+
+## Step 2: Build API
+### Type
+feature
+### Dependencies
+- Step 1: Setup Database
+";
+    fs::write(&md_path, content).expect("write md");
+
+    let output = run_br(
+        &workspace,
+        ["create", "--file", "issues.md", "--json"],
+        "create_colon_title_deps_json",
+    );
+    assert!(
+        output.status.success(),
+        "create --file --json failed: {}",
+        output.stderr
+    );
+
+    let payload = extract_json_payload(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&payload).expect("json parse");
+    let issues = json.as_array().expect("json array");
+    assert_eq!(issues.len(), 2);
+
+    let db_id = issues[0]["id"].as_str().expect("setup issue id");
+    let api_deps = issues[1]["dependencies"]
+        .as_array()
+        .expect("api dependencies array");
+    assert_eq!(
+        api_deps.len(),
+        1,
+        "expected 1 dependency (colon in title should not break resolution), got {}: {api_deps:?}",
+        api_deps.len()
+    );
+    assert_eq!(
+        api_deps[0]["depends_on_id"].as_str(),
+        Some(db_id),
+        "dependency should resolve title with colon to the generated ID"
+    );
+}
