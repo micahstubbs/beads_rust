@@ -1,6 +1,6 @@
 [package]
 name = "beads_rust"
-version = "0.1.41"
+version = "0.1.42"
 edition = "2024"
 rust-version = "1.88"
 description = "Agent-first issue tracker (SQLite + JSONL)"
@@ -106,7 +106,7 @@ unicode-width = "0.2.2"
 semver = "1.0.27"
 
 # MCP server (optional; gated behind the `mcp` feature)
-fastmcp-rust = { version = "0.2.0", optional = true }
+fastmcp-rust = { version = "0.2.1", optional = true }
 
 # Self-update (optional; gated behind the `self_update` feature)
 self_update = { version = "0.42", features = ["rustls", "archive-tar", "compression-flate2"], default-features = false, optional = true }
@@ -152,21 +152,17 @@ self_update = [
 
 # NOTE: no `[patch.crates-io]` here.
 #
-# fsqlite 0.1.2+ and all fsqlite-* transitive crates are published on
-# crates.io, so this crate resolves its dependencies from there out of the
-# box.  That makes `cargo install --git https://github.com/Dicklesworthstone/beads_rust.git`
-# work without requiring a sibling `frankensqlite` checkout (issue #250 bug 1).
+# All dependencies — fsqlite 0.1.2+, its fsqlite-* transitive crates, and
+# fastmcp-rust 0.2.1+ — are published on crates.io, so this crate
+# resolves everything from the registry out of the box.  That makes
+# `cargo install --git https://github.com/Dicklesworthstone/beads_rust.git`
+# work without requiring sibling `frankensqlite` or `fastmcp_rust`
+# checkouts (issue #250 bug 1).
 #
-# Local frankensqlite co-development: contributors who want to hack on
-# frankensqlite alongside beads_rust can add a workspace-level
+# Local co-development: contributors who want to hack on frankensqlite
+# or fastmcp_rust alongside beads_rust can add a workspace-level
 # `.cargo/config.toml` with their own `[patch.crates-io]` table.  See
 # `scripts/dev-local-frankensqlite.toml` for a ready-to-copy template.
-#
-# The `fastmcp-rust` crate is still unpublished, so keep its git override
-# here — this is the only patch we need to ship with the crate, and it
-# does not reference any local paths.
-[patch.crates-io]
-fastmcp-rust         = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", package = "fastmcp-rust" }
 
 [lints.rust]
 unsafe_code = "forbid"
