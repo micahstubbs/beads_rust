@@ -42,5 +42,18 @@ fsqlite-vfs           = { path = "../frankensqlite/crates/fsqlite-vfs" }
 fsqlite-wal           = { path = "../frankensqlite/crates/fsqlite-wal" }
 fsqlite-ext-icu       = { path = "../frankensqlite/crates/fsqlite-ext-icu" }
 fsqlite-ext-misc      = { path = "../frankensqlite/crates/fsqlite-ext-misc" }
-# fastmcp-rust is on crates.io at 0.2.1+; uncomment to hack locally:
-# fastmcp-rust          = { path = "../fastmcp_rust/crates/fastmcp" }
+
+# fastmcp_rust is on crates.io at 0.2.1+ and the `mcp` feature is off by
+# default, so most contributors can ignore the block below.  Uncomment
+# whichever lines you need when co-developing fastmcp_rust — they must
+# all be consistent (overriding only the facade while leaving the
+# transitive crates pointing at crates.io is rarely what you want).
+# fastmcp-rust      = { path = "../fastmcp_rust/crates/fastmcp" }
+# fastmcp-core      = { path = "../fastmcp_rust/crates/fastmcp-core" }
+# fastmcp-protocol  = { path = "../fastmcp_rust/crates/fastmcp-protocol" }
+# fastmcp-transport = { path = "../fastmcp_rust/crates/fastmcp-transport" }
+# fastmcp-server    = { path = "../fastmcp_rust/crates/fastmcp-server" }
+# fastmcp-client    = { path = "../fastmcp_rust/crates/fastmcp-client" }
+# fastmcp-console   = { path = "../fastmcp_rust/crates/fastmcp-console" }
+# fastmcp-cli       = { path = "../fastmcp_rust/crates/fastmcp-cli" }
+# fastmcp-derive    = { path = "../fastmcp_rust/crates/fastmcp-macros" }  # package is fastmcp-derive, dir is fastmcp-macros
