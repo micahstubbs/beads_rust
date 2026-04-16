@@ -993,8 +993,7 @@ fn e2e_staleness_detects_real_content_change() {
 fn e2e_sync_import_force_preserves_integrity_and_close_works() {
     let _log = common::test_log("e2e_sync_import_force_preserves_integrity_and_close_works");
     let workspace = BrWorkspace::new();
-    let mut artifacts =
-        TestArtifacts::new(&workspace, "sync_import_force_preserves_integrity");
+    let mut artifacts = TestArtifacts::new(&workspace, "sync_import_force_preserves_integrity");
 
     // Initialize with a custom prefix so resolution can't fall back to the
     // default "br-" prefix (matches the reporter's swarm workspace setup).
@@ -1050,11 +1049,7 @@ fn e2e_sync_import_force_preserves_integrity_and_close_works() {
     // flag triggers `reset_data_tables()` + bulk import — the exact path
     // that historically left frankensqlite's B-tree/indexes inconsistent.
     let reinit = run_br(&workspace, ["init", "--prefix", "rr", "--force"], "reinit");
-    assert!(
-        reinit.status.success(),
-        "reinit failed: {}",
-        reinit.stderr
-    );
+    assert!(reinit.status.success(), "reinit failed: {}", reinit.stderr);
 
     let import = run_br(
         &workspace,
@@ -1103,7 +1098,12 @@ fn e2e_sync_import_force_preserves_integrity_and_close_works() {
     );
 
     let close = run_br(&workspace, ["close", &last_id], "close");
-    artifacts.record_command("close", &close.stdout, &close.stderr, close.status.success());
+    artifacts.record_command(
+        "close",
+        &close.stdout,
+        &close.stderr,
+        close.status.success(),
+    );
     assert!(
         close.status.success(),
         "close {last_id} failed after force/rebuild import: stdout={} stderr={}",
