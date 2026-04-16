@@ -970,3 +970,205 @@ fn e2e_staleness_detects_real_content_change() {
         artifacts.artifact_dir
     );
 }
+
+/// Regression test for issue #248: `br sync --import-only --force` left the
+/// on-disk SQLite file in a state where C sqlite3's `PRAGMA integrity_check`
+/// reported "database disk image is malformed (11)" and where a subsequent
+/// `br close` could fail with "Issue not found" / corrupt the DB further.
+///
+/// The root cause was that the force/rebuild path drops and recreates the
+/// data tables before bulk-inserting from JSONL, but (unlike the
+/// `rebuild_database_family` chokepoint used by `br doctor --repair` and auto
+/// recovery) it did not run a post-import `VACUUM` + `REINDEX`.  On larger
+/// imports this left partial-index rows missing and B-tree freeblock
+/// accounting anomalies that only surfaced when a later write transaction
+/// looked up an issue by id (issues #237, #245, #246 covered the adjacent
+/// paths).  This test exports ~220 issues to JSONL, removes the DB, runs
+/// `br sync --import-only --force`, and asserts that:
+///   1. The rebuilt DB passes the strict C-sqlite3 `PRAGMA integrity_check`
+///      (frankensqlite-generated files must be readable by upstream sqlite).
+///   2. A subsequent `br close` on a non-zero-blocker issue succeeds and
+///      the DB still passes `integrity_check` afterwards.
+#[test]
+fn e2e_sync_import_force_preserves_integrity_and_close_works() {
+    let _log = common::test_log("e2e_sync_import_force_preserves_integrity_and_close_works");
+    let workspace = BrWorkspace::new();
+    let mut artifacts =
+        TestArtifacts::new(&workspace, "sync_import_force_preserves_integrity");
+
+    // Initialize with a custom prefix so resolution can't fall back to the
+    // default "br-" prefix (matches the reporter's swarm workspace setup).
+    let init = run_br(&workspace, ["init", "--prefix", "rr"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    // Create enough issues to cross the bulk-insert threshold where
+    // frankensqlite's B-tree layer stops cleaning up after itself reliably.
+    // 220 is comfortably above the 200 seen in empirical repros for #248
+    // and well under any test-timeout budget.
+    const ISSUE_COUNT: usize = 220;
+    let mut last_id: String = String::new();
+    for i in 0..ISSUE_COUNT {
+        let title = format!("issue {i}");
+        let create = run_br(
+            &workspace,
+            ["create", &title, "-p", "3", "--silent", "--no-auto-flush"],
+            "create_bulk",
+        );
+        assert!(
+            create.status.success(),
+            "create {i} failed: {}",
+            create.stderr
+        );
+        last_id = create.stdout.trim().to_string();
+    }
+    assert!(!last_id.is_empty(), "expected at least one created id");
+
+    // Flush DB → JSONL so the JSONL is the canonical source for the rebuild.
+    let flush = run_br(&workspace, ["sync", "--flush-only"], "flush");
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
+
+    let beads_dir = workspace.root.join(".beads");
+    let db_path = beads_dir.join("beads.db");
+    let jsonl_path = beads_dir.join("issues.jsonl");
+    artifacts.capture_jsonl("after_flush", &jsonl_path);
+
+    // Delete the DB family (db + WAL + SHM sidecars) to simulate the
+    // "rebuild from canonical JSONL" path the reporter's swarm script takes.
+    for sidecar in [
+        "beads.db",
+        "beads.db-wal",
+        "beads.db-shm",
+        "beads.db-journal",
+    ] {
+        let path = beads_dir.join(sidecar);
+        if path.exists() {
+            fs::remove_file(&path).expect("remove db sidecar");
+        }
+    }
+
+    // Re-init and force-import from the canonical JSONL.  The `--force`
+    // flag triggers `reset_data_tables()` + bulk import — the exact path
+    // that historically left frankensqlite's B-tree/indexes inconsistent.
+    let reinit = run_br(&workspace, ["init", "--prefix", "rr", "--force"], "reinit");
+    assert!(
+        reinit.status.success(),
+        "reinit failed: {}",
+        reinit.stderr
+    );
+
+    let import = run_br(
+        &workspace,
+        ["sync", "--import-only", "--force"],
+        "force_import",
+    );
+    artifacts.record_command(
+        "force_import",
+        &import.stdout,
+        &import.stderr,
+        import.status.success(),
+    );
+    assert!(
+        import.status.success(),
+        "force import failed: {}",
+        import.stderr
+    );
+
+    // Probe #1: C-sqlite3 must see an integrity-clean file.  `sqlite3`
+    // binary is a hard test dependency because that's the parser that the
+    // reporter's `check_beads_trust.sh` uses in the wild.
+    let integrity_before_close = run_sqlite3_pragma_integrity_check(&db_path);
+    artifacts.record_command(
+        "integrity_check_before_close",
+        &integrity_before_close,
+        "",
+        integrity_before_close.trim() == "ok",
+    );
+    assert_eq!(
+        integrity_before_close.trim(),
+        "ok",
+        "C sqlite3 integrity_check must pass after force/rebuild import (issue #248).\n\
+         Without the post-import VACUUM+REINDEX, this returns\n\
+         'database disk image is malformed (11)'.\n\
+         output: {integrity_before_close}"
+    );
+
+    // Probe #2: a regular `br close` on an issue visible to `br show`
+    // must succeed without tripping the mutation-path "Issue not found"
+    // code path and without further corrupting the DB.
+    let show = run_br(&workspace, ["show", &last_id], "show_before_close");
+    assert!(
+        show.status.success(),
+        "show {last_id} failed: {}",
+        show.stderr
+    );
+
+    let close = run_br(&workspace, ["close", &last_id], "close");
+    artifacts.record_command("close", &close.stdout, &close.stderr, close.status.success());
+    assert!(
+        close.status.success(),
+        "close {last_id} failed after force/rebuild import: stdout={} stderr={}",
+        close.stdout,
+        close.stderr
+    );
+    assert!(
+        !close.stderr.contains("Issue not found"),
+        "close should not report 'Issue not found' for an id visible to show (issue #248):\n{}",
+        close.stderr
+    );
+
+    let integrity_after_close = run_sqlite3_pragma_integrity_check(&db_path);
+    artifacts.record_command(
+        "integrity_check_after_close",
+        &integrity_after_close,
+        "",
+        integrity_after_close.trim() == "ok",
+    );
+    assert_eq!(
+        integrity_after_close.trim(),
+        "ok",
+        "C sqlite3 integrity_check must still pass after a successful close (issue #248).\n\
+         output: {integrity_after_close}"
+    );
+
+    artifacts.persist();
+
+    eprintln!(
+        "[PASS] e2e_sync_import_force_preserves_integrity_and_close_works\n\
+         - Exported {ISSUE_COUNT} issues to JSONL\n\
+         - Removed DB and force-imported from JSONL\n\
+         - C sqlite3 integrity_check clean before and after close\n\
+         - Close succeeded without 'Issue not found'\n\
+         - Artifacts saved to: {:?}",
+        artifacts.artifact_dir
+    );
+}
+
+/// Invoke the C `sqlite3` CLI to run `PRAGMA integrity_check` against the
+/// given database.  Returns stdout verbatim (expected to be "ok\n" for a
+/// clean DB).  If the binary is missing the test falls back to the string
+/// "sqlite3-missing" so the assertion fails with a clear message rather
+/// than panicking in the test harness.
+fn run_sqlite3_pragma_integrity_check(db_path: &Path) -> String {
+    match std::process::Command::new("sqlite3")
+        .arg(db_path)
+        .arg("PRAGMA integrity_check;")
+        .output()
+    {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            if stdout.trim().is_empty() {
+                // sqlite3 prints error messages on stderr and exits non-zero
+                // when the DB is unreadable; surface the stderr so the
+                // regression test makes clear what went wrong.
+                format!(
+                    "<sqlite3 exited {} with empty stdout; stderr: {}>",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )
+            } else {
+                stdout
+            }
+        }
+        Err(err) => format!("sqlite3-missing: {err}"),
+    }
+}
