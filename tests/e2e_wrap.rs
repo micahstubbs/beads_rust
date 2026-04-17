@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, run_br, run_br_with_env};
+use common::cli::{BrWorkspace, parse_list_issues, run_br, run_br_with_env};
 
 fn init_workspace_with_long_issues(workspace: &BrWorkspace) {
     // Initialize
@@ -92,19 +92,13 @@ fn e2e_list_wrap_json_unchanged() {
     assert!(output_no_wrap.status.success());
     assert!(output_wrap.status.success());
 
-    // JSON output should be identical (wrap is text-only feature)
-    // Both should be valid JSON with the same structure
-    let json_no_wrap: serde_json::Value =
-        serde_json::from_str(&output_no_wrap.stdout).expect("parse json");
-    let json_wrap: serde_json::Value =
-        serde_json::from_str(&output_wrap.stdout).expect("parse json");
-
-    assert!(json_no_wrap.is_array());
-    assert!(json_wrap.is_array());
-    assert_eq!(
-        json_no_wrap.as_array().unwrap().len(),
-        json_wrap.as_array().unwrap().len()
-    );
+    // JSON output should be identical (wrap is text-only feature).
+    // `br list --json` emits a paginated envelope `{"issues": [...], "total": N, ...}`,
+    // so compare the `issues` array from each run rather than treating the whole
+    // body as an array.
+    let issues_no_wrap = parse_list_issues(&output_no_wrap.stdout);
+    let issues_wrap = parse_list_issues(&output_wrap.stdout);
+    assert_eq!(issues_no_wrap.len(), issues_wrap.len());
 }
 
 // =============================================================================
@@ -118,8 +112,7 @@ fn e2e_show_without_wrap() {
 
     // Get the issue ID
     let list_output = run_br(&workspace, ["list", "--json"], "list_for_show");
-    let issues: Vec<serde_json::Value> =
-        serde_json::from_str(&list_output.stdout).expect("parse json");
+    let issues = parse_list_issues(&list_output.stdout);
     let long_issue_id = issues
         .iter()
         .find(|i| i["title"].as_str().unwrap_or("").contains("very long"))
@@ -144,8 +137,7 @@ fn e2e_show_with_wrap() {
 
     // Get the issue ID
     let list_output = run_br(&workspace, ["list", "--json"], "list_for_show_wrap");
-    let issues: Vec<serde_json::Value> =
-        serde_json::from_str(&list_output.stdout).expect("parse json");
+    let issues = parse_list_issues(&list_output.stdout);
     let long_issue_id = issues
         .iter()
         .find(|i| i["title"].as_str().unwrap_or("").contains("very long"))
@@ -239,8 +231,7 @@ fn e2e_comments_with_wrap() {
 
     // Get an issue ID
     let list_output = run_br(&workspace, ["list", "--json"], "list_for_comments");
-    let issues: Vec<serde_json::Value> =
-        serde_json::from_str(&list_output.stdout).expect("parse json");
+    let issues = parse_list_issues(&list_output.stdout);
     let issue_id = issues[0]["id"].as_str().unwrap();
 
     // Add a long comment
@@ -302,8 +293,7 @@ fn e2e_blocked_with_dependencies() {
 
     // Get issue IDs
     let list_output = run_br(&workspace, ["list", "--json"], "list_for_blocked");
-    let issues: Vec<serde_json::Value> =
-        serde_json::from_str(&list_output.stdout).expect("parse json");
+    let issues = parse_list_issues(&list_output.stdout);
     if issues.len() < 2 {
         // Skip if not enough issues
         return;

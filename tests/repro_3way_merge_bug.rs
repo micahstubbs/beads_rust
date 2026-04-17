@@ -37,8 +37,16 @@ fn repro_3way_merge_data_loss() {
     assert!(sync1.status.success(), "sync1 failed");
 
     // 4. Modify labels LOCALLY (Left side of merge)
-    let label_local = run_br(&workspace, ["label", &issue_id, "local-tag"], "label_local");
-    assert!(label_local.status.success(), "label_local failed");
+    let label_local = run_br(
+        &workspace,
+        ["label", "add", &issue_id, "local-tag"],
+        "label_local",
+    );
+    assert!(
+        label_local.status.success(),
+        "label_local failed: {}",
+        label_local.stderr
+    );
 
     // 5. Modify description EXTERNALLY (Right side of merge)
     // We simulate this by directly editing the JSONL.

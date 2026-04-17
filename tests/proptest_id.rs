@@ -45,8 +45,19 @@ proptest! {
 
         info!("proptest_id_valid: output_id={id}");
 
-        prop_assert!(id.starts_with("bd-"), "ID must start with bd-");
-        prop_assert!(id.len() >= 6, "ID must be at least 6 chars (bd-XXX)");
+        // The default prefix in Rust is `br-` (the Go prototype used `bd-`);
+        // assert the structural property "prefix + dash + >=3 hash chars"
+        // instead of a stale literal.
+        let default_prefix = IdConfig::default().prefix;
+        let expected_start = format!("{default_prefix}-");
+        prop_assert!(
+            id.starts_with(&expected_start),
+            "ID '{id}' must start with '{expected_start}'"
+        );
+        prop_assert!(
+            id.len() >= expected_start.len() + 3,
+            "ID '{id}' must be at least {} chars ({}XXX)", expected_start.len() + 3, expected_start
+        );
         prop_assert!(
             is_valid_id_format(&id),
             "Generated ID must pass format validation: {id}"

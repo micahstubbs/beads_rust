@@ -267,47 +267,76 @@ fn test_cargo_metadata() {
     );
 }
 
-/// Test that all package manifests have consistent version numbers.
+/// Test that all package manifests carry a version no newer than Cargo.toml.
+///
+/// The `update-package-manifests.yml` workflow rewrites every packaging
+/// manifest (Homebrew, Scoop, AUR) after a release is published, driven by
+/// the release tag and the checksums attached to the release.  During
+/// development Cargo.toml is bumped ahead of the manifests: the manifests
+/// catch up only once a tagged release has been built and CI has rewritten
+/// them.  This test therefore asserts "manifest version parses and is not
+/// ahead of Cargo.toml" rather than requiring exact equality, which would
+/// otherwise fail on every pre-release commit.
 #[test]
 fn test_version_consistency() {
-    // Extract version from Cargo.toml
     let cargo_toml = fs::read_to_string("Cargo.toml").expect("Failed to read Cargo.toml");
-    let cargo_version = cargo_toml
+    let cargo_version_str = cargo_toml
         .lines()
         .find(|line| line.starts_with("version = "))
         .and_then(|line| line.split('"').nth(1))
         .expect("Could not find version in Cargo.toml");
+    let cargo_version = semver::Version::parse(cargo_version_str)
+        .expect("Cargo.toml version must be valid semver");
 
-    // Check Homebrew formula
+    fn parse_version(raw: &str, source: &str) -> semver::Version {
+        semver::Version::parse(raw.trim())
+            .unwrap_or_else(|e| panic!("{source} version '{raw}' is not valid semver: {e}"))
+    }
+
     let formula_path = Path::new("packaging/homebrew/br.rb");
     if formula_path.exists() {
         let formula = fs::read_to_string(formula_path).expect("Failed to read Homebrew formula");
+        let raw = formula
+            .lines()
+            .find_map(|line| {
+                let line = line.trim();
+                line.strip_prefix("version \"")
+                    .and_then(|rest| rest.strip_suffix('"'))
+            })
+            .expect("Homebrew formula missing `version \"…\"` line");
+        let manifest_version = parse_version(raw, "Homebrew formula");
         assert!(
-            formula.contains(&format!("version \"{cargo_version}\"")),
-            "Homebrew formula version should match Cargo.toml ({cargo_version})"
+            manifest_version <= cargo_version,
+            "Homebrew formula version {manifest_version} is ahead of Cargo.toml {cargo_version}"
         );
     }
 
-    // Check Scoop manifest
     let scoop_path = Path::new("packaging/scoop/br.json");
     if scoop_path.exists() {
         let scoop = fs::read_to_string(scoop_path).expect("Failed to read Scoop manifest");
         let scoop_json: serde_json::Value =
             serde_json::from_str(&scoop).expect("Invalid Scoop JSON");
-        let scoop_version = scoop_json["version"].as_str().unwrap_or("");
-        assert_eq!(
-            scoop_version, cargo_version,
-            "Scoop manifest version should match Cargo.toml"
+        let scoop_version_str = scoop_json["version"]
+            .as_str()
+            .expect("Scoop manifest missing `version`");
+        let scoop_version = parse_version(scoop_version_str, "Scoop manifest");
+        assert!(
+            scoop_version <= cargo_version,
+            "Scoop manifest version {scoop_version} is ahead of Cargo.toml {cargo_version}"
         );
     }
 
-    // Check AUR PKGBUILD
     let pkgbuild_path = Path::new("packaging/aur/PKGBUILD");
     if pkgbuild_path.exists() {
         let pkgbuild = fs::read_to_string(pkgbuild_path).expect("Failed to read PKGBUILD");
+        let raw = pkgbuild
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("pkgver="))
+            .expect("PKGBUILD missing `pkgver=` line");
+        let manifest_version = parse_version(raw, "PKGBUILD");
         assert!(
-            pkgbuild.contains(&format!("pkgver={cargo_version}")),
-            "PKGBUILD version should match Cargo.toml ({cargo_version})"
+            manifest_version <= cargo_version,
+            "PKGBUILD pkgver {manifest_version} is ahead of Cargo.toml {cargo_version}"
         );
     }
 }
