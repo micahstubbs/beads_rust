@@ -455,4 +455,11 @@ jobs:
           toolchain: nightly
 
       - name: Publish to crates.io
-        run: cargo publish --token ${{ secrets.CRATES_IO_TOKEN }}
+        # `--locked` pins resolution to Cargo.lock; without it, a nightly-only
+        # transitive dep bump can silently modify Cargo.lock when cargo fetch
+        # runs during `cargo publish`, and the publish then refuses with
+        # "files in the working directory contain changes that were not yet
+        # committed into git" (seen on v0.1.43).  `--no-verify` skips the
+        # rebuild-and-test pass that CI already ran, keeping the publish
+        # under the 15-minute timeout and avoiding a second resolution.
+        run: cargo publish --locked --no-verify --token ${{ secrets.CRATES_IO_TOKEN }}
