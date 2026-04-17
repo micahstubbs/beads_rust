@@ -1577,7 +1577,7 @@ impl ToolHandler for CloseIssueTool {
         }
 
         // Check what this issue was blocking (now potentially unblocked)
-        let dependents = storage.get_dependents(id).unwrap_or_default();
+        let dependents = storage.get_blocked_issue_ids(id).unwrap_or_default();
         if dependents.is_empty() {
             result["next_actions"] = json!(["Issue closed successfully."]);
         } else {
