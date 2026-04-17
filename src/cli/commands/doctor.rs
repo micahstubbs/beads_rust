@@ -312,6 +312,37 @@ fn write_probe_after_repair(db_path: &Path) -> bool {
     }
 }
 
+/// Return true if any integrity check reported WARN-level page anomalies
+/// (e.g. "page N: never used", "free space corruption", "malformed"): the
+/// kind of residue VACUUM can clean up.
+///
+/// Intentionally distinct from [`report_has_page_corruption`] (ERROR-only),
+/// because orphaned pages introduced/exposed by a light-repair pass (notably
+/// the blocked-cache rebuild from `repair_recoverable_db_state`) land as
+/// WARN-level findings — they don't flip the DB into `ok: false` on their
+/// own, but they persist across subsequent `--repair` runs unless we
+/// compact the file.
+///
+/// See #253 for the original report and the exact sequence that leaves the
+/// DB in this state.
+fn report_has_warn_level_page_anomaly(report: &DoctorReport) -> bool {
+    report.checks.iter().any(|check| {
+        if !matches!(check.status, CheckStatus::Warn) {
+            return false;
+        }
+        if check.name != "sqlite.integrity_check" && check.name != "sqlite3.integrity_check" {
+            return false;
+        }
+        check.message.as_deref().is_some_and(|msg| {
+            let lower = msg.to_lowercase();
+            lower.contains("never used")
+                || lower.contains("free space corruption")
+                || lower.contains("malformed")
+                || lower.contains("disk image")
+        })
+    })
+}
+
 /// Return true if any integrity check reported partial-index row mismatches
 /// ("row N missing from index") as a warning.  These can be repaired via `REINDEX`.
 fn report_has_partial_index_warnings(report: &DoctorReport) -> bool {
@@ -2446,11 +2477,30 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         repair_via_vacuum(&paths.db_path, &mut local_repair);
     }
 
-    let after_local_repair = if local_repair.applied() {
+    let mut after_local_repair = if local_repair.applied() {
         collect_doctor_report(&beads_dir, &paths)?
     } else {
         initial.clone()
     };
+
+    // #253: the light-repair passes above (notably `reset_blocked_cache_table`
+    // via `repair_recoverable_db_state`) can leave orphaned pages behind that
+    // surface as WARN-level `page N: never used` integrity findings. These
+    // don't flip the DB into ERROR status, so the pre-repair
+    // `report_has_page_corruption` gate misses them — but they're still
+    // page-level residue that VACUUM resolves cleanly. Run VACUUM once to
+    // compact, and re-collect the report.  Guarded by `!local_repair.vacuumed`
+    // so we never loop.
+    if !local_repair.vacuumed && report_has_warn_level_page_anomaly(&after_local_repair.report) {
+        tracing::info!(
+            path = %paths.db_path.display(),
+            "Post-repair report has WARN-level page anomalies; running VACUUM to clean up orphaned pages"
+        );
+        repair_via_vacuum(&paths.db_path, &mut local_repair);
+        if local_repair.vacuumed {
+            after_local_repair = collect_doctor_report(&beads_dir, &paths)?;
+        }
+    }
 
     if after_local_repair.report.ok {
         // Issue #245: REINDEX can fix index ordering so integrity_check
@@ -3442,5 +3492,107 @@ mod tests {
 
         let local_repair = repair_recoverable_db_state(&beads_dir, &db_path, &report);
         assert!(!local_repair.blocked_cache_rebuilt);
+    }
+
+    // ===================================================================
+    // #253: WARN-level page anomalies left by the light-repair pass
+    // should trigger a follow-up VACUUM so the DB ends in a clean state
+    // and subsequent `--repair` runs don't report "nothing to repair"
+    // with integrity_check still dirty.
+    // ===================================================================
+
+    #[test]
+    fn report_has_warn_level_page_anomaly_matches_orphan_page_warn() {
+        for msg in [
+            "page 55 is never used",
+            "*** in database main ***; Page 55: never used; Page 264: never used",
+            "database disk image is malformed",
+            "Tree 28 page 28: free space corruption",
+        ] {
+            let report = DoctorReport {
+                ok: true, // WARNs don't flip ok → false
+                checks: vec![CheckResult {
+                    name: "sqlite.integrity_check".to_string(),
+                    status: CheckStatus::Warn,
+                    message: Some(msg.to_string()),
+                    details: None,
+                }],
+            };
+            assert!(
+                report_has_warn_level_page_anomaly(&report),
+                "expected WARN-level page anomaly to match: {msg:?}"
+            );
+        }
+
+        // sqlite3 binary variant should also match (the C sqlite3 cross-check).
+        let report = DoctorReport {
+            ok: true,
+            checks: vec![CheckResult {
+                name: "sqlite3.integrity_check".to_string(),
+                status: CheckStatus::Warn,
+                message: Some("Page 55: never used".to_string()),
+                details: None,
+            }],
+        };
+        assert!(report_has_warn_level_page_anomaly(&report));
+    }
+
+    #[test]
+    fn report_has_warn_level_page_anomaly_ignores_non_page_warns() {
+        // "missing from index" is a partial-index REINDEX case, not a VACUUM case.
+        let report = DoctorReport {
+            ok: true,
+            checks: vec![CheckResult {
+                name: "sqlite.integrity_check".to_string(),
+                status: CheckStatus::Warn,
+                message: Some("row 42 missing from index idx_foo".to_string()),
+                details: None,
+            }],
+        };
+        assert!(!report_has_warn_level_page_anomaly(&report));
+
+        // Out-of-order index warning: known frankensqlite DESC-index artifact,
+        // not a VACUUM case.
+        let report = DoctorReport {
+            ok: true,
+            checks: vec![CheckResult {
+                name: "sqlite.integrity_check".to_string(),
+                status: CheckStatus::Warn,
+                message: Some("out of order index idx_foo".to_string()),
+                details: None,
+            }],
+        };
+        assert!(!report_has_warn_level_page_anomaly(&report));
+    }
+
+    #[test]
+    fn report_has_warn_level_page_anomaly_ignores_error_level_findings() {
+        // ERROR-level findings are handled by the existing
+        // `report_has_page_corruption` path; this predicate is
+        // specifically scoped to WARN-level residue left after light repair.
+        let report = DoctorReport {
+            ok: false,
+            checks: vec![CheckResult {
+                name: "sqlite.integrity_check".to_string(),
+                status: CheckStatus::Error,
+                message: Some("page 55 is never used".to_string()),
+                details: None,
+            }],
+        };
+        assert!(!report_has_warn_level_page_anomaly(&report));
+    }
+
+    #[test]
+    fn report_has_warn_level_page_anomaly_ignores_non_integrity_checks() {
+        let report = DoctorReport {
+            ok: true,
+            checks: vec![CheckResult {
+                name: "db.sidecars".to_string(),
+                status: CheckStatus::Warn,
+                message: Some("WAL sidecar exists without a matching SHM sidecar".to_string()),
+                details: None,
+            }],
+        };
+        assert!(!report_has_warn_level_page_anomaly(&report));
     }
 }
