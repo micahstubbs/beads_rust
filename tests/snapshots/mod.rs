@@ -66,6 +66,12 @@ static VERSION_NUM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"version \d+\.\d+\.\d+").expect("version number regex"));
 static LINE_NUM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\.rs:\d+:").expect("line number regex"));
+/// `tracing` source-location annotation that appears in dev builds after the
+/// target-and-colon, e.g., `beads_rust::sync::path: src/sync/path.rs:123:`.
+/// Release builds omit it.  Normalize by deleting the segment entirely so the
+/// dev-vs-release formatter delta does not cause snapshot drift.
+static TRACING_SRC_LOC_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r": src/[^\s]+\.rs:(\d+|LINE):").expect("tracing src loc regex"));
 static PATH_SEP_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\\").expect("path separator regex"));
 static TRAILING_WS_RE: LazyLock<Regex> =
@@ -446,7 +452,13 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
         log.push("build_profile".to_string());
     }
 
-    // 10. Normalize line numbers
+    // 10. Normalize line numbers.  Drop the tracing source-location segment
+    // first (so we stay dev/release invariant) and then normalize any
+    // remaining `file.rs:123:` references to `file.rs:LINE:`.
+    if config.normalize_line_numbers && TRACING_SRC_LOC_RE.is_match(&normalized) {
+        normalized = TRACING_SRC_LOC_RE.replace_all(&normalized, ":").to_string();
+        log.push("tracing_src_loc".to_string());
+    }
     if config.normalize_line_numbers && LINE_NUM_RE.is_match(&normalized) {
         normalized = LINE_NUM_RE
             .replace_all(&normalized, ".rs:LINE:")
