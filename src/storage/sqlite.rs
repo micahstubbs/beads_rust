@@ -6958,60 +6958,39 @@ impl SqliteStorage {
             graph.entry(from).or_default().push(to);
         }
 
-        let mut cycles = Vec::new();
-        let mut visited = HashSet::new();
-        let mut rec_stack = HashSet::new();
-        let mut path = Vec::new();
-
-        // Stack stores (node_id, neighbor_index)
-        let mut stack: Vec<(String, usize)> = Vec::new();
-
-        // Sort keys for deterministic output
+        let mut unique_cycles = HashSet::new();
         let mut keys: Vec<_> = graph.keys().cloned().collect();
         keys.sort();
 
-        for node in keys {
-            if visited.contains(&node) {
-                continue;
-            }
+        // Enforce a sensible depth cap to prevent exponential blowup on dense/corrupted graphs
+        let max_depth = DEPENDENCY_TRAVERSAL_MAX_DEPTH.min(20);
 
-            stack.push((node.clone(), 0));
-            visited.insert(node.clone());
-            rec_stack.insert(node.clone());
-            path.push(node.clone());
+        for start_node in keys {
+            let mut stack = vec![(start_node.clone(), vec![start_node.clone()])];
 
-            while let Some((u, idx)) = stack.last_mut() {
-                let neighbors = graph.get(u);
-
-                if let Some(neighbors) = neighbors
-                    && *idx < neighbors.len()
-                {
-                    let v = &neighbors[*idx];
-                    *idx += 1;
-
-                    if rec_stack.contains(v) {
-                        // Found a cycle: reconstruct it from the current path
-                        if let Some(start_pos) = path.iter().position(|x| x == v) {
-                            let mut cycle = path[start_pos..].to_vec();
-                            cycle.push(v.clone()); // Close the loop
-                            cycles.push(cycle);
-                        }
-                    } else if !visited.contains(v) {
-                        visited.insert(v.clone());
-                        rec_stack.insert(v.clone());
-                        path.push(v.clone());
-                        stack.push((v.clone(), 0));
-                    }
+            while let Some((u, path)) = stack.pop() {
+                if path.len() > max_depth {
                     continue;
                 }
-
-                // Finished processing all neighbors of u
-                rec_stack.remove(u);
-                path.pop();
-                stack.pop();
+                if let Some(neighbors) = graph.get(&u) {
+                    for v in neighbors {
+                        // Only consider cycles where start_node is the strictly minimum node
+                        if v == &start_node {
+                            let mut cycle = path.clone();
+                            cycle.push(v.clone());
+                            unique_cycles.insert(cycle);
+                        } else if v > &start_node && !path.contains(v) {
+                            let mut new_path = path.clone();
+                            new_path.push(v.clone());
+                            stack.push((v.clone(), new_path));
+                        }
+                    }
+                }
             }
         }
 
+        let mut cycles: Vec<_> = unique_cycles.into_iter().collect();
+        cycles.sort();
         Ok(cycles)
     }
 
