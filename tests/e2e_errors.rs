@@ -295,8 +295,9 @@ fn e2e_sync_invalid_orphans() {
 }
 
 #[test]
-fn e2e_sync_auto_rebuild_rejects_rename_prefix_after_recovery() {
-    let _log = common::test_log("e2e_sync_auto_rebuild_rejects_rename_prefix_after_recovery");
+fn e2e_sync_rename_prefix_applies_after_missing_db_recovery_with_force() {
+    let _log =
+        common::test_log("e2e_sync_rename_prefix_applies_after_missing_db_recovery_with_force");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -349,52 +350,41 @@ fn e2e_sync_auto_rebuild_rejects_rename_prefix_after_recovery() {
             "--no-auto-import",
             "--no-auto-flush",
         ],
-        "sync_auto_rebuild_rename_prefix_conflict",
+        "sync_missing_db_rename_prefix_force",
     );
     assert!(
-        !result.status.success(),
-        "rename-prefix should fail after open-time auto-rebuild"
+        result.status.success(),
+        "rename-prefix import should succeed after deferring open-time recovery: {}",
+        result.stderr
     );
-    assert_eq!(result.status.code(), Some(4), "exit code should be 4");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
-    assert!(verify_error_structure(&json), "missing required fields");
-    assert_eq!(json["error"]["code"], "VALIDATION_FAILED");
-    let message = json["error"]["message"]
-        .as_str()
-        .expect("validation message");
-    assert!(
-        message.contains("Open-time recovery rebuilt the database before import"),
-        "unexpected message: {message}"
-    );
-    assert!(
-        message.contains("`--rename-prefix`"),
-        "unexpected message: {message}"
-    );
-    assert!(
-        message.contains("`br --db"),
-        "unexpected message: {message}"
-    );
-    assert!(
-        message.contains("--import-only --force --rename-prefix`"),
-        "unexpected message: {message}"
-    );
-    assert!(
-        message.contains("--no-auto-import --no-auto-flush"),
-        "unexpected message: {message}"
-    );
+    let payload = extract_json_payload(&result.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("parse import json");
+    assert_eq!(json["created"].as_u64(), Some(1));
 
     let alt_storage = SqliteStorage::open(&alt_db).expect("open rebuilt alternate db");
     assert_eq!(
         alt_storage.count_all_issues().expect("count issues"),
         1,
-        "alternate DB should already be rebuilt from JSONL before the validation error"
+        "alternate DB should be populated by the explicit rename-prefix import"
+    );
+    let imported_ids = alt_storage.get_all_ids().expect("all ids");
+    assert_eq!(imported_ids.len(), 1);
+    assert!(
+        imported_ids[0].starts_with("target-"),
+        "renamed import should use the configured prefix: {:?}",
+        imported_ids
+    );
+    assert_ne!(
+        imported_ids[0], mismatched_id,
+        "rename-prefix import should rewrite mismatched IDs"
     );
 }
 
 #[test]
-fn e2e_sync_auto_rebuild_rejects_plain_rename_prefix_after_recovery() {
-    let _log = common::test_log("e2e_sync_auto_rebuild_rejects_plain_rename_prefix_after_recovery");
+fn e2e_sync_rename_prefix_applies_after_missing_db_recovery_without_force() {
+    let _log =
+        common::test_log("e2e_sync_rename_prefix_applies_after_missing_db_recovery_without_force");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -449,42 +439,34 @@ fn e2e_sync_auto_rebuild_rejects_plain_rename_prefix_after_recovery() {
             "--no-auto-import",
             "--no-auto-flush",
         ],
-        "sync_auto_rebuild_plain_rename_prefix_conflict",
+        "sync_missing_db_plain_rename_prefix",
     );
     assert!(
-        !result.status.success(),
-        "plain rename-prefix should fail after open-time auto-rebuild"
+        result.status.success(),
+        "plain rename-prefix import should succeed after deferring open-time recovery: {}",
+        result.stderr
     );
-    assert_eq!(result.status.code(), Some(4), "exit code should be 4");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
-    assert!(verify_error_structure(&json), "missing required fields");
-    assert_eq!(json["error"]["code"], "VALIDATION_FAILED");
-    let message = json["error"]["message"]
-        .as_str()
-        .expect("validation message");
-    assert!(
-        message.contains("Open-time recovery rebuilt the database before import"),
-        "unexpected message: {message}"
-    );
-    assert!(
-        message.contains("`br --db"),
-        "unexpected message: {message}"
-    );
-    assert!(
-        message.contains("sync --import-only --rename-prefix`"),
-        "unexpected message: {message}"
-    );
-    assert!(
-        message.contains("--no-auto-import --no-auto-flush"),
-        "unexpected message: {message}"
-    );
+    let payload = extract_json_payload(&result.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("parse import json");
+    assert_eq!(json["created"].as_u64(), Some(1));
 
     let alt_storage = SqliteStorage::open(&alt_db).expect("open rebuilt alternate db");
     assert_eq!(
         alt_storage.count_all_issues().expect("count issues"),
         1,
-        "alternate DB should already be rebuilt from JSONL before the validation error"
+        "alternate DB should be populated by the explicit rename-prefix import"
+    );
+    let imported_ids = alt_storage.get_all_ids().expect("all ids");
+    assert_eq!(imported_ids.len(), 1);
+    assert!(
+        imported_ids[0].starts_with("target-"),
+        "renamed import should use the configured prefix: {:?}",
+        imported_ids
+    );
+    assert_ne!(
+        imported_ids[0], mismatched_id,
+        "rename-prefix import should rewrite mismatched IDs"
     );
 }
 
@@ -540,6 +522,117 @@ fn e2e_sync_auto_rebuild_plain_import_reports_recovery_result() {
         alt_storage.count_all_issues().expect("count issues"),
         1,
         "alternate DB should be populated by automatic recovery"
+    );
+}
+
+#[test]
+fn e2e_sync_rename_prefix_clears_duplicate_external_ref_after_missing_db_recovery() {
+    let _log = common::test_log(
+        "e2e_sync_rename_prefix_clears_duplicate_external_ref_after_missing_db_recovery",
+    );
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let set_prefix = run_br(
+        &workspace,
+        ["config", "set", "issue_prefix=target"],
+        "config_set_issue_prefix",
+    );
+    assert!(
+        set_prefix.status.success(),
+        "config set failed: {}",
+        set_prefix.stderr
+    );
+
+    let first = run_br(
+        &workspace,
+        ["create", "First issue", "--external-ref", "EXT-DUP"],
+        "create_first",
+    );
+    assert!(
+        first.status.success(),
+        "create first failed: {}",
+        first.stderr
+    );
+    let first_id = parse_created_id(&first.stdout);
+
+    let second = run_br(&workspace, ["create", "Second issue"], "create_second");
+    assert!(
+        second.status.success(),
+        "create second failed: {}",
+        second.stderr
+    );
+    let second_id = parse_created_id(&second.stdout);
+
+    let flush = run_br(&workspace, ["sync", "--flush-only"], "sync_flush");
+    assert!(
+        flush.status.success(),
+        "sync flush failed: {}",
+        flush.stderr
+    );
+
+    let issues_path = workspace.root.join(".beads").join("issues.jsonl");
+    let updated = fs::read_to_string(&issues_path)
+        .expect("read issues jsonl")
+        .lines()
+        .map(|line| {
+            let mut value: Value = serde_json::from_str(line).expect("issue json");
+            if value["id"].as_str() == Some(&second_id) {
+                value["external_ref"] = Value::String("EXT-DUP".to_string());
+            }
+            serde_json::to_string(&value).expect("serialize issue json")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&issues_path, format!("{updated}\n")).expect("rewrite jsonl");
+
+    let alt_db = workspace
+        .root
+        .join(".beads")
+        .join("auto-rebuilt-duplicate-extref-alt.db");
+    let result = run_br(
+        &workspace,
+        [
+            "--db",
+            alt_db.to_str().expect("alt db path"),
+            "sync",
+            "--import-only",
+            "--rename-prefix",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "sync_missing_db_duplicate_external_ref_cleanup",
+    );
+    assert!(
+        result.status.success(),
+        "rename-prefix duplicate external_ref cleanup should succeed after deferring open-time recovery: {}",
+        result.stderr
+    );
+
+    let alt_storage = SqliteStorage::open(&alt_db).expect("open rebuilt alternate db");
+    assert_eq!(
+        alt_storage.count_all_issues().expect("count issues"),
+        2,
+        "alternate DB should be populated by the explicit import"
+    );
+    assert_eq!(
+        alt_storage
+            .get_issue(&first_id)
+            .expect("query first issue")
+            .and_then(|issue| issue.external_ref),
+        Some("EXT-DUP".to_string()),
+        "the first external_ref should be preserved"
+    );
+    assert_eq!(
+        alt_storage
+            .get_issue(&second_id)
+            .expect("query second issue")
+            .and_then(|issue| issue.external_ref),
+        None,
+        "the explicit rename-prefix import should clear the duplicate external_ref on later entries"
     );
 }
 

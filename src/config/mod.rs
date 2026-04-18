@@ -487,15 +487,68 @@ struct RecoveryBackupSet {
     files: Vec<(PathBuf, PathBuf)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonlRecoveryStrategy {
+    RebuildFromJsonl,
+    DeferToExplicitImport,
+}
+
 fn open_sqlite_storage_with_recovery(
     beads_dir: &Path,
     paths: &ConfigPaths,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
 ) -> Result<(SqliteStorage, bool)> {
+    open_sqlite_storage_with_recovery_strategy(
+        beads_dir,
+        paths,
+        lock_timeout,
+        bootstrap_layer,
+        JsonlRecoveryStrategy::RebuildFromJsonl,
+    )
+}
+
+fn open_sqlite_storage_with_deferred_jsonl_recovery(
+    beads_dir: &Path,
+    paths: &ConfigPaths,
+    lock_timeout: Option<u64>,
+    bootstrap_layer: &ConfigLayer,
+) -> Result<(SqliteStorage, bool)> {
+    open_sqlite_storage_with_recovery_strategy(
+        beads_dir,
+        paths,
+        lock_timeout,
+        bootstrap_layer,
+        JsonlRecoveryStrategy::DeferToExplicitImport,
+    )
+}
+
+fn open_sqlite_storage_with_recovery_strategy(
+    beads_dir: &Path,
+    paths: &ConfigPaths,
+    lock_timeout: Option<u64>,
+    bootstrap_layer: &ConfigLayer,
+    recovery_strategy: JsonlRecoveryStrategy,
+) -> Result<(SqliteStorage, bool)> {
     if !paths.db_path.is_file() && paths.jsonl_path.is_file() {
-        let storage = rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer)?;
-        return Ok((storage, true));
+        return match recovery_strategy {
+            JsonlRecoveryStrategy::RebuildFromJsonl => {
+                let storage =
+                    rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer)?;
+                Ok((storage, true))
+            }
+            JsonlRecoveryStrategy::DeferToExplicitImport => {
+                warn!(
+                    db_path = %paths.db_path.display(),
+                    jsonl_path = %paths.jsonl_path.display(),
+                    "Database file is missing; deferring JSONL recovery to explicit import semantics"
+                );
+                Ok((
+                    SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout)?,
+                    false,
+                ))
+            }
+        };
     }
 
     // Issue #228: proactively remove truncated WAL sidecar files before
@@ -520,20 +573,50 @@ fn open_sqlite_storage_with_recovery(
         )));
     }
 
+    let prepare_fresh_storage = || -> Result<SqliteStorage> {
+        let (storage, recovery_dir) =
+            rebuild_database_family_with_backup(&paths.db_path, beads_dir, || {
+                SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout)
+            })?;
+        warn!(
+            db_path = %paths.db_path.display(),
+            recovery_dir = %recovery_dir.display(),
+            "Prepared a fresh SQLite database; explicit import will populate it"
+        );
+        Ok(storage)
+    };
+
     match SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout) {
         Ok(storage) => match storage.detect_recoverable_open_anomaly() {
             Ok(None) => Ok((storage, false)),
             Ok(Some(anomaly)) => {
                 drop(storage);
-                warn!(
-                    db_path = %paths.db_path.display(),
-                    jsonl_path = %paths.jsonl_path.display(),
-                    anomaly = %anomaly,
-                    "Detected recoverable database anomaly after open; rebuilding from JSONL"
-                );
-                let storage =
-                    rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer)?;
-                Ok((storage, true))
+                match recovery_strategy {
+                    JsonlRecoveryStrategy::RebuildFromJsonl => {
+                        warn!(
+                            db_path = %paths.db_path.display(),
+                            jsonl_path = %paths.jsonl_path.display(),
+                            anomaly = %anomaly,
+                            "Detected recoverable database anomaly after open; rebuilding from JSONL"
+                        );
+                        let storage = rebuild_database_from_jsonl(
+                            beads_dir,
+                            paths,
+                            lock_timeout,
+                            bootstrap_layer,
+                        )?;
+                        Ok((storage, true))
+                    }
+                    JsonlRecoveryStrategy::DeferToExplicitImport => {
+                        warn!(
+                            db_path = %paths.db_path.display(),
+                            jsonl_path = %paths.jsonl_path.display(),
+                            anomaly = %anomaly,
+                            "Detected recoverable database anomaly after open; deferring JSONL recovery to explicit import semantics"
+                        );
+                        Ok((prepare_fresh_storage()?, false))
+                    }
+                }
             }
             Err(probe_err) => {
                 drop(storage);
@@ -545,15 +628,32 @@ fn open_sqlite_storage_with_recovery(
                     return Err(probe_err);
                 }
 
-                warn!(
-                    db_path = %paths.db_path.display(),
-                    jsonl_path = %paths.jsonl_path.display(),
-                    probe_error = %probe_err,
-                    "Post-open database probe failed; rebuilding from JSONL"
-                );
-                let storage =
-                    rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer)?;
-                Ok((storage, true))
+                match recovery_strategy {
+                    JsonlRecoveryStrategy::RebuildFromJsonl => {
+                        warn!(
+                            db_path = %paths.db_path.display(),
+                            jsonl_path = %paths.jsonl_path.display(),
+                            probe_error = %probe_err,
+                            "Post-open database probe failed; rebuilding from JSONL"
+                        );
+                        let storage = rebuild_database_from_jsonl(
+                            beads_dir,
+                            paths,
+                            lock_timeout,
+                            bootstrap_layer,
+                        )?;
+                        Ok((storage, true))
+                    }
+                    JsonlRecoveryStrategy::DeferToExplicitImport => {
+                        warn!(
+                            db_path = %paths.db_path.display(),
+                            jsonl_path = %paths.jsonl_path.display(),
+                            probe_error = %probe_err,
+                            "Post-open database probe failed; deferring JSONL recovery to explicit import semantics"
+                        );
+                        Ok((prepare_fresh_storage()?, false))
+                    }
+                }
             }
         },
         Err(open_err) => {
@@ -561,21 +661,39 @@ fn open_sqlite_storage_with_recovery(
                 return Err(open_err);
             }
 
-            match rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer) {
-                Ok(storage) => Ok((storage, true)),
-                Err(recovery_err) => {
+            match recovery_strategy {
+                JsonlRecoveryStrategy::RebuildFromJsonl => {
+                    match rebuild_database_from_jsonl(
+                        beads_dir,
+                        paths,
+                        lock_timeout,
+                        bootstrap_layer,
+                    ) {
+                        Ok(storage) => Ok((storage, true)),
+                        Err(recovery_err) => {
+                            warn!(
+                                db_path = %paths.db_path.display(),
+                                jsonl_path = %paths.jsonl_path.display(),
+                                open_error = %open_err,
+                                recovery_error = %recovery_err,
+                                "Automatic database recovery from JSONL failed"
+                            );
+                            if should_surface_recovery_error(&recovery_err) {
+                                Err(recovery_err)
+                            } else {
+                                Err(open_err)
+                            }
+                        }
+                    }
+                }
+                JsonlRecoveryStrategy::DeferToExplicitImport => {
                     warn!(
                         db_path = %paths.db_path.display(),
                         jsonl_path = %paths.jsonl_path.display(),
                         open_error = %open_err,
-                        recovery_error = %recovery_err,
-                        "Automatic database recovery from JSONL failed"
+                        "Open failed with a recoverable database error; deferring JSONL recovery to explicit import semantics"
                     );
-                    if should_surface_recovery_error(&recovery_err) {
-                        Err(recovery_err)
-                    } else {
-                        Err(open_err)
-                    }
+                    Ok((prepare_fresh_storage()?, false))
                 }
             }
         }
@@ -1312,7 +1430,11 @@ impl OpenStorageResult {
 /// # Errors
 ///
 /// Returns an error if configuration loading, JSONL import, or storage setup fails.
-pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<OpenStorageResult> {
+fn open_storage_with_cli_impl(
+    beads_dir: &Path,
+    cli: &CliOverrides,
+    defer_jsonl_recovery: bool,
+) -> Result<OpenStorageResult> {
     let startup = load_startup_config_with_paths(beads_dir, cli.db.as_ref())?;
     let StartupConfig {
         paths,
@@ -1368,12 +1490,21 @@ pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<Ope
             loaded_jsonl_hash,
         })
     } else {
-        let (storage, auto_rebuilt) = open_sqlite_storage_with_recovery(
-            beads_dir,
-            &paths,
-            resolved_lock_timeout,
-            &merged_layer,
-        )?;
+        let (storage, auto_rebuilt) = if defer_jsonl_recovery {
+            open_sqlite_storage_with_deferred_jsonl_recovery(
+                beads_dir,
+                &paths,
+                resolved_lock_timeout,
+                &merged_layer,
+            )?
+        } else {
+            open_sqlite_storage_with_recovery(
+                beads_dir,
+                &paths,
+                resolved_lock_timeout,
+                &merged_layer,
+            )?
+        };
         Ok(OpenStorageResult {
             storage,
             paths,
@@ -1386,6 +1517,17 @@ pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<Ope
             loaded_jsonl_hash: None,
         })
     }
+}
+
+pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<OpenStorageResult> {
+    open_storage_with_cli_impl(beads_dir, cli, false)
+}
+
+pub fn open_storage_with_cli_deferred_jsonl_recovery(
+    beads_dir: &Path,
+    cli: &CliOverrides,
+) -> Result<OpenStorageResult> {
+    open_storage_with_cli_impl(beads_dir, cli, true)
 }
 
 #[must_use]

@@ -113,9 +113,18 @@ pub fn execute(
         });
     }
 
-    // Open storage
+    // Open storage. For `--rename-prefix` imports, defer any implicit JSONL
+    // recovery until the explicit import path below so the command's import
+    // semantics (ID rewrites and duplicate external_ref cleanup) are applied
+    // in the same invocation instead of being skipped by open-time recovery.
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let mut open_result = config::open_storage_with_cli(&beads_dir, cli)?;
+    let defer_jsonl_recovery =
+        !args.status && !args.flush_only && !args.merge && args.rename_prefix;
+    let mut open_result = if defer_jsonl_recovery {
+        config::open_storage_with_cli_deferred_jsonl_recovery(&beads_dir, cli)?
+    } else {
+        config::open_storage_with_cli(&beads_dir, cli)?
+    };
 
     // When `--rebuild` is requested against an existing (non-auto-rebuilt) DB,
     // delegate the actual rebuild to the same proven path that auto-recovery
@@ -992,6 +1001,18 @@ fn jsonl_contains_prefix_mismatch(jsonl_path: &Path, expected_prefix: &str) -> R
     Ok(false)
 }
 
+fn jsonl_contains_duplicate_external_refs(jsonl_path: &Path) -> Result<bool> {
+    let mut seen_external_refs = HashSet::new();
+    for issue in read_issues_from_jsonl(jsonl_path)? {
+        if let Some(external_ref) = issue.external_ref {
+            if !seen_external_refs.insert(external_ref) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn emit_auto_rebuild_import_result(
     storage: &crate::storage::SqliteStorage,
     use_json: bool,
@@ -1085,11 +1106,12 @@ fn execute_import(
     // happy-path short-circuit because the rebuild is already done. Skip the
     // whole check when there is no rename request (`target_prefix.is_none()`)
     // so we avoid the disk-touching `resolve_paths` call on the common path.
-    if auto_rebuilt
+    let rename_semantics_were_skipped = auto_rebuilt
         && target_prefix.as_deref().is_some_and(|prefix| {
             jsonl_contains_prefix_mismatch(jsonl_path, prefix).unwrap_or(true)
-        })
-    {
+                || jsonl_contains_duplicate_external_refs(jsonl_path).unwrap_or(true)
+        });
+    if rename_semantics_were_skipped {
         let rerun_db_path = config::resolve_paths(beads_dir, None)
             .ok()
             .filter(|paths| paths.db_path != *db_path)
@@ -1779,7 +1801,8 @@ fn render_merge_result_rich(report: &crate::sync::MergeReport, ctx: &OutputConte
 mod tests {
     use super::{
         auto_rebuild_semantic_conflict_field, auto_rebuild_semantic_flag_conflict_reason,
-        detect_prefix_from_jsonl, jsonl_contains_prefix_mismatch, validate_sync_paths,
+        detect_prefix_from_jsonl, jsonl_contains_duplicate_external_refs,
+        jsonl_contains_prefix_mismatch, validate_sync_paths,
     };
     use crate::cli::SyncArgs;
     use crate::config::CliOverrides;
@@ -2164,5 +2187,41 @@ mod tests {
         .unwrap();
 
         assert!(jsonl_contains_prefix_mismatch(&jsonl_path, "bd").unwrap());
+    }
+
+    #[test]
+    fn test_jsonl_contains_duplicate_external_refs_detects_duplicates() {
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join("issues.jsonl");
+
+        let mut first = make_test_issue("bd-alpha", "First");
+        first.external_ref = Some("EXT-123".to_string());
+        let mut second = make_test_issue("bd-beta", "Second");
+        second.external_ref = Some("EXT-123".to_string());
+
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&first).unwrap(),
+                serde_json::to_string(&second).unwrap()
+            ),
+        )
+        .unwrap();
+
+        assert!(jsonl_contains_duplicate_external_refs(&jsonl_path).unwrap());
+
+        second.external_ref = Some("EXT-456".to_string());
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&first).unwrap(),
+                serde_json::to_string(&second).unwrap()
+            ),
+        )
+        .unwrap();
+
+        assert!(!jsonl_contains_duplicate_external_refs(&jsonl_path).unwrap());
     }
 }
