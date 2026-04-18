@@ -136,19 +136,35 @@ pub fn execute(
     // — `recover_database_from_jsonl` runs a preflight that fails hard if
     // the file is missing, whereas `execute_import` already handles a
     // missing JSONL gracefully, so leave that case to the normal path.
+    //
+    // Skip the delegation when the caller asked for behavior that the
+    // auto-recovery path does not replicate: `--rename-prefix` rewrites
+    // imported IDs into the configured prefix, while
+    // `repair_database_from_jsonl` always runs with `rename_on_import =
+    // false`. That means the delegation would silently skip the requested
+    // rename behavior.
+    //
+    // `--orphans` is intentionally *not* part of this guard today. The
+    // current import engine parses `orphan_mode` into `ImportConfig`, but it
+    // does not consult that field during import, so delegating does not change
+    // effective behavior. If orphan-mode semantics become active in the future,
+    // revisit this guard and the auto-rebuild conflict detection below.
+    let delegation_would_drop_user_flags = args.rename_prefix;
     if args.rebuild
         && !args.status
         && !open_result.no_db
         && !open_result.auto_rebuilt
         && open_result.paths.jsonl_path.is_file()
+        && !delegation_would_drop_user_flags
     {
         info!(
             db_path = %open_result.paths.db_path.display(),
             jsonl_path = %open_result.paths.jsonl_path.display(),
             "--rebuild requested on existing DB: delegating to auto-recovery rebuild path"
         );
+        // `recover_database_from_jsonl` sets `auto_rebuilt = true` on success,
+        // which is what gates the short-circuit inside `execute_import` below.
         open_result.recover_database_from_jsonl()?;
-        open_result.auto_rebuilt = true;
     }
 
     let config::OpenStorageResult {
@@ -878,6 +894,132 @@ fn should_show_progress(json: bool, quiet: bool) -> bool {
     !json && !quiet && std::io::stdout().is_terminal()
 }
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn push_cli_rerun_overrides(rerun: &mut Vec<String>, cli: &config::CliOverrides) {
+    if cli.json == Some(true) {
+        rerun.push("--json".to_string());
+    }
+    if cli.quiet == Some(true) {
+        rerun.push("--quiet".to_string());
+    }
+    // Preserve `--no-color` so the re-run inherits the caller's output
+    // preference; dropping it silently flips colorized output back on.
+    if cli.display_color == Some(false) {
+        rerun.push("--no-color".to_string());
+    }
+    // Preserve `--actor` so audit-log entries from the re-run carry the
+    // same identity the operator originally specified.
+    if let Some(actor) = &cli.actor {
+        rerun.push("--actor".to_string());
+        rerun.push(shell_quote(actor));
+    }
+    if cli.allow_stale == Some(true) {
+        rerun.push("--allow-stale".to_string());
+    }
+    if cli.no_daemon == Some(true) {
+        rerun.push("--no-daemon".to_string());
+    }
+    if cli.no_auto_import == Some(true) {
+        rerun.push("--no-auto-import".to_string());
+    }
+    if cli.no_auto_flush == Some(true) {
+        rerun.push("--no-auto-flush".to_string());
+    }
+    if let Some(timeout) = cli.lock_timeout {
+        rerun.push("--lock-timeout".to_string());
+        rerun.push(timeout.to_string());
+    }
+}
+
+fn auto_rebuild_semantic_flag_conflict_reason(
+    args: &SyncArgs,
+    cli: &config::CliOverrides,
+    db_path: Option<&Path>,
+) -> Option<String> {
+    if !args.rename_prefix {
+        return None;
+    }
+
+    let mut rerun = vec!["br".to_string()];
+    if let Some(path) = db_path {
+        rerun.push("--db".to_string());
+        rerun.push(shell_quote(&path.display().to_string()));
+    }
+    push_cli_rerun_overrides(&mut rerun, cli);
+    rerun.push("sync".to_string());
+    rerun.push("--import-only".to_string());
+    if args.allow_external_jsonl {
+        rerun.push("--allow-external-jsonl".to_string());
+    }
+    if args.force {
+        rerun.push("--force".to_string());
+    }
+    if args.rebuild {
+        rerun.push("--rebuild".to_string());
+    }
+    rerun.push("--rename-prefix".to_string());
+
+    Some(format!(
+        "Open-time recovery rebuilt the database before import, so the requested import semantics (`--rename-prefix`) were not applied. Re-run `{}` now that the DB is healthy.",
+        rerun.join(" ")
+    ))
+}
+
+fn auto_rebuild_semantic_conflict_field(args: &SyncArgs) -> &'static str {
+    if args.rebuild {
+        "rebuild"
+    } else if args.force {
+        "force"
+    } else {
+        "rename_prefix"
+    }
+}
+
+fn jsonl_contains_prefix_mismatch(jsonl_path: &Path, expected_prefix: &str) -> Result<bool> {
+    let expected_prefix = expected_prefix.trim_end_matches('-');
+    for issue in read_issues_from_jsonl(jsonl_path)? {
+        if issue.status == crate::model::Status::Tombstone {
+            continue;
+        }
+        match split_prefix_remainder(&issue.id) {
+            Some((prefix, _)) if prefix == expected_prefix => {}
+            _ => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
+fn emit_auto_rebuild_import_result(
+    storage: &crate::storage::SqliteStorage,
+    use_json: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let created = storage.count_all_issues()?;
+    let result = ImportResultOutput {
+        created,
+        updated: 0,
+        skipped: 0,
+        tombstone_skipped: 0,
+        orphans_removed: 0,
+        blocked_cache_rebuilt: true,
+    };
+    if use_json {
+        ctx.json_pretty(&result);
+    } else if !suppress_human_sync_output(ctx, use_json) {
+        if ctx.is_rich() {
+            render_import_result_rich(&result, ctx);
+        } else {
+            println!("Imported from JSONL (via automatic recovery):");
+            println!("  Created: {} issues", result.created);
+            println!("  Rebuilt blocked cache");
+        }
+    }
+    Ok(())
+}
+
 /// Execute the --import-only operation.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn execute_import(
@@ -908,37 +1050,65 @@ fn execute_import(
     // JSONL. Re-running `--rebuild`/`--force` here would redo the import and
     // trigger fsqlite's stale-pager OpenRead bug ("could not open storage
     // cursor on root page N") because `reset_data_tables` + bulk INSERT within
-    // the fresh connection exercises exactly the code path that just ran. In
-    // this case we short-circuit to the happy path output; the rebuild is
-    // already done.
-    if auto_rebuilt && (args.rebuild || args.force) {
-        info!(
-            "Skipping redundant --rebuild/--force import: database was just rebuilt from JSONL during open"
-        );
-        // Report the actual number of rows the rebuild put into the DB,
-        // not the JSONL line count — the two diverge when the JSONL contains
-        // tombstones or otherwise skipped records. Reading from the storage
-        // also avoids a redundant parse pass over a multi-megabyte JSONL.
-        let created = storage.count_all_issues()?;
-        let result = ImportResultOutput {
-            created,
-            updated: 0,
-            skipped: 0,
-            tombstone_skipped: 0,
-            orphans_removed: 0,
-            blocked_cache_rebuilt: true,
-        };
-        if use_json {
-            ctx.json_pretty(&result);
-        } else if !suppress_human_sync_output(ctx, use_json) {
-            if ctx.is_rich() {
-                render_import_result_rich(&result, ctx);
+    // the fresh connection exercises exactly the code path that just ran.
+    // Prefix is a default for newly generated IDs, not a project-wide import
+    // invariant. Only compute an expected prefix when the caller explicitly
+    // asked to rename imported IDs into the configured prefix.
+    let target_prefix = if args.rename_prefix {
+        let layer = config::load_config(beads_dir, Some(storage), cli)?;
+        let id_cfg = config::id_config_from_layer(&layer);
+        Some(if id_cfg.prefix == "br" {
+            // Prefix is still the default — check if we should auto-detect from JSONL
+            let db_prefix = storage.get_config("issue_prefix")?;
+            if let Some(p) = db_prefix {
+                p
+            } else if let Some(detected) = detect_prefix_from_jsonl(jsonl_path) {
+                info!(detected_prefix = %detected, "Auto-detected prefix from JSONL (no prefix configured)");
+                // Persist the detected prefix to config for future operations
+                storage.set_config("issue_prefix", &detected)?;
+                detected
             } else {
-                println!("Imported from JSONL (via automatic recovery):");
-                println!("  Created: {} issues", result.created);
-                println!("  Rebuilt blocked cache");
+                "br".to_string()
             }
+        } else {
+            // Config layer resolved a non-default prefix — use it
+            id_cfg.prefix
+        })
+    } else {
+        None
+    };
+
+    // When the caller requested semantics that auto-recovery could not honor
+    // (`--rename-prefix`) *and* the JSONL actually contains mismatched IDs
+    // that would have been renamed, fail explicitly so the operator can re-run
+    // on the now-healthy DB. If the flag would have been a no-op, preserve the
+    // happy-path short-circuit because the rebuild is already done. Skip the
+    // whole check when there is no rename request (`target_prefix.is_none()`)
+    // so we avoid the disk-touching `resolve_paths` call on the common path.
+    if auto_rebuilt
+        && target_prefix.as_deref().is_some_and(|prefix| {
+            jsonl_contains_prefix_mismatch(jsonl_path, prefix).unwrap_or(true)
+        })
+    {
+        let rerun_db_path = config::resolve_paths(beads_dir, None)
+            .ok()
+            .filter(|paths| paths.db_path != *db_path)
+            .map(|_| db_path);
+        if let Some(reason) = auto_rebuild_semantic_flag_conflict_reason(args, cli, rerun_db_path) {
+            return Err(BeadsError::Validation {
+                field: auto_rebuild_semantic_conflict_field(args).to_string(),
+                reason,
+            });
         }
+    }
+
+    if auto_rebuilt {
+        info!(
+            force = args.force,
+            rebuild = args.rebuild,
+            "Skipping import body: database was rebuilt from JSONL during open"
+        );
+        emit_auto_rebuild_import_result(storage, use_json, ctx)?;
         return Ok(());
     }
 
@@ -1022,33 +1192,6 @@ fn execute_import(
         beads_dir: Some(path_policy.beads_dir.clone()),
         allow_external_jsonl: args.allow_external_jsonl,
         show_progress,
-    };
-
-    // Prefix is a default for newly generated IDs, not a project-wide import
-    // invariant. Only compute an expected prefix when the caller explicitly
-    // asked to rename imported IDs into the configured prefix.
-    let target_prefix = if args.rename_prefix {
-        let layer = config::load_config(beads_dir, Some(storage), cli)?;
-        let id_cfg = config::id_config_from_layer(&layer);
-        Some(if id_cfg.prefix == "br" {
-            // Prefix is still the default — check if we should auto-detect from JSONL
-            let db_prefix = storage.get_config("issue_prefix")?;
-            if let Some(p) = db_prefix {
-                p
-            } else if let Some(detected) = detect_prefix_from_jsonl(jsonl_path) {
-                info!(detected_prefix = %detected, "Auto-detected prefix from JSONL (no prefix configured)");
-                // Persist the detected prefix to config for future operations
-                storage.set_config("issue_prefix", &detected)?;
-                detected
-            } else {
-                "br".to_string()
-            }
-        } else {
-            // Config layer resolved a non-default prefix — use it
-            id_cfg.prefix
-        })
-    } else {
-        None
     };
 
     let preserved_tombstones = if args.force || args.rebuild {
@@ -1634,13 +1777,18 @@ fn render_merge_result_rich(report: &crate::sync::MergeReport, ctx: &OutputConte
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_prefix_from_jsonl, validate_sync_paths};
+    use super::{
+        auto_rebuild_semantic_conflict_field, auto_rebuild_semantic_flag_conflict_reason,
+        detect_prefix_from_jsonl, jsonl_contains_prefix_mismatch, validate_sync_paths,
+    };
+    use crate::cli::SyncArgs;
+    use crate::config::CliOverrides;
     use crate::error::BeadsError;
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use chrono::Utc;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     fn make_test_issue(id: &str, title: &str) -> Issue {
@@ -1829,5 +1977,192 @@ mod tests {
             detect_prefix_from_jsonl(&jsonl_path),
             Some("document-intelligence".to_string())
         );
+    }
+
+    #[test]
+    fn test_auto_rebuild_semantic_flag_conflict_reason_absent_for_default_import_semantics() {
+        let args = SyncArgs::default();
+        assert!(
+            auto_rebuild_semantic_flag_conflict_reason(&args, &CliOverrides::default(), None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_auto_rebuild_semantic_flag_conflict_reason_mentions_rename_prefix_rerun() {
+        let args = SyncArgs {
+            force: true,
+            rename_prefix: true,
+            ..SyncArgs::default()
+        };
+
+        let reason =
+            auto_rebuild_semantic_flag_conflict_reason(&args, &CliOverrides::default(), None)
+                .expect("rename-prefix conflict");
+        assert!(reason.contains("`--rename-prefix`"), "reason: {reason}");
+        assert!(
+            reason.contains("`br sync --import-only --force --rename-prefix`"),
+            "reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn test_auto_rebuild_semantic_flag_conflict_reason_ignores_orphans_only_request() {
+        let args = SyncArgs {
+            rebuild: true,
+            orphans: Some("resurrect".to_string()),
+            ..SyncArgs::default()
+        };
+
+        assert!(
+            auto_rebuild_semantic_flag_conflict_reason(&args, &CliOverrides::default(), None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_auto_rebuild_semantic_flag_conflict_reason_mentions_both_flags() {
+        let args = SyncArgs {
+            force: true,
+            rebuild: true,
+            rename_prefix: true,
+            orphans: Some("skip".to_string()),
+            ..SyncArgs::default()
+        };
+
+        let reason =
+            auto_rebuild_semantic_flag_conflict_reason(&args, &CliOverrides::default(), None)
+                .expect("combined conflict");
+        assert!(reason.contains("`--rename-prefix`"), "reason: {reason}");
+        assert!(
+            reason.contains("`br sync --import-only --force --rebuild --rename-prefix`"),
+            "reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn test_auto_rebuild_semantic_flag_conflict_reason_preserves_custom_db_override() {
+        let args = SyncArgs {
+            force: true,
+            rename_prefix: true,
+            ..SyncArgs::default()
+        };
+
+        let custom_db = Path::new("/tmp/custom db.sqlite");
+        let reason = auto_rebuild_semantic_flag_conflict_reason(
+            &args,
+            &CliOverrides::default(),
+            Some(custom_db),
+        )
+        .expect("rename-prefix conflict");
+        assert!(
+            reason.contains(
+                "`br --db '/tmp/custom db.sqlite' sync --import-only --force --rename-prefix`"
+            ),
+            "reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn test_auto_rebuild_semantic_flag_conflict_reason_preserves_external_jsonl_flag() {
+        let args = SyncArgs {
+            force: true,
+            rename_prefix: true,
+            allow_external_jsonl: true,
+            ..SyncArgs::default()
+        };
+
+        let reason =
+            auto_rebuild_semantic_flag_conflict_reason(&args, &CliOverrides::default(), None)
+                .expect("rename-prefix conflict");
+        assert!(
+            reason
+                .contains("`br sync --import-only --allow-external-jsonl --force --rename-prefix`"),
+            "reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn test_auto_rebuild_semantic_flag_conflict_reason_preserves_cli_startup_flags() {
+        let args = SyncArgs {
+            force: true,
+            rename_prefix: true,
+            ..SyncArgs::default()
+        };
+        let cli = CliOverrides {
+            json: Some(true),
+            allow_stale: Some(true),
+            no_auto_import: Some(true),
+            no_auto_flush: Some(true),
+            lock_timeout: Some(17),
+            ..CliOverrides::default()
+        };
+
+        let reason = auto_rebuild_semantic_flag_conflict_reason(&args, &cli, None)
+            .expect("rename-prefix conflict");
+        assert!(
+            reason.contains(
+                "`br --json --allow-stale --no-auto-import --no-auto-flush --lock-timeout 17 sync --import-only --force --rename-prefix`"
+            ),
+            "reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn test_auto_rebuild_semantic_conflict_field_prefers_explicit_rebuild_then_force() {
+        let plain = SyncArgs {
+            rename_prefix: true,
+            ..SyncArgs::default()
+        };
+        assert_eq!(
+            auto_rebuild_semantic_conflict_field(&plain),
+            "rename_prefix"
+        );
+
+        let force = SyncArgs {
+            force: true,
+            rename_prefix: true,
+            ..SyncArgs::default()
+        };
+        assert_eq!(auto_rebuild_semantic_conflict_field(&force), "force");
+
+        let rebuild = SyncArgs {
+            force: true,
+            rebuild: true,
+            rename_prefix: true,
+            ..SyncArgs::default()
+        };
+        assert_eq!(auto_rebuild_semantic_conflict_field(&rebuild), "rebuild");
+    }
+
+    #[test]
+    fn test_jsonl_contains_prefix_mismatch_only_for_non_tombstone_ids() {
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join("issues.jsonl");
+
+        let matching = make_test_issue("bd-alpha", "Matching");
+        let mut tombstone = make_test_issue("other-beta", "Tombstone mismatch");
+        tombstone.status = Status::Tombstone;
+
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&matching).unwrap(),
+                serde_json::to_string(&tombstone).unwrap()
+            ),
+        )
+        .unwrap();
+
+        assert!(!jsonl_contains_prefix_mismatch(&jsonl_path, "bd").unwrap());
+
+        let mismatch = make_test_issue("other-gamma", "Mismatch");
+        fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&mismatch).unwrap()),
+        )
+        .unwrap();
+
+        assert!(jsonl_contains_prefix_mismatch(&jsonl_path, "bd").unwrap());
     }
 }

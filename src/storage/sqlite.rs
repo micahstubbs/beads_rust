@@ -906,7 +906,7 @@ impl SqliteStorage {
     ///
     /// Returns an error only if even a PASSIVE checkpoint fails. TRUNCATE
     /// failure is downgraded to a warning because it is best-effort.
-    pub fn checkpoint_full(&self) -> Result<()> {
+    pub(crate) fn checkpoint_full(&self) -> Result<()> {
         if let Err(e) = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
             tracing::debug!(
                 error = %e,

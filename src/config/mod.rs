@@ -1162,6 +1162,11 @@ impl OpenStorageResult {
 
     /// Rebuild the current SQLite database from the resolved JSONL export.
     ///
+    /// On success, `auto_rebuilt` is set to `true` so downstream code can
+    /// detect that the storage is now a fresh import of the JSONL and skip
+    /// redundant rebuilds (for example, `br sync --rebuild` short-circuits
+    /// when it sees this flag).
+    ///
     /// # Errors
     ///
     /// Returns an error if recovery fails or if this context is in `--no-db`
@@ -1190,6 +1195,7 @@ impl OpenStorageResult {
         )?;
         self.storage = storage;
         self.loaded_jsonl_hash = None;
+        self.auto_rebuilt = true;
         Ok(())
     }
 
