@@ -92,13 +92,37 @@ pub fn execute(
 ) -> Result<()> {
     // Open storage
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+    let mut open_result = config::open_storage_with_cli(&beads_dir, cli)?;
+
+    // When `--rebuild` is requested against an existing (non-auto-rebuilt) DB,
+    // delegate the actual rebuild to the same proven path that auto-recovery
+    // uses: backup the DB family, open a fresh connection, import JSONL,
+    // checkpoint+reopen, VACUUM/REINDEX. The in-place
+    // `reset_data_tables`+`import_from_jsonl` code path inside `execute_import`
+    // is fragile on fsqlite — it trips stale-pager/MVCC bugs that leave
+    // "never used" pages and partial-index mismatches that VACUUM can't
+    // always reclaim. Using `recover_database_from_jsonl` sidesteps all of
+    // that, and `execute_import` then sees `auto_rebuilt == true` and
+    // short-circuits.
+    if args.rebuild && !open_result.no_db && !open_result.auto_rebuilt {
+        info!(
+            db_path = %open_result.paths.db_path.display(),
+            jsonl_path = %open_result.paths.jsonl_path.display(),
+            "--rebuild requested on existing DB: delegating to auto-recovery rebuild path"
+        );
+        open_result.recover_database_from_jsonl()?;
+        open_result.auto_rebuilt = true;
+    }
+
     let config::OpenStorageResult {
         mut storage,
         paths,
         auto_rebuilt,
         ..
-    } = config::open_storage_with_cli(&beads_dir, cli)?;
+    } = open_result;
 
+    let db_path = paths.db_path.clone();
+    let db_lock_timeout = cli.lock_timeout;
     let jsonl_path = paths.jsonl_path;
     let retention_days = paths.metadata.deletions_retention_days;
     let use_json = ctx.is_json() || args.robot;
@@ -170,6 +194,8 @@ pub fn execute(
             use_json,
             show_progress,
             auto_rebuilt,
+            &db_path,
+            db_lock_timeout,
             ctx,
         )
     }
@@ -848,6 +874,8 @@ fn execute_import(
     use_json: bool,
     show_progress: bool,
     auto_rebuilt: bool,
+    db_path: &std::path::Path,
+    _db_lock_timeout: Option<u64>,
     ctx: &OutputContext,
 ) -> Result<()> {
     info!("Starting JSONL import");
@@ -1015,10 +1043,28 @@ fn execute_import(
     // fsqlite btree cursor bugs on DELETE operations in large tables.
     // Config/metadata are preserved.  Without this, --rebuild on a corrupt DB
     // can hang indefinitely during orphan deletion (#245).
+    //
+    // Skip the reset when the `issues` table is already empty (e.g. right
+    // after `br init` or `br init --force`): the DROP + CREATE sequence
+    // generates "never used" freelist pages that fsqlite's VACUUM cannot
+    // reclaim, which C sqlite3's integrity_check then flags as corruption
+    // (issue #248). When the target is already empty, we can INSERT directly
+    // and skip the leak entirely.
     if args.force || args.rebuild {
-        debug!("Force/rebuild import: resetting data tables to avoid btree DELETE bugs");
-        storage.reset_data_tables()?;
-        restore_tombstones(storage, &preserved_tombstones)?;
+        let existing_issue_count = storage.count_all_issues().unwrap_or(usize::MAX);
+        if existing_issue_count == 0 && preserved_tombstones.is_empty() {
+            debug!(
+                "Force/rebuild import: target DB already empty, skipping reset_data_tables to avoid fsqlite freelist leak"
+            );
+        } else {
+            debug!(
+                existing_issue_count,
+                preserved_tombstones = preserved_tombstones.len(),
+                "Force/rebuild import: resetting data tables to avoid btree DELETE bugs"
+            );
+            storage.reset_data_tables()?;
+            restore_tombstones(storage, &preserved_tombstones)?;
+        }
     }
 
     // Execute import
@@ -1079,11 +1125,27 @@ fn execute_import(
     // not need this hardening.  Keeping the VACUUM/REINDEX scoped to the
     // force/rebuild branch avoids paying the cost on every `br sync` run.
     if args.force || args.rebuild {
+        // Drain the WAL before VACUUM/REINDEX so the snapshot they operate
+        // on matches what's actually on disk. Without this, fsqlite's
+        // post-import MVCC state lags behind and VACUUM fails silently with
+        // "database is busy (snapshot conflict on pages)", leaving the
+        // free-space / partial-index corruption that triggered issue #248.
+        // Reopening the connection at this point also works around the
+        // stale snapshot, but on fsqlite it can reorder root pages in a way
+        // the next reader cannot cope with, so we checkpoint in place
+        // instead.
+        if let Err(e) = storage.checkpoint_full() {
+            warn!(
+                error = %e,
+                db_path = %db_path.display(),
+                "Full WAL checkpoint after force/rebuild import failed (non-fatal)"
+            );
+        }
         if let Err(e) = storage.execute_raw("VACUUM") {
-            debug!(error = %e, "VACUUM after force/rebuild import failed (non-fatal)");
+            warn!(error = %e, "VACUUM after force/rebuild import failed (non-fatal); DB may still contain free-space corruption");
         }
         if let Err(e) = storage.execute_raw("REINDEX") {
-            debug!(error = %e, "REINDEX after force/rebuild import failed (non-fatal)");
+            warn!(error = %e, "REINDEX after force/rebuild import failed (non-fatal); partial-index entries may be inconsistent");
         }
     }
 

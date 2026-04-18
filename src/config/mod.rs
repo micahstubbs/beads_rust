@@ -817,16 +817,18 @@ fn rebuild_database_family(
     storage.set_config("issue_prefix", prefix)?;
     let import_result = import_from_jsonl(&mut storage, jsonl_path, import_config, Some(prefix))?;
 
-    // After a large bulk import, fsqlite's pager/MVCC state can lag behind
-    // what was actually written: VACUUM/REINDEX run against an old snapshot
-    // and fail with "database is busy (snapshot conflict on pages: page N >
-    // snapshot db_size M)", while the next cursor OpenRead refuses freshly
-    // allocated root pages as "invalid transaction-backed root page". Drain
-    // the WAL to the main DB file (TRUNCATE checkpoint, safe here because we
-    // hold the `.write.lock` exclusively) and then reopen a fresh connection
-    // at the same path so the pager reloads its view from disk. Without this
-    // pair, the post-rebuild cleanup below silently fails and leaves the DB
-    // in a state that the next reader cannot open.
+    // After a bulk import, fsqlite's pager/MVCC state can lag behind what
+    // was actually written: VACUUM runs against an old snapshot and fails
+    // with "database is busy (snapshot conflict on pages: page N > snapshot
+    // db_size M)", so the corruption it was supposed to clean up stays on
+    // disk. Drain the WAL to the main DB file (TRUNCATE checkpoint, safe
+    // here because we hold the `.write.lock` exclusively) so VACUUM's
+    // snapshot matches what is on disk. We intentionally do NOT drop and
+    // reopen the connection here: fsqlite's VACUUM/REINDEX implementation
+    // on a reopened connection can reorder or invalidate root pages
+    // (`OpenRead failed: could not open storage cursor on root page N`),
+    // which a later `get_issue` then trips over. Staying on the import
+    // connection keeps the cursor metadata coherent.
     if let Err(e) = storage.checkpoint_full() {
         tracing::warn!(
             error = %e,
@@ -834,7 +836,6 @@ fn rebuild_database_family(
             "Full WAL checkpoint after rebuild failed (non-fatal)"
         );
     }
-    storage.reopen_at(db_path, lock_timeout)?;
 
     // Post-rebuild VACUUM to eliminate freeblock accounting anomalies that
     // frankensqlite's B-tree layer may leave behind during bulk import.
