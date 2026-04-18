@@ -954,6 +954,68 @@ fn e2e_sync_rename_prefix_validation_failure_does_not_create_missing_db() {
 }
 
 #[test]
+fn e2e_sync_rename_prefix_import_failure_does_not_leave_missing_db_created() {
+    let _log = common::test_log(
+        "e2e_sync_rename_prefix_import_failure_does_not_leave_missing_db_created",
+    );
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let set_prefix = run_br(
+        &workspace,
+        ["config", "set", "issue_prefix=target"],
+        "config_set_issue_prefix",
+    );
+    assert!(
+        set_prefix.status.success(),
+        "config set failed: {}",
+        set_prefix.stderr
+    );
+
+    let issues_path = workspace.root.join(".beads").join("issues.jsonl");
+    fs::write(&issues_path, "{\"id\":\"broken\"\n").expect("write malformed jsonl");
+
+    let alt_db = workspace
+        .root
+        .join(".beads")
+        .join("deferred-recovery-import-missing-alt.db");
+    assert!(
+        !alt_db.exists(),
+        "precondition: alternate db should start missing"
+    );
+
+    let result = run_br(
+        &workspace,
+        [
+            "--db",
+            alt_db.to_str().expect("alt db path"),
+            "sync",
+            "--import-only",
+            "--rename-prefix",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "sync_failed_deferred_recovery_import_missing_db",
+    );
+    assert!(
+        !result.status.success(),
+        "malformed JSONL should fail explicit import after deferred recovery"
+    );
+    assert!(
+        result.stderr.contains("Invalid JSON"),
+        "unexpected stderr: {}",
+        result.stderr
+    );
+    assert!(
+        !alt_db.exists(),
+        "failed deferred import should not leave a fresh alternate db behind when none existed before"
+    );
+}
+
+#[test]
 fn e2e_sync_export_guards() {
     let _log = common::test_log("e2e_sync_export_guards");
     let workspace = BrWorkspace::new();

@@ -538,6 +538,8 @@ fn open_sqlite_storage_with_recovery_strategy(
                 Ok((storage, true, None))
             }
             JsonlRecoveryStrategy::DeferToExplicitImport => {
+                let cleanup_set =
+                    prepare_missing_database_cleanup_for_recovery(&paths.db_path, beads_dir)?;
                 warn!(
                     db_path = %paths.db_path.display(),
                     jsonl_path = %paths.jsonl_path.display(),
@@ -546,7 +548,7 @@ fn open_sqlite_storage_with_recovery_strategy(
                 Ok((
                     SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout)?,
                     false,
-                    None,
+                    Some(cleanup_set),
                 ))
             }
         };
@@ -1039,6 +1041,21 @@ fn backup_database_family_for_recovery(
     move_database_family_to_recovery(db_path, beads_dir, &stamp)
 }
 
+fn prepare_missing_database_cleanup_for_recovery(
+    db_path: &Path,
+    beads_dir: &Path,
+) -> Result<RecoveryBackupSet> {
+    let stamp = Utc::now().format("%Y%m%d_%H%M%S_%f").to_string();
+    let recovery_dir = recovery_dir_for_db_path(db_path, beads_dir);
+    fs::create_dir_all(&recovery_dir)?;
+    Ok(RecoveryBackupSet {
+        db_path: db_path.to_path_buf(),
+        recovery_dir,
+        stamp,
+        files: Vec::new(),
+    })
+}
+
 fn move_database_family_to_recovery(
     db_path: &Path,
     beads_dir: &Path,
@@ -1356,18 +1373,21 @@ impl OpenStorageResult {
         let Some(backup_set) = self.pending_recovery_backup.take() else {
             return Ok(());
         };
+        let had_original_database_family = !backup_set.files.is_empty();
 
         self.storage = SqliteStorage::open_memory()?;
         restore_database_family_after_failed_rebuild(&backup_set)?;
-        self.storage =
-            SqliteStorage::open_with_timeout(&self.paths.db_path, self.resolved_lock_timeout)
-                .map_err(|reopen_err| BeadsError::WithContext {
-                    context: format!(
-                        "Restored the original database family at '{}' but failed to reopen it",
-                        self.paths.db_path.display()
-                    ),
-                    source: Box::new(BeadsError::from(reopen_err)),
-                })?;
+        if had_original_database_family {
+            self.storage =
+                SqliteStorage::open_with_timeout(&self.paths.db_path, self.resolved_lock_timeout)
+                    .map_err(|reopen_err| BeadsError::WithContext {
+                        context: format!(
+                            "Restored the original database family at '{}' but failed to reopen it",
+                            self.paths.db_path.display()
+                        ),
+                        source: Box::new(BeadsError::from(reopen_err)),
+                    })?;
+        }
         self.loaded_jsonl_hash = None;
         self.auto_rebuilt = false;
         Ok(())

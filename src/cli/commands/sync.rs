@@ -1306,10 +1306,25 @@ fn execute_import(
     // cleared everything beforehand, the post-import DB contents already
     // mirror the JSONL (modulo the prefix rewrite), so the orphan pass has
     // nothing legitimate to remove anyway.
+    //
+    // Tombstones preserved across `reset_data_tables` via `snapshot_tombstones`
+    // are NOT orphans — the whole point of preserving them was to keep
+    // deletion-retention state alive across the rebuild. If the user has not
+    // flushed to JSONL since deleting an issue, the tombstone is in the DB
+    // but not in the JSONL, and a naïve set-difference would wipe it. Union
+    // their IDs into the "acceptable" set so they survive the cleanup.
     if args.rebuild && !args.rename_prefix {
         let jsonl_ids = get_issue_ids_from_jsonl(jsonl_path)?;
+        let preserved_ids: HashSet<String> = preserved_tombstones
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
         let db_ids: HashSet<String> = storage.get_all_ids()?.into_iter().collect();
-        let orphan_ids: Vec<String> = db_ids.difference(&jsonl_ids).cloned().collect();
+        let orphan_ids: Vec<String> = db_ids
+            .iter()
+            .filter(|id| !jsonl_ids.contains(*id) && !preserved_ids.contains(*id))
+            .cloned()
+            .collect();
 
         if !orphan_ids.is_empty() {
             info!(
