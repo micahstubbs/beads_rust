@@ -618,21 +618,96 @@ fn e2e_sync_rename_prefix_clears_duplicate_external_ref_after_missing_db_recover
         2,
         "alternate DB should be populated by the explicit import"
     );
+    let retained = [&first_id, &second_id]
+        .into_iter()
+        .filter(|id| {
+            alt_storage
+                .get_issue(id)
+                .expect("query imported issue")
+                .and_then(|issue| issue.external_ref)
+                .as_deref()
+                == Some("EXT-DUP")
+        })
+        .count();
+    let cleared = [&first_id, &second_id]
+        .into_iter()
+        .filter(|id| {
+            alt_storage
+                .get_issue(id)
+                .expect("query imported issue")
+                .and_then(|issue| issue.external_ref)
+                .is_none()
+        })
+        .count();
     assert_eq!(
-        alt_storage
-            .get_issue(&first_id)
-            .expect("query first issue")
-            .and_then(|issue| issue.external_ref),
-        Some("EXT-DUP".to_string()),
-        "the first external_ref should be preserved"
+        retained, 1,
+        "exactly one duplicate external_ref should be preserved"
     );
     assert_eq!(
-        alt_storage
-            .get_issue(&second_id)
-            .expect("query second issue")
-            .and_then(|issue| issue.external_ref),
-        None,
-        "the explicit rename-prefix import should clear the duplicate external_ref on later entries"
+        cleared, 1,
+        "exactly one duplicate external_ref should be cleared"
+    );
+}
+
+#[test]
+fn e2e_sync_rename_prefix_failed_import_restores_original_corrupt_db_family() {
+    let _log = common::test_log(
+        "e2e_sync_rename_prefix_failed_import_restores_original_corrupt_db_family",
+    );
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let set_prefix = run_br(
+        &workspace,
+        ["config", "set", "issue_prefix=target"],
+        "config_set_issue_prefix",
+    );
+    assert!(
+        set_prefix.status.success(),
+        "config set failed: {}",
+        set_prefix.stderr
+    );
+
+    let issues_path = workspace.root.join(".beads").join("issues.jsonl");
+    fs::write(&issues_path, "{\"id\":\"broken\"\n").expect("write malformed jsonl");
+
+    let alt_db = workspace
+        .root
+        .join(".beads")
+        .join("deferred-recovery-restore-alt.db");
+    let original_bytes = b"not a sqlite database but should be restored".to_vec();
+    fs::write(&alt_db, &original_bytes).expect("write corrupt alt db");
+
+    let result = run_br(
+        &workspace,
+        [
+            "--db",
+            alt_db.to_str().expect("alt db path"),
+            "sync",
+            "--import-only",
+            "--rename-prefix",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "sync_failed_deferred_recovery_restore",
+    );
+    assert!(
+        !result.status.success(),
+        "malformed JSONL should fail explicit import after deferred recovery"
+    );
+    assert!(
+        result.stderr.contains("Invalid JSON"),
+        "unexpected stderr: {}",
+        result.stderr
+    );
+
+    let restored_bytes = fs::read(&alt_db).expect("read restored alt db");
+    assert_eq!(
+        restored_bytes, original_bytes,
+        "failed deferred import should restore the original corrupt db bytes"
     );
 }
 
