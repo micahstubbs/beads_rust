@@ -128,6 +128,11 @@ sample_beads_db_files/**/*.db-wal
 /child.json
 /parent.json
 
+# One-off sed-based refactor helper scripts (see AGENTS.md — never run scripts
+# that mutate code files; these are agent-generated dev scratch and must stay
+# out of the repo).
+/fix_*.sh
+
 # Beads snapshot backups (timestamped)
 .beads.snapshot_*/
 
