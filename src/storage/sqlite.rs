@@ -2769,37 +2769,6 @@ impl SqliteStorage {
         Ok(ids)
     }
 
-    /// Get issue IDs blocked by `blocks` dependency type only (not full cache).
-    ///
-    /// This is used for stats computation where blocked count should be based
-    /// only on `blocks` deps per classic bd semantics.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database query fails.
-    pub fn get_blocked_by_blocks_deps_only(&self) -> Result<HashSet<String>> {
-        // Returns issues that:
-        // 1. Have a 'blocks' type dependency
-        // 2. Where the blocker is not closed/tombstone
-        // 3. AND the blocked issue itself is not closed/tombstone
-        let rows = self.conn.query(
-            r"SELECT DISTINCT d.issue_id
-              FROM dependencies d
-              LEFT JOIN issues blocker ON d.depends_on_id = blocker.id
-              LEFT JOIN issues blocked ON d.issue_id = blocked.id
-              WHERE d.type = 'blocks'
-                AND blocker.status NOT IN ('closed', 'tombstone')
-                AND blocked.status NOT IN ('closed', 'tombstone')",
-        )?;
-        let mut ids = HashSet::new();
-        for row in &rows {
-            if let Some(id) = row.get(0).and_then(SqliteValue::as_text) {
-                ids.insert(id.to_string());
-            }
-        }
-        Ok(ids)
-    }
-
     /// Get raw `blocks` dependency edges as (issue_id, depends_on_id) pairs.
     ///
     /// This is a lightweight single-table query (no JOINs) suitable for
@@ -2810,9 +2779,15 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_blocks_dep_edges(&self) -> Result<Vec<(String, String)>> {
-        let rows = self
-            .conn
-            .query("SELECT issue_id, depends_on_id FROM dependencies WHERE type = 'blocks'")?;
+        let rows = self.conn.query(
+            r"
+            SELECT issue_id, depends_on_id FROM dependencies 
+            WHERE type IN ('blocks', 'conditional-blocks', 'waits-for')
+            UNION
+            SELECT depends_on_id, issue_id FROM dependencies 
+            WHERE type = 'parent-child'
+            ",
+        )?;
         Ok(rows
             .iter()
             .filter_map(|row| {

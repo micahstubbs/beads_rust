@@ -433,7 +433,7 @@ fn bottleneck_context(storage: &SqliteStorage) -> McpResult<String> {
 
     // Count how many open issues each open issue blocks
     let mut blocks_count: HashMap<&str, usize> = HashMap::new();
-    for (blocker, blocked) in &edges {
+    for (blocked, blocker) in &edges {
         if open_ids.contains(blocker.as_str()) && open_ids.contains(blocked.as_str()) {
             *blocks_count.entry(blocker.as_str()).or_default() += 1;
         }

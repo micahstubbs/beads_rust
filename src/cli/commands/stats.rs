@@ -1338,9 +1338,14 @@ mod tests {
             .add_dependency("t-2", "t-1", "blocks", "tester")
             .unwrap();
 
-        let blocked_ids = storage.get_blocked_by_blocks_deps_only().unwrap();
-        assert!(blocked_ids.contains("t-2"));
-        assert!(!blocked_ids.contains("t-1"));
+        let all_issues = [&blocking_issue, &dependent_issue]
+            .into_iter()
+            .map(stats_row)
+            .collect::<Vec<_>>();
+        let summary = compute_summary(&storage, &all_issues, None).unwrap();
+
+        assert_eq!(summary.blocked_issues, 1);
+        assert_eq!(summary.ready_issues, 1); // t-1 is ready, t-2 is blocked
     }
 
     #[test]
@@ -1421,9 +1426,14 @@ mod tests {
             .add_dependency("t-2", "t-1", "blocks", "tester")
             .unwrap();
 
-        let blocked_ids = storage.get_blocked_by_blocks_deps_only().unwrap();
+        let all_issues = [&blocking_issue, &dependent_issue]
+            .into_iter()
+            .map(stats_row)
+            .collect::<Vec<_>>();
+        let summary = compute_summary(&storage, &all_issues, None).unwrap();
+
         // t-2 should NOT be blocked because t-1 is closed
-        assert!(!blocked_ids.contains("t-2"));
+        assert_eq!(summary.blocked_issues, 0);
     }
 
     #[test]

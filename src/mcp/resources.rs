@@ -826,7 +826,7 @@ fn compute_bottlenecks(storage: &SqliteStorage) -> McpResult<serde_json::Value> 
 
     // Count how many open issues each open issue blocks
     let mut blocks_count: HashMap<&str, usize> = HashMap::new();
-    for (blocker, blocked) in &edges {
+    for (blocked, blocker) in &edges {
         if open_map.contains_key(blocker.as_str()) && open_map.contains_key(blocked.as_str()) {
             *blocks_count.entry(blocker.as_str()).or_default() += 1;
         }
