@@ -864,7 +864,6 @@ fn should_show_progress(json: bool, quiet: bool) -> bool {
 
 /// Execute the --import-only operation.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn execute_import(
     storage: &mut crate::storage::SqliteStorage,
     beads_dir: &std::path::Path,
