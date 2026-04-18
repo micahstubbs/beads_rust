@@ -132,11 +132,8 @@ pub fn execute(
     );
     let defer_jsonl_recovery =
         !args.status && !args.flush_only && !args.merge && args.rename_prefix;
-    let mut open_result = if defer_jsonl_recovery {
-        config::open_storage_with_cli_deferred_jsonl_recovery(&beads_dir, cli)?
-    } else {
-        config::open_storage_with_cli(&beads_dir, cli)?
-    };
+    let mut open_result =
+        config::open_storage_with_startup_config(startup, cli, defer_jsonl_recovery)?;
 
     // When `--rebuild` is requested against an existing (non-auto-rebuilt) DB,
     // delegate the actual rebuild to the same proven path that auto-recovery

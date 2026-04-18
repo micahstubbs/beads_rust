@@ -1501,22 +1501,22 @@ impl OpenStorageResult {
     }
 }
 
-/// Open storage with CLI overrides and support for `--no-db` mode.
+/// Open storage with a preloaded startup snapshot and support for `--no-db` mode.
 ///
 /// # Errors
 ///
-/// Returns an error if configuration loading, JSONL import, or storage setup fails.
-fn open_storage_with_cli_impl(
-    beads_dir: &Path,
+/// Returns an error if JSONL import or storage setup fails.
+pub(crate) fn open_storage_with_startup_config(
+    startup: StartupConfig,
     cli: &CliOverrides,
     defer_jsonl_recovery: bool,
 ) -> Result<OpenStorageResult> {
-    let startup = load_startup_config_with_paths(beads_dir, cli.db.as_ref())?;
     let StartupConfig {
         paths,
         layers: startup_layers,
         ..
     } = startup;
+    let beads_dir = paths.beads_dir.clone();
     let cli_layer = cli.as_layer();
 
     let mut all_layers = startup_layers.clone();
@@ -1525,7 +1525,7 @@ fn open_storage_with_cli_impl(
 
     let no_db = no_db_from_layer(&merged_layer).unwrap_or(false);
     let allow_external_jsonl =
-        implicit_external_jsonl_allowed(beads_dir, &paths.db_path, &paths.jsonl_path);
+        implicit_external_jsonl_allowed(&beads_dir, &paths.db_path, &paths.jsonl_path);
 
     let resolved_lock_timeout = cli
         .lock_timeout
@@ -1534,12 +1534,13 @@ fn open_storage_with_cli_impl(
 
     if no_db {
         let mut storage = SqliteStorage::open_memory()?;
-        let prefix = resolve_bootstrap_issue_prefix(&merged_layer, beads_dir, &paths.jsonl_path)?;
+        let prefix =
+            resolve_bootstrap_issue_prefix(&merged_layer, &beads_dir, &paths.jsonl_path)?;
         storage.set_config("issue_prefix", &prefix)?;
 
         if paths.jsonl_path.is_file() {
             let mut import_config =
-                import_config_for_resolved_jsonl(beads_dir, &paths.db_path, &paths.jsonl_path);
+                import_config_for_resolved_jsonl(&beads_dir, &paths.db_path, &paths.jsonl_path);
             import_config.skip_prefix_validation = true;
             import_from_jsonl(
                 &mut storage,
@@ -1569,14 +1570,14 @@ fn open_storage_with_cli_impl(
     } else {
         let (storage, auto_rebuilt, pending_recovery_backup) = if defer_jsonl_recovery {
             open_sqlite_storage_with_deferred_jsonl_recovery(
-                beads_dir,
+                &beads_dir,
                 &paths,
                 resolved_lock_timeout,
                 &merged_layer,
             )?
         } else {
             open_sqlite_storage_with_recovery(
-                beads_dir,
+                &beads_dir,
                 &paths,
                 resolved_lock_timeout,
                 &merged_layer,
@@ -1595,6 +1596,20 @@ fn open_storage_with_cli_impl(
             pending_recovery_backup,
         })
     }
+}
+
+/// Open storage with CLI overrides and support for `--no-db` mode.
+///
+/// # Errors
+///
+/// Returns an error if configuration loading, JSONL import, or storage setup fails.
+fn open_storage_with_cli_impl(
+    beads_dir: &Path,
+    cli: &CliOverrides,
+    defer_jsonl_recovery: bool,
+) -> Result<OpenStorageResult> {
+    let startup = load_startup_config_with_paths(beads_dir, cli.db.as_ref())?;
+    open_storage_with_startup_config(startup, cli, defer_jsonl_recovery)
 }
 
 pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<OpenStorageResult> {
@@ -4556,6 +4571,58 @@ routing:
         );
         assert!(!db_path.exists(), "cleanup should remove the fresh db path");
         assert!(!storage_ctx.auto_rebuilt);
+    }
+
+    #[test]
+    fn open_storage_with_startup_config_uses_preloaded_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let first_jsonl = beads_dir.join("first.jsonl");
+        let second_jsonl = beads_dir.join("second.jsonl");
+        write_single_issue_jsonl(&first_jsonl, "bd-first", "First startup snapshot");
+        write_single_issue_jsonl(&second_jsonl, "bd-second", "Mutated metadata path");
+
+        let metadata_path = beads_dir.join("metadata.json");
+        fs::write(
+            &metadata_path,
+            r#"{"database":"beads.db","jsonl_export":"first.jsonl"}"#,
+        )
+        .expect("write initial metadata");
+
+        let startup = load_startup_config_with_paths(&beads_dir, None).expect("load startup");
+
+        fs::write(
+            &metadata_path,
+            r#"{"database":"beads.db","jsonl_export":"second.jsonl"}"#,
+        )
+        .expect("rewrite metadata");
+
+        let cli = CliOverrides {
+            no_db: Some(true),
+            ..CliOverrides::default()
+        };
+        let storage_ctx =
+            open_storage_with_startup_config(startup, &cli, false).expect("open storage");
+
+        assert_eq!(storage_ctx.paths.jsonl_path, first_jsonl);
+        assert!(
+            storage_ctx
+                .storage
+                .get_issue("bd-first")
+                .expect("query preloaded jsonl issue")
+                .is_some(),
+            "preloaded startup snapshot should still import from the original JSONL path"
+        );
+        assert!(
+            storage_ctx
+                .storage
+                .get_issue("bd-second")
+                .expect("query mutated jsonl issue")
+                .is_none(),
+            "mutating metadata after startup load must not change the opened storage paths"
+        );
     }
 
     #[test]
