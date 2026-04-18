@@ -1145,6 +1145,397 @@ fn e2e_sync_import_force_preserves_integrity_and_close_works() {
     );
 }
 
+/// Regression coverage for the "rebuilt alternate DB" workflow seen during
+/// real planning sessions: create a sibling DB via
+/// `br --db <alt> sync --import-only --rebuild`, then continue working
+/// against that alternate DB family. Historically this was the matrix where
+/// freshly-created ids would sometimes appear in `br list` yet fail in
+/// `br show` / `br update` / `br dep add` with `Issue not found`.
+///
+/// The test keeps the rebuilt DB as the active target, then repeatedly:
+///   1. creates a fresh bead in the rebuilt DB,
+///   2. resolves it immediately via `show`,
+///   3. mutates it via `update`,
+///   4. adds a dependency to a seed bead that came from the rebuild,
+///   5. defers every other bead,
+/// while asserting the alternate DB stays readable by upstream sqlite3.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_rebuilt_alt_db_preserves_fresh_lookup_and_mutation_paths() {
+    const LOOP_COUNT: usize = 25;
+
+    let _log = common::test_log("e2e_rebuilt_alt_db_preserves_fresh_lookup_and_mutation_paths");
+    let workspace = BrWorkspace::new();
+    let mut artifacts = TestArtifacts::new(&workspace, "rebuilt_alt_db_fresh_lookup");
+
+    let init = run_br(
+        &workspace,
+        ["init", "--prefix", "alt"],
+        "init_alt_workspace",
+    );
+    artifacts.record_command(
+        "init_alt_workspace",
+        &init.stdout,
+        &init.stderr,
+        init.status.success(),
+    );
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let seed_a = run_br(
+        &workspace,
+        [
+            "create",
+            "--title",
+            "seed A",
+            "--type",
+            "task",
+            "--priority",
+            "2",
+            "--json",
+        ],
+        "create_seed_a",
+    );
+    artifacts.record_command(
+        "create_seed_a",
+        &seed_a.stdout,
+        &seed_a.stderr,
+        seed_a.status.success(),
+    );
+    assert!(
+        seed_a.status.success(),
+        "seed A create failed: {}",
+        seed_a.stderr
+    );
+    let seed_a_payload = common::cli::extract_json_payload(&seed_a.stdout);
+    let seed_a_json: serde_json::Value =
+        serde_json::from_str(&seed_a_payload).expect("seed A create json");
+    let seed_a_id = seed_a_json["id"].as_str().expect("seed A id").to_string();
+
+    let seed_b = run_br(
+        &workspace,
+        [
+            "create",
+            "--title",
+            "seed B",
+            "--type",
+            "task",
+            "--priority",
+            "2",
+            "--json",
+        ],
+        "create_seed_b",
+    );
+    artifacts.record_command(
+        "create_seed_b",
+        &seed_b.stdout,
+        &seed_b.stderr,
+        seed_b.status.success(),
+    );
+    assert!(
+        seed_b.status.success(),
+        "seed B create failed: {}",
+        seed_b.stderr
+    );
+    let seed_b_payload = common::cli::extract_json_payload(&seed_b.stdout);
+    let seed_b_json: serde_json::Value =
+        serde_json::from_str(&seed_b_payload).expect("seed B create json");
+    let seed_b_id = seed_b_json["id"].as_str().expect("seed B id").to_string();
+
+    let flush = run_br(
+        &workspace,
+        ["sync", "--flush-only"],
+        "flush_before_alt_rebuild",
+    );
+    artifacts.record_command(
+        "flush_before_alt_rebuild",
+        &flush.stdout,
+        &flush.stderr,
+        flush.status.success(),
+    );
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
+
+    let beads_dir = workspace.root.join(".beads");
+    let jsonl_path = beads_dir.join("issues.jsonl");
+    artifacts.capture_jsonl("before_alt_rebuild", &jsonl_path);
+
+    let alt_db = beads_dir.join("beads.rebuilt.db");
+    let rebuild = run_br(
+        &workspace,
+        [
+            "--db",
+            alt_db.to_str().expect("alt db path"),
+            "sync",
+            "--import-only",
+            "--rebuild",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "rebuild_alt_db",
+    );
+    artifacts.record_command(
+        "rebuild_alt_db",
+        &rebuild.stdout,
+        &rebuild.stderr,
+        rebuild.status.success(),
+    );
+    assert!(
+        rebuild.status.success(),
+        "alt-db rebuild failed: stdout={} stderr={}",
+        rebuild.stdout,
+        rebuild.stderr
+    );
+
+    let integrity_after_rebuild = run_sqlite3_pragma_integrity_check(&alt_db);
+    artifacts.record_command(
+        "integrity_after_rebuild",
+        &integrity_after_rebuild,
+        "",
+        integrity_after_rebuild.trim() == "ok",
+    );
+    assert_eq!(
+        integrity_after_rebuild.trim(),
+        "ok",
+        "rebuilt alternate DB must pass upstream sqlite3 integrity_check before we trust it.\noutput: {integrity_after_rebuild}"
+    );
+
+    let dep_seed = run_br(
+        &workspace,
+        [
+            "--db",
+            alt_db.to_str().expect("alt db path"),
+            "dep",
+            "add",
+            &seed_b_id,
+            &seed_a_id,
+            "--json",
+        ],
+        "seed_dep_add_after_rebuild",
+    );
+    artifacts.record_command(
+        "seed_dep_add_after_rebuild",
+        &dep_seed.stdout,
+        &dep_seed.stderr,
+        dep_seed.status.success(),
+    );
+    assert!(
+        dep_seed.status.success(),
+        "seed dep add failed after rebuild: stdout={} stderr={}",
+        dep_seed.stdout,
+        dep_seed.stderr
+    );
+
+    for i in 0..LOOP_COUNT {
+        let title = format!("rebuilt alt lookup loop {i}");
+        let create = run_br(
+            &workspace,
+            [
+                "--db",
+                alt_db.to_str().expect("alt db path"),
+                "create",
+                "--title",
+                &title,
+                "--type",
+                "task",
+                "--priority",
+                "2",
+                "--json",
+            ],
+            &format!("loop_create_{i}"),
+        );
+        artifacts.record_command(
+            &format!("loop_create_{i}"),
+            &create.stdout,
+            &create.stderr,
+            create.status.success(),
+        );
+        assert!(
+            create.status.success(),
+            "create in rebuilt alt DB failed on loop {i}: stdout={} stderr={}",
+            create.stdout,
+            create.stderr
+        );
+        let create_payload = common::cli::extract_json_payload(&create.stdout);
+        let create_json: serde_json::Value =
+            serde_json::from_str(&create_payload).expect("loop create json");
+        let fresh_id = create_json["id"]
+            .as_str()
+            .expect("fresh issue id")
+            .to_string();
+
+        let show = run_br(
+            &workspace,
+            [
+                "--db",
+                alt_db.to_str().expect("alt db path"),
+                "show",
+                &fresh_id,
+                "--json",
+            ],
+            &format!("loop_show_{i}"),
+        );
+        artifacts.record_command(
+            &format!("loop_show_{i}"),
+            &show.stdout,
+            &show.stderr,
+            show.status.success(),
+        );
+        assert!(
+            show.status.success(),
+            "show failed for freshly-created id {fresh_id} on loop {i}: stdout={} stderr={}",
+            show.stdout,
+            show.stderr
+        );
+        assert!(
+            !show.stderr.contains("Issue not found") && !show.stdout.contains("Issue not found"),
+            "show reported 'Issue not found' for freshly-created id {fresh_id} on loop {i}: stdout={} stderr={}",
+            show.stdout,
+            show.stderr
+        );
+        let show_payload = common::cli::extract_json_payload(&show.stdout);
+        let show_json: serde_json::Value =
+            serde_json::from_str(&show_payload).expect("show json payload");
+        let show_items = show_json.as_array().expect("show payload array");
+        assert_eq!(
+            show_items.len(),
+            1,
+            "show should return exactly one issue for {fresh_id} on loop {i}: {show_payload}"
+        );
+        assert_eq!(
+            show_items[0]["id"].as_str(),
+            Some(fresh_id.as_str()),
+            "show returned the wrong issue for {fresh_id} on loop {i}: {show_payload}"
+        );
+
+        let update = run_br(
+            &workspace,
+            [
+                "--db",
+                alt_db.to_str().expect("alt db path"),
+                "update",
+                &fresh_id,
+                "--notes",
+                &format!("loop note {i}"),
+                "--json",
+            ],
+            &format!("loop_update_{i}"),
+        );
+        artifacts.record_command(
+            &format!("loop_update_{i}"),
+            &update.stdout,
+            &update.stderr,
+            update.status.success(),
+        );
+        assert!(
+            update.status.success(),
+            "update failed for freshly-created id {fresh_id} on loop {i}: stdout={} stderr={}",
+            update.stdout,
+            update.stderr
+        );
+        assert!(
+            !update.stderr.contains("Issue not found")
+                && !update.stdout.contains("Issue not found"),
+            "update reported 'Issue not found' for freshly-created id {fresh_id} on loop {i}: stdout={} stderr={}",
+            update.stdout,
+            update.stderr
+        );
+
+        let dep_add = run_br(
+            &workspace,
+            [
+                "--db",
+                alt_db.to_str().expect("alt db path"),
+                "dep",
+                "add",
+                &fresh_id,
+                &seed_a_id,
+                "--json",
+            ],
+            &format!("loop_dep_add_{i}"),
+        );
+        artifacts.record_command(
+            &format!("loop_dep_add_{i}"),
+            &dep_add.stdout,
+            &dep_add.stderr,
+            dep_add.status.success(),
+        );
+        assert!(
+            dep_add.status.success(),
+            "dep add failed for freshly-created id {fresh_id} on loop {i}: stdout={} stderr={}",
+            dep_add.stdout,
+            dep_add.stderr
+        );
+        assert!(
+            !dep_add.stderr.contains("Issue not found")
+                && !dep_add.stdout.contains("Issue not found"),
+            "dep add reported 'Issue not found' for freshly-created id {fresh_id} on loop {i}: stdout={} stderr={}",
+            dep_add.stdout,
+            dep_add.stderr
+        );
+
+        if i % 2 == 0 {
+            let defer = run_br(
+                &workspace,
+                [
+                    "--db",
+                    alt_db.to_str().expect("alt db path"),
+                    "defer",
+                    &fresh_id,
+                    "--until",
+                    "2099-01-01",
+                    "--json",
+                ],
+                &format!("loop_defer_{i}"),
+            );
+            artifacts.record_command(
+                &format!("loop_defer_{i}"),
+                &defer.stdout,
+                &defer.stderr,
+                defer.status.success(),
+            );
+            assert!(
+                defer.status.success(),
+                "defer failed for freshly-created id {fresh_id} on loop {i}: stdout={} stderr={}",
+                defer.stdout,
+                defer.stderr
+            );
+            assert!(
+                !defer.stderr.contains("Issue not found")
+                    && !defer.stdout.contains("Issue not found"),
+                "defer reported 'Issue not found' for freshly-created id {fresh_id} on loop {i}: stdout={} stderr={}",
+                defer.stdout,
+                defer.stderr
+            );
+        }
+    }
+
+    let integrity_after_loops = run_sqlite3_pragma_integrity_check(&alt_db);
+    artifacts.record_command(
+        "integrity_after_loops",
+        &integrity_after_loops,
+        "",
+        integrity_after_loops.trim() == "ok",
+    );
+    assert_eq!(
+        integrity_after_loops.trim(),
+        "ok",
+        "alternate DB must stay readable by upstream sqlite3 after repeated fresh-id mutations.\noutput: {integrity_after_loops}"
+    );
+
+    artifacts.capture_jsonl("after_alt_db_loops", &jsonl_path);
+    artifacts.persist();
+
+    eprintln!(
+        "[PASS] e2e_rebuilt_alt_db_preserves_fresh_lookup_and_mutation_paths\n\
+         - Rebuilt alternate DB from canonical JSONL\n\
+         - Exercised {LOOP_COUNT} fresh create/show/update/dep/defer loops on the rebuilt DB\n\
+         - No command reported 'Issue not found' for freshly-created IDs\n\
+         - Upstream sqlite3 integrity_check stayed clean\n\
+         - Artifacts saved to: {:?}",
+        artifacts.artifact_dir
+    );
+}
+
 /// Invoke the C `sqlite3` CLI to run `PRAGMA integrity_check` against the
 /// given database.  Returns stdout verbatim (expected to be "ok\n" for a
 /// clean DB).  If the binary is missing the test falls back to the string
