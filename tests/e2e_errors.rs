@@ -955,9 +955,8 @@ fn e2e_sync_rename_prefix_validation_failure_does_not_create_missing_db() {
 
 #[test]
 fn e2e_sync_rename_prefix_import_failure_does_not_leave_missing_db_created() {
-    let _log = common::test_log(
-        "e2e_sync_rename_prefix_import_failure_does_not_leave_missing_db_created",
-    );
+    let _log =
+        common::test_log("e2e_sync_rename_prefix_import_failure_does_not_leave_missing_db_created");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");

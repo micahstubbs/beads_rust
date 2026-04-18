@@ -1381,12 +1381,12 @@ impl OpenStorageResult {
             self.storage =
                 SqliteStorage::open_with_timeout(&self.paths.db_path, self.resolved_lock_timeout)
                     .map_err(|reopen_err| BeadsError::WithContext {
-                        context: format!(
-                            "Restored the original database family at '{}' but failed to reopen it",
-                            self.paths.db_path.display()
-                        ),
-                        source: Box::new(BeadsError::from(reopen_err)),
-                    })?;
+                    context: format!(
+                        "Restored the original database family at '{}' but failed to reopen it",
+                        self.paths.db_path.display()
+                    ),
+                    source: Box::new(BeadsError::from(reopen_err)),
+                })?;
         }
         self.loaded_jsonl_hash = None;
         self.auto_rebuilt = false;
@@ -1534,8 +1534,7 @@ pub(crate) fn open_storage_with_startup_config(
 
     if no_db {
         let mut storage = SqliteStorage::open_memory()?;
-        let prefix =
-            resolve_bootstrap_issue_prefix(&merged_layer, &beads_dir, &paths.jsonl_path)?;
+        let prefix = resolve_bootstrap_issue_prefix(&merged_layer, &beads_dir, &paths.jsonl_path)?;
         storage.set_config("issue_prefix", &prefix)?;
 
         if paths.jsonl_path.is_file() {
