@@ -118,6 +118,18 @@ pub fn execute(
     // semantics (ID rewrites and duplicate external_ref cleanup) are applied
     // in the same invocation instead of being skipped by open-time recovery.
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+    let startup = config::load_startup_config_with_paths(&beads_dir, cli.db.as_ref())?;
+    let path_policy = validate_sync_paths(
+        &beads_dir,
+        &startup.paths.jsonl_path,
+        args.allow_external_jsonl,
+    )?;
+    debug!(
+        jsonl_path = %path_policy.jsonl_path.display(),
+        manifest_path = %path_policy.manifest_path.display(),
+        external_jsonl = path_policy.is_external,
+        "Resolved sync path policy"
+    );
     let defer_jsonl_recovery =
         !args.status && !args.flush_only && !args.merge && args.rename_prefix;
     let mut open_result = if defer_jsonl_recovery {
@@ -178,18 +190,10 @@ pub fn execute(
 
     let command_result = (|| {
         let db_path = open_result.paths.db_path.clone();
-        let jsonl_path = open_result.paths.jsonl_path.clone();
         let retention_days = open_result.paths.metadata.deletions_retention_days;
         let use_json = ctx.is_json() || args.robot;
         let quiet = cli.quiet.unwrap_or(false);
         let show_progress = should_show_progress(use_json, quiet);
-        let path_policy = validate_sync_paths(&beads_dir, &jsonl_path, args.allow_external_jsonl)?;
-        debug!(
-            jsonl_path = %path_policy.jsonl_path.display(),
-            manifest_path = %path_policy.manifest_path.display(),
-            external_jsonl = path_policy.is_external,
-            "Resolved sync path policy"
-        );
 
         // Handle --status flag
         if args.status {

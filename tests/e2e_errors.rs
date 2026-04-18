@@ -889,6 +889,71 @@ fn e2e_sync_rename_prefix_validation_failure_restores_original_corrupt_db_family
 }
 
 #[test]
+fn e2e_sync_rename_prefix_validation_failure_does_not_create_missing_db() {
+    let _log =
+        common::test_log("e2e_sync_rename_prefix_validation_failure_does_not_create_missing_db");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let external_dir = workspace.root.join("external-jsonl");
+    fs::create_dir_all(&external_dir).expect("create external dir");
+    let external_jsonl = external_dir.join("metadata.jsonl");
+    fs::write(
+        &external_jsonl,
+        "{\"id\":\"legacy-1\",\"title\":\"External metadata JSONL\",\"status\":\"open\",\"priority\":2,\"issue_type\":\"task\",\"created_at\":\"2026-01-01T00:00:00Z\",\"updated_at\":\"2026-01-01T00:00:00Z\"}\n",
+    )
+    .expect("write external jsonl");
+
+    let metadata_path = workspace.root.join(".beads").join("metadata.json");
+    let metadata_json = format!(
+        r#"{{"database":"beads.db","jsonl_export":"{}"}}"#,
+        external_jsonl.display()
+    );
+    fs::write(&metadata_path, metadata_json).expect("write metadata");
+
+    let alt_db = workspace
+        .root
+        .join(".beads")
+        .join("deferred-recovery-validation-missing-alt.db");
+    assert!(
+        !alt_db.exists(),
+        "precondition: alternate db should start missing"
+    );
+
+    let result = run_br(
+        &workspace,
+        [
+            "--db",
+            alt_db.to_str().expect("alt db path"),
+            "sync",
+            "--import-only",
+            "--rename-prefix",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "sync_failed_deferred_recovery_validation_missing_db",
+    );
+    assert!(
+        !result.status.success(),
+        "external metadata JSONL without allow flag should fail validation"
+    );
+    let combined = format!("{}{}", result.stdout, result.stderr);
+    assert!(
+        combined.contains("external")
+            || combined.contains("allow-external-jsonl")
+            || combined.contains("outside"),
+        "unexpected validation failure output: {combined}"
+    );
+    assert!(
+        !alt_db.exists(),
+        "validation failure should not create a fresh alternate db"
+    );
+}
+
+#[test]
 fn e2e_sync_export_guards() {
     let _log = common::test_log("e2e_sync_export_guards");
     let workspace = BrWorkspace::new();
