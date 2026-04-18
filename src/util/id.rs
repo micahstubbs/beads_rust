@@ -709,11 +709,16 @@ impl IdResolver {
         // Step 3: Substring match on hash portion
         if self.config.allow_substring_match {
             // Extract the potential hash portion (after dash, or entire input if no dash)
-            let hash_pattern = split_prefix_remainder(&normalized)
-                .map_or(normalized.as_str(), |(_, remainder)| remainder);
+            let (prefix, hash_pattern) = split_prefix_remainder(&normalized)
+                .map_or((None, normalized.as_str()), |(p, r)| (Some(p), r));
 
             if !hash_pattern.is_empty() {
-                let matches = substring_match_fn(hash_pattern);
+                let mut matches = substring_match_fn(hash_pattern);
+                
+                if let Some(p) = prefix {
+                    let expected_prefix = format!("{p}-");
+                    matches.retain(|id| id.starts_with(&expected_prefix));
+                }
 
                 match matches.len() {
                     0 => {
@@ -792,11 +797,16 @@ impl IdResolver {
         }
 
         if self.config.allow_substring_match {
-            let hash_pattern = split_prefix_remainder(&normalized)
-                .map_or(normalized.as_str(), |(_, remainder)| remainder);
+            let (prefix, hash_pattern) = split_prefix_remainder(&normalized)
+                .map_or((None, normalized.as_str()), |(p, r)| (Some(p), r));
 
             if !hash_pattern.is_empty() {
-                let matches = substring_match_fn(hash_pattern)?;
+                let mut matches = substring_match_fn(hash_pattern)?;
+                
+                if let Some(p) = prefix {
+                    let expected_prefix = format!("{p}-");
+                    matches.retain(|id| id.starts_with(&expected_prefix));
+                }
 
                 match matches.len() {
                     0 => {}
