@@ -617,7 +617,16 @@ fn execute_import(
         // Resolve parent (item-specific header or CLI global fallback)
         let parent_candidate = parsed.parent.as_deref().or(args.parent.as_deref());
         let resolved_parent = parent_candidate
-            .map(|p| resolve_issue_id(storage, &id_resolver, p))
+            .map(|p| {
+                let p_lower = p.to_lowercase();
+                if let Some(id) = standin_to_id.get(&p_lower) {
+                    Ok(id.clone())
+                } else if let Some(id) = title_to_id.get(&p_lower) {
+                    Ok(id.clone())
+                } else {
+                    resolve_issue_id(storage, &id_resolver, p)
+                }
+            })
             .transpose()?;
 
         let mut retries = 0;

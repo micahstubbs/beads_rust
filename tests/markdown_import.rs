@@ -473,8 +473,8 @@ invalid-type:bd-123
     assert!(
         output
             .stderr
-            .contains("warning: skipping invalid dependency type"),
-        "expected warning for invalid dependency type"
+            .contains("Issue not found: invalid-type:bd-123"),
+        "expected warning for missing issue id"
     );
 }
 

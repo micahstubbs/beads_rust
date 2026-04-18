@@ -431,8 +431,13 @@ pub fn parse_dependency(dep_str: &str) -> (String, String, bool) {
     } else if let Some((type_part, id_part)) = dep_str.split_once(':') {
         let type_part = type_part.trim();
         let id_part = id_part.trim();
-        let is_valid = validate_dependency_type(type_part).is_some();
-        (type_part.to_string(), id_part.to_string(), is_valid)
+        if validate_dependency_type(type_part).is_some() {
+            (type_part.to_string(), id_part.to_string(), true)
+        } else {
+            // Type part is not a valid dependency type, so the colon is likely part of the title/ID.
+            // Treat the whole string as the ID with default 'blocks' type.
+            ("blocks".to_string(), dep_str.trim().to_string(), true)
+        }
     } else {
         ("blocks".to_string(), dep_str.to_string(), true)
     }
@@ -640,10 +645,11 @@ This is the actual description.
         assert_eq!(id, "bd-456");
         assert!(valid);
 
+        // Invalid type prefixes should now be treated as part of the ID (e.g. for title matches)
         let (t, id, valid) = parse_dependency("invalid:bd-789");
-        assert_eq!(t, "invalid");
-        assert_eq!(id, "bd-789");
-        assert!(!valid);
+        assert_eq!(t, "blocks");
+        assert_eq!(id, "invalid:bd-789");
+        assert!(valid);
     }
 
     #[test]
