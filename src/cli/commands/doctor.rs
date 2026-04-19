@@ -1716,7 +1716,15 @@ fn select_doctor_jsonl_path(beads_dir: &Path, paths: &config::ConfigPaths) -> Op
     }
 }
 
-fn check_jsonl(path: &Path, checks: &mut Vec<CheckResult>) -> Result<usize> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonlCountState {
+    Available(usize),
+    Invalid,
+    Missing,
+    Unreadable,
+}
+
+fn check_jsonl(path: &Path, checks: &mut Vec<CheckResult>) -> Result<JsonlCountState> {
     let summary = validate_jsonl_issue_records(path)?;
 
     if summary.invalid_count == 0 {
@@ -1730,6 +1738,7 @@ fn check_jsonl(path: &Path, checks: &mut Vec<CheckResult>) -> Result<usize> {
                 "records": summary.record_count
             })),
         );
+        Ok(JsonlCountState::Available(summary.record_count))
     } else {
         let preview = summary.preview_messages();
         push_check(
@@ -1760,14 +1769,13 @@ fn check_jsonl(path: &Path, checks: &mut Vec<CheckResult>) -> Result<usize> {
                     .collect::<Vec<_>>()
             })),
         );
+        Ok(JsonlCountState::Invalid)
     }
-
-    Ok(summary.record_count)
 }
 
 fn check_db_count(
     conn: &Connection,
-    jsonl_count: Option<usize>,
+    jsonl_count: JsonlCountState,
     checks: &mut Vec<CheckResult>,
 ) -> Result<()> {
     let db_count: i64 = conn.query_row(
@@ -1777,37 +1785,58 @@ fn check_db_count(
         .and_then(SqliteValue::as_integer)
         .unwrap_or(0);
 
-    if let Some(jsonl_count) = jsonl_count {
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let db_count_usize = db_count as usize;
-        if db_count_usize == jsonl_count {
-            push_check(
-                checks,
-                "counts.db_vs_jsonl",
-                CheckStatus::Ok,
-                Some(format!("Both have {db_count} records")),
-                None,
-            );
-        } else {
+    match jsonl_count {
+        JsonlCountState::Available(jsonl_count) => {
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            let db_count_usize = db_count as usize;
+            if db_count_usize == jsonl_count {
+                push_check(
+                    checks,
+                    "counts.db_vs_jsonl",
+                    CheckStatus::Ok,
+                    Some(format!("Both have {db_count} records")),
+                    None,
+                );
+            } else {
+                push_check(
+                    checks,
+                    "counts.db_vs_jsonl",
+                    CheckStatus::Warn,
+                    Some("DB and JSONL counts differ".to_string()),
+                    Some(serde_json::json!({
+                        "db": db_count,
+                        "jsonl": jsonl_count
+                    })),
+                );
+            }
+        }
+        JsonlCountState::Invalid => {
             push_check(
                 checks,
                 "counts.db_vs_jsonl",
                 CheckStatus::Warn,
-                Some("DB and JSONL counts differ".to_string()),
-                Some(serde_json::json!({
-                    "db": db_count,
-                    "jsonl": jsonl_count
-                })),
+                Some("JSONL is invalid; cannot compare counts".to_string()),
+                Some(serde_json::json!({ "db": db_count })),
             );
         }
-    } else {
-        push_check(
-            checks,
-            "counts.db_vs_jsonl",
-            CheckStatus::Warn,
-            Some("JSONL not found; cannot compare counts".to_string()),
-            Some(serde_json::json!({ "db": db_count })),
-        );
+        JsonlCountState::Missing => {
+            push_check(
+                checks,
+                "counts.db_vs_jsonl",
+                CheckStatus::Warn,
+                Some("JSONL not found; cannot compare counts".to_string()),
+                Some(serde_json::json!({ "db": db_count })),
+            );
+        }
+        JsonlCountState::Unreadable => {
+            push_check(
+                checks,
+                "counts.db_vs_jsonl",
+                CheckStatus::Warn,
+                Some("JSONL unreadable; cannot compare counts".to_string()),
+                Some(serde_json::json!({ "db": db_count })),
+            );
+        }
     }
 
     Ok(())
@@ -2230,14 +2259,14 @@ fn inspect_doctor_jsonl(
     beads_dir: &Path,
     paths: &config::ConfigPaths,
     checks: &mut Vec<CheckResult>,
-) -> (Option<PathBuf>, Option<usize>) {
+) -> (Option<PathBuf>, JsonlCountState) {
     let jsonl_path = select_doctor_jsonl_path(beads_dir, paths);
     let jsonl_count = if let Some(path) = jsonl_path.as_ref() {
         check_sync_jsonl_path(path, beads_dir, checks);
         check_sync_conflict_markers(path, checks);
 
         match check_jsonl(path, checks) {
-            Ok(count) => Some(count),
+            Ok(count) => count,
             Err(err) => {
                 push_check(
                     checks,
@@ -2246,7 +2275,7 @@ fn inspect_doctor_jsonl(
                     Some(format!("Failed to read JSONL: {err}")),
                     Some(serde_json::json!({ "path": path.display().to_string() })),
                 );
-                None
+                JsonlCountState::Unreadable
             }
         }
     } else {
@@ -2257,7 +2286,7 @@ fn inspect_doctor_jsonl(
             Some("No JSONL file found (.beads/issues.jsonl or .beads/beads.jsonl)".to_string()),
             None,
         );
-        None
+        JsonlCountState::Missing
     };
 
     (jsonl_path, jsonl_count)
@@ -2267,7 +2296,7 @@ fn inspect_doctor_database(
     beads_dir: &Path,
     db_path: &Path,
     jsonl_path: Option<&Path>,
-    jsonl_count: Option<usize>,
+    jsonl_count: JsonlCountState,
     checks: &mut Vec<CheckResult>,
 ) {
     if let Err(err) = check_recovery_artifacts(beads_dir, db_path, checks) {
@@ -2303,7 +2332,7 @@ fn inspect_doctor_database(
 fn inspect_existing_doctor_database(
     db_path: &Path,
     jsonl_path: Option<&Path>,
-    jsonl_count: Option<usize>,
+    jsonl_count: JsonlCountState,
     checks: &mut Vec<CheckResult>,
 ) {
     match config::with_database_family_snapshot(db_path, |snapshot_db_path| {
@@ -2757,8 +2786,8 @@ mod tests {
         std::io::Write::write_all(file.as_file_mut(), b"{bad json}\n")?;
 
         let mut checks = Vec::new();
-        let count = check_jsonl(file.path(), &mut checks).unwrap();
-        assert_eq!(count, 2);
+        let state = check_jsonl(file.path(), &mut checks).unwrap();
+        assert_eq!(state, JsonlCountState::Invalid);
 
         let check = find_check(&checks, "jsonl.parse").expect("check present");
         assert!(matches!(check.status, CheckStatus::Error));
@@ -2776,8 +2805,8 @@ mod tests {
         std::io::Write::write_all(file.as_file_mut(), b"\n")?;
 
         let mut checks = Vec::new();
-        let count = check_jsonl(file.path(), &mut checks).unwrap();
-        assert_eq!(count, 1);
+        let state = check_jsonl(file.path(), &mut checks).unwrap();
+        assert_eq!(state, JsonlCountState::Invalid);
 
         let check = find_check(&checks, "jsonl.parse").expect("check present");
         assert!(matches!(check.status, CheckStatus::Error));
@@ -2791,6 +2820,65 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn test_check_jsonl_returns_count_only_for_valid_records() -> Result<()> {
+        let mut file = NamedTempFile::new().unwrap();
+        let issue = sample_issue("bd-good01", "Good issue");
+        let encoded = serde_json::to_string(&issue)?;
+        std::io::Write::write_all(file.as_file_mut(), encoded.as_bytes())?;
+        std::io::Write::write_all(file.as_file_mut(), b"\n")?;
+
+        let mut checks = Vec::new();
+        let state = check_jsonl(file.path(), &mut checks).unwrap();
+        assert_eq!(state, JsonlCountState::Available(1));
+
+        let check = find_check(&checks, "jsonl.parse").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_collect_doctor_report_skips_count_comparison_for_invalid_jsonl() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .create_issue(&sample_issue("bd-test01", "Doctor count source"), "doctor-test")
+            .unwrap();
+
+        let valid_json = serde_json::to_string(&sample_issue("bd-test01", "Doctor count source"))
+            .unwrap();
+        fs::write(&jsonl_path, format!("{valid_json}\n{{bad json}}\n")).unwrap();
+
+        let paths = config::ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path,
+            jsonl_path,
+            metadata: config::Metadata::default(),
+        };
+
+        let report = collect_doctor_report(&beads_dir, &paths).expect("doctor report");
+        let parse_check = find_check(&report.report.checks, "jsonl.parse").expect("jsonl parse");
+        let counts_check =
+            find_check(&report.report.checks, "counts.db_vs_jsonl").expect("count check");
+
+        assert!(matches!(parse_check.status, CheckStatus::Error));
+        assert!(matches!(counts_check.status, CheckStatus::Warn));
+        assert!(
+            counts_check
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("JSONL is invalid")),
+            "unexpected count-check message: {:?}",
+            counts_check.message
+        );
     }
 
     #[test]
@@ -3262,7 +3350,7 @@ mod tests {
         lock_conn.execute("BEGIN IMMEDIATE").unwrap();
 
         let mut checks = Vec::new();
-        inspect_existing_doctor_database(&db_path, None, None, &mut checks);
+        inspect_existing_doctor_database(&db_path, None, JsonlCountState::Missing, &mut checks);
 
         let check = find_check(&checks, "db.write_probe").expect("check present");
         assert!(
