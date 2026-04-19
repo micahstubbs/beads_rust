@@ -461,7 +461,16 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
         return true;
     }
     match cmd {
-        Commands::Sync(args) => !args.flush_only && !args.status,
+        // Every sync mode except `--status` writes to the SQLite database.
+        // `--flush-only` looks like a "just rewrite JSONL" path but also calls
+        // `finalize_export` inside a `with_write_transaction`, updating dirty
+        // flags, export hashes, and metadata (jsonl_content_hash,
+        // last_export_time, needs_flush). Without the `.write.lock`, a
+        // concurrent `br sync --flush-only` racing with another process's
+        // auto-flush (or a second `--flush-only`) can trip fsqlite's
+        // concurrent-write deadlock that this lock was specifically added
+        // to prevent (issue #243). Only `--status` is truly read-only.
+        Commands::Sync(args) => !args.status,
         Commands::Config { command } => matches!(
             command,
             beads_rust::cli::ConfigCommands::Set { .. }
@@ -747,6 +756,36 @@ mod tests {
         let sync_cmd = Cli::parse_from(["br", "sync"]).command;
         assert!(!is_mutating_command(&sync_cmd));
         assert!(!should_auto_import(&sync_cmd));
+    }
+
+    #[test]
+    fn sync_flush_only_requires_write_lock() {
+        // Regression: `br sync --flush-only` calls `finalize_export` inside a
+        // `with_write_transaction` (clears dirty flags, updates
+        // jsonl_content_hash + last_export_time + needs_flush metadata, writes
+        // export hashes). That makes it a write-side operation as far as
+        // fsqlite is concerned. Previously the `needs_write_lock` match arm
+        // excluded `--flush-only`, leaving two concurrent `br sync
+        // --flush-only` invocations — or one racing a mutating command's
+        // auto-flush — to hit the fsqlite concurrent-write deadlock that the
+        // `.write.lock` was specifically introduced (issue #243) to prevent.
+        let flush_only = Cli::parse_from(["br", "sync", "--flush-only"]).command;
+        let status = Cli::parse_from(["br", "sync", "--status"]).command;
+        let merge = Cli::parse_from(["br", "sync", "--merge"]).command;
+        let import_only = Cli::parse_from(["br", "sync", "--import-only"]).command;
+        let default_sync = Cli::parse_from(["br", "sync"]).command;
+
+        assert!(
+            needs_write_lock(&flush_only),
+            "`br sync --flush-only` writes DB metadata and must serialize via .write.lock"
+        );
+        assert!(
+            !needs_write_lock(&status),
+            "`br sync --status` is read-only and must not block on .write.lock"
+        );
+        assert!(needs_write_lock(&merge));
+        assert!(needs_write_lock(&import_only));
+        assert!(needs_write_lock(&default_sync));
     }
 
     #[test]
