@@ -611,15 +611,21 @@ fn execute_flush(
     let db_issue_count = storage.count_issues()?;
     debug!(dirty_count = dirty_ids.len(), "Found dirty issues");
 
+    // Refuse to overwrite a JSONL that still holds unresolved merge-conflict
+    // markers. The main flush path below would blow away the `<<<<<<<` /
+    // `=======` / `>>>>>>>` regions along with whatever remote side of the
+    // merge they contain, silently resolving the conflict in favor of the
+    // local DB. Detect the markers up-front so the operator can resolve the
+    // merge (or pass `--force` if they actually intend the DB to win).
+    if jsonl_exists && !args.force {
+        crate::sync::ensure_no_conflict_markers(jsonl_path)?;
+    }
+
     // If no dirty issues and no force, report nothing to do
     if dirty_ids.is_empty() && !needs_flush && jsonl_exists && !args.force {
-        // Before we parse the existing JSONL for the divergence/empty-DB
-        // safety checks, detect unresolved merge-conflict markers. Those
-        // would otherwise fall out of `count_issues_in_jsonl` /
-        // `get_issue_ids_from_jsonl` below as a generic "Invalid JSON at
-        // line 1" error, hiding the much more actionable
-        // "merge conflict markers detected" guidance.
-        crate::sync::ensure_no_conflict_markers(jsonl_path)?;
+        // `ensure_no_conflict_markers` ran above before we got here, so
+        // `count_issues_in_jsonl` / `get_issue_ids_from_jsonl` below won't
+        // trip over unresolved `<<<<<<<` / `=======` / `>>>>>>>` lines.
 
         // Guard against empty DB overwriting a non-empty JSONL.
         let existing_count = count_issues_in_jsonl(jsonl_path)?;
@@ -1593,6 +1599,8 @@ fn restore_tombstones(
     storage.with_write_transaction(|storage| {
         for tombstone in tombstones {
             storage.upsert_issue_for_import(&tombstone.issue)?;
+        }
+        for tombstone in tombstones {
             if let Some(labels) = &tombstone.labels {
                 storage.sync_labels_for_import(&tombstone.issue.id, labels)?;
             }
@@ -2250,6 +2258,37 @@ mod tests {
         assert!(storage.get_labels("bd-delete").unwrap().is_empty());
         assert!(storage.get_dependencies_full("bd-delete").unwrap().is_empty());
         assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_restore_tombstones_restores_dependencies_between_preserved_tombstones() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let first = make_test_issue("bd-first", "First");
+        let second = make_test_issue("bd-second", "Second");
+        storage.create_issue(&first, "test").unwrap();
+        storage.create_issue(&second, "test").unwrap();
+        storage
+            .add_dependency("bd-first", "bd-second", "blocks", "test")
+            .unwrap();
+        storage
+            .delete_issue("bd-first", "test", "deleted for rebuild", None)
+            .unwrap();
+        storage
+            .delete_issue("bd-second", "test", "deleted for rebuild", None)
+            .unwrap();
+
+        let tombstones = snapshot_tombstones(&storage).unwrap();
+
+        storage.reset_data_tables().unwrap();
+        restore_tombstones(&mut storage, &tombstones).unwrap();
+
+        let dependencies = storage.get_dependencies_full("bd-first").unwrap();
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].depends_on_id, "bd-second");
+        let mut dirty_ids = storage.get_dirty_issue_ids().unwrap();
+        dirty_ids.sort();
+        assert_eq!(dirty_ids, vec!["bd-first".to_string(), "bd-second".to_string()]);
     }
 
     #[test]
