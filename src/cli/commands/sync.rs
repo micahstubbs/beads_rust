@@ -6,7 +6,7 @@
 use crate::cli::SyncArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::model::Issue;
+use crate::model::{Comment, Dependency, Issue};
 use crate::output::OutputContext;
 use crate::sync::history::HistoryConfig;
 use crate::sync::{
@@ -19,6 +19,7 @@ use crate::sync::{
     validate_sync_path_with_external,
 };
 use crate::util::id::split_prefix_remainder;
+use chrono::Utc;
 use rich_rust::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -188,12 +189,24 @@ pub fn execute(
         // any tombstones that were in the old DB but not yet flushed would
         // be silently lost. Grab them here, restore them after the
         // delegated rebuild completes.
-        let preserved_pre_delegation_tombstones = snapshot_tombstones(&open_result.storage)?;
+        //
+        // `get_tombstone_ids_from_jsonl` parses the JSONL, and that parse
+        // fails with a generic "Invalid JSON at line 1" when the file
+        // contains merge-conflict markers. Scan for markers first so the
+        // operator gets the conflict-markers error class that
+        // `recover_database_from_jsonl`'s preflight would have surfaced
+        // otherwise.
+        crate::sync::ensure_no_conflict_markers(&open_result.paths.jsonl_path)?;
+        let jsonl_tombstone_ids = get_tombstone_ids_from_jsonl(&open_result.paths.jsonl_path)?;
+        let preserved_pre_delegation_tombstones = tombstones_missing_from_jsonl_tombstones(
+            snapshot_tombstones(&open_result.storage)?,
+            &jsonl_tombstone_ids,
+        );
         // `recover_database_from_jsonl` sets `auto_rebuilt = true` on success,
         // which is what gates the short-circuit inside `execute_import` below.
         open_result.recover_database_from_jsonl()?;
         if !preserved_pre_delegation_tombstones.is_empty() {
-            restore_tombstones(&open_result.storage, &preserved_pre_delegation_tombstones)?;
+            restore_tombstones(&mut open_result.storage, &preserved_pre_delegation_tombstones)?;
             debug!(
                 count = preserved_pre_delegation_tombstones.len(),
                 "Restored tombstones across delegated auto-recovery rebuild"
@@ -600,6 +613,14 @@ fn execute_flush(
 
     // If no dirty issues and no force, report nothing to do
     if dirty_ids.is_empty() && !needs_flush && jsonl_exists && !args.force {
+        // Before we parse the existing JSONL for the divergence/empty-DB
+        // safety checks, detect unresolved merge-conflict markers. Those
+        // would otherwise fall out of `count_issues_in_jsonl` /
+        // `get_issue_ids_from_jsonl` below as a generic "Invalid JSON at
+        // line 1" error, hiding the much more actionable
+        // "merge conflict markers detected" guidance.
+        crate::sync::ensure_no_conflict_markers(jsonl_path)?;
+
         // Guard against empty DB overwriting a non-empty JSONL.
         let existing_count = count_issues_in_jsonl(jsonl_path)?;
         if existing_count > 0 && db_issue_count == 0 {
@@ -731,8 +752,7 @@ fn execute_flush(
     };
 
     // Output result
-    let cleared_dirty =
-        export_result.exported_ids.len() + export_result.skipped_tombstone_ids.len();
+    let cleared_dirty = export_result.exported_marked_at.len();
     let result = FlushResult {
         exported_issues: report.issues_exported,
         exported_dependencies: report.dependencies_exported,
@@ -1258,8 +1278,36 @@ fn execute_import(
         show_progress,
     };
 
+    // For force/rebuild imports we read the JSONL twice before
+    // `import_from_jsonl` is even called (once to collect issue IDs for the
+    // orphan pass, once to precompute tombstone IDs for the preservation
+    // filter). Those reads fail with a generic "Invalid JSON at line 1"
+    // error when the JSONL contains merge-conflict markers, which buries
+    // the much more actionable "merge conflict markers detected" message
+    // that `import_from_jsonl` would surface later. Run the conflict-marker
+    // scan up-front so the operator sees the right error class regardless
+    // of which parse attempt fires first.
+    if args.force || args.rebuild {
+        crate::sync::ensure_no_conflict_markers(jsonl_path)?;
+    }
+    let jsonl_issue_ids = if args.force || args.rebuild {
+        Some(get_issue_ids_from_jsonl(jsonl_path)?)
+    } else {
+        None
+    };
+    let jsonl_tombstone_ids = if args.force || args.rebuild {
+        Some(get_tombstone_ids_from_jsonl(jsonl_path)?)
+    } else {
+        None
+    };
+
     let preserved_tombstones = if args.force || args.rebuild {
-        snapshot_tombstones(storage)?
+        tombstones_missing_from_jsonl_tombstones(
+            snapshot_tombstones(storage)?,
+            jsonl_tombstone_ids
+                .as_ref()
+                .expect("force/rebuild imports should precompute JSONL tombstone IDs"),
+        )
     } else {
         Vec::new()
     };
@@ -1285,10 +1333,9 @@ fn execute_import(
             debug!(
                 existing_issue_count,
                 preserved_tombstones = preserved_tombstones.len(),
-                "Force/rebuild import: resetting data tables to avoid btree DELETE bugs"
+                "Force/rebuild import: resetting data tables to avoid btree DELETE bugs; preserved tombstones will be restored atomically after import"
             );
             storage.reset_data_tables()?;
-            restore_tombstones(storage, &preserved_tombstones)?;
         }
     }
 
@@ -1327,9 +1374,13 @@ fn execute_import(
     // but not in the JSONL, and a naïve set-difference would wipe it. Union
     // their IDs into the "acceptable" set so they survive the cleanup.
     if args.rebuild && !args.rename_prefix {
-        let jsonl_ids = get_issue_ids_from_jsonl(jsonl_path)?;
-        let preserved_ids: HashSet<String> =
-            preserved_tombstones.iter().map(|t| t.id.clone()).collect();
+        let jsonl_ids = jsonl_issue_ids
+            .as_ref()
+            .expect("--rebuild should precompute JSONL issue IDs");
+        let preserved_ids: HashSet<String> = preserved_tombstones
+            .iter()
+            .map(|t| t.issue.id.clone())
+            .collect();
         let db_ids: HashSet<String> = storage.get_all_ids()?.into_iter().collect();
         let orphan_ids: Vec<String> = db_ids
             .iter()
@@ -1358,6 +1409,10 @@ fn execute_import(
         debug!(
             "Skipping --rebuild orphan cleanup: --rename-prefix rewrote IDs, so JSONL IDs no longer match DB IDs and the set-difference would be incorrect"
         );
+    }
+
+    if (args.force || args.rebuild) && !preserved_tombstones.is_empty() {
+        restore_tombstones(storage, &preserved_tombstones)?;
     }
 
     // Post-rebuild VACUUM + REINDEX to eliminate B-tree/index corruption
@@ -1447,30 +1502,180 @@ fn execute_import(
     Ok(())
 }
 
-fn snapshot_tombstones(storage: &crate::storage::SqliteStorage) -> Result<Vec<Issue>> {
+#[derive(Clone, Debug)]
+struct PreservedTombstone {
+    issue: Issue,
+    labels: Option<Vec<String>>,
+    dependencies: Option<Vec<Dependency>>,
+    comments: Option<Vec<Comment>>,
+}
+
+fn snapshot_tombstones(storage: &crate::storage::SqliteStorage) -> Result<Vec<PreservedTombstone>> {
     let mut tombstones = Vec::new();
-    for meta in storage.get_all_issues_metadata()? {
-        if meta.status != crate::model::Status::Tombstone {
+    let tombstone_ids = match storage.get_issue_ids_by_status(crate::model::Status::Tombstone) {
+        Ok(ids) => ids,
+        Err(error) => {
+            warn!(
+                error = %error,
+                "Failed to enumerate tombstones before rebuild; continuing without tombstone preservation"
+            );
+            return Ok(tombstones);
+        }
+    };
+
+    for tombstone_id in tombstone_ids {
+        let Some(issue) = (match storage.get_issue(&tombstone_id) {
+            Ok(issue) => issue,
+            Err(error) => {
+                warn!(
+                    issue_id = %tombstone_id,
+                    error = %error,
+                    "Skipping tombstone preservation for issue that could not be read before rebuild"
+                );
+                continue;
+            }
+        }) else {
             continue;
-        }
-        if let Some(issue) = storage.get_issue(&meta.id)? {
-            tombstones.push(issue);
-        }
+        };
+
+        let labels = match storage.get_labels(&tombstone_id) {
+            Ok(labels) => Some(labels),
+            Err(error) => {
+                warn!(
+                    issue_id = %tombstone_id,
+                    error = %error,
+                    "Failed to snapshot tombstone labels before rebuild; preserving issue row only"
+                );
+                None
+            }
+        };
+        let dependencies = match storage.get_dependencies_full(&tombstone_id) {
+            Ok(dependencies) => Some(dependencies),
+            Err(error) => {
+                warn!(
+                    issue_id = %tombstone_id,
+                    error = %error,
+                    "Failed to snapshot tombstone dependencies before rebuild; preserving issue row only"
+                );
+                None
+            }
+        };
+        let comments = match storage.get_comments(&tombstone_id) {
+            Ok(comments) => Some(comments),
+            Err(error) => {
+                warn!(
+                    issue_id = %tombstone_id,
+                    error = %error,
+                    "Failed to snapshot tombstone comments before rebuild; preserving issue row only"
+                );
+                None
+            }
+        };
+        tombstones.push(PreservedTombstone {
+            issue,
+            labels,
+            dependencies,
+            comments,
+        });
     }
     Ok(tombstones)
 }
 
-fn restore_tombstones(storage: &crate::storage::SqliteStorage, tombstones: &[Issue]) -> Result<()> {
-    for tombstone in tombstones {
-        storage.upsert_issue_for_import(tombstone)?;
+fn restore_tombstones(
+    storage: &mut crate::storage::SqliteStorage,
+    tombstones: &[PreservedTombstone],
+) -> Result<()> {
+    if tombstones.is_empty() {
+        return Ok(());
     }
+
+    let marked_at = Utc::now().to_rfc3339();
+    storage.with_write_transaction(|storage| {
+        for tombstone in tombstones {
+            storage.upsert_issue_for_import(&tombstone.issue)?;
+            if let Some(labels) = &tombstone.labels {
+                storage.sync_labels_for_import(&tombstone.issue.id, labels)?;
+            }
+            if let Some(dependencies) = &tombstone.dependencies {
+                storage.sync_dependencies_for_import(&tombstone.issue.id, dependencies)?;
+            }
+            if let Some(comments) = &tombstone.comments {
+                storage.sync_comments_for_import(&tombstone.issue.id, comments)?;
+            }
+            storage.replace_dirty_issue_marker(&tombstone.issue.id, &marked_at)?;
+        }
+        Ok(())
+    })?;
+
     if !tombstones.is_empty() {
         debug!(
             count = tombstones.len(),
-            "Restored tombstones after force reset"
+            "Restored tombstones atomically after rebuild and marked them dirty for export"
         );
     }
     Ok(())
+}
+
+fn tombstones_missing_from_jsonl_tombstones(
+    tombstones: Vec<PreservedTombstone>,
+    jsonl_tombstone_ids: &HashSet<String>,
+) -> Vec<PreservedTombstone> {
+    let original_count = tombstones.len();
+    let preserved: Vec<PreservedTombstone> = tombstones
+        .into_iter()
+        .filter(|tombstone| !jsonl_tombstone_ids.contains(&tombstone.issue.id))
+        .collect();
+
+    let skipped = original_count.saturating_sub(preserved.len());
+    if skipped > 0 {
+        debug!(
+            preserved = preserved.len(),
+            skipped, "Skipping tombstone preservation for IDs already present in JSONL"
+        );
+    }
+
+    preserved
+}
+
+fn get_tombstone_ids_from_jsonl(path: &Path) -> Result<HashSet<String>> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut line_buf = String::new();
+    let mut line_num = 0;
+    let mut seen_ids = HashSet::new();
+    let mut tombstone_ids = HashSet::new();
+
+    loop {
+        line_buf.clear();
+        let bytes = reader.read_line(&mut line_buf)?;
+        if bytes == 0 {
+            break;
+        }
+
+        line_num += 1;
+        let trimmed = line_buf.trim_end_matches(['\n', '\r']);
+        if trimmed.trim().is_empty() {
+            continue;
+        }
+
+        let issue: Issue = serde_json::from_str(trimmed)
+            .map_err(|e| BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num, e)))?;
+
+        if !seen_ids.insert(issue.id.clone()) {
+            return Err(BeadsError::Config(format!(
+                "Duplicate issue id '{}' in {} at line {}",
+                issue.id,
+                path.display(),
+                line_num
+            )));
+        }
+
+        if issue.status == crate::model::Status::Tombstone {
+            tombstone_ids.insert(issue.id);
+        }
+    }
+
+    Ok(tombstone_ids)
 }
 
 /// Render import result with rich formatting.
@@ -1627,6 +1832,13 @@ fn execute_merge(
     // 3. Load Right State (external JSONL)
     let mut right = HashMap::new();
     if jsonl_path.exists() {
+        // `read_issues_from_jsonl` parses JSON line-by-line, which yields a
+        // generic "Invalid JSON at line 1" error when the JSONL still
+        // contains unresolved merge-conflict markers from a botched
+        // `git merge` / `git pull`. A three-way merge on top of that state
+        // would be nonsense, so scan for markers first and surface the
+        // helpful error before we try to parse.
+        crate::sync::ensure_no_conflict_markers(jsonl_path)?;
         for issue in read_issues_from_jsonl(jsonl_path)? {
             right.insert(issue.id.clone(), issue);
         }
@@ -1869,9 +2081,11 @@ fn render_merge_result_rich(report: &crate::sync::MergeReport, ctx: &OutputConte
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_rebuild_semantic_conflict_field, auto_rebuild_semantic_flag_conflict_reason,
-        detect_prefix_from_jsonl, jsonl_contains_duplicate_external_refs,
-        jsonl_contains_prefix_mismatch, validate_sync_paths,
+        PreservedTombstone, auto_rebuild_semantic_conflict_field,
+        auto_rebuild_semantic_flag_conflict_reason, detect_prefix_from_jsonl,
+        get_tombstone_ids_from_jsonl, jsonl_contains_duplicate_external_refs,
+        jsonl_contains_prefix_mismatch, restore_tombstones, snapshot_tombstones,
+        tombstones_missing_from_jsonl_tombstones, validate_sync_paths,
     };
     use crate::cli::SyncArgs;
     use crate::config::CliOverrides;
@@ -1879,6 +2093,7 @@ mod tests {
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use chrono::Utc;
+    use std::collections::HashSet;
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -1947,6 +2162,208 @@ mod tests {
 
         let dirty_ids = storage.get_dirty_issue_ids().unwrap();
         assert!(!dirty_ids.is_empty());
+    }
+
+    #[test]
+    fn test_restore_tombstones_preserves_relations_and_marks_dirty() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let keep = make_test_issue("bd-keep", "Keep");
+        let delete = make_test_issue("bd-delete", "Delete");
+        storage.create_issue(&keep, "test").unwrap();
+        storage.create_issue(&delete, "test").unwrap();
+        storage.add_label("bd-delete", "urgent", "test").unwrap();
+        storage
+            .add_comment("bd-delete", "test", "preserve this comment")
+            .unwrap();
+        storage
+            .add_dependency("bd-delete", "bd-keep", "blocks", "test")
+            .unwrap();
+        storage
+            .delete_issue("bd-delete", "test", "deleted for rebuild", None)
+            .unwrap();
+
+        let tombstones = snapshot_tombstones(&storage).unwrap();
+        assert_eq!(tombstones.len(), 1);
+        assert_eq!(tombstones[0].issue.id, "bd-delete");
+        assert_eq!(
+            tombstones[0].labels.as_ref().unwrap(),
+            &vec!["urgent".to_string()]
+        );
+        assert_eq!(tombstones[0].comments.as_ref().unwrap().len(), 1);
+        assert_eq!(tombstones[0].dependencies.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            tombstones[0].dependencies.as_ref().unwrap()[0].depends_on_id,
+            "bd-keep"
+        );
+
+        storage.reset_data_tables().unwrap();
+        storage.upsert_issue_for_import(&keep).unwrap();
+        restore_tombstones(&mut storage, &tombstones).unwrap();
+
+        let restored = storage.get_issue("bd-delete").unwrap().unwrap();
+        assert_eq!(restored.status, Status::Tombstone);
+        assert_eq!(
+            storage.get_labels("bd-delete").unwrap(),
+            vec!["urgent".to_string()]
+        );
+        assert_eq!(storage.get_comments("bd-delete").unwrap().len(), 1);
+        let dependencies = storage.get_dependencies_full("bd-delete").unwrap();
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].depends_on_id, "bd-keep");
+
+        let dirty_ids = storage.get_dirty_issue_ids().unwrap();
+        assert_eq!(dirty_ids, vec!["bd-delete".to_string()]);
+    }
+
+    #[test]
+    fn test_restore_tombstones_rolls_back_when_relation_restore_fails() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let keep = make_test_issue("bd-keep", "Keep");
+        let issue = make_test_issue("bd-delete", "Delete");
+        storage.create_issue(&keep, "test").unwrap();
+        storage.create_issue(&issue, "test").unwrap();
+        storage.add_label("bd-delete", "urgent", "test").unwrap();
+        storage
+            .add_comment("bd-delete", "test", "preserve this comment")
+            .unwrap();
+        storage
+            .add_dependency("bd-delete", "bd-keep", "blocks", "test")
+            .unwrap();
+        storage
+            .delete_issue("bd-delete", "test", "deleted for rebuild", None)
+            .unwrap();
+
+        let tombstones = snapshot_tombstones(&storage).unwrap();
+
+        storage.reset_data_tables().unwrap();
+        storage.upsert_issue_for_import(&keep).unwrap();
+        storage.execute_raw("DROP TABLE comments").unwrap();
+
+        let err = restore_tombstones(&mut storage, &tombstones).unwrap_err();
+        assert!(
+            err.to_string().contains("comments"),
+            "unexpected restore failure: {err}"
+        );
+        assert!(storage.get_issue("bd-delete").unwrap().is_none());
+        assert!(storage.get_labels("bd-delete").unwrap().is_empty());
+        assert!(storage.get_dependencies_full("bd-delete").unwrap().is_empty());
+        assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_tombstones_missing_from_jsonl_tombstones_only_skips_already_flushed_deletions() {
+        let in_jsonl = PreservedTombstone {
+            issue: make_test_issue("bd-in-jsonl", "in jsonl"),
+            labels: Some(vec!["jsonl".to_string()]),
+            dependencies: Some(Vec::new()),
+            comments: Some(Vec::new()),
+        };
+        let missing = PreservedTombstone {
+            issue: make_test_issue("bd-missing", "missing"),
+            labels: Some(vec!["local".to_string()]),
+            dependencies: Some(Vec::new()),
+            comments: Some(Vec::new()),
+        };
+
+        let filtered = tombstones_missing_from_jsonl_tombstones(
+            vec![in_jsonl, missing.clone()],
+            &HashSet::from(["bd-in-jsonl".to_string()]),
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].issue.id, "bd-missing");
+        assert_eq!(filtered[0].labels, missing.labels);
+        assert_eq!(filtered[0].dependencies, missing.dependencies);
+        assert_eq!(filtered[0].comments, missing.comments);
+    }
+
+    #[test]
+    fn test_get_tombstone_ids_from_jsonl_rejects_duplicate_issue_ids() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let jsonl_path = temp_dir.path().join("duplicate-tombstones.jsonl");
+        let mut first = make_test_issue("bd-dup", "first");
+        first.status = Status::Tombstone;
+        let second = make_test_issue("bd-dup", "second");
+        let content = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        );
+        std::fs::write(&jsonl_path, content).unwrap();
+
+        let err = get_tombstone_ids_from_jsonl(&jsonl_path).unwrap_err();
+        match err {
+            BeadsError::Config(message) => {
+                assert!(
+                    message.contains("Duplicate issue id 'bd-dup'"),
+                    "unexpected duplicate-id error: {message}"
+                );
+            }
+            other => panic!("expected duplicate-id config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_snapshot_tombstones_tolerates_broken_relation_tables() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let issue = make_test_issue("bd-delete", "Delete");
+        storage.create_issue(&issue, "test").unwrap();
+        storage
+            .delete_issue("bd-delete", "test", "deleted for rebuild", None)
+            .unwrap();
+
+        storage.execute_raw("DROP TABLE comments").unwrap();
+        storage.execute_raw("DROP TABLE labels").unwrap();
+        storage.execute_raw("DROP TABLE dependencies").unwrap();
+
+        let tombstones = snapshot_tombstones(&storage).unwrap();
+        assert_eq!(tombstones.len(), 1);
+        assert_eq!(tombstones[0].issue.id, "bd-delete");
+        assert_eq!(tombstones[0].issue.status, Status::Tombstone);
+        assert!(tombstones[0].labels.is_none());
+        assert!(tombstones[0].dependencies.is_none());
+        assert!(tombstones[0].comments.is_none());
+    }
+
+    #[test]
+    fn test_snapshot_tombstones_ignores_malformed_non_tombstone_rows() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let open_issue = make_test_issue("bd-open", "Open");
+        let delete_issue = make_test_issue("bd-delete", "Delete");
+        storage.create_issue(&open_issue, "test").unwrap();
+        storage.create_issue(&delete_issue, "test").unwrap();
+        storage
+            .delete_issue("bd-delete", "test", "deleted for rebuild", None)
+            .unwrap();
+
+        storage
+            .execute_raw("UPDATE issues SET updated_at = 'not-a-datetime' WHERE id = 'bd-open'")
+            .unwrap();
+
+        let tombstones = snapshot_tombstones(&storage).unwrap();
+        assert_eq!(tombstones.len(), 1);
+        assert_eq!(tombstones[0].issue.id, "bd-delete");
+        assert_eq!(tombstones[0].issue.status, Status::Tombstone);
+    }
+
+    #[test]
+    fn test_snapshot_tombstones_tolerates_missing_issues_table() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let issue = make_test_issue("bd-delete", "Delete");
+        storage.create_issue(&issue, "test").unwrap();
+        storage
+            .delete_issue("bd-delete", "test", "deleted for rebuild", None)
+            .unwrap();
+
+        storage.execute_raw("DROP TABLE issues").unwrap();
+
+        let tombstones = snapshot_tombstones(&storage).unwrap();
+        assert!(tombstones.is_empty());
     }
 
     #[test]

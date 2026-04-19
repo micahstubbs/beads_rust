@@ -1936,6 +1936,29 @@ impl SqliteStorage {
         Ok(metas)
     }
 
+    /// Return issue IDs with the requested status without parsing unrelated
+    /// issue metadata columns.
+    ///
+    /// This is intentionally narrower than `get_all_issues_metadata()`: callers
+    /// that only need tombstone IDs should not fail because some other issue row
+    /// has a malformed timestamp or other metadata decoding problem.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn get_issue_ids_by_status(&self, status: Status) -> Result<Vec<String>> {
+        let rows = self.conn.query_with_params(
+            "SELECT id FROM issues WHERE status = ? ORDER BY id",
+            &[SqliteValue::from(status.as_str())],
+        )?;
+
+        Ok(rows
+            .iter()
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text))
+            .map(str::to_string)
+            .collect())
+    }
+
     fn get_issue_from_conn(conn: &Connection, id: &str) -> Result<Option<Issue>> {
         let sql = r"
             SELECT id, content_hash, title, description, design,
@@ -7145,6 +7168,27 @@ impl SqliteStorage {
         )?;
 
         Ok(rows > 0)
+    }
+
+    /// Replace an issue's dirty marker inside the current write transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the marker cannot be updated.
+    pub(crate) fn replace_dirty_issue_marker(
+        &self,
+        issue_id: &str,
+        marked_at: &str,
+    ) -> Result<()> {
+        self.conn.execute_with_params(
+            "DELETE FROM dirty_issues WHERE issue_id = ?",
+            &[SqliteValue::from(issue_id)],
+        )?;
+        self.conn.execute_with_params(
+            "INSERT INTO dirty_issues (issue_id, marked_at) VALUES (?, ?)",
+            &[SqliteValue::from(issue_id), SqliteValue::from(marked_at)],
+        )?;
+        Ok(())
     }
 
     /// Sync labels for an issue (remove existing, add new).

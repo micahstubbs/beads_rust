@@ -45,6 +45,55 @@ fn run_lint_json(workspace: &BrWorkspace, mut args: Vec<String>, label: &str) ->
     serde_json::from_str(&payload).expect("parse lint json")
 }
 
+fn overwrite_local_tombstone_title(workspace: &BrWorkspace, id: &str, title: &str) {
+    let db_path = workspace.root.join(".beads").join("beads.db");
+    let storage = SqliteStorage::open(&db_path).expect("open local beads db");
+    let mut issue = storage
+        .get_issue(id)
+        .expect("read issue from db")
+        .expect("issue should exist in db");
+    assert_eq!(
+        issue.status.as_str(),
+        "tombstone",
+        "local override helper expects a tombstone issue"
+    );
+    issue.title = title.to_string();
+    storage
+        .upsert_issue_for_import(&issue)
+        .expect("write divergent local tombstone");
+}
+
+fn assert_issue_title_and_clean_sync_state(
+    workspace: &BrWorkspace,
+    id: &str,
+    expected_title: &str,
+    show_label: &str,
+    status_label: &str,
+) {
+    let show = run_br(workspace, ["show", id, "--json"], show_label);
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    let payload = extract_json_payload(&show.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("parse show json");
+    let record = if json.is_array() {
+        json.as_array().and_then(|rows| rows.first()).cloned()
+    } else {
+        Some(json.clone())
+    }
+    .expect("show should return a record");
+    assert_eq!(record["status"].as_str(), Some("tombstone"));
+    assert_eq!(record["title"].as_str(), Some(expected_title));
+
+    let status = run_br(workspace, ["sync", "--status", "--json"], status_label);
+    assert!(status.status.success(), "status failed: {}", status.stderr);
+    let payload = extract_json_payload(&status.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("parse status json");
+    assert_eq!(
+        json["dirty_count"].as_u64(),
+        Some(0),
+        "import should not re-dirty tombstones that were already present in JSONL"
+    );
+}
+
 #[test]
 fn e2e_error_handling() {
     let _log = common::test_log("e2e_error_handling");
@@ -97,6 +146,130 @@ fn e2e_error_handling() {
 
     let sync_bad = run_br(&workspace, ["sync", "--import-only"], "sync_bad_jsonl");
     assert!(!sync_bad.status.success());
+}
+
+#[test]
+fn e2e_sync_force_import_keeps_jsonl_authoritative_for_existing_tombstones() {
+    let _log =
+        common::test_log("e2e_sync_force_import_keeps_jsonl_authoritative_for_existing_tombstones");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "JSONL tombstone title", "--json"],
+        "create",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let created: Value =
+        serde_json::from_str(&extract_json_payload(&create.stdout)).expect("create json");
+    let id = created["id"].as_str().expect("issue id").to_string();
+
+    let flush_open = run_br(&workspace, ["sync", "--flush-only"], "flush_open");
+    assert!(
+        flush_open.status.success(),
+        "flush open failed: {}",
+        flush_open.stderr
+    );
+
+    let delete = run_br(
+        &workspace,
+        ["delete", &id, "--force", "--no-auto-flush"],
+        "delete",
+    );
+    assert!(delete.status.success(), "delete failed: {}", delete.stderr);
+
+    let flush_tombstone = run_br(&workspace, ["sync", "--flush-only"], "flush_tombstone");
+    assert!(
+        flush_tombstone.status.success(),
+        "flush tombstone failed: {}",
+        flush_tombstone.stderr
+    );
+
+    overwrite_local_tombstone_title(&workspace, &id, "stale local tombstone title");
+
+    let import = run_br(
+        &workspace,
+        ["sync", "--import-only", "--force", "--json"],
+        "force_import",
+    );
+    assert!(
+        import.status.success(),
+        "force import failed: {}",
+        import.stderr
+    );
+
+    assert_issue_title_and_clean_sync_state(
+        &workspace,
+        &id,
+        "JSONL tombstone title",
+        "show_after_force_import",
+        "status_after_force_import",
+    );
+}
+
+#[test]
+fn e2e_sync_rebuild_keeps_jsonl_authoritative_for_existing_tombstones() {
+    let _log =
+        common::test_log("e2e_sync_rebuild_keeps_jsonl_authoritative_for_existing_tombstones");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "JSONL tombstone title", "--json"],
+        "create",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let created: Value =
+        serde_json::from_str(&extract_json_payload(&create.stdout)).expect("create json");
+    let id = created["id"].as_str().expect("issue id").to_string();
+
+    let flush_open = run_br(&workspace, ["sync", "--flush-only"], "flush_open");
+    assert!(
+        flush_open.status.success(),
+        "flush open failed: {}",
+        flush_open.stderr
+    );
+
+    let delete = run_br(
+        &workspace,
+        ["delete", &id, "--force", "--no-auto-flush"],
+        "delete",
+    );
+    assert!(delete.status.success(), "delete failed: {}", delete.stderr);
+
+    let flush_tombstone = run_br(&workspace, ["sync", "--flush-only"], "flush_tombstone");
+    assert!(
+        flush_tombstone.status.success(),
+        "flush tombstone failed: {}",
+        flush_tombstone.stderr
+    );
+
+    overwrite_local_tombstone_title(&workspace, &id, "stale local tombstone title");
+
+    let rebuild = run_br(
+        &workspace,
+        ["sync", "--import-only", "--rebuild", "--json"],
+        "rebuild_import",
+    );
+    assert!(
+        rebuild.status.success(),
+        "rebuild import failed: {}",
+        rebuild.stderr
+    );
+
+    assert_issue_title_and_clean_sync_state(
+        &workspace,
+        &id,
+        "JSONL tombstone title",
+        "show_after_rebuild_import",
+        "status_after_rebuild_import",
+    );
 }
 
 #[test]
@@ -467,6 +640,202 @@ fn e2e_sync_rename_prefix_applies_after_missing_db_recovery_without_force() {
     assert_ne!(
         imported_ids[0], mismatched_id,
         "rename-prefix import should rewrite mismatched IDs"
+    );
+}
+
+#[test]
+fn e2e_sync_rebuild_preserves_unflushed_tombstones_across_delegation() {
+    // Regression: `br sync --import-only --rebuild` on an existing DB used
+    // to lose tombstones that had not yet been flushed to JSONL. The
+    // in-place path preserves them via `snapshot_tombstones` +
+    // `restore_tombstones` across `reset_data_tables`, but the new
+    // delegation path to `recover_database_from_jsonl` opens a fresh DB and
+    // imports only what's in the JSONL. Unflushed tombstones therefore
+    // vanished silently, taking their deletion-retention state with them.
+    // The fix snapshots tombstones before delegation and restores them
+    // after.
+    let _log =
+        common::test_log("e2e_sync_rebuild_preserves_unflushed_tombstones_across_delegation");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    // Create two issues so the rebuild has content to preserve.
+    let keep = run_br(&workspace, ["create", "Keep"], "create_keep");
+    assert!(keep.status.success(), "create keep failed: {}", keep.stderr);
+    let keep_id = parse_created_id(&keep.stdout);
+
+    let delete = run_br(&workspace, ["create", "Delete"], "create_delete");
+    assert!(
+        delete.status.success(),
+        "create delete failed: {}",
+        delete.stderr
+    );
+    let delete_id = parse_created_id(&delete.stdout);
+
+    // Flush both as open so the JSONL reflects the pre-deletion state.
+    let flush = run_br(&workspace, ["sync", "--flush-only"], "sync_flush");
+    assert!(
+        flush.status.success(),
+        "sync flush failed: {}",
+        flush.stderr
+    );
+
+    // Delete one issue WITHOUT flushing: the tombstone only lives in the
+    // DB, the JSONL still shows `delete_id` as open.
+    let delete_cmd = run_br(
+        &workspace,
+        ["delete", &delete_id, "--force", "--no-auto-flush"],
+        "delete_no_flush",
+    );
+    assert!(
+        delete_cmd.status.success(),
+        "delete failed: {}",
+        delete_cmd.stderr
+    );
+
+    // Run --rebuild. The delegation path fires because the DB exists, no
+    // rename was requested, and the JSONL is available.
+    let rebuild = run_br(
+        &workspace,
+        ["sync", "--import-only", "--rebuild", "--json"],
+        "sync_rebuild",
+    );
+    assert!(
+        rebuild.status.success(),
+        "rebuild failed: {}",
+        rebuild.stderr
+    );
+
+    // The surviving tombstone must still be queryable via `br show`. If the
+    // delegation had silently wiped it, `show` would either report
+    // "Issue not found" or return the resurrected-as-open version from the
+    // JSONL.
+    let show = run_br(&workspace, ["show", &delete_id, "--json"], "show_tombstone");
+    assert!(
+        show.status.success(),
+        "tombstone lookup failed after --rebuild: {}",
+        show.stderr
+    );
+    let payload = extract_json_payload(&show.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("parse show json");
+    let record = if json.is_array() {
+        json.as_array().and_then(|a| a.first()).cloned()
+    } else {
+        Some(json.clone())
+    }
+    .expect("show should return at least one record");
+    assert_eq!(
+        record["status"].as_str(),
+        Some("tombstone"),
+        "tombstone status was lost across --rebuild: {record}"
+    );
+
+    // The kept issue must still be open.
+    let show_keep = run_br(&workspace, ["show", &keep_id, "--json"], "show_keep");
+    assert!(
+        show_keep.status.success(),
+        "keep lookup failed: {}",
+        show_keep.stderr
+    );
+    let payload = extract_json_payload(&show_keep.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("parse show keep json");
+    let record = if json.is_array() {
+        json.as_array().and_then(|a| a.first()).cloned()
+    } else {
+        Some(json.clone())
+    }
+    .expect("show should return at least one record");
+    assert_eq!(record["status"].as_str(), Some("open"));
+
+    // The preserved tombstone must remain dirty so a later flush writes the
+    // deletion back to JSONL instead of incorrectly reporting "Nothing to
+    // export". Without this, the rebuilt DB and JSONL silently diverge until
+    // a future import/rebuild cycle resurrects the supposedly deleted issue.
+    let status = run_br(
+        &workspace,
+        ["sync", "--status", "--json"],
+        "status_after_rebuild",
+    );
+    assert!(
+        status.status.success(),
+        "status failed after rebuild: {}",
+        status.stderr
+    );
+    let payload = extract_json_payload(&status.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("parse status json");
+    assert_eq!(
+        json["dirty_count"].as_u64(),
+        Some(1),
+        "the preserved tombstone should stay dirty until it is flushed"
+    );
+
+    let flush_after_rebuild = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--json"],
+        "flush_after_rebuild",
+    );
+    assert!(
+        flush_after_rebuild.status.success(),
+        "flush after rebuild failed: {}",
+        flush_after_rebuild.stderr
+    );
+    let payload = extract_json_payload(&flush_after_rebuild.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("parse flush json");
+    assert_eq!(
+        json["cleared_dirty"].as_u64(),
+        Some(1),
+        "flush should report the single preserved tombstone dirty flag it cleared"
+    );
+
+    let issues_path = workspace.root.join(".beads").join("issues.jsonl");
+    let jsonl = fs::read_to_string(&issues_path).expect("read rebuilt issues jsonl");
+    let exported_issue_states: Vec<(String, String)> = jsonl
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let value: Value = serde_json::from_str(line).expect("parse exported issue line");
+            (
+                value["id"].as_str().expect("exported issue id").to_string(),
+                value["status"]
+                    .as_str()
+                    .expect("exported issue status")
+                    .to_string(),
+            )
+        })
+        .collect();
+    assert!(
+        exported_issue_states
+            .iter()
+            .any(|(id, status)| id == &delete_id && status == "tombstone"),
+        "flush after rebuild should export the preserved tombstone: {:?}",
+        exported_issue_states
+    );
+    assert!(
+        exported_issue_states
+            .iter()
+            .any(|(id, status)| id == &keep_id && status == "open"),
+        "flush after rebuild should keep the surviving issue open: {:?}",
+        exported_issue_states
+    );
+
+    let status_after_flush = run_br(
+        &workspace,
+        ["sync", "--status", "--json"],
+        "status_after_flush",
+    );
+    assert!(
+        status_after_flush.status.success(),
+        "status failed after flush: {}",
+        status_after_flush.stderr
+    );
+    let payload = extract_json_payload(&status_after_flush.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("parse post-flush status json");
+    assert_eq!(
+        json["dirty_count"].as_u64(),
+        Some(0),
+        "flush should clear the preserved tombstone's dirty flag"
     );
 }
 
