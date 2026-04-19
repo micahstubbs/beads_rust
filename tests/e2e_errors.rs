@@ -644,6 +644,129 @@ fn e2e_sync_rename_prefix_applies_after_missing_db_recovery_without_force() {
 }
 
 #[test]
+fn e2e_auto_flush_skips_silently_overwriting_conflict_markered_jsonl() {
+    // Regression: post-command auto-flush used to unconditionally call
+    // `export_to_jsonl_with_policy`, which overwrote any existing JSONL —
+    // including unresolved `<<<<<<<` / `=======` / `>>>>>>>` regions from
+    // a botched `git merge`. Auto-import's conflict-markers check catches
+    // most of these before the mutation runs, but commands invoked with
+    // `--no-auto-import` skip that guard entirely, leaving auto-flush as
+    // the last line of defense. The fix teaches `auto_flush` itself to
+    // skip when it sees merge markers, so the mutation still lands in the
+    // DB but the JSONL on disk keeps its unresolved state for the
+    // operator to fix.
+    let _log =
+        common::test_log("e2e_auto_flush_skips_silently_overwriting_conflict_markered_jsonl");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(&workspace, ["create", "Seed"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let issue_id = parse_created_id(&create.stdout);
+
+    let seed_flush = run_br(&workspace, ["sync", "--flush-only"], "sync_flush_seed");
+    assert!(
+        seed_flush.status.success(),
+        "initial flush failed: {}",
+        seed_flush.stderr
+    );
+
+    // Drop the JSONL into a half-resolved merge-conflict state.
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let clean = fs::read_to_string(&jsonl_path).expect("read jsonl");
+    let conflicted = format!("<<<<<<< HEAD\n{clean}=======\n{clean}>>>>>>> branch\n");
+    fs::write(&jsonl_path, &conflicted).expect("write conflicted jsonl");
+    let before_bytes = fs::read(&jsonl_path).expect("read conflicted jsonl");
+
+    // Run a mutating command with `--no-auto-import` so the first line of
+    // defense (auto-import's conflict-markers scan) is bypassed. The
+    // mutation should still succeed against the DB, but auto-flush must
+    // NOT overwrite the conflict-markered JSONL.
+    let update = run_br(
+        &workspace,
+        ["--no-auto-import", "update", &issue_id, "--priority", "1"],
+        "update_no_auto_import",
+    );
+    assert!(
+        update.status.success(),
+        "mutation should still succeed even though auto-flush is skipped: {}",
+        update.stderr
+    );
+
+    // On-disk JSONL must still hold the conflict markers byte-for-byte.
+    let after_bytes = fs::read(&jsonl_path).expect("reread jsonl");
+    assert_eq!(
+        before_bytes, after_bytes,
+        "auto-flush must not rewrite a JSONL that contains unresolved merge-conflict markers"
+    );
+}
+
+#[test]
+fn e2e_sync_flush_checks_conflict_markers_before_noop_short_circuit() {
+    // Regression: `br sync --flush-only` can return early when the DB has
+    // nothing dirty. That early return must not hide unresolved JSONL merge
+    // markers, because a user running sync for safety should still be told
+    // the working tree contains an unresolved beads data conflict.
+    let _log = common::test_log("e2e_sync_flush_checks_conflict_markers_before_noop_short_circuit");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(&workspace, ["create", "Seed"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let _ = parse_created_id(&create.stdout);
+
+    let first_flush = run_br(&workspace, ["sync", "--flush-only"], "sync_flush_initial");
+    assert!(
+        first_flush.status.success(),
+        "initial flush should succeed: {}",
+        first_flush.stderr
+    );
+
+    // Simulate a merge conflict by wrapping the clean JSONL in conflict
+    // markers, as if `git merge` left the file in a half-resolved state.
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let clean = fs::read_to_string(&jsonl_path).expect("read jsonl");
+    let conflicted = format!("<<<<<<< HEAD\n{clean}=======\n{clean}>>>>>>> branch\n");
+    fs::write(&jsonl_path, &conflicted).expect("write conflicted jsonl");
+    let before_size = fs::metadata(&jsonl_path).expect("stat jsonl").len();
+
+    // A subsequent no-op flush must refuse with a conflict-markers error
+    // before taking the "nothing to do" short-circuit.
+    let flush = run_br(&workspace, ["sync", "--flush-only"], "sync_flush");
+    assert!(
+        !flush.status.success(),
+        "flush should fail when JSONL contains conflict markers: stdout={} stderr={}",
+        flush.stdout,
+        flush.stderr
+    );
+    // Error goes to stderr, not stdout, so check the human-readable text
+    // rather than trying to parse JSON from stdout.
+    let lower = flush.stderr.to_lowercase();
+    assert!(
+        lower.contains("conflict") || lower.contains("marker"),
+        "flush error should mention conflict markers, got stderr: {}",
+        flush.stderr
+    );
+
+    // The JSONL on disk must still contain the conflict markers: if the
+    // flush had overwritten it, the markers would be gone.
+    let after = fs::read_to_string(&jsonl_path).expect("reread jsonl");
+    assert!(
+        after.contains("<<<<<<<"),
+        "conflict markers must still be on disk after refused flush"
+    );
+    assert_eq!(
+        fs::metadata(&jsonl_path).expect("stat jsonl").len(),
+        before_size,
+        "JSONL size must not change when flush refuses due to conflict markers"
+    );
+}
+
+#[test]
 fn e2e_sync_rebuild_preserves_unflushed_tombstones_across_delegation() {
     // Regression: `br sync --import-only --rebuild` on an existing DB used
     // to lose tombstones that had not yet been flushed to JSONL. The
@@ -1994,6 +2117,86 @@ fn e2e_structured_error_conflict_markers() {
     assert!(
         result.stderr.contains("conflict") || result.stderr.contains("CONFLICT"),
         "should detect conflict markers"
+    );
+}
+
+#[test]
+fn e2e_sync_flush_refuses_to_overwrite_conflict_markers() {
+    let _log = common::test_log("e2e_sync_flush_refuses_to_overwrite_conflict_markers");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Flush conflict seed", "--no-auto-flush"],
+        "create_seed",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let id = parse_created_id(&create.stdout);
+
+    let first_flush = run_br(&workspace, ["sync", "--flush-only"], "first_flush");
+    assert!(
+        first_flush.status.success(),
+        "initial flush failed: {}",
+        first_flush.stderr
+    );
+
+    let issues_path = workspace.root.join(".beads").join("issues.jsonl");
+    let original_jsonl = fs::read_to_string(&issues_path).expect("read initial jsonl");
+    assert!(
+        original_jsonl.contains("Flush conflict seed"),
+        "initial flush should export the seed issue"
+    );
+
+    let update = run_br(
+        &workspace,
+        [
+            "update",
+            &id,
+            "--title",
+            "Dirty title that must not be flushed over conflict markers",
+            "--no-auto-flush",
+        ],
+        "dirty_update",
+    );
+    assert!(update.status.success(), "update failed: {}", update.stderr);
+
+    let conflicted_jsonl = format!(
+        "<<<<<<< HEAD\n{}=======\n{}>>>>>>> feature-branch\n",
+        original_jsonl, original_jsonl
+    );
+    fs::write(&issues_path, &conflicted_jsonl).expect("write conflicted jsonl");
+
+    let refused_flush = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--json"],
+        "refused_flush",
+    );
+    assert!(
+        !refused_flush.status.success(),
+        "flush should fail while issues.jsonl contains merge conflict markers"
+    );
+    let exit_code = refused_flush.status.code().unwrap_or(0);
+    assert!(
+        exit_code == 6 || exit_code == 7,
+        "conflict-marker flush refusal should be a sync/config error, got {exit_code}"
+    );
+    assert!(
+        refused_flush.stderr.contains("conflict") || refused_flush.stderr.contains("CONFLICT"),
+        "flush error should explain the unresolved conflict markers: {}",
+        refused_flush.stderr
+    );
+
+    let after_refusal = fs::read_to_string(&issues_path).expect("read refused jsonl");
+    assert_eq!(
+        after_refusal, conflicted_jsonl,
+        "flush refusal must leave the conflicted JSONL byte-for-byte untouched"
+    );
+    assert!(
+        !after_refusal.contains("Dirty title that must not be flushed over conflict markers"),
+        "dirty DB title must not be exported over unresolved JSONL conflict markers"
     );
 }
 

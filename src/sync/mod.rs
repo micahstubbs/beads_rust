@@ -614,10 +614,8 @@ pub(crate) fn validate_jsonl_issue_records(path: &Path) -> Result<JsonlIssueVali
             Ok(mut issue) => {
                 normalize_issue(&mut issue);
                 if !seen_ids.insert(issue.id.clone()) {
-                    summary.push_failure(
-                        line_num + 1,
-                        format!("Duplicate issue id '{}'", issue.id),
-                    );
+                    summary
+                        .push_failure(line_num + 1, format!("Duplicate issue id '{}'", issue.id));
                     continue;
                 }
                 if let Err(errors) = IssueValidator::validate(&issue) {
@@ -2693,6 +2691,25 @@ pub fn auto_flush(
     if !db_newer {
         tracing::debug!("Auto-flush: no dirty issues, skipping");
         return Ok(AutoFlushResult::default());
+    }
+
+    // Refuse to auto-flush over a JSONL that still holds unresolved
+    // merge-conflict markers. The downstream export path would otherwise
+    // silently overwrite the `<<<<<<<` / `=======` / `>>>>>>>` regions
+    // (along with the remote side of the merge the operator hadn't yet
+    // looked at) every time a mutating CLI command returns. Explicit
+    // `br sync --flush-only` already has a `--force` escape hatch for this
+    // case; auto-flush has no such surface, so the only safe default is to
+    // stop, log clearly, and let the next explicit sync surface the error.
+    if jsonl_exists {
+        if let Err(err) = ensure_no_conflict_markers(jsonl_path) {
+            tracing::warn!(
+                jsonl_path = %jsonl_path.display(),
+                error = %err,
+                "Skipping auto-flush: JSONL contains merge-conflict markers. Resolve them (or run `br sync --flush-only --force` to override) before the next write.",
+            );
+            return Ok(AutoFlushResult::default());
+        }
     }
 
     tracing::debug!(
@@ -5615,8 +5632,8 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
 
-        let err =
-            import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap_err();
+        let err = import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd"))
+            .unwrap_err();
         assert!(err.to_string().contains("Duplicate issue id 'bd-001'"));
     }
 
@@ -6108,8 +6125,7 @@ mod tests {
         let issue2 = make_test_issue("bd-002", "Another good issue");
         let good_json_1 = serde_json::to_string(&issue1).unwrap();
         let good_json_2 = serde_json::to_string(&issue2).unwrap();
-        let content =
-            format!("{good_json_1}\nNOT VALID JSON\n{good_json_2}\n{{\"broken: true}}\n");
+        let content = format!("{good_json_1}\nNOT VALID JSON\n{good_json_2}\n{{\"broken: true}}\n");
         std::fs::write(&jsonl_path, content).unwrap();
 
         let config = ImportConfig {
