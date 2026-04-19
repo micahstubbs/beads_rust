@@ -625,10 +625,8 @@ fn open_sqlite_storage_with_recovery_strategy(
                         // haven't landed in JSONL would be silently dropped by
                         // the rebuild (which only imports what's in JSONL),
                         // taking their deletion-retention state with them.
-                        let preserved_tombstones = preserved_unflushed_tombstones(
-                            &storage,
-                            &paths.jsonl_path,
-                        );
+                        let preserved_tombstones =
+                            preserved_unflushed_tombstones(&storage, &paths.jsonl_path);
                         drop(storage);
                         let mut storage = rebuild_database_from_jsonl(
                             beads_dir,
@@ -679,10 +677,8 @@ fn open_sqlite_storage_with_recovery_strategy(
                         // case is the same as the old behavior (no
                         // preservation), the best case is we rescue the
                         // unflushed tombstones the old code lost silently.
-                        let preserved_tombstones = preserved_unflushed_tombstones(
-                            &storage,
-                            &paths.jsonl_path,
-                        );
+                        let preserved_tombstones =
+                            preserved_unflushed_tombstones(&storage, &paths.jsonl_path);
                         drop(storage);
                         let mut storage = rebuild_database_from_jsonl(
                             beads_dir,

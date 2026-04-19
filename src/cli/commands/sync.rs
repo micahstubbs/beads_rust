@@ -1917,15 +1917,15 @@ mod tests {
         detect_prefix_from_jsonl, jsonl_contains_duplicate_external_refs,
         jsonl_contains_prefix_mismatch, validate_sync_paths,
     };
-    use crate::sync::{
-        PreservedTombstone, get_tombstone_ids_from_jsonl, restore_tombstones, snapshot_tombstones,
-        tombstones_missing_from_jsonl_tombstones,
-    };
     use crate::cli::SyncArgs;
     use crate::config::CliOverrides;
     use crate::error::BeadsError;
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
+    use crate::sync::{
+        PreservedTombstone, get_tombstone_ids_from_jsonl, restore_tombstones, snapshot_tombstones,
+        tombstones_missing_from_jsonl_tombstones,
+    };
     use chrono::Utc;
     use std::collections::HashSet;
     use std::fs;

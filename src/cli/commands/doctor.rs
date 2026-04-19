@@ -8,8 +8,10 @@ use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::sync::{
-    PathValidation, compute_staleness, scan_conflict_markers, validate_jsonl_issue_records,
-    validate_no_git_path, validate_sync_path, validate_sync_path_with_external,
+    PathValidation, PreservedTombstone, compute_staleness, get_tombstone_ids_from_jsonl,
+    restore_tombstones, scan_conflict_markers, snapshot_tombstones,
+    tombstones_missing_from_jsonl_tombstones, validate_jsonl_issue_records, validate_no_git_path,
+    validate_sync_path, validate_sync_path_with_external,
 };
 use fsqlite::Connection;
 use fsqlite_error::FrankenError;
@@ -686,7 +688,19 @@ fn repair_database_from_jsonl(
         cli.as_layer(),
     ]);
 
-    let (storage, import_result) = config::repair_database_from_jsonl(
+    // Snapshot any local tombstones before the JSONL rebuild. `doctor
+    // --repair` reaches this branch only after light repairs failed (or
+    // never applied) and the on-disk DB reports errors, so the storage
+    // handle here might be limping — but `snapshot_tombstones` is already
+    // fault-tolerant (warn+empty on enumeration failure, warn+partial on
+    // per-tombstone failure) and the cost of trying is a few selects.
+    // Without this, repair would silently wipe any tombstone the user
+    // deleted but had not yet flushed to JSONL (same hazard that
+    // `br sync --rebuild` preserves via snapshot/restore), since the
+    // rebuild only replays what's in the JSONL.
+    let preserved_tombstones = preserved_tombstones_for_doctor_rebuild(db_path, jsonl_path);
+
+    let (mut storage, import_result) = config::repair_database_from_jsonl(
         beads_dir,
         db_path,
         jsonl_path,
@@ -694,6 +708,10 @@ fn repair_database_from_jsonl(
         &bootstrap_layer,
         show_progress,
     )?;
+
+    if !preserved_tombstones.is_empty() {
+        restore_tombstones(&mut storage, &preserved_tombstones)?;
+    }
 
     let fk_violations = storage.execute_raw_query("PRAGMA foreign_key_check")?.len();
 
@@ -734,6 +752,67 @@ fn repair_database_from_jsonl(
         skipped: import_result.skipped_count,
         fk_violations_cleaned: fk_violations,
     })
+}
+
+/// Best-effort snapshot of unflushed local tombstones, guarded on every
+/// failure mode the doctor-repair path may encounter (DB missing, DB can't
+/// be opened, JSONL unreadable).
+///
+/// This mirrors the helper at the config layer (`preserved_unflushed_tombstones`)
+/// but has to live here because the doctor-repair entry point is where we have
+/// the storage-open attempt — the config helper receives an already-open
+/// storage handle. Returns an empty vector if no tombstones survive filtering
+/// or if any step fails; the rebuild itself always proceeds either way, and
+/// `snapshot_tombstones` logs its own best-effort warnings.
+fn preserved_tombstones_for_doctor_rebuild(
+    db_path: &Path,
+    jsonl_path: &Path,
+) -> Vec<PreservedTombstone> {
+    if !db_path.is_file() {
+        return Vec::new();
+    }
+    let storage = match SqliteStorage::open(db_path) {
+        Ok(storage) => storage,
+        Err(err) => {
+            tracing::debug!(
+                db_path = %db_path.display(),
+                error = %err,
+                "Could not open DB for pre-repair tombstone snapshot; proceeding without preservation"
+            );
+            return Vec::new();
+        }
+    };
+    let snapshot = match snapshot_tombstones(&storage) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                error = %err,
+                "Failed to snapshot tombstones before doctor --repair JSONL rebuild"
+            );
+            return Vec::new();
+        }
+    };
+    drop(storage);
+    if snapshot.is_empty() {
+        return snapshot;
+    }
+    let jsonl_tombstone_ids = if jsonl_path.is_file() {
+        match get_tombstone_ids_from_jsonl(jsonl_path) {
+            Ok(ids) => ids,
+            Err(err) => {
+                tracing::debug!(
+                    jsonl_path = %jsonl_path.display(),
+                    error = %err,
+                    "Could not read JSONL tombstone IDs during doctor --repair; preserving every snapshotted tombstone and letting the rebuild surface the JSONL error"
+                );
+                std::collections::HashSet::new()
+            }
+        }
+    } else {
+        std::collections::HashSet::new()
+    };
+    tombstones_missing_from_jsonl_tombstones(snapshot, &jsonl_tombstone_ids)
 }
 
 fn repair_recoverable_db_state(
