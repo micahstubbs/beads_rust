@@ -1466,16 +1466,11 @@ fn execute_import(
         // file (issue #248). `VACUUM INTO` sidesteps the bug because it
         // writes a brand-new compacted file from the reachable page set,
         // page count and layout matching what `sqlite3 "VACUUM INTO"`
-        // would produce. Best-effort: on any failure the helper leaves
-        // `*storage` as the pre-compaction handle, so we never lose data
-        // — we only miss the cosmetic compaction.
-        if let Err(e) = storage.checkpoint_full() {
-            warn!(
-                error = %e,
-                db_path = %db_path.display(),
-                "Full WAL checkpoint before VACUUM INTO failed (non-fatal)"
-            );
-        }
+        // would produce. The helper runs its own pre-VACUUM-INTO WAL
+        // checkpoint to drain the frames the VACUUM/REINDEX above just
+        // wrote. Best-effort: on any failure the helper leaves
+        // `*storage` in the best working state it can recover, and we
+        // only miss the cosmetic compaction — never correctness.
         config::compact_database_via_vacuum_into_in_place(storage, db_path, cli.lock_timeout);
     }
 

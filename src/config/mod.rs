@@ -1088,21 +1088,52 @@ fn rebuild_database_family(
 
 /// Compact a database at `db_path` by writing a fresh copy via `VACUUM
 /// INTO` to a temp file, atomically replacing the original, and reopening
-/// the storage connection in place. On any failure (VACUUM INTO error,
-/// rename error, reopen error) we leave the storage untouched — the
-/// caller keeps the original (possibly leaky) storage and only misses
-/// the compaction, never a correctness guarantee.
+/// the storage connection in place.
+///
+/// Preconditions: the caller must pass a `storage` handle whose connection
+/// was opened against `db_path` (the helper names its temp file
+/// `.<stem>.vacuum.<pid>.tmp` next to `db_path` and installs it there).
+/// Passing mismatched storage and db_path would copy the storage's actual
+/// DB contents over db_path.
+///
+/// Failure handling: on any failure (VACUUM INTO error, rename error, or
+/// reopen error after a successful rename) the helper leaves `*storage`
+/// in the best-available working state:
+///   * VACUUM INTO failed  → `*storage` is unchanged (still the
+///     pre-compaction connection).
+///   * Rename failed       → `*storage` is reopened against the still-
+///     intact original `db_path`; the compacted temp file is removed.
+///   * Reopen failed after a successful rename → `*storage` is left as
+///     the in-memory placeholder handle we swapped in; the persistent
+///     DB on disk IS correctly compacted, so the caller's next attempt
+///     (or the next invocation of `br`) will find a clean file.
+/// This helper never returns a Result because its only value is
+/// cosmetic (the file size / integrity-check output). Correctness of the
+/// DB contents is established by the VACUUM/REINDEX that runs before
+/// compaction; a missed compaction surfaces as upstream sqlite3's
+/// `Page N: never used` diagnostic, not as data loss.
 ///
 /// This is called only in rebuild/force-import paths where the DB is
-/// known to have just been fully populated from JSONL, so losing the
-/// compaction on error is a cosmetic integrity-check regression (upstream
-/// sqlite3 may flag trailing pages as `Page N: never used`) rather than a
-/// data-loss scenario.
+/// known to have just been fully populated from JSONL.
 pub(crate) fn compact_database_via_vacuum_into_in_place(
     storage: &mut SqliteStorage,
     db_path: &Path,
     lock_timeout: Option<u64>,
 ) {
+    // Drain any WAL frames the prior VACUUM/REINDEX (run by the caller)
+    // left behind, so `VACUUM INTO` sees the fully-committed on-disk
+    // state instead of having to reach into a WAL that fsqlite's own
+    // `VACUUM INTO` may or may not consult. Keeping this inside the
+    // helper means every caller gets the same guarantee regardless of
+    // whether they remembered to checkpoint themselves.
+    if let Err(err) = storage.checkpoint_full() {
+        tracing::debug!(
+            error = %err,
+            db_path = %db_path.display(),
+            "Pre-VACUUM-INTO WAL checkpoint failed (non-fatal); compaction may miss uncheckpointed frames"
+        );
+    }
+
     // Unique temp path next to the real DB so the subsequent rename is on
     // the same filesystem (atomic) and so parallel rebuilds of different
     // DBs don't collide.
@@ -1111,8 +1142,12 @@ pub(crate) fn compact_database_via_vacuum_into_in_place(
         .and_then(|s| s.to_str())
         .map_or_else(|| "beads".to_string(), str::to_string);
     let temp_path = db_path.with_file_name(format!(".{stem}.vacuum.{}.tmp", std::process::id()));
-    // Defensive: if a previous aborted rebuild left a stale temp file
-    // behind, remove it before `VACUUM INTO` tries to open it.
+    // Defensive: if a previous aborted rebuild from this same PID left a
+    // stale temp file behind, remove it before `VACUUM INTO` tries to
+    // open it. Stale temp files from other (crashed) PIDs are left alone
+    // because we cannot safely distinguish "crashed process" from
+    // "concurrent rebuild holding the temp open" without coordinating
+    // via the `.write.lock` we already depend on upstream.
     let _ = fs::remove_file(&temp_path);
 
     let temp_path_display = temp_path.display().to_string();
