@@ -241,9 +241,11 @@ fn maybe_delegate_rebuild(
 
 /// Dispatch to the appropriate sync-subcommand implementation based on
 /// the flag pattern (`--status` / `--flush-only` / `--merge` /
-/// default-or-`--import-only`). Runs in a closure so an early `return`
-/// inside the status branch still yields a `Result<()>` the caller can
-/// route through `finalize_sync_result`.
+/// default-or-`--import-only`). The status branch is read-only; the
+/// other three hold a `&mut` borrow on `open_result.storage` for the
+/// duration of their execution. Any `Err` propagates back to
+/// `finalize_sync_result`, which is the single place that decides how to
+/// handle recovery-backup rollback.
 fn dispatch_sync_subcommand(
     args: &SyncArgs,
     cli: &config::CliOverrides,

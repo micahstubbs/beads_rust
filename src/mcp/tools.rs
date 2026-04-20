@@ -1119,6 +1119,13 @@ impl ToolHandler for CreateIssueTool {
         }
     }
 
+    // The trait signature dictates a single entry point; the body branches
+    // through every mutable-issue field + label/comment side channel, each
+    // of which has its own coercion/warning surface. Extracting would
+    // scatter the argument-parse-to-apply flow across six helpers whose
+    // only caller is this one, hurting readability more than the line
+    // count helps.
+    #[allow(clippy::too_many_lines)]
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
         let title = args
             .get("title")
@@ -1412,7 +1419,7 @@ impl ToolHandler for UpdateIssueTool {
                             {"tool": "show_issue", "arguments": {"id": id}}
                         ]
                     }),
-                ).into());
+                ));
             };
 
             // Handle label mutations
@@ -1432,10 +1439,10 @@ impl ToolHandler for UpdateIssueTool {
             }
 
             // Add comment if provided
-            if let Some(comment) = args.get("comment").and_then(|v| v.as_str()) {
-                if !comment.is_empty() {
-                    let _ = storage.add_comment(id, &self.0.actor, comment);
-                }
+            if let Some(comment) = args.get("comment").and_then(|v| v.as_str())
+                && !comment.is_empty()
+            {
+                let _ = storage.add_comment(id, &self.0.actor, comment);
             }
 
             Ok(issue)
@@ -1536,10 +1543,9 @@ impl ToolHandler for CloseIssueTool {
             if let Some(details) = storage
                 .get_issue_details(id, false, false, 0)
                 .map_err(beads_to_mcp)?
+                && details.issue.status == Status::Closed
             {
-                if details.issue.status == Status::Closed {
-                    return Ok((details.issue, None, None));
-                }
+                return Ok((details.issue, None, None));
             }
 
             let now = chrono::Utc::now();
@@ -1682,6 +1688,12 @@ impl ToolHandler for ManageDependenciesTool {
         }
     }
 
+    // The trait signature funnels `add` / `remove` / `list` into a single
+    // entry point, and each branch has its own cycle-detection, error-
+    // wrapping, and response-shape work. Extracting per-action helpers
+    // would fragment shared argument parsing for a marginal line-count
+    // win.
+    #[allow(clippy::too_many_lines)]
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
         let action = args
             .get("action")
@@ -1725,10 +1737,12 @@ impl ToolHandler for ManageDependenciesTool {
                 )])
             }
             "add" => {
-                let depends_on = args
-                    .get("depends_on")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| McpError::invalid_params("'depends_on' is required for action 'add'"))?;
+                let depends_on =
+                    args.get("depends_on")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            McpError::invalid_params("'depends_on' is required for action 'add'")
+                        })?;
 
                 let dep_type_raw = args
                     .get("dep_type")
@@ -1761,12 +1775,14 @@ impl ToolHandler for ManageDependenciesTool {
                                     {"tool": "manage_dependencies", "arguments": {"action": "list", "id": depends_on}}
                                 ]
                             }),
-                        ).into());
+                        ));
                     }
                 }
 
                 let added = self.0.with_mutation(|storage| {
-                    storage.add_dependency(id, depends_on, &dep_type_str, &self.0.actor).map_err(beads_to_mcp)
+                    storage
+                        .add_dependency(id, depends_on, &dep_type_str, &self.0.actor)
+                        .map_err(beads_to_mcp)
                 })?;
 
                 let mut result = json!({
@@ -1782,10 +1798,12 @@ impl ToolHandler for ManageDependenciesTool {
                 Ok(vec![Content::text(result.to_string())])
             }
             "remove" => {
-                let depends_on = args
-                    .get("depends_on")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| McpError::invalid_params("'depends_on' is required for action 'remove'"))?;
+                let depends_on =
+                    args.get("depends_on")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            McpError::invalid_params("'depends_on' is required for action 'remove'")
+                        })?;
 
                 // Validate target ID (placeholder check only — it might have been deleted)
                 if let Some(err) = detect_placeholder(depends_on) {
@@ -1799,7 +1817,9 @@ impl ToolHandler for ManageDependenciesTool {
                 }
 
                 let removed = self.0.with_mutation(|storage| {
-                    storage.remove_dependency(id, depends_on, &self.0.actor).map_err(beads_to_mcp)
+                    storage
+                        .remove_dependency(id, depends_on, &self.0.actor)
+                        .map_err(beads_to_mcp)
                 })?;
 
                 Ok(vec![Content::text(
@@ -1820,7 +1840,7 @@ impl ToolHandler for ManageDependenciesTool {
                     "available_options": ["add", "remove", "list"],
                     "fix_hint": "Use 'list' to view dependencies, 'add' to create, 'remove' to delete"
                 }),
-            ).into()),
+            )),
         }
     }
 }

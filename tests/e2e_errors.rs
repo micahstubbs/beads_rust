@@ -767,6 +767,7 @@ fn e2e_sync_flush_checks_conflict_markers_before_noop_short_circuit() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_sync_rebuild_preserves_unflushed_tombstones_across_delegation() {
     // Regression: `br sync --import-only --rebuild` on an existing DB used
     // to lose tombstones that had not yet been flushed to JSONL. The
@@ -1118,6 +1119,7 @@ fn e2e_sync_auto_rebuild_plain_import_reports_recovery_result() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_sync_rename_prefix_clears_duplicate_external_ref_after_missing_db_recovery() {
     let _log = common::test_log(
         "e2e_sync_rename_prefix_clears_duplicate_external_ref_after_missing_db_recovery",
