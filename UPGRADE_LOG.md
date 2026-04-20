@@ -145,3 +145,44 @@ cargo test --lib
 - `cargo test --lib`: 775 passed, 0 failed
 - `cargo test --test conformance`: 320 passed, 0 failed, 26 ignored
 - `cargo test` (full): 1 pre-existing failure in `e2e_close_blocked_requires_force` (unrelated to upgrades)
+
+---
+
+# Upgrade Session: 2026-04-20
+
+**Date:** 2026-04-20  |  **Project:** beads_rust  |  **Language:** Rust
+
+## Summary
+- **Updated:** 2 (sibling /dp libraries)  |  **Skipped:** 2  |  **Failed:** 0
+
+## Sibling Project Updates
+
+### rich_rust: 0.2.0 -> 0.2.1
+- **Breaking:** None (patch release)
+- **Highlights:** Removes nightly-only feature gate (now builds on stable Rust 2024 edition); syntax highlighting fix in `Prompt`/`Select`; dep bumps
+- **Tests:** cargo check + `cargo test --lib --all-features` pass (1240 tests)
+
+### toon_rust (tru): 0.2.0 -> 0.2.2
+- **Breaking:** None (patch-bump range)
+- **Highlights:** RUSTSEC-2026-0009 fix (time 0.3.45 -> 0.3.47 to eliminate stack-exhaustion DoS); MSRV bump to 1.88 (project already at 1.88)
+- **Tests:** cargo check + `cargo test --lib --all-features` pass (1240 tests)
+
+## Skipped (already at latest)
+
+| Crate | Local `/dp` version | crates.io | beads_rust pin |
+|-------|--------------------|-----------|----------------|
+| fsqlite (+ full workspace) | 0.1.2 / 0.1.3 (vfs) | 0.1.2 / 0.1.3 | matches |
+| fastmcp-rust | 0.2.1 | 0.2.1 | matches |
+
+## Pre-existing Test Failures (NOT caused by these upgrades)
+
+Confirmed by running the same tests against the HEAD commit with Cargo.toml unchanged:
+
+- `e2e_sync_tombstone_protection` (tests/e2e_basic_lifecycle.rs:1168): tombstone resurrection through a modified JSONL + `sync --import-only --force` is not blocked as the test expects (status flips from `tombstone` to `open`). Flag for follow-up issue; v0.1.44 shipped with this same failure.
+- `config::tests::open_storage_with_cli_recovers_malformed_schema_db_{from_valid_jsonl, with_in_progress_issue}`: fail ONLY when local `.cargo/config.toml` patches fsqlite-* to the `/data/projects/frankensqlite` workspace. Both pass cleanly against the crates.io fsqlite 0.1.2 the release pipeline uses.
+
+## Validation
+
+- `cargo check --all-targets --all-features` (crates.io fsqlite): Pass
+- `cargo test --lib --all-features` (crates.io fsqlite): 1240 passed, 0 failed
+- `cargo test --all-features --tests`: 160 passed, 1 pre-existing failure (see above)

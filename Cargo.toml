@@ -1,6 +1,6 @@
 [package]
 name = "beads_rust"
-version = "0.1.44"
+version = "0.1.45"
 edition = "2024"
 rust-version = "1.88"
 description = "Agent-first issue tracker (SQLite + JSONL)"
@@ -87,10 +87,10 @@ indicatif = "0.18.4"
 crossterm = "0.29"
 
 # Rich terminal output (sibling project)
-rich_rust = { version = "0.2.0", features = ["full"] }
+rich_rust = { version = "0.2.1", features = ["full"] }
 
 # TOON format support (sibling project)
-toon_rust = { version = "0.2.0", package = "tru" }
+toon_rust = { version = "0.2.2", package = "tru" }
 
 # Path normalization (strips \\?\ prefix on Windows)
 dunce = "1.0.5"
