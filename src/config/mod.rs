@@ -533,74 +533,19 @@ fn open_sqlite_storage_with_recovery_strategy(
     recovery_strategy: JsonlRecoveryStrategy,
 ) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
     if !paths.db_path.is_file() && paths.jsonl_path.is_file() {
-        return match recovery_strategy {
-            JsonlRecoveryStrategy::RebuildFromJsonl => {
-                let storage =
-                    rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer)?;
-                Ok((storage, true, None))
-            }
-            JsonlRecoveryStrategy::DeferToExplicitImport => {
-                let cleanup_set =
-                    prepare_missing_database_cleanup_for_recovery(&paths.db_path, beads_dir)?;
-                warn!(
-                    db_path = %paths.db_path.display(),
-                    jsonl_path = %paths.jsonl_path.display(),
-                    "Database file is missing; deferring JSONL recovery to explicit import semantics"
-                );
-                Ok((
-                    SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout)?,
-                    false,
-                    Some(cleanup_set),
-                ))
-            }
-        };
+        return open_when_db_file_is_missing(
+            beads_dir,
+            paths,
+            lock_timeout,
+            bootstrap_layer,
+            recovery_strategy,
+        );
     }
 
-    // Issue #228: proactively remove truncated WAL sidecar files before
-    // opening.  A WAL file that exists but is shorter than 32 bytes (the WAL
-    // header size) cannot be valid and will cause frankensqlite to return
-    // WalCorrupt during rebuild.  Removing it is safe — SQLite recreates the
-    // WAL on the next write, and the main DB file already contains all
-    // committed data (the adaptive checkpoint drains frames continuously).
-    let wal_path = PathBuf::from(format!("{}-wal", paths.db_path.to_string_lossy()));
-    if let Ok(meta) = fs::metadata(&wal_path)
-        && meta.len() < 32
-    {
-        tracing::warn!(
-            wal_path = %wal_path.display(),
-            wal_size = meta.len(),
-            "removing truncated WAL sidecar (< 32 bytes) before open"
-        );
-        let _ = fs::remove_file(&wal_path);
-        let _ = fs::remove_file(PathBuf::from(format!(
-            "{}-shm",
-            paths.db_path.to_string_lossy()
-        )));
-    }
+    remove_truncated_wal_sidecar(&paths.db_path);
 
     let prepare_fresh_storage = || -> Result<(SqliteStorage, RecoveryBackupSet)> {
-        let backup_set = backup_database_family_for_recovery(&paths.db_path, beads_dir)?;
-        let recovery_dir = backup_set.recovery_dir.clone();
-        let storage = match SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout) {
-            Ok(storage) => storage,
-            Err(open_err) => {
-                if let Err(restore_err) = restore_database_family_after_failed_rebuild(&backup_set)
-                {
-                    return Err(recovery_restore_failure(
-                        &backup_set,
-                        &open_err.into(),
-                        restore_err,
-                    ));
-                }
-                return Err(open_err.into());
-            }
-        };
-        warn!(
-            db_path = %paths.db_path.display(),
-            recovery_dir = %recovery_dir.display(),
-            "Prepared a fresh SQLite database; explicit import will populate it"
-        );
-        Ok((storage, backup_set))
+        prepare_fresh_storage_for_deferred_import(&paths.db_path, beads_dir, lock_timeout)
     };
 
     match SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout) {
@@ -640,43 +585,150 @@ fn open_sqlite_storage_with_recovery_strategy(
             if !should_attempt_jsonl_recovery(&open_err, &paths.db_path, &paths.jsonl_path) {
                 return Err(open_err);
             }
+            rebuild_or_defer_after_open_error(
+                open_err,
+                beads_dir,
+                paths,
+                lock_timeout,
+                bootstrap_layer,
+                recovery_strategy,
+                &prepare_fresh_storage,
+            )
+        }
+    }
+}
 
-            match recovery_strategy {
-                JsonlRecoveryStrategy::RebuildFromJsonl => {
-                    match rebuild_database_from_jsonl(
-                        beads_dir,
-                        paths,
-                        lock_timeout,
-                        bootstrap_layer,
-                    ) {
-                        Ok(storage) => Ok((storage, true, None)),
-                        Err(recovery_err) => {
-                            warn!(
-                                db_path = %paths.db_path.display(),
-                                jsonl_path = %paths.jsonl_path.display(),
-                                open_error = %open_err,
-                                recovery_error = %recovery_err,
-                                "Automatic database recovery from JSONL failed"
-                            );
-                            if should_surface_recovery_error(&recovery_err) {
-                                Err(recovery_err)
-                            } else {
-                                Err(open_err)
-                            }
-                        }
-                    }
-                }
-                JsonlRecoveryStrategy::DeferToExplicitImport => {
+/// Handle the "DB file missing, JSONL present" case: either rebuild the
+/// DB from JSONL outright, or (for the deferred-recovery path) prepare a
+/// cleanup set and let the caller's explicit import populate a fresh DB.
+fn open_when_db_file_is_missing(
+    beads_dir: &Path,
+    paths: &ConfigPaths,
+    lock_timeout: Option<u64>,
+    bootstrap_layer: &ConfigLayer,
+    recovery_strategy: JsonlRecoveryStrategy,
+) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
+    match recovery_strategy {
+        JsonlRecoveryStrategy::RebuildFromJsonl => {
+            let storage =
+                rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer)?;
+            Ok((storage, true, None))
+        }
+        JsonlRecoveryStrategy::DeferToExplicitImport => {
+            let cleanup_set =
+                prepare_missing_database_cleanup_for_recovery(&paths.db_path, beads_dir)?;
+            warn!(
+                db_path = %paths.db_path.display(),
+                jsonl_path = %paths.jsonl_path.display(),
+                "Database file is missing; deferring JSONL recovery to explicit import semantics"
+            );
+            Ok((
+                SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout)?,
+                false,
+                Some(cleanup_set),
+            ))
+        }
+    }
+}
+
+/// Issue #228: proactively remove truncated WAL sidecar files before
+/// opening. A WAL file that exists but is shorter than 32 bytes (the WAL
+/// header size) cannot be valid and will cause frankensqlite to return
+/// `WalCorrupt` during rebuild. Removing it is safe — SQLite recreates
+/// the WAL on the next write, and the main DB file already contains all
+/// committed data (the adaptive checkpoint drains frames continuously).
+fn remove_truncated_wal_sidecar(db_path: &Path) {
+    let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+    let Ok(meta) = fs::metadata(&wal_path) else {
+        return;
+    };
+    if meta.len() >= 32 {
+        return;
+    }
+    tracing::warn!(
+        wal_path = %wal_path.display(),
+        wal_size = meta.len(),
+        "removing truncated WAL sidecar (< 32 bytes) before open"
+    );
+    let _ = fs::remove_file(&wal_path);
+    let _ = fs::remove_file(PathBuf::from(format!("{}-shm", db_path.to_string_lossy())));
+}
+
+/// Back up the current database family and reopen a fresh handle. Used
+/// by the deferred-import recovery path when we want to install a blank
+/// DB and let an explicit `br sync --import-only` populate it.
+fn prepare_fresh_storage_for_deferred_import(
+    db_path: &Path,
+    beads_dir: &Path,
+    lock_timeout: Option<u64>,
+) -> Result<(SqliteStorage, RecoveryBackupSet)> {
+    let backup_set = backup_database_family_for_recovery(db_path, beads_dir)?;
+    let recovery_dir = backup_set.recovery_dir.clone();
+    let storage = match SqliteStorage::open_with_timeout(db_path, lock_timeout) {
+        Ok(storage) => storage,
+        Err(open_err) => {
+            if let Err(restore_err) = restore_database_family_after_failed_rebuild(&backup_set) {
+                return Err(recovery_restore_failure(
+                    &backup_set,
+                    &open_err,
+                    restore_err,
+                ));
+            }
+            return Err(open_err);
+        }
+    };
+    warn!(
+        db_path = %db_path.display(),
+        recovery_dir = %recovery_dir.display(),
+        "Prepared a fresh SQLite database; explicit import will populate it"
+    );
+    Ok((storage, backup_set))
+}
+
+/// Handle the `Err(open_err)` branch of the top-level open: either
+/// rebuild the DB from JSONL or, on the deferred-import strategy, move
+/// the broken DB family aside and open a fresh placeholder. The rebuild
+/// arm prefers the original open error over a recovery error unless the
+/// recovery error carries extra context worth surfacing.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_or_defer_after_open_error(
+    open_err: BeadsError,
+    beads_dir: &Path,
+    paths: &ConfigPaths,
+    lock_timeout: Option<u64>,
+    bootstrap_layer: &ConfigLayer,
+    recovery_strategy: JsonlRecoveryStrategy,
+    prepare_fresh_storage: &dyn Fn() -> Result<(SqliteStorage, RecoveryBackupSet)>,
+) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
+    match recovery_strategy {
+        JsonlRecoveryStrategy::RebuildFromJsonl => {
+            match rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer) {
+                Ok(storage) => Ok((storage, true, None)),
+                Err(recovery_err) => {
                     warn!(
                         db_path = %paths.db_path.display(),
                         jsonl_path = %paths.jsonl_path.display(),
                         open_error = %open_err,
-                        "Open failed with a recoverable database error; deferring JSONL recovery to explicit import semantics"
+                        recovery_error = %recovery_err,
+                        "Automatic database recovery from JSONL failed"
                     );
-                    let (storage, backup_set) = prepare_fresh_storage()?;
-                    Ok((storage, false, Some(backup_set)))
+                    if should_surface_recovery_error(&recovery_err) {
+                        Err(recovery_err)
+                    } else {
+                        Err(open_err)
+                    }
                 }
             }
+        }
+        JsonlRecoveryStrategy::DeferToExplicitImport => {
+            warn!(
+                db_path = %paths.db_path.display(),
+                jsonl_path = %paths.jsonl_path.display(),
+                open_error = %open_err,
+                "Open failed with a recoverable database error; deferring JSONL recovery to explicit import semantics"
+            );
+            let (storage, backup_set) = prepare_fresh_storage()?;
+            Ok((storage, false, Some(backup_set)))
         }
     }
 }
@@ -1679,7 +1731,7 @@ impl OpenStorageResult {
                         "Restored the original database family at '{}' but failed to reopen it",
                         self.paths.db_path.display()
                     ),
-                    source: Box::new(BeadsError::from(reopen_err)),
+                    source: Box::new(reopen_err),
                 })?;
         }
         self.loaded_jsonl_hash = None;

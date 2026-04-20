@@ -1946,7 +1946,7 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub fn get_issue_ids_by_status(&self, status: Status) -> Result<Vec<String>> {
+    pub fn get_issue_ids_by_status(&self, status: &Status) -> Result<Vec<String>> {
         let rows = self.conn.query_with_params(
             "SELECT id FROM issues WHERE status = ? ORDER BY id",
             &[SqliteValue::from(status.as_str())],

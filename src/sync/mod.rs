@@ -2701,15 +2701,13 @@ pub fn auto_flush(
     // `br sync --flush-only` already has a `--force` escape hatch for this
     // case; auto-flush has no such surface, so the only safe default is to
     // stop, log clearly, and let the next explicit sync surface the error.
-    if jsonl_exists {
-        if let Err(err) = ensure_no_conflict_markers(jsonl_path) {
-            tracing::warn!(
-                jsonl_path = %jsonl_path.display(),
-                error = %err,
-                "Skipping auto-flush: JSONL contains merge-conflict markers. Resolve them (or run `br sync --flush-only --force` to override) before the next write.",
-            );
-            return Ok(AutoFlushResult::default());
-        }
+    if jsonl_exists && let Err(err) = ensure_no_conflict_markers(jsonl_path) {
+        tracing::warn!(
+            jsonl_path = %jsonl_path.display(),
+            error = %err,
+            "Skipping auto-flush: JSONL contains merge-conflict markers. Resolve them (or run `br sync --flush-only --force` to override) before the next write.",
+        );
+        return Ok(AutoFlushResult::default());
     }
 
     tracing::debug!(
@@ -4063,7 +4061,7 @@ pub(crate) struct PreservedTombstone {
 #[must_use]
 pub(crate) fn snapshot_tombstones(storage: &SqliteStorage) -> Vec<PreservedTombstone> {
     let mut tombstones = Vec::new();
-    let tombstone_ids = match storage.get_issue_ids_by_status(crate::model::Status::Tombstone) {
+    let tombstone_ids = match storage.get_issue_ids_by_status(&crate::model::Status::Tombstone) {
         Ok(ids) => ids,
         Err(error) => {
             tracing::warn!(

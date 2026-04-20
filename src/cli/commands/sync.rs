@@ -90,28 +90,7 @@ pub fn execute(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    // Validate arg combinations BEFORE opening storage or triggering any
-    // rebuild side effects. A `--flush-only --rebuild` or `--merge --rebuild`
-    // combination must return an error without having touched the DB family
-    // — otherwise the validation message arrives after `recover_database_from_jsonl`
-    // has already moved the existing DB aside.
-    let mode_count = u8::from(args.flush_only) + u8::from(args.import_only) + u8::from(args.merge);
-    if mode_count > 1 {
-        return Err(BeadsError::Validation {
-            field: "mode".to_string(),
-            reason: "Must specify exactly one of --flush-only, --import-only, or --merge"
-                .to_string(),
-        });
-    }
-
-    // --rebuild only makes sense with import (the default or --import-only)
-    if args.rebuild && (args.flush_only || args.merge) {
-        return Err(BeadsError::Validation {
-            field: "rebuild".to_string(),
-            reason: "--rebuild can only be used with import mode (not --flush-only or --merge)"
-                .to_string(),
-        });
-    }
+    validate_sync_mode_args(args)?;
 
     // Open storage. For `--rename-prefix` imports, defer any implicit JSONL
     // recovery until the explicit import path below so the command's import
@@ -135,140 +114,200 @@ pub fn execute(
     let mut open_result =
         config::open_storage_with_startup_config(startup, cli, defer_jsonl_recovery)?;
 
-    // When `--rebuild` is requested against an existing (non-auto-rebuilt) DB,
-    // delegate the actual rebuild to the same proven path that auto-recovery
-    // uses: backup the DB family, open a fresh connection, import JSONL,
-    // checkpoint, VACUUM/REINDEX. The in-place
-    // `reset_data_tables`+`import_from_jsonl` code path inside `execute_import`
-    // is fragile on fsqlite — it trips stale-pager/MVCC bugs that leave
-    // "never used" pages and partial-index mismatches that VACUUM can't
-    // always reclaim. Using `recover_database_from_jsonl` sidesteps all of
-    // that, and `execute_import` then sees `auto_rebuilt == true` and
-    // short-circuits.
-    //
-    // Only fire this for the request that will actually go through
-    // `execute_import`: `--rebuild` without `--status`, and not alongside
-    // `--flush-only`/`--merge` (already rejected above). `--status` must
-    // stay read-only even when the caller also passed `--rebuild`, so skip
-    // the rebuild if status was requested. Also require the JSONL to exist
-    // — `recover_database_from_jsonl` runs a preflight that fails hard if
-    // the file is missing, whereas `execute_import` already handles a
-    // missing JSONL gracefully, so leave that case to the normal path.
-    //
-    // Skip the delegation when the caller asked for behavior that the
-    // auto-recovery path does not replicate: `--rename-prefix` rewrites
-    // imported IDs into the configured prefix, while
-    // `repair_database_from_jsonl` always runs with `rename_on_import =
-    // false`. That means the delegation would silently skip the requested
-    // rename behavior.
-    //
-    // `--orphans` is intentionally *not* part of this guard today. The
-    // current import engine parses `orphan_mode` into `ImportConfig`, but it
-    // does not consult that field during import, so delegating does not change
-    // effective behavior. If orphan-mode semantics become active in the future,
-    // revisit this guard and the auto-rebuild conflict detection below.
+    maybe_delegate_rebuild(args, &mut open_result)?;
+
+    let command_result =
+        dispatch_sync_subcommand(args, cli, ctx, &beads_dir, &path_policy, &mut open_result);
+
+    finalize_sync_result(command_result, &mut open_result)
+}
+
+/// Reject argument combinations that must fail BEFORE opening storage or
+/// triggering any rebuild side effect. A `--flush-only --rebuild` or
+/// `--merge --rebuild` combination must return an error without having
+/// touched the DB family — otherwise the validation message arrives after
+/// `recover_database_from_jsonl` has already moved the existing DB aside.
+fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
+    let mode_count = u8::from(args.flush_only) + u8::from(args.import_only) + u8::from(args.merge);
+    if mode_count > 1 {
+        return Err(BeadsError::Validation {
+            field: "mode".to_string(),
+            reason: "Must specify exactly one of --flush-only, --import-only, or --merge"
+                .to_string(),
+        });
+    }
+
+    // --rebuild only makes sense with import (the default or --import-only)
+    if args.rebuild && (args.flush_only || args.merge) {
+        return Err(BeadsError::Validation {
+            field: "rebuild".to_string(),
+            reason: "--rebuild can only be used with import mode (not --flush-only or --merge)"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// When `--rebuild` is requested against an existing (non-auto-rebuilt)
+/// DB, delegate the actual rebuild to the same proven path that auto-
+/// recovery uses: backup the DB family, open a fresh connection, import
+/// JSONL, checkpoint, VACUUM/REINDEX. The in-place
+/// `reset_data_tables`+`import_from_jsonl` code path inside
+/// `execute_import` is fragile on fsqlite — it trips stale-pager/MVCC
+/// bugs that leave "never used" pages and partial-index mismatches that
+/// VACUUM can't always reclaim. Using `recover_database_from_jsonl`
+/// sidesteps all of that, and `execute_import` then sees
+/// `auto_rebuilt == true` and short-circuits.
+///
+/// Only fire this for the request that will actually go through
+/// `execute_import`: `--rebuild` without `--status`, and not alongside
+/// `--flush-only`/`--merge` (already rejected above). `--status` must
+/// stay read-only even when the caller also passed `--rebuild`, so skip
+/// the rebuild if status was requested. Also require the JSONL to exist —
+/// `recover_database_from_jsonl` runs a preflight that fails hard if the
+/// file is missing, whereas `execute_import` already handles a missing
+/// JSONL gracefully, so leave that case to the normal path.
+///
+/// Skip the delegation when the caller asked for behavior that the
+/// auto-recovery path does not replicate: `--rename-prefix` rewrites
+/// imported IDs into the configured prefix, while
+/// `repair_database_from_jsonl` always runs with
+/// `rename_on_import = false`. That means the delegation would silently
+/// skip the requested rename behavior.
+///
+/// `--orphans` is intentionally *not* part of this guard today. The
+/// current import engine parses `orphan_mode` into `ImportConfig`, but it
+/// does not consult that field during import, so delegating does not
+/// change effective behavior. If orphan-mode semantics become active in
+/// the future, revisit this guard and the auto-rebuild conflict
+/// detection below.
+fn maybe_delegate_rebuild(
+    args: &SyncArgs,
+    open_result: &mut config::OpenStorageResult,
+) -> Result<()> {
     let delegation_would_drop_user_flags = args.rename_prefix;
-    if args.rebuild
+    let should_delegate = args.rebuild
         && !args.status
         && !open_result.no_db
         && !open_result.auto_rebuilt
         && open_result.paths.jsonl_path.is_file()
-        && !delegation_would_drop_user_flags
-    {
-        info!(
-            db_path = %open_result.paths.db_path.display(),
-            jsonl_path = %open_result.paths.jsonl_path.display(),
-            "--rebuild requested on existing DB: delegating to auto-recovery rebuild path"
-        );
-        // Snapshot tombstones before the delegation wipes the DB. The
-        // in-place rebuild path inside `execute_import` preserves deletion-
-        // retention state across `reset_data_tables` via
-        // `snapshot_tombstones` + `restore_tombstones`; the auto-recovery
-        // path opens a fresh DB and only imports what's in the JSONL, so
-        // any tombstones that were in the old DB but not yet flushed would
-        // be silently lost. Grab them here, restore them after the
-        // delegated rebuild completes.
-        //
-        // `scan_jsonl_for_tombstone_filter` parses the JSONL, and that
-        // parse fails with a generic "Invalid JSON at line 1" when the
-        // file contains merge-conflict markers. Scan for markers first so
-        // the operator gets the conflict-markers error class that
-        // `recover_database_from_jsonl`'s preflight would have surfaced
-        // otherwise.
-        crate::sync::ensure_no_conflict_markers(&open_result.paths.jsonl_path)?;
-        let jsonl_filter = scan_jsonl_for_tombstone_filter(&open_result.paths.jsonl_path)?;
-        let preserved_pre_delegation_tombstones = tombstones_missing_from_jsonl_tombstones(
-            snapshot_tombstones(&open_result.storage),
-            &jsonl_filter,
-        );
-        // `recover_database_from_jsonl` sets `auto_rebuilt = true` on success,
-        // which is what gates the short-circuit inside `execute_import` below.
-        open_result.recover_database_from_jsonl()?;
-        let restore_count = preserved_pre_delegation_tombstones.len();
-        restore_tombstones_after_rebuild(
-            &mut open_result.storage,
-            &preserved_pre_delegation_tombstones,
-        )?;
-        if restore_count > 0 {
-            debug!(
-                count = restore_count,
-                "Restored tombstones across delegated auto-recovery rebuild"
-            );
-        }
+        && !delegation_would_drop_user_flags;
+    if !should_delegate {
+        return Ok(());
     }
 
-    let command_result = (|| {
-        let db_path = open_result.paths.db_path.clone();
-        let retention_days = open_result.paths.metadata.deletions_retention_days;
-        let use_json = ctx.is_json() || args.robot;
-        let quiet = cli.quiet.unwrap_or(false);
-        let show_progress = should_show_progress(use_json, quiet);
+    info!(
+        db_path = %open_result.paths.db_path.display(),
+        jsonl_path = %open_result.paths.jsonl_path.display(),
+        "--rebuild requested on existing DB: delegating to auto-recovery rebuild path"
+    );
+    // Snapshot tombstones before the delegation wipes the DB. The
+    // in-place rebuild path inside `execute_import` preserves deletion-
+    // retention state across `reset_data_tables` via
+    // `snapshot_tombstones` + `restore_tombstones`; the auto-recovery
+    // path opens a fresh DB and only imports what's in the JSONL, so
+    // any tombstones that were in the old DB but not yet flushed would
+    // be silently lost. Grab them here, restore them after the
+    // delegated rebuild completes.
+    //
+    // `scan_jsonl_for_tombstone_filter` parses the JSONL, and that
+    // parse fails with a generic "Invalid JSON at line 1" when the
+    // file contains merge-conflict markers. Scan for markers first so
+    // the operator gets the conflict-markers error class that
+    // `recover_database_from_jsonl`'s preflight would have surfaced
+    // otherwise.
+    crate::sync::ensure_no_conflict_markers(&open_result.paths.jsonl_path)?;
+    let jsonl_filter = scan_jsonl_for_tombstone_filter(&open_result.paths.jsonl_path)?;
+    let preserved_pre_delegation_tombstones = tombstones_missing_from_jsonl_tombstones(
+        snapshot_tombstones(&open_result.storage),
+        &jsonl_filter,
+    );
+    // `recover_database_from_jsonl` sets `auto_rebuilt = true` on success,
+    // which is what gates the short-circuit inside `execute_import` below.
+    open_result.recover_database_from_jsonl()?;
+    let restore_count = preserved_pre_delegation_tombstones.len();
+    restore_tombstones_after_rebuild(
+        &mut open_result.storage,
+        &preserved_pre_delegation_tombstones,
+    )?;
+    if restore_count > 0 {
+        debug!(
+            count = restore_count,
+            "Restored tombstones across delegated auto-recovery rebuild"
+        );
+    }
+    Ok(())
+}
 
-        // Handle --status flag
-        if args.status {
-            return execute_status(&open_result.storage, &path_policy, use_json, ctx);
-        }
+/// Dispatch to the appropriate sync-subcommand implementation based on
+/// the flag pattern (`--status` / `--flush-only` / `--merge` /
+/// default-or-`--import-only`). Runs in a closure so an early `return`
+/// inside the status branch still yields a `Result<()>` the caller can
+/// route through `finalize_sync_result`.
+fn dispatch_sync_subcommand(
+    args: &SyncArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    beads_dir: &Path,
+    path_policy: &SyncPathPolicy,
+    open_result: &mut config::OpenStorageResult,
+) -> Result<()> {
+    let db_path = open_result.paths.db_path.clone();
+    let retention_days = open_result.paths.metadata.deletions_retention_days;
+    let use_json = ctx.is_json() || args.robot;
+    let quiet = cli.quiet.unwrap_or(false);
+    let show_progress = should_show_progress(use_json, quiet);
 
-        if args.flush_only {
-            execute_flush(
-                &mut open_result.storage,
-                &beads_dir,
-                &path_policy,
-                args,
-                use_json,
-                show_progress,
-                retention_days,
-                ctx,
-            )
-        } else if args.merge {
-            execute_merge(
-                &mut open_result.storage,
-                &path_policy,
-                args,
-                use_json,
-                show_progress,
-                retention_days,
-                cli,
-                ctx,
-            )
-        } else {
-            // Default to import-only if no flag is specified (consistent with existing behavior)
-            // or explicitly import-only
-            execute_import(
-                &mut open_result.storage,
-                &beads_dir,
-                cli,
-                &path_policy,
-                args,
-                use_json,
-                show_progress,
-                open_result.auto_rebuilt,
-                &db_path,
-                ctx,
-            )
-        }
-    })();
+    if args.status {
+        return execute_status(&open_result.storage, path_policy, use_json, ctx);
+    }
+    if args.flush_only {
+        return execute_flush(
+            &mut open_result.storage,
+            beads_dir,
+            path_policy,
+            args,
+            use_json,
+            show_progress,
+            retention_days,
+            ctx,
+        );
+    }
+    if args.merge {
+        return execute_merge(
+            &mut open_result.storage,
+            path_policy,
+            args,
+            use_json,
+            show_progress,
+            retention_days,
+            cli,
+            ctx,
+        );
+    }
+    // Default to import-only if no flag is specified (consistent with
+    // existing behavior) or explicitly `--import-only`.
+    execute_import(
+        &mut open_result.storage,
+        beads_dir,
+        cli,
+        path_policy,
+        args,
+        use_json,
+        show_progress,
+        open_result.auto_rebuilt,
+        &db_path,
+        ctx,
+    )
+}
 
+/// Fold the subcommand result into the final command outcome, restoring
+/// the pre-recovery backup on error (deferred-recovery paths only) and
+/// discarding it on success.
+fn finalize_sync_result(
+    command_result: Result<()>,
+    open_result: &mut config::OpenStorageResult,
+) -> Result<()> {
     match command_result {
         Ok(()) => {
             open_result.discard_pending_recovery_backup();
@@ -1075,10 +1114,10 @@ fn jsonl_contains_prefix_mismatch(jsonl_path: &Path, expected_prefix: &str) -> R
 fn jsonl_contains_duplicate_external_refs(jsonl_path: &Path) -> Result<bool> {
     let mut seen_external_refs = HashSet::new();
     for issue in read_issues_from_jsonl(jsonl_path)? {
-        if let Some(external_ref) = issue.external_ref {
-            if !seen_external_refs.insert(external_ref) {
-                return Ok(true);
-            }
+        if let Some(external_ref) = issue.external_ref
+            && !seen_external_refs.insert(external_ref)
+        {
+            return Ok(true);
         }
     }
     Ok(false)
