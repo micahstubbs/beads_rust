@@ -542,7 +542,7 @@ fn open_sqlite_storage_with_recovery_strategy(
         );
     }
 
-    remove_truncated_wal_sidecar(&paths.db_path);
+    quarantine_truncated_wal_sidecar(&paths.db_path, beads_dir);
 
     let prepare_fresh_storage = || -> Result<(SqliteStorage, RecoveryBackupSet)> {
         prepare_fresh_storage_for_deferred_import(&paths.db_path, beads_dir, lock_timeout)
@@ -631,13 +631,13 @@ fn open_when_db_file_is_missing(
     }
 }
 
-/// Issue #228: proactively remove truncated WAL sidecar files before
+/// Issue #228: proactively quarantine truncated WAL sidecar files before
 /// opening. A WAL file that exists but is shorter than 32 bytes (the WAL
 /// header size) cannot be valid and will cause frankensqlite to return
-/// `WalCorrupt` during rebuild. Removing it is safe — SQLite recreates
-/// the WAL on the next write, and the main DB file already contains all
-/// committed data (the adaptive checkpoint drains frames continuously).
-fn remove_truncated_wal_sidecar(db_path: &Path) {
+/// `WalCorrupt` during rebuild. Moving the sidecars out of the live
+/// database family lets SQLite recreate them on the next write while
+/// preserving the original bytes for operator inspection.
+fn quarantine_truncated_wal_sidecar(db_path: &Path, beads_dir: &Path) {
     let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
     let Ok(meta) = fs::metadata(&wal_path) else {
         return;
@@ -645,13 +645,31 @@ fn remove_truncated_wal_sidecar(db_path: &Path) {
     if meta.len() >= 32 {
         return;
     }
-    tracing::warn!(
-        wal_path = %wal_path.display(),
-        wal_size = meta.len(),
-        "removing truncated WAL sidecar (< 32 bytes) before open"
-    );
-    let _ = fs::remove_file(&wal_path);
-    let _ = fs::remove_file(PathBuf::from(format!("{}-shm", db_path.to_string_lossy())));
+    let wal_size = meta.len();
+    let shm_path = PathBuf::from(format!("{}-shm", db_path.to_string_lossy()));
+    match quarantine_database_artifacts(
+        db_path,
+        beads_dir,
+        [wal_path.clone(), shm_path],
+        "truncated-wal",
+    ) {
+        Ok(quarantined_paths) => {
+            tracing::warn!(
+                wal_path = %wal_path.display(),
+                wal_size,
+                quarantined_paths = ?quarantined_paths,
+                "quarantined truncated WAL sidecar (< 32 bytes) before open"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                wal_path = %wal_path.display(),
+                wal_size,
+                error = %err,
+                "failed to quarantine truncated WAL sidecar before open"
+            );
+        }
+    }
 }
 
 /// Back up the current database family and reopen a fresh handle. Used
@@ -5570,6 +5588,98 @@ routing:
         assert_eq!(
             backup_count, 0,
             "no recovery backup should be created when JSONL preflight fails"
+        );
+    }
+
+    #[test]
+    fn quarantine_truncated_wal_sidecar_moves_wal_and_shm_to_recovery() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+        let shm_path = PathBuf::from(format!("{}-shm", db_path.to_string_lossy()));
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        fs::write(&db_path, b"db").expect("write db");
+        fs::write(&wal_path, b"bad").expect("write truncated wal");
+        fs::write(&shm_path, b"sidecar shared memory").expect("write shm");
+
+        quarantine_truncated_wal_sidecar(&db_path, &beads_dir);
+
+        assert!(
+            !wal_path.exists(),
+            "truncated wal should be moved out of the live database family"
+        );
+        assert!(
+            !shm_path.exists(),
+            "matching shm sidecar should be moved with the truncated wal"
+        );
+
+        let recovery_dir = recovery_dir_for_db_path(&db_path, &beads_dir);
+        let quarantined_paths: Vec<_> = fs::read_dir(&recovery_dir)
+            .expect("list recovery dir")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .collect();
+        let wal_backup = quarantined_paths
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("beads.db-wal.")
+                            && Path::new(name)
+                                .extension()
+                                .is_some_and(|ext| ext.eq_ignore_ascii_case("truncated-wal"))
+                    })
+            })
+            .expect("wal quarantine artifact");
+        let shm_backup = quarantined_paths
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("beads.db-shm.")
+                            && Path::new(name)
+                                .extension()
+                                .is_some_and(|ext| ext.eq_ignore_ascii_case("truncated-wal"))
+                    })
+            })
+            .expect("shm quarantine artifact");
+
+        assert_eq!(
+            fs::read(wal_backup).expect("read quarantined wal"),
+            b"bad",
+            "quarantined wal bytes must remain inspectable"
+        );
+        assert_eq!(
+            fs::read(shm_backup).expect("read quarantined shm"),
+            b"sidecar shared memory",
+            "quarantined shm bytes must remain inspectable"
+        );
+    }
+
+    #[test]
+    fn quarantine_truncated_wal_sidecar_leaves_valid_wal_family_in_place() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+        let shm_path = PathBuf::from(format!("{}-shm", db_path.to_string_lossy()));
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        fs::write(&db_path, b"db").expect("write db");
+        fs::write(&wal_path, [0_u8; 32]).expect("write valid-sized wal");
+        fs::write(&shm_path, b"live shm").expect("write shm");
+
+        quarantine_truncated_wal_sidecar(&db_path, &beads_dir);
+
+        assert!(wal_path.is_file(), "valid-sized wal should remain live");
+        assert!(shm_path.is_file(), "shm should remain live with valid wal");
+        assert!(
+            !recovery_dir_for_db_path(&db_path, &beads_dir).exists(),
+            "valid-sized wal should not create a recovery quarantine"
         );
     }
 
