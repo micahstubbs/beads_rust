@@ -51,7 +51,7 @@ You need to track issues for your project, but:
 
 ### The Solution
 
-**br** is a local-first issue tracker that stores issues in SQLite with JSONL export for git-friendly collaboration. It's **20K lines of Rust** focused on one thing: tracking issues without getting in your way.
+**br** is a local-first issue tracker that stores issues in SQLite with JSONL export for git-friendly collaboration. It provides dependency-aware issue tracking, machine-readable output, sync/recovery tooling, and agent-friendly workflows without leaving your repository.
 
 ```bash
 br init                              # Initialize in your repo
@@ -203,9 +203,12 @@ Output mode is auto-detected:
 - **JSON**: Machine-readable (`--json` flag)
 - **Quiet**: Minimal output (`--quiet` flag)
 
-### 6. Minimal Footprint
+### 6. Focused Local Scope
 
-~20K lines of Rust vs ~276K lines in the original Go beads. Faster compilation, smaller binary, fewer moving parts.
+br has grown into a full CLI surface for local issue tracking: routing, recovery,
+TOON/JSON schemas, MCP support, conformance checks, and sync safety tools are
+all part of the current scope. The focus is still local-first operation, explicit
+git/VCS handoff, and no background services installed behind your back.
 
 ---
 
@@ -215,15 +218,14 @@ Output mode is auto-detected:
 
 | Aspect | br (Rust) | beads (Go) |
 |--------|-----------|------------|
-| Lines of code | ~20,000 | ~276,000 |
 | Git operations | **Never** (explicit) | Auto-commit, hooks |
 | Storage | SQLite + JSONL | Dolt/SQLite |
 | Background daemon | **No** | Yes |
 | Hook installation | **Manual** | Automatic |
 | Binary size | ~5-8 MB | ~30+ MB |
-| Complexity | Focused | Feature-rich |
+| Scope | Local CLI, sync, recovery, and agent workflows | Feature-rich ecosystem |
 
-**When to use br:** You want a stable, minimal issue tracker that stays out of your way.
+**When to use br:** You want a stable, local-first issue tracker with explicit sync, dependency-aware planning, and machine-readable output.
 
 **When to use beads:** You want advanced features like Linear/Jira sync, RPC daemon, automatic hooks.
 
@@ -738,7 +740,7 @@ br sync --import-only
 
 - **Smaller binary:** ~5-8 MB vs ~30+ MB
 - **Memory safety:** No runtime garbage collection
-- **Stability:** Fewer moving parts = fewer things to break
+- **Operational fit:** The CLI, release pipeline, and agent tooling are already Rust-based
 - **Personal preference:** The author's flywheel tooling is Rust-based
 
 ### Q: How do dependencies work?
