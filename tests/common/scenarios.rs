@@ -3085,11 +3085,151 @@ pub mod catalog {
             ])
     }
 
+    /// Deterministic single-workspace stress story that repeats mixed human/agent command ordering.
+    #[allow(clippy::too_many_lines)]
+    pub fn long_lived_mixed_order_stress(seed: u64, iterations: usize) -> WorkspaceEvolutionPlan {
+        let iterations = iterations.max(1);
+        let mut steps = Vec::with_capacity(iterations.saturating_mul(12).saturating_add(8));
+
+        steps.push(captured_create_step(
+            seed,
+            "stress-anchor",
+            "anchor",
+            "create_anchor",
+        ));
+        steps.push(sync_flush_step("flush_anchor"));
+
+        for iteration in 0..iterations {
+            let iteration_seed = seed
+                .checked_add(u64::try_from(iteration).expect("iteration should fit into u64"))
+                .expect("stress seed should not overflow");
+            let alias = format!("stress_{iteration}");
+            let create_label = format!("create_stress_{iteration}");
+            steps.push(captured_create_step(
+                iteration_seed,
+                &format!("stress-{iteration}"),
+                &alias,
+                &create_label,
+            ));
+
+            steps.push(command_step(
+                vec![
+                    "sync".to_string(),
+                    "--status".to_string(),
+                    "--json".to_string(),
+                ],
+                &format!("status_after_create_{iteration}"),
+            ));
+            steps.push(stale_read_step("list", &format!("stale_list_{iteration}")));
+            steps.push(command_step(
+                vec![
+                    "update".to_string(),
+                    format!("{{{alias}}}"),
+                    "--status".to_string(),
+                    "in_progress".to_string(),
+                    "--json".to_string(),
+                ],
+                &format!("agent_claim_{iteration}"),
+            ));
+            steps.push(command_step(
+                vec![
+                    "label".to_string(),
+                    "add".to_string(),
+                    format!("{{{alias}}}"),
+                    format!("stress-{iteration}"),
+                    "--json".to_string(),
+                ],
+                &format!("human_label_{iteration}"),
+            ));
+            steps.push(command_step(
+                vec![
+                    "comments".to_string(),
+                    "add".to_string(),
+                    format!("{{{alias}}}"),
+                    seeded_reason(iteration_seed, "stress-note"),
+                    "--json".to_string(),
+                ],
+                &format!("agent_comment_{iteration}"),
+            ));
+
+            if iteration % 3 == 1 {
+                steps.push(close_step(
+                    iteration_seed,
+                    &alias,
+                    "stress-close",
+                    &format!("close_stress_{iteration}"),
+                    true,
+                ));
+                steps.push(reopen_step(
+                    iteration_seed,
+                    &alias,
+                    "stress-reopen",
+                    &format!("reopen_stress_{iteration}"),
+                ));
+            }
+
+            if iteration % 4 == 2 {
+                steps.push(WorkspaceEvolutionStep::command(
+                    WorkspaceEvolutionCommand::new(
+                        ScenarioCommand::new(["show", "missing-stress-id", "--json"])
+                            .with_label(format!("expected_missing_show_{iteration}")),
+                    )
+                    .expect_failure(),
+                ));
+            }
+
+            if iteration % 2 == 0 {
+                steps.push(sync_flush_step(&format!("flush_even_{iteration}")));
+            } else {
+                steps.push(command_step(
+                    vec![
+                        "sync".to_string(),
+                        "--import-only".to_string(),
+                        "--force".to_string(),
+                        "--json".to_string(),
+                    ],
+                    &format!("import_odd_{iteration}"),
+                ));
+            }
+
+            if iteration % 5 == 4 {
+                steps.push(WorkspaceEvolutionStep::snapshot(format!(
+                    "checkpoint_{iteration}"
+                )));
+            }
+        }
+
+        steps.push(command_step(
+            vec!["ready".to_string(), "--json".to_string()],
+            "ready_after_stress",
+        ));
+        steps.push(command_step(
+            vec!["info".to_string(), "--json".to_string()],
+            "info_after_stress",
+        ));
+        steps.push(command_step(
+            vec!["where".to_string(), "--json".to_string()],
+            "where_after_stress",
+        ));
+        steps.push(sync_flush_step("flush_after_stress"));
+        steps.push(command_step(
+            vec!["doctor".to_string(), "--json".to_string()],
+            "doctor_after_stress",
+        ));
+
+        WorkspaceEvolutionPlan::new("long_lived_mixed_order_stress", seed)
+            .with_description(
+                "Seeded long-running single-workspace stress story covering repeated issue lifecycle operations, sync status/import/export checks, expected failures, process restarts, and mixed human/agent command ordering.",
+            )
+            .with_steps(steps)
+    }
+
     /// Deterministic catalog of long-lived workspace evolutions for a seed.
     pub fn long_lived_seed_suite(seed: u64) -> Vec<WorkspaceEvolutionPlan> {
         vec![
             long_lived_dependency_story(seed),
             long_lived_recovery_story(seed),
+            long_lived_mixed_order_stress(seed, 6),
         ]
     }
 }

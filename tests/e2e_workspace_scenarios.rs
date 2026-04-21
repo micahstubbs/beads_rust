@@ -15,7 +15,9 @@ mod common;
 
 use common::cli::parse_list_issues;
 use common::harness::{TestWorkspace, extract_json_payload};
+use common::scenarios::{WorkspaceEvolutionEventKind, catalog};
 use serde_json::Value;
+use tempfile::TempDir;
 
 // =============================================================================
 // Init Scenarios
@@ -442,4 +444,82 @@ fn scenario_workspace_lifecycle() {
     doctor2.assert_success();
 
     ws.finish(true);
+}
+
+#[test]
+fn scenario_long_lived_single_workspace_stress_suite() {
+    let iterations = std::env::var("BR_LONG_STRESS_ITERATIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8);
+
+    let materialized = catalog::long_lived_mixed_order_stress(41, iterations)
+        .execute()
+        .expect("long-lived stress plan should execute");
+
+    let command_events: Vec<_> = materialized
+        .events
+        .iter()
+        .filter(|event| event.kind == WorkspaceEvolutionEventKind::Command)
+        .collect();
+    assert!(
+        command_events.len() >= iterations.saturating_mul(8),
+        "stress suite should run a meaningful command volume: {} events for {iterations} iterations",
+        command_events.len()
+    );
+
+    let expected_failures: Vec<_> = command_events
+        .iter()
+        .filter_map(|event| {
+            event
+                .command_result
+                .as_ref()
+                .filter(|result| !result.success)
+                .map(|result| (*event, result))
+        })
+        .collect();
+    assert!(
+        !expected_failures.is_empty(),
+        "stress suite should include expected intermittent failure probes"
+    );
+    for (event, result) in expected_failures {
+        assert!(
+            event.matched_expectation,
+            "expected failure should still match its declared outcome: {}",
+            event.label
+        );
+        assert!(
+            result.log_path.exists(),
+            "expected failure should leave a replay log at {}",
+            result.log_path.display()
+        );
+    }
+
+    let final_doctor = materialized
+        .event("doctor_after_stress")
+        .and_then(|event| event.command_result.as_ref())
+        .expect("final doctor event");
+    assert!(
+        final_doctor.success,
+        "stress workspace should finish doctor-clean: {}",
+        final_doctor.stderr
+    );
+
+    let replay_target = TempDir::new().expect("replay target");
+    materialized
+        .materialize_into(replay_target.path())
+        .expect("copy materialized stress workspace");
+    assert!(
+        replay_target
+            .path()
+            .join(".beads")
+            .join("issues.jsonl")
+            .exists(),
+        "materialized stress workspace should retain the JSONL export"
+    );
+    assert!(
+        replay_target.path().join("logs").exists(),
+        "materialized stress workspace should retain command logs"
+    );
 }
