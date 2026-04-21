@@ -706,3 +706,105 @@ fn workspace_failure_replay_core_write_surfaces_match_expected_posture() {
         }
     }
 }
+
+fn infer_classification(metadata: &WorkspaceFailureFixtureMetadata) -> &'static str {
+    let startup = metadata.outcome_for("startup/open");
+    let doctor = metadata.outcome_for("doctor");
+    let create = metadata.outcome_for("create");
+    let sync_status = metadata.outcome_for("sync --status");
+
+    let startup_fails = matches!(
+        startup,
+        Some(
+            WorkspaceFailureCommandOutcome::FailsPrefixMismatch
+                | WorkspaceFailureCommandOutcome::FailsConflictMarkers
+                | WorkspaceFailureCommandOutcome::FailsInvalidJson
+        )
+    );
+    let startup_needs_recovery = matches!(
+        startup,
+        Some(WorkspaceFailureCommandOutcome::SuccessWithAutoRecovery)
+    );
+    let doctor_reports_errors =
+        matches!(doctor, Some(WorkspaceFailureCommandOutcome::ReportsErrors));
+    let sync_shows_drift = matches!(
+        sync_status,
+        Some(WorkspaceFailureCommandOutcome::StatusJsonlNewer)
+    );
+
+    if startup_fails {
+        return "unsafe";
+    }
+    if startup_needs_recovery {
+        return "recoverable";
+    }
+    if doctor_reports_errors || sync_shows_drift {
+        return "degraded";
+    }
+    match (startup, create) {
+        (
+            Some(WorkspaceFailureCommandOutcome::Success),
+            Some(WorkspaceFailureCommandOutcome::Success),
+        ) if !doctor_reports_errors && !sync_shows_drift => {
+            if matches!(doctor, Some(WorkspaceFailureCommandOutcome::DoctorClean))
+                && matches!(
+                    sync_status,
+                    Some(WorkspaceFailureCommandOutcome::StatusInSync) | None
+                )
+            {
+                "healthy"
+            } else {
+                "usable"
+            }
+        }
+        _ => "unknown",
+    }
+}
+
+#[test]
+fn workspace_failure_replay_classification_coherence() {
+    let _log = common::test_log("workspace_failure_replay_classification_coherence");
+    let fixtures = list_workspace_failure_fixtures().expect("fixture catalog");
+
+    assert!(
+        !fixtures.is_empty(),
+        "fixture catalog should contain at least one fixture"
+    );
+
+    let valid_classifications = ["healthy", "usable", "degraded", "recoverable", "unsafe"];
+
+    for fixture in &fixtures {
+        let declared = &fixture.metadata.expected_classification;
+        assert!(
+            valid_classifications.contains(&declared.as_str()),
+            "{}: declared classification '{}' is not in the valid set {:?}",
+            fixture.metadata.name,
+            declared,
+            valid_classifications
+        );
+
+        let inferred = infer_classification(&fixture.metadata);
+        assert_eq!(
+            declared.as_str(),
+            inferred,
+            "{}: declared classification '{}' does not match inferred '{}' from surface outcomes \
+             (startup/open={:?}, doctor={:?}, create={:?})",
+            fixture.metadata.name,
+            declared,
+            inferred,
+            fixture.metadata.outcome_for("startup/open"),
+            fixture.metadata.outcome_for("doctor"),
+            fixture.metadata.outcome_for("create"),
+        );
+    }
+
+    let families: std::collections::HashSet<&str> = fixtures
+        .iter()
+        .map(|f| f.metadata.expected_classification.as_str())
+        .collect();
+    assert!(
+        families.len() >= 3,
+        "fixture corpus should cover at least 3 distinct classification levels, got: {:?}",
+        families
+    );
+}

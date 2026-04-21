@@ -224,10 +224,13 @@ pub fn classify_file_state(db_path: &Path, jsonl_path: &Path) -> Vec<AnomalyClas
     }
 
     if db_path.is_file()
-        && let Ok(bytes) = std::fs::read(db_path)
-        && (bytes.len() < 16 || !bytes.starts_with(b"SQLite format 3\0"))
+        && let Ok(mut file) = std::fs::File::open(db_path)
     {
-        anomalies.push(AnomalyClass::DatabaseNotSqlite);
+        use std::io::Read;
+        let mut header = [0u8; 16];
+        if file.read_exact(&mut header).is_err() || &header != b"SQLite format 3\0" {
+            anomalies.push(AnomalyClass::DatabaseNotSqlite);
+        }
     }
 
     let wal_path = db_path.with_extension("db-wal");
@@ -253,6 +256,7 @@ pub fn classify_file_state(db_path: &Path, jsonl_path: &Path) -> Vec<AnomalyClas
             line.starts_with("<<<<<<<")
                 || line.starts_with(">>>>>>>")
                 || line.starts_with("=======")
+                || line.starts_with("|||||||")
         });
         if has_conflict_markers {
             anomalies.push(AnomalyClass::JsonlConflictMarkers);
@@ -353,6 +357,41 @@ mod tests {
         let classification = WorkspaceClassification::from_anomalies(anomalies);
         assert_eq!(classification.health, WorkspaceHealth::Unsafe);
         assert!(!classification.recovery_possible());
+    }
+
+    #[test]
+    fn diff3_style_conflict_markers_are_detected() {
+        let (_dir, db_path, jsonl_path) = setup_workspace();
+        let mut f = std::fs::File::create(&db_path).unwrap();
+        f.write_all(b"SQLite format 3\0").unwrap();
+        f.write_all(&[0u8; 100]).unwrap();
+        std::fs::write(
+            &jsonl_path,
+            "<<<<<<< HEAD\n{\"id\":\"a\"}\n||||||| merged common ancestors\n{\"id\":\"base\"}\n=======\n{\"id\":\"b\"}\n>>>>>>> branch\n",
+        )
+        .unwrap();
+
+        let anomalies = classify_file_state(&db_path, &jsonl_path);
+        assert!(
+            anomalies
+                .iter()
+                .any(|a| matches!(a, AnomalyClass::JsonlConflictMarkers))
+        );
+    }
+
+    #[test]
+    fn tiny_db_file_below_sqlite_magic_is_flagged_as_not_sqlite() {
+        let (_dir, db_path, jsonl_path) = setup_workspace();
+        // Only 8 bytes — less than the 16-byte SQLite magic header.
+        std::fs::write(&db_path, b"short").unwrap();
+        std::fs::write(&jsonl_path, "{\"id\":\"test-1\"}\n").unwrap();
+
+        let anomalies = classify_file_state(&db_path, &jsonl_path);
+        assert!(
+            anomalies
+                .iter()
+                .any(|a| matches!(a, AnomalyClass::DatabaseNotSqlite))
+        );
     }
 
     #[test]
