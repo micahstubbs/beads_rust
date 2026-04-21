@@ -36,7 +36,7 @@ This guide covers how AI coding agents can effectively use `br` (beads_rust) for
 2. **Check exit codes** for success/failure
 3. **Parse structured errors** for recovery hints
 4. **Use `br ready`** to find actionable work
-5. **Sync at session end** with `br sync --flush-only`
+5. **Run a final export check** with `br sync --flush-only` before committing `.beads/`
 
 ---
 
@@ -57,7 +57,7 @@ br close br-123 --reason "Implemented feature X" --json
 # Create discovered work
 br create "Found bug during implementation" -t bug -p 1 --deps discovered-from:br-123 --json
 
-# Session end
+# Session end: mutations auto-flush by default, but this is an idempotent final check
 br sync --flush-only
 ```
 
@@ -184,9 +184,9 @@ $ br ready --json --limit 2
 └─────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────┐
-│  5. SYNC (at session end)                                   │
+│  5. FINAL EXPORT CHECK (at session end)                     │
 │     br sync --flush-only                                    │
-│     → Export to JSONL for git collaboration                 │
+│     → Confirm JSONL is current before committing .beads/    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -610,7 +610,7 @@ br ready --json --limit 10
 br update <id> --claim
 # ... work ...
 br close <id> --reason "Completed by Claude"
-br sync --flush-only
+br sync --flush-only  # final JSONL export check before committing .beads/
 ```
 
 ### Cursor AI
@@ -654,7 +654,7 @@ br update <id> --status in_progress --assignee copilot
 3. **Set `BD_ACTOR`** for audit trail attribution
 4. **Use `--claim`** for atomic status+assignee updates
 5. **Create discovered issues** with `--deps discovered-from:<id>`
-6. **Sync at session end** with `br sync --flush-only`
+6. **Run a final JSONL export check** at session end with `br sync --flush-only`
 7. **Use `br ready`** to find actionable work
 8. **Include reasons** when closing issues
 9. **Use degraded comments** only when Agent Mail reservations are unavailable
@@ -675,7 +675,7 @@ br update <id> --status in_progress --assignee copilot
 br ready --json > /tmp/session_start.json
 
 # Session end checklist
-br sync --flush-only
+br sync --flush-only  # idempotent; mutations normally auto-flushed already
 git add .beads/
 git commit -m "Update issues"
 ```

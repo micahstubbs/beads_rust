@@ -57,8 +57,8 @@ You need to track issues for your project, but:
 br init                              # Initialize in your repo
 br create "Fix login timeout" -p 1   # Create high-priority issue
 br ready                             # See what's actionable
-br close br-abc123                   # Close when done
-br sync --flush-only                 # Export for git commit
+br close br-abc123                   # Close when done; JSONL auto-flushes by default
+br sync --flush-only                 # Optional final export check before git commit
 ```
 
 ### Why br?
@@ -109,7 +109,7 @@ br close br-e9b1d4 --reason "Schema implemented"
 br ready
 # br-7f3a2c  P1  feature  Implement user auth
 
-# Export to JSONL for git commit
+# Mutations auto-flushed JSONL by default; run an idempotent final export check
 br sync --flush-only
 git add .beads/ && git commit -m "Update issues"
 ```
@@ -145,10 +145,15 @@ git diff .beads/issues.jsonl
 
 ### 3. Explicit Over Implicit
 
-Every operation is explicit. No magic, no surprises.
+State changes are explicit. Successful mutating commands update SQLite and
+auto-flush JSONL by default, but `br` still never runs git, pushes, pulls, or
+imports remote changes without a command.
 
 ```bash
-# Export is explicit (not automatic)
+# Mutations auto-flush .beads/issues.jsonl by default
+br close br-abc123 --reason "Done"
+
+# Re-run export after --no-auto-flush/config changes, recovery, or as a final check
 br sync --flush-only
 
 # Import is explicit (not automatic)
@@ -373,7 +378,7 @@ br close br-a1b2c3 --reason "Increased timeout to 60s, added retry logic"
 ### 7. Sync to Git
 
 ```bash
-br sync --flush-only        # Export DB to JSONL
+br sync --flush-only        # Idempotent final JSONL export check
 git add .beads/             # Stage changes
 git commit -m "Fix: login timeout (br-a1b2c3)"
 ```
@@ -876,8 +881,8 @@ Quick example:
 br ready --json | jq '.[0]'           # Get top priority
 br update br-abc --status in_progress # Claim work
 # ... do work ...
-br close br-abc --reason "Completed"  # Done
-br sync --flush-only                  # Export for git
+br close br-abc --reason "Completed"  # Done; JSONL auto-flushes by default
+br sync --flush-only                  # Final export check before staging .beads/
 ```
 
 ---

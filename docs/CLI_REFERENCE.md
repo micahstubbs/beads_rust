@@ -81,6 +81,13 @@ These options apply to all commands:
 | `-h, --help` | Print help |
 | `-V, --version` | Print version |
 
+By default, successful mutating commands auto-flush SQLite changes to
+`.beads/issues.jsonl`, so the JSONL file is normally ready to stage after the
+command completes. Use `--no-auto-flush` to skip that export for a single
+command. `br sync --flush-only` remains useful as an idempotent final export
+check before committing, after `--no-auto-flush`, after disabling auto-flush in
+config, or during recovery.
+
 ---
 
 ## Cross-Project Routing
@@ -839,7 +846,7 @@ br sync [OPTIONS]
 
 **Examples:**
 ```bash
-# Export to JSONL
+# Export to JSONL explicitly; useful as a final check before committing .beads/
 br sync --flush-only
 
 # Import from JSONL
