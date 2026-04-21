@@ -11705,4 +11705,94 @@ mod tests {
         );
         assert_eq!(storage.get_metadata(BLOCKED_CACHE_STATE_KEY).unwrap(), None);
     }
+
+    /// Regression test for beads_rust-ok70: verify that status-change updates
+    /// complete successfully and the blocked cache is rebuilt without SQL parse
+    /// errors, even when the dependency graph is complex (parent-child chains,
+    /// cross-blocking, multiple epic parents).
+    #[test]
+    fn test_update_status_triggers_successful_cache_rebuild() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t = Utc::now();
+
+        let epic = make_issue("proj-epic", "Epic", Status::Open, 0, Some("epic"), t, None);
+        let task1 = make_issue("proj-task1", "Task 1", Status::Open, 1, Some("task"), t, None);
+        let task2 = make_issue("proj-task2", "Task 2", Status::Open, 1, Some("task"), t, None);
+        let task3 = make_issue("proj-task3", "Task 3", Status::Open, 2, Some("task"), t, None);
+        let blocker = make_issue("proj-blocker", "Blocker", Status::Open, 1, Some("bug"), t, None);
+
+        storage.create_issue(&epic, "tester").unwrap();
+        storage.create_issue(&task1, "tester").unwrap();
+        storage.create_issue(&task2, "tester").unwrap();
+        storage.create_issue(&task3, "tester").unwrap();
+        storage.create_issue(&blocker, "tester").unwrap();
+
+        // Build a complex dependency graph:
+        // epic <- task1 (parent-child)
+        // epic <- task2 (parent-child)
+        // task1 is blocked by blocker
+        // task3 is blocked by task2
+        storage
+            .add_dependency("proj-task1", "proj-epic", "parent-child", "tester")
+            .unwrap();
+        storage
+            .add_dependency("proj-task2", "proj-epic", "parent-child", "tester")
+            .unwrap();
+        storage
+            .add_dependency("proj-task1", "proj-blocker", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("proj-task3", "proj-task2", "blocks", "tester")
+            .unwrap();
+
+        // Verify initial blocked state
+        let blocked = storage.get_blocked_issues().unwrap();
+        assert!(
+            blocked.iter().any(|(i, _)| i.id == "proj-task1"),
+            "task1 should be blocked by blocker"
+        );
+        assert!(
+            blocked.iter().any(|(i, _)| i.id == "proj-task3"),
+            "task3 should be blocked by task2"
+        );
+
+        // Update status to in_progress — this triggers blocked cache rebuild
+        let updates = IssueUpdate {
+            status: Some(Status::InProgress),
+            ..Default::default()
+        };
+        let updated = storage
+            .update_issue("proj-blocker", &updates, "tester")
+            .unwrap();
+        assert_eq!(updated.status, Status::InProgress);
+
+        // Cache should still be consistent after rebuild
+        assert!(
+            !storage.blocked_cache_marked_stale().unwrap(),
+            "cache should not be stale after successful update"
+        );
+
+        // Close the blocker — should unblock task1
+        let close_updates = IssueUpdate {
+            status: Some(Status::Closed),
+            close_reason: Some(Some("done".to_string())),
+            ..Default::default()
+        };
+        let closed = storage
+            .update_issue("proj-blocker", &close_updates, "tester")
+            .unwrap();
+        assert_eq!(closed.status, Status::Closed);
+
+        // task1 should now be unblocked
+        let blocked_after = storage.get_blocked_issues().unwrap();
+        assert!(
+            !blocked_after.iter().any(|(i, _)| i.id == "proj-task1"),
+            "task1 should be unblocked after blocker is closed"
+        );
+        // task3 should still be blocked by task2
+        assert!(
+            blocked_after.iter().any(|(i, _)| i.id == "proj-task3"),
+            "task3 should still be blocked by task2"
+        );
+    }
 }
