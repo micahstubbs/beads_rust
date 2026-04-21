@@ -81,6 +81,27 @@ struct SyncPathPolicy {
     allow_external_jsonl: bool,
 }
 
+struct SyncStartupState {
+    beads_dir: PathBuf,
+    path_policy: SyncPathPolicy,
+    open_result: config::OpenStorageResult,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SyncOperation {
+    Status,
+    Flush,
+    Merge,
+    Import,
+}
+
+struct SyncDispatchOptions {
+    db_path: PathBuf,
+    retention_days: Option<u64>,
+    use_json: bool,
+    show_progress: bool,
+}
+
 /// Execute the sync command.
 ///
 /// # Errors
@@ -94,10 +115,26 @@ pub fn execute(
 ) -> Result<()> {
     validate_sync_mode_args(args)?;
 
-    // Open storage. For `--rename-prefix` imports, defer any implicit JSONL
-    // recovery until the explicit import path below so the command's import
-    // semantics (ID rewrites and duplicate external_ref cleanup) are applied
-    // in the same invocation instead of being skipped by open-time recovery.
+    let mut startup = prepare_sync_startup(args, cli)?;
+
+    maybe_delegate_rebuild(args, &mut startup.open_result)?;
+
+    let command_result = dispatch_sync_subcommand(
+        args,
+        cli,
+        ctx,
+        &startup.beads_dir,
+        &startup.path_policy,
+        &mut startup.open_result,
+    );
+
+    finalize_sync_result(command_result, &mut startup.open_result)
+}
+
+/// Resolve path policy and open storage before dispatch. Keeping this separate
+/// from `execute` makes the command's startup phase distinct from the
+/// status/export/import/merge operation handlers below.
+fn prepare_sync_startup(args: &SyncArgs, cli: &config::CliOverrides) -> Result<SyncStartupState> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let startup = config::load_startup_config_with_paths(&beads_dir, cli.db.as_ref())?;
     let allow_external_jsonl = args.allow_external_jsonl
@@ -115,17 +152,23 @@ pub fn execute(
         allow_external_jsonl = path_policy.allow_external_jsonl,
         "Resolved sync path policy"
     );
-    let defer_jsonl_recovery =
-        !args.status && !args.flush_only && !args.merge && args.rename_prefix;
-    let mut open_result =
-        config::open_storage_with_startup_config(startup, cli, defer_jsonl_recovery)?;
 
-    maybe_delegate_rebuild(args, &mut open_result)?;
+    let open_result =
+        config::open_storage_with_startup_config(startup, cli, should_defer_jsonl_recovery(args))?;
 
-    let command_result =
-        dispatch_sync_subcommand(args, cli, ctx, &beads_dir, &path_policy, &mut open_result);
+    Ok(SyncStartupState {
+        beads_dir,
+        path_policy,
+        open_result,
+    })
+}
 
-    finalize_sync_result(command_result, &mut open_result)
+/// For `--rename-prefix` imports, defer any implicit JSONL recovery until the
+/// explicit import path below so the command's import semantics (ID rewrites and
+/// duplicate external_ref cleanup) are applied in the same invocation instead
+/// of being skipped by open-time recovery.
+fn should_defer_jsonl_recovery(args: &SyncArgs) -> bool {
+    !args.status && !args.flush_only && !args.merge && args.rename_prefix
 }
 
 /// Reject argument combinations that must fail BEFORE opening storage or
@@ -302,53 +345,75 @@ fn dispatch_sync_subcommand(
     path_policy: &SyncPathPolicy,
     open_result: &mut config::OpenStorageResult,
 ) -> Result<()> {
-    let db_path = open_result.paths.db_path.clone();
-    let retention_days = open_result.paths.metadata.deletions_retention_days;
-    let use_json = ctx.is_json() || args.robot;
-    let quiet = cli.quiet.unwrap_or(false);
-    let show_progress = should_show_progress(use_json, quiet);
+    let options = sync_dispatch_options(args, cli, ctx, open_result);
 
-    if args.status {
-        return execute_status(&open_result.storage, path_policy, use_json, ctx);
-    }
-    if args.flush_only {
-        return execute_flush(
+    match sync_operation(args) {
+        SyncOperation::Status => {
+            execute_status(&open_result.storage, path_policy, options.use_json, ctx)
+        }
+        SyncOperation::Flush => execute_flush(
             &mut open_result.storage,
             beads_dir,
             path_policy,
             args,
-            use_json,
-            show_progress,
-            retention_days,
+            options.use_json,
+            options.show_progress,
+            options.retention_days,
             ctx,
-        );
-    }
-    if args.merge {
-        return execute_merge(
+        ),
+        SyncOperation::Merge => execute_merge(
             &mut open_result.storage,
             path_policy,
             args,
-            use_json,
-            show_progress,
-            retention_days,
+            options.use_json,
+            options.show_progress,
+            options.retention_days,
             cli,
             ctx,
-        );
+        ),
+        // Default to import-only if no flag is specified (consistent with
+        // existing behavior) or explicitly `--import-only`.
+        SyncOperation::Import => execute_import(
+            &mut open_result.storage,
+            beads_dir,
+            cli,
+            path_policy,
+            args,
+            options.use_json,
+            options.show_progress,
+            open_result.auto_rebuilt,
+            &options.db_path,
+            ctx,
+        ),
     }
-    // Default to import-only if no flag is specified (consistent with
-    // existing behavior) or explicitly `--import-only`.
-    execute_import(
-        &mut open_result.storage,
-        beads_dir,
-        cli,
-        path_policy,
-        args,
+}
+
+fn sync_dispatch_options(
+    args: &SyncArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    open_result: &config::OpenStorageResult,
+) -> SyncDispatchOptions {
+    let use_json = ctx.is_json() || args.robot;
+    let quiet = cli.quiet.unwrap_or(false);
+    SyncDispatchOptions {
+        db_path: open_result.paths.db_path.clone(),
+        retention_days: open_result.paths.metadata.deletions_retention_days,
         use_json,
-        show_progress,
-        open_result.auto_rebuilt,
-        &db_path,
-        ctx,
-    )
+        show_progress: should_show_progress(use_json, quiet),
+    }
+}
+
+fn sync_operation(args: &SyncArgs) -> SyncOperation {
+    if args.status {
+        SyncOperation::Status
+    } else if args.flush_only {
+        SyncOperation::Flush
+    } else if args.merge {
+        SyncOperation::Merge
+    } else {
+        SyncOperation::Import
+    }
 }
 
 /// Fold the subcommand result into the final command outcome, restoring
@@ -2119,9 +2184,10 @@ fn render_merge_result_rich(report: &crate::sync::MergeReport, ctx: &OutputConte
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_rebuild_semantic_conflict_field, auto_rebuild_semantic_flag_conflict_reason,
-        detect_prefix_from_jsonl, jsonl_contains_duplicate_external_refs,
-        jsonl_contains_prefix_mismatch, merge_conflict_resolution,
+        SyncOperation, auto_rebuild_semantic_conflict_field,
+        auto_rebuild_semantic_flag_conflict_reason, detect_prefix_from_jsonl,
+        jsonl_contains_duplicate_external_refs, jsonl_contains_prefix_mismatch,
+        merge_conflict_resolution, should_defer_jsonl_recovery, sync_operation,
         validate_operator_requested_sync_path, validate_sync_mode_args, validate_sync_paths,
     };
     use crate::cli::SyncArgs;
@@ -2236,6 +2302,70 @@ mod tests {
         let err = validate_sync_mode_args(&args).expect_err("force-db should require merge");
         assert!(matches!(err, BeadsError::Validation { .. }));
         assert!(err.to_string().contains("--merge"));
+    }
+
+    #[test]
+    fn test_sync_operation_selects_default_and_explicit_modes() {
+        assert_eq!(sync_operation(&SyncArgs::default()), SyncOperation::Import);
+
+        let flush = SyncArgs {
+            flush_only: true,
+            ..SyncArgs::default()
+        };
+        assert_eq!(sync_operation(&flush), SyncOperation::Flush);
+
+        let merge = SyncArgs {
+            merge: true,
+            ..SyncArgs::default()
+        };
+        assert_eq!(sync_operation(&merge), SyncOperation::Merge);
+
+        let import = SyncArgs {
+            import_only: true,
+            ..SyncArgs::default()
+        };
+        assert_eq!(sync_operation(&import), SyncOperation::Import);
+    }
+
+    #[test]
+    fn test_sync_operation_status_takes_precedence_over_work_modes() {
+        let args = SyncArgs {
+            status: true,
+            flush_only: true,
+            ..SyncArgs::default()
+        };
+
+        assert_eq!(sync_operation(&args), SyncOperation::Status);
+    }
+
+    #[test]
+    fn test_should_defer_jsonl_recovery_only_for_rename_prefix_import() {
+        let rename_import = SyncArgs {
+            rename_prefix: true,
+            ..SyncArgs::default()
+        };
+        assert!(should_defer_jsonl_recovery(&rename_import));
+
+        let status = SyncArgs {
+            status: true,
+            rename_prefix: true,
+            ..SyncArgs::default()
+        };
+        assert!(!should_defer_jsonl_recovery(&status));
+
+        let flush = SyncArgs {
+            flush_only: true,
+            rename_prefix: true,
+            ..SyncArgs::default()
+        };
+        assert!(!should_defer_jsonl_recovery(&flush));
+
+        let merge = SyncArgs {
+            merge: true,
+            rename_prefix: true,
+            ..SyncArgs::default()
+        };
+        assert!(!should_defer_jsonl_recovery(&merge));
     }
 
     #[test]
