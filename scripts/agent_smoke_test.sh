@@ -85,11 +85,14 @@ log "Env: BR_OUTPUT_FORMAT takes precedence over TOON_DEFAULT_FORMAT"
 BR_OUTPUT_FORMAT=json TOON_DEFAULT_FORMAT=toon "$BR" list --limit 1 | jq -e "$list_is_array_or_page" >/dev/null
 
 log "Error envelope (stderr JSON)"
+OUT_JSON="$WORKDIR/out.json"
 ERR_JSON="$WORKDIR/err.json"
 set +e
-"$BR" show bd-NOTEXIST --format json > /dev/null 2> "$ERR_JSON"
+"$BR" show bd-NOTEXIST --json > "$OUT_JSON" 2> "$ERR_JSON"
 EC=$?
 set -e
+test "$EC" -eq 3
+test ! -s "$OUT_JSON"
 jq -e ".error.code == \"ISSUE_NOT_FOUND\"" "$ERR_JSON" >/dev/null
 log "Exit code for not-found: $EC"
 log "OK"

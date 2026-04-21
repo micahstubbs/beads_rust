@@ -237,19 +237,34 @@ Returns:
 ### Python Example
 
 ```python
-import subprocess
 import json
+import subprocess
+
+
+class BrError(RuntimeError):
+    def __init__(self, exit_code, envelope, stdout, stderr):
+        error = envelope.get("error", {})
+        message = error.get("message") or stderr.strip() or f"br exited {exit_code}"
+        super().__init__(message)
+        self.exit_code = exit_code
+        self.envelope = envelope
+        self.code = error.get("code")
+        self.hint = error.get("hint")
+        self.stdout = stdout
+        self.stderr = stderr
+
 
 def br_command(*args):
-    """Run br command and return parsed JSON."""
+    """Run br command and return parsed stdout JSON."""
     result = subprocess.run(
-        ['br', *args, '--json'],
+        ['br', '--json', *args],
         capture_output=True,
-        text=True
+        text=True,
+        check=False,
     )
     if result.returncode != 0:
-        error = json.loads(result.stdout)
-        raise RuntimeError(f"br error: {error.get('message', 'Unknown')}")
+        envelope = json.loads(result.stderr) if result.stderr.strip() else {}
+        raise BrError(result.returncode, envelope, result.stdout, result.stderr)
     return json.loads(result.stdout)
 
 # Find ready work
@@ -265,14 +280,24 @@ if ready:
 ### JavaScript/Node Example
 
 ```javascript
-const { execSync } = require('child_process');
+const { spawnSync } = require('node:child_process');
 
 function br(...args) {
-  const result = execSync(`br ${args.join(' ')} --json`, {
+  const result = spawnSync('br', ['--json', ...args], {
     encoding: 'utf-8',
-    stdio: ['pipe', 'pipe', 'pipe']
+    stdio: ['ignore', 'pipe', 'pipe']
   });
-  return JSON.parse(result);
+  if (result.status !== 0) {
+    const envelope = result.stderr.trim() ? JSON.parse(result.stderr) : {};
+    const error = envelope.error || {};
+    const err = new Error(error.message || result.stderr.trim() || `br exited ${result.status}`);
+    err.exitCode = result.status;
+    err.code = error.code;
+    err.hint = error.hint;
+    err.envelope = envelope;
+    throw err;
+  }
+  return JSON.parse(result.stdout);
 }
 
 // Find ready work
@@ -321,15 +346,19 @@ br list --json --assignee $(whoami) | jq '.issues[].title'
 
 ### Structured Error Response
 
+With `--json`, successful command data is written to stdout. Structured errors are written to stderr and the process exits non-zero, so agents must parse the stream that matches the exit code.
+
 ```json
 {
-  "error_code": 3,
-  "message": "Issue not found: bd-xyz999",
-  "kind": "not_found",
-  "recovery_hints": [
-    "Check the issue ID spelling",
-    "Use 'br list' to find valid IDs"
-  ]
+  "error": {
+    "code": "ISSUE_NOT_FOUND",
+    "message": "Issue not found: bd-xyz999",
+    "hint": "Run 'br list' to see available issues.",
+    "retryable": false,
+    "context": {
+      "searched_id": "bd-xyz999"
+    }
+  }
 }
 ```
 
