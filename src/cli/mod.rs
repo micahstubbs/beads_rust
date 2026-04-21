@@ -2573,8 +2573,10 @@ mod tests {
         resolve_output_format_basic_with_outer_mode, resolve_output_format_with_outer_mode,
     };
     use crate::storage::sqlite::SqliteStorage;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
     use tempfile::TempDir;
+
+    const CLI_REFERENCE: &str = include_str!("../../docs/CLI_REFERENCE.md");
 
     #[test]
     fn test_list_limit_defaults_to_50() {
@@ -2673,5 +2675,69 @@ mod tests {
             false,
         );
         assert_eq!(resolved, OutputFormat::Json);
+    }
+
+    #[test]
+    fn test_cli_reference_documents_current_clap_surface() {
+        assert_all_top_level_commands_are_documented();
+        assert_doc_contains_all(CLAP_DRIFT_SENTINELS);
+    }
+
+    const CLAP_DRIFT_SENTINELS: &[&str] = &[
+        "--lock-timeout <LOCK_TIMEOUT>",
+        "`--from-file <PATH>` | Read IDs from file",
+        "`--cascade` | Delete dependents recursively",
+        "`--force` | Bypass dependent checks, orphaning dependents",
+        "`--hard` | Prune tombstones from JSONL immediately",
+        "br config <COMMAND>",
+        "`set <KEY=VALUE>` or `set <KEY> <VALUE>`",
+        "`delete <KEY>` | Delete a config value; `unset` is an alias",
+        "`save <NAME> [FILTERS...]`",
+        "no free-form query string argument",
+        "`--allow-external-jsonl` | Allow JSONL path outside `.beads/`",
+        "`--rename-prefix` | During import, rewrite mismatched issue IDs",
+        "`--rebuild` | During import, rebuild SQLite from JSONL",
+        "`--notes-contains <TEXT>` | Notes contains substring",
+        "`--format <FMT>` | Output format: text, json, csv, toon",
+        "`--days <N>` | Issues not updated in N days (default: 30)",
+        "`issue-with-counts`, `issue-details`",
+    ];
+
+    fn assert_all_top_level_commands_are_documented() {
+        let command = Cli::command();
+        let missing = command
+            .get_subcommands()
+            .map(clap::Command::get_name)
+            .filter(|name| !is_generated_help_command(name))
+            .filter(|name| !top_level_command_is_documented(name))
+            .collect::<Vec<_>>();
+
+        assert!(
+            missing.is_empty(),
+            "docs/CLI_REFERENCE.md is missing top-level command headings: {missing:?}"
+        );
+    }
+
+    fn is_generated_help_command(name: &str) -> bool {
+        name == "help"
+    }
+
+    fn top_level_command_is_documented(name: &str) -> bool {
+        if name == "status" {
+            return CLI_REFERENCE.contains("### stats / status");
+        }
+        if name == "undefer" {
+            return CLI_REFERENCE.contains("### defer / undefer");
+        }
+        CLI_REFERENCE.contains(&format!("### {name}"))
+    }
+
+    fn assert_doc_contains_all(needles: &[&str]) {
+        for needle in needles {
+            assert!(
+                CLI_REFERENCE.contains(needle),
+                "docs/CLI_REFERENCE.md is missing Clap drift sentinel: {needle}"
+            );
+        }
     }
 }

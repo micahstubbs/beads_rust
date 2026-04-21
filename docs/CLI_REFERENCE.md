@@ -26,6 +26,7 @@ Comprehensive reference for all `br` (beads_rust) commands.
   - [stale](#stale)
 - [Organization Commands](#organization-commands)
   - [dep](#dep)
+  - [graph](#graph)
   - [label](#label)
   - [epic](#epic)
   - [comments](#comments)
@@ -39,8 +40,12 @@ Comprehensive reference for all `br` (beads_rust) commands.
 - [Agent Integration](#agent-integration)
   - [serve](#serve)
 - [Diagnostics & Info](#diagnostics--info)
+  - [agents](#agents)
   - [stats / status](#stats--status)
   - [doctor](#doctor)
+  - [info](#info)
+  - [where](#where)
+  - [schema](#schema)
   - [version](#version)
   - [audit](#audit)
   - [history](#history)
@@ -68,7 +73,7 @@ These options apply to all commands:
 | `--no-auto-flush` | Skip automatic JSONL export after mutations |
 | `--no-auto-import` | Skip automatic import check |
 | `--allow-stale` | Allow stale DB (bypass freshness check warning) |
-| `--lock-timeout <MS>` | SQLite busy timeout in milliseconds |
+| `--lock-timeout <LOCK_TIMEOUT>` | SQLite busy/write-lock timeout in milliseconds |
 | `--no-db` | JSONL-only mode (no DB connection) |
 | `-v, --verbose` | Increase logging verbosity (-v, -vv) |
 | `-q, --quiet` | Quiet mode (errors only) |
@@ -133,6 +138,7 @@ br init [OPTIONS]
 |--------|-------------|
 | `--prefix <PREFIX>` | Issue ID prefix (e.g., "bd", "proj") |
 | `--force` | Overwrite existing database |
+| `--backend <BACKEND>` | Backend type placeholder; currently ignored and always uses SQLite |
 
 **Examples:**
 ```bash
@@ -175,6 +181,7 @@ br create [OPTIONS] [TITLE]
 | `--defer <DATE>` | Defer until date |
 | `--external-ref <REF>` | External reference (e.g., `gh-123`) |
 | `--ephemeral` | Mark as ephemeral (not exported to JSONL) |
+| `-s, --status <STATUS>` | Initial status (`open`, `deferred`, `in_progress`, `closed`) |
 | `--dry-run` | Preview without creating |
 | `--silent` | Output only issue ID |
 | `-f, --file <PATH>` | Create issues from markdown file (bulk import) |
@@ -241,6 +248,7 @@ br list [OPTIONS]
 | `--priority-max <N>` | Filter by maximum priority |
 | `--title-contains <TEXT>` | Title contains substring |
 | `--desc-contains <TEXT>` | Description contains substring |
+| `--notes-contains <TEXT>` | Notes contains substring |
 | `-a, --all` | Include closed issues |
 | `--deferred` | Include deferred issues |
 | `--overdue` | Filter for overdue issues |
@@ -253,7 +261,9 @@ br list [OPTIONS]
 | `-r, --reverse` | Reverse sort order |
 | `--long` | Long output format |
 | `--pretty` | Tree/pretty output format |
-| `--format <FMT>` | Output format: text, json, csv |
+| `--wrap` | Wrap long lines instead of truncating in text output |
+| `--format <FMT>` | Output format: text, json, csv, toon |
+| `--stats` | Show token savings stats when using TOON output |
 | `--fields <FIELDS>` | CSV fields (comma-separated) |
 
 **Examples:**
@@ -283,6 +293,13 @@ Show detailed issue information.
 ```bash
 br show [IDS]...
 ```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--format <FMT>` | Output format: text, json, toon |
+| `--wrap` | Wrap long lines instead of truncating in text output |
+| `--stats` | Show token savings stats when using TOON output |
 
 **Examples:**
 ```bash
@@ -320,6 +337,7 @@ br update [OPTIONS] [IDS]...
 | `--assignee <NAME>` | Assign (empty string clears) |
 | `--owner <EMAIL>` | Set owner (empty string clears) |
 | `--claim` | Atomic claim (assignee=actor + status=in_progress) |
+| `--force` | Force update even if issue is blocked |
 | `--due <DATE>` | Set due date (empty string clears) |
 | `--defer <DATE>` | Set defer date (empty string clears) |
 | `--estimate <MINUTES>` | Set time estimate |
@@ -328,6 +346,7 @@ br update [OPTIONS] [IDS]...
 | `--set-labels <LABELS>` | Replace all labels |
 | `--parent <ID>` | Reparent (empty string removes) |
 | `--external-ref <REF>` | Set external reference |
+| `--session <ID>` | Set `closed_by_session` when closing |
 
 **Examples:**
 ```bash
@@ -385,8 +404,14 @@ br close bd-abc123 --suggest-next --json
 Reopen a closed issue.
 
 ```bash
-br reopen <IDS>...
+br reopen [OPTIONS] [IDS]...
 ```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `-r, --reason <TEXT>` | Reason for reopening, stored as a comment |
+| `--robot` | Machine-readable output |
 
 ---
 
@@ -401,8 +426,12 @@ br delete [OPTIONS] <IDS>...
 **Options:**
 | Option | Description |
 |--------|-------------|
-| `-r, --reason <TEXT>` | Deletion reason |
-| `-f, --force` | Skip confirmation |
+| `--reason <TEXT>` | Delete reason (default: `delete`) |
+| `--from-file <PATH>` | Read IDs from file (one per line, `#` comments ignored) |
+| `--cascade` | Delete dependents recursively |
+| `--force` | Bypass dependent checks, orphaning dependents |
+| `--hard` | Prune tombstones from JSONL immediately |
+| `--dry-run` | Preview only, no changes |
 
 ---
 
@@ -428,6 +457,11 @@ br ready [OPTIONS]
 | `-p, --priority <N>` | Filter by priority |
 | `--sort <POLICY>` | Sort: hybrid (default), priority, oldest |
 | `--include-deferred` | Include deferred issues |
+| `--parent <ID>` | Filter to children of a parent issue |
+| `-r, --recursive` | Include all descendants with `--parent` |
+| `--wrap` | Wrap long lines instead of truncating in text output |
+| `--format <FMT>` | Output format: text, json, toon |
+| `--stats` | Show token savings stats when using TOON output |
 | `--robot` | Machine-readable output |
 
 **Examples:**
@@ -453,6 +487,19 @@ br blocked [OPTIONS]
 ```
 
 Shows issues that are blocked by other open issues.
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--limit <N>` | Maximum results (default: 50, 0=unlimited) |
+| `--detailed` | Include full blocker details in text output |
+| `--wrap` | Wrap long lines instead of truncating in text output |
+| `-t, --type <TYPE>` | Filter by type |
+| `-p, --priority <N>` | Filter by priority |
+| `-l, --label <LABEL>` | Filter by label |
+| `--format <FMT>` | Output format: text, json, toon |
+| `--stats` | Show token savings stats when using TOON output |
+| `--robot` | Machine-readable output |
 
 ---
 
@@ -489,6 +536,19 @@ br count [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--by <FIELD>` | Group by: status, type, priority, assignee, label |
+| `--by-status` | Group by status |
+| `--by-priority` | Group by priority |
+| `--by-type` | Group by issue type |
+| `--by-assignee` | Group by assignee |
+| `--by-label` | Group by label |
+| `--status <STATUS>` | Filter by status (repeatable or comma-separated) |
+| `--type <TYPE>` | Filter by issue type (repeatable or comma-separated) |
+| `--priority <PRIORITY>` | Filter by priority (repeatable or comma-separated) |
+| `--assignee <NAME>` | Filter by assignee |
+| `--unassigned` | Only include unassigned issues |
+| `--include-closed` | Include closed and tombstone issues |
+| `--include-templates` | Include template issues |
+| `--title-contains <TEXT>` | Title contains substring |
 
 **Examples:**
 ```bash
@@ -515,7 +575,8 @@ br stale [OPTIONS]
 **Options:**
 | Option | Description |
 |--------|-------------|
-| `--days <N>` | Issues not updated in N days (default: 14) |
+| `--days <N>` | Issues not updated in N days (default: 30) |
+| `--status <STATUS>` | Filter by status (repeatable or comma-separated) |
 
 **Abandoned in-progress claims:**
 
@@ -591,6 +652,23 @@ br dep cycles
 
 ---
 
+### graph
+
+Visualize the dependency graph for one issue or for all active connected
+components.
+
+```bash
+br graph [OPTIONS] [ISSUE]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--all` | Show graph for all open, in-progress, and blocked issues |
+| `--compact` | Print one line per issue |
+
+---
+
 ### label
 
 Manage labels on issues.
@@ -602,9 +680,11 @@ br label <COMMAND>
 **Subcommands:**
 | Command | Description |
 |---------|-------------|
-| `add <ID> <LABELS>` | Add labels to issue |
-| `remove <ID> <LABELS>` | Remove labels from issue |
+| `add [ISSUES]... --label <LABEL>` | Add a label to one or more issues |
+| `remove [ISSUES]... --label <LABEL>` | Remove a label from one or more issues |
 | `list [ID]` | List labels (optionally for specific issue) |
+| `list-all` | List all unique labels with counts |
+| `rename <OLD_NAME> <NEW_NAME>` | Rename a label across all issues |
 
 ---
 
@@ -619,8 +699,8 @@ br epic <COMMAND>
 **Subcommands:**
 | Command | Description |
 |---------|-------------|
-| `status <ID>` | Show epic status with child progress |
-| `close-eligible <ID>` | Check if epic can be closed |
+| `status [--eligible-only]` | Show epic status with child progress and eligibility |
+| `close-eligible [--dry-run]` | Close epics that are eligible because all children are closed |
 
 ---
 
@@ -635,8 +715,17 @@ br comments <COMMAND>
 **Subcommands:**
 | Command | Description |
 |---------|-------------|
-| `add <ID> <BODY>` | Add comment |
+| `add <ID> [TEXT]...` | Add a comment |
 | `list <ID>` | List comments |
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--wrap` | Wrap long comment lines when listing |
+| `add -f, --file <PATH>` | Read comment text from file |
+| `add --author <NAME>` | Override the default author |
+| `add --message <TEXT>` | Comment text as an alternative flag |
+| `list --wrap` | Wrap long comment lines |
 
 ---
 
@@ -648,13 +737,14 @@ Defer or undefer issues.
 
 ```bash
 br defer <IDS>... [OPTIONS]
-br undefer <IDS>...
+br undefer <IDS>... [OPTIONS]
 ```
 
 **Options:**
 | Option | Description |
 |--------|-------------|
 | `--until <DATE>` | Defer until date |
+| `--robot` | Machine-readable output |
 
 ---
 
@@ -665,6 +755,13 @@ List orphan issues (referenced in commits but still open).
 ```bash
 br orphans [OPTIONS]
 ```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--details` | Show detailed commit information |
+| `--fix` | Prompt to fix orphans |
+| `--robot` | Machine-readable output |
 
 ---
 
@@ -679,10 +776,13 @@ br query <COMMAND>
 **Subcommands:**
 | Command | Description |
 |---------|-------------|
-| `save <NAME> <QUERY>` | Save a query |
-| `run <NAME>` | Run a saved query |
+| `save <NAME> [FILTERS...]` | Save the current list-style filter set as a named query |
+| `run <NAME> [FILTERS...]` | Run a saved query, merging any additional filters from the CLI |
 | `list` | List saved queries |
 | `delete <NAME>` | Delete a saved query |
+
+`query save` and `query run` use the same filter flags as `br list`; there is
+no free-form query string argument.
 
 ---
 
@@ -773,20 +873,18 @@ br sync --flush-only -v
 Configuration management.
 
 ```bash
-br config [OPTIONS]
+br config <COMMAND>
 ```
 
-**Options:**
-| Option | Description |
-|--------|-------------|
-| `-l, --list` | List all config options with descriptions |
-| `-g, --get <KEY>` | Get a specific config value |
-| `-s, --set <KEY=VALUE>` | Set a config value |
-| `-d, --delete <KEY>` | Delete a config value |
-| `-e, --edit` | Open config in `$EDITOR` |
-| `-p, --path` | Show config file paths |
-| `--project` | Show only project config |
-| `--user` | Show only user config |
+**Subcommands:**
+| Command | Description |
+|---------|-------------|
+| `list [--project | --user]` | List available config options |
+| `get <KEY>` | Get a specific config value |
+| `set <KEY=VALUE>` or `set <KEY> <VALUE>` | Set a config value |
+| `delete <KEY>` | Delete a config value; `unset` is an alias |
+| `edit` | Open the user config file in `$EDITOR` |
+| `path` | Show config file paths |
 
 **Examples:**
 ```bash
@@ -798,6 +896,7 @@ br config get id.prefix
 
 # Set value
 br config set id.prefix=myproj
+br config set id.prefix myproj
 
 # Edit in editor
 br config edit
@@ -870,26 +969,66 @@ script is simpler.
 
 ## Diagnostics & Info
 
+### agents
+
+Manage the Beads workflow section in an `AGENTS.md` file.
+
+```bash
+br agents [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--add` | Add beads workflow instructions to `AGENTS.md` |
+| `--remove` | Remove beads workflow instructions from `AGENTS.md` |
+| `--update` | Update beads workflow instructions to the latest version |
+| `--check` | Check status only (default behavior) |
+| `--dry-run` | Preview changes without modifying files |
+| `-f, --force` | Skip confirmation prompts |
+
+---
+
 ### stats / status
 
 Show project statistics.
 
 ```bash
-br stats
-br status  # alias
+br stats [OPTIONS]
+br status [OPTIONS]  # alias
 ```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--by-type` | Show breakdown by issue type |
+| `--by-priority` | Show breakdown by priority |
+| `--by-assignee` | Show breakdown by assignee |
+| `--by-label` | Show breakdown by label |
+| `--activity` | Include recent activity stats explicitly |
+| `--no-activity` | Skip recent activity stats |
+| `--activity-hours <HOURS>` | Activity window in hours (default: 24) |
+| `--format <FMT>` | Output format: text, json, toon |
+| `--stats` | Show token savings stats when using TOON output |
+| `--robot` | Machine-readable output |
 
 ---
 
 ### doctor
 
-Run read-only diagnostics.
+Run diagnostics and optionally repair issues.
 
 ```bash
-br doctor
+br doctor [OPTIONS]
 ```
 
 Checks database integrity, schema compatibility, and configuration.
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--repair` | Attempt to repair detected issues by rebuilding DB from JSONL |
+| `--allow-repeated-repair` | Allow another JSONL rebuild after prior failed recovery evidence |
 
 ---
 
@@ -910,6 +1049,26 @@ Show the active `.beads` directory (after redirects, if any).
 ```bash
 br where
 ```
+
+---
+
+### schema
+
+Emit JSON Schemas for agent/tooling integrations.
+
+```bash
+br schema [TARGET] [OPTIONS]
+```
+
+**Targets:** `all`, `issue`, `issue-with-counts`, `issue-details`,
+`ready-issue`, `stale-issue`, `blocked-issue`, `tree-node`, `statistics`,
+`error`.
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--format <FMT>` | Output format: text, json, toon |
+| `--stats` | Show token savings stats when using TOON output |
 
 ---
 
