@@ -403,6 +403,18 @@ pub struct ImportResult {
     pub orphans_removed: usize,
     /// Number of orphaned FK rows cleaned after deferred-FK import.
     pub orphan_cleaned_count: usize,
+    /// Number of label rows imported from JSONL for applied issue records.
+    pub labels_imported: usize,
+    /// Number of dependency rows imported from JSONL for applied issue records.
+    pub dependencies_imported: usize,
+    /// Number of comment rows imported from JSONL for applied issue records.
+    pub comments_imported: usize,
+    /// Number of export-hash rows recorded for the imported JSONL snapshot.
+    pub export_hashes_recorded: usize,
+    /// Number of blocked-cache rows rebuilt after import.
+    pub blocked_cache_entries: usize,
+    /// Number of child-counter rows rebuilt after import.
+    pub child_counter_entries: usize,
 }
 
 // ============================================================================
@@ -3431,11 +3443,11 @@ pub fn import_from_jsonl(
         }
 
         if !new_export_hashes.is_empty() {
-            storage.set_export_hashes_in_tx(&new_export_hashes)?;
+            tx_result.export_hashes_recorded = storage.set_export_hashes_in_tx(&new_export_hashes)?;
         }
 
-        storage.rebuild_blocked_cache_in_tx()?;
-        storage.rebuild_child_counters_in_tx()?;
+        tx_result.blocked_cache_entries = storage.rebuild_blocked_cache_in_tx()?;
+        tx_result.child_counter_entries = storage.rebuild_child_counters_in_tx()?;
         storage
             .set_metadata_in_tx(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
         storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, &jsonl_hash)?;
@@ -3489,6 +3501,7 @@ fn process_import_action(
             sync_issue_relations(storage, issue)?;
             result.imported_count += 1;
             result.created_count += 1;
+            record_imported_relation_counts(result, issue);
         }
         CollisionAction::Update { existing_id } => {
             // When updating by external_ref or content_hash, the incoming issue may have
@@ -3504,6 +3517,7 @@ fn process_import_action(
             }
             result.imported_count += 1;
             result.updated_count += 1;
+            record_imported_relation_counts(result, issue);
         }
         CollisionAction::Skip { reason } => {
             tracing::debug!(id = %issue.id, reason = %reason, "Skipping issue");
@@ -3515,6 +3529,12 @@ fn process_import_action(
         }
     }
     Ok(())
+}
+
+fn record_imported_relation_counts(result: &mut ImportResult, issue: &Issue) {
+    result.labels_imported += issue.labels.len();
+    result.dependencies_imported += issue.dependencies.len();
+    result.comments_imported += issue.comments.len();
 }
 
 /// Sync labels, dependencies, and comments for an imported issue.

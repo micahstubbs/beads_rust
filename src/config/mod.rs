@@ -20,12 +20,15 @@ use crate::sync::{
     preflight_import, restore_tombstones_after_rebuild, scan_jsonl_for_tombstone_filter,
     snapshot_tombstones, tombstones_missing_from_jsonl_tombstones,
 };
-use crate::util::id::{IdConfig, abbreviate_prefix, normalize_prefix, split_prefix_remainder};
+use crate::util::id::{
+    IdConfig, abbreviate_prefix, normalize_prefix, parse_id, split_prefix_remainder,
+};
 use chrono::Utc;
 use fsqlite_error::FrankenError;
+use fsqlite_types::SqliteValue;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{BufRead, IsTerminal, Read};
@@ -1488,7 +1491,233 @@ fn verify_rebuilt_database_postconditions(
         )));
     }
 
+    verify_rebuilt_table_count(
+        storage,
+        "labels",
+        import_result.labels_imported,
+        "labels imported from JSONL",
+    )?;
+    verify_rebuilt_table_count(
+        storage,
+        "dependencies",
+        import_result.dependencies_imported,
+        "dependencies imported from JSONL",
+    )?;
+    verify_rebuilt_table_count(
+        storage,
+        "comments",
+        import_result.comments_imported,
+        "comments imported from JSONL",
+    )?;
+    verify_rebuilt_table_count(
+        storage,
+        "events",
+        0,
+        "events are local-only and not in JSONL",
+    )?;
+    verify_rebuilt_table_count(
+        storage,
+        "dirty_issues",
+        0,
+        "dirty markers should be absent immediately after JSONL rebuild",
+    )?;
+    verify_rebuilt_table_count(
+        storage,
+        "export_hashes",
+        import_result.export_hashes_recorded,
+        "export hashes recorded for imported JSONL",
+    )?;
+    verify_rebuilt_table_count(
+        storage,
+        "blocked_issues_cache",
+        import_result.blocked_cache_entries,
+        "blocked cache rows rebuilt after import",
+    )?;
+    verify_blocked_cache_payloads(storage)?;
+    verify_child_counters(storage, import_result.child_counter_entries)?;
+
     Ok(())
+}
+
+fn verify_rebuilt_table_count(
+    storage: &SqliteStorage,
+    table: &str,
+    expected: usize,
+    invariant: &str,
+) -> Result<()> {
+    let actual = count_recovery_table_rows(storage, table)?;
+    if actual == expected {
+        return Ok(());
+    }
+
+    Err(BeadsError::Config(format!(
+        "post-recovery validation failed: {table} row count mismatch ({invariant}); expected {expected}, found {actual}"
+    )))
+}
+
+fn count_recovery_table_rows(storage: &SqliteStorage, table: &str) -> Result<usize> {
+    const ALLOWED_TABLES: &[&str] = &[
+        "labels",
+        "dependencies",
+        "comments",
+        "events",
+        "dirty_issues",
+        "export_hashes",
+        "blocked_issues_cache",
+        "child_counters",
+    ];
+    if !ALLOWED_TABLES.contains(&table) {
+        return Err(BeadsError::Config(format!(
+            "post-recovery validation refused disallowed table count for {table}"
+        )));
+    }
+
+    let rows = storage
+        .execute_raw_query(&format!("SELECT COUNT(*) FROM {table}"))
+        .map_err(|source| BeadsError::WithContext {
+            context: format!("Post-recovery validation failed while counting {table} rows"),
+            source: Box::new(source),
+        })?;
+    let count = rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(SqliteValue::as_integer)
+        .unwrap_or(0);
+    usize::try_from(count).map_err(|_| {
+        BeadsError::Config(format!(
+            "post-recovery validation failed: {table} row count is negative ({count})"
+        ))
+    })
+}
+
+fn verify_blocked_cache_payloads(storage: &SqliteStorage) -> Result<()> {
+    let rows = storage
+        .execute_raw_query("SELECT issue_id, blocked_by FROM blocked_issues_cache")
+        .map_err(|source| BeadsError::WithContext {
+            context: "Post-recovery validation failed while reading blocked_issues_cache"
+                .to_string(),
+            source: Box::new(source),
+        })?;
+
+    for row in rows {
+        let issue_id = row
+            .first()
+            .and_then(SqliteValue::as_text)
+            .unwrap_or("<missing>");
+        let blocked_by = row.get(1).and_then(SqliteValue::as_text).ok_or_else(|| {
+            BeadsError::Config(format!(
+                "post-recovery validation failed: blocked_issues_cache.blocked_by missing for {issue_id}"
+            ))
+        })?;
+        let blockers: Vec<String> = serde_json::from_str(blocked_by).map_err(|err| {
+            BeadsError::Config(format!(
+                "post-recovery validation failed: blocked_issues_cache.blocked_by contains invalid JSON for {issue_id}: {err}"
+            ))
+        })?;
+        if blockers.is_empty() {
+            return Err(BeadsError::Config(format!(
+                "post-recovery validation failed: blocked_issues_cache contains empty blocker list for {issue_id}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn verify_child_counters(storage: &SqliteStorage, rebuilt_count: usize) -> Result<()> {
+    verify_rebuilt_table_count(
+        storage,
+        "child_counters",
+        rebuilt_count,
+        "child counters rebuilt after import",
+    )?;
+
+    let expected = expected_child_counters(storage)?;
+    let actual = actual_child_counters(storage)?;
+    if actual == expected {
+        return Ok(());
+    }
+
+    Err(BeadsError::Config(format!(
+        "post-recovery validation failed: child_counters derived values differ from rebuilt issue IDs; expected {expected:?}, found {actual:?}"
+    )))
+}
+
+fn expected_child_counters(storage: &SqliteStorage) -> Result<HashMap<String, u32>> {
+    let rows = storage
+        .execute_raw_query("SELECT id FROM issues")
+        .map_err(|source| BeadsError::WithContext {
+            context: "Post-recovery validation failed while reading issue IDs".to_string(),
+            source: Box::new(source),
+        })?;
+    let issue_ids: HashSet<String> = rows
+        .iter()
+        .filter_map(|row| {
+            row.first()
+                .and_then(SqliteValue::as_text)
+                .map(str::to_string)
+        })
+        .collect();
+    let mut expected = HashMap::new();
+
+    for id in &issue_ids {
+        let Ok(parsed) = parse_id(id) else {
+            continue;
+        };
+        if parsed.is_root() {
+            continue;
+        }
+        let Some(parent) = parsed.parent() else {
+            continue;
+        };
+        if !issue_ids.contains(&parent) {
+            continue;
+        }
+        let Some(&child_number) = parsed.child_path.last() else {
+            continue;
+        };
+        let entry = expected.entry(parent).or_insert(0);
+        if child_number > *entry {
+            *entry = child_number;
+        }
+    }
+
+    Ok(expected)
+}
+
+fn actual_child_counters(storage: &SqliteStorage) -> Result<HashMap<String, u32>> {
+    let rows = storage
+        .execute_raw_query("SELECT parent_id, last_child FROM child_counters")
+        .map_err(|source| BeadsError::WithContext {
+            context: "Post-recovery validation failed while reading child_counters".to_string(),
+            source: Box::new(source),
+        })?;
+    let mut actual = HashMap::new();
+
+    for row in rows {
+        let parent_id = row
+            .first()
+            .and_then(SqliteValue::as_text)
+            .ok_or_else(|| {
+                BeadsError::Config(
+                    "post-recovery validation failed: child_counters.parent_id missing".to_string(),
+                )
+            })?
+            .to_string();
+        let last_child = row.get(1).and_then(SqliteValue::as_integer).ok_or_else(|| {
+            BeadsError::Config(format!(
+                "post-recovery validation failed: child_counters.last_child missing for {parent_id}"
+            ))
+        })?;
+        let last_child = u32::try_from(last_child).map_err(|_| {
+            BeadsError::Config(format!(
+                "post-recovery validation failed: child_counters.last_child is invalid for {parent_id}: {last_child}"
+            ))
+        })?;
+        actual.insert(parent_id, last_child);
+    }
+
+    Ok(actual)
 }
 
 /// Compact a database at `db_path` by writing a fresh copy via `VACUUM
@@ -3303,11 +3532,17 @@ fn yaml_scalar_to_string(value: &serde_yml::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Issue, IssueType, Priority, Status};
+    use crate::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use chrono::Utc;
     use std::process::Command;
     use tempfile::TempDir;
+
+    struct RelationRichFixture {
+        _temp: TempDir,
+        storage: SqliteStorage,
+        import_result: ImportResult,
+    }
 
     fn write_issue_jsonl(path: &Path, issue: &Issue) {
         let json = serde_json::to_string(&issue).expect("serialize issue");
@@ -3324,6 +3559,90 @@ mod tests {
             ..Issue::default()
         };
         write_issue_jsonl(path, &issue);
+    }
+
+    fn relation_rich_rebuild_fixture() -> RelationRichFixture {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        let now = Utc::now();
+        let parent = Issue {
+            id: "bd-parent".to_string(),
+            title: "Parent issue".to_string(),
+            created_at: now,
+            updated_at: now,
+            ..Issue::default()
+        };
+        let child = Issue {
+            id: "bd-parent.1".to_string(),
+            title: "Child issue".to_string(),
+            created_at: now,
+            updated_at: now,
+            ..Issue::default()
+        };
+        storage
+            .upsert_issue_for_import(&parent)
+            .expect("insert parent");
+        storage
+            .upsert_issue_for_import(&child)
+            .expect("insert child");
+        storage
+            .sync_labels_for_import(&parent.id, &["recovery".to_string()])
+            .expect("sync labels");
+        storage
+            .sync_dependencies_for_import(
+                &child.id,
+                &[Dependency {
+                    issue_id: child.id.clone(),
+                    depends_on_id: parent.id.clone(),
+                    dep_type: DependencyType::Blocks,
+                    created_at: now,
+                    created_by: Some("tester".to_string()),
+                    metadata: None,
+                    thread_id: None,
+                }],
+            )
+            .expect("sync dependency");
+        storage
+            .sync_comments_for_import(
+                &parent.id,
+                &[Comment {
+                    id: 0,
+                    issue_id: parent.id.clone(),
+                    author: "tester".to_string(),
+                    body: "relation survives rebuild".to_string(),
+                    created_at: now,
+                }],
+            )
+            .expect("sync comment");
+        storage
+            .set_export_hashes(&[
+                (parent.id.clone(), "parent-hash".to_string()),
+                (child.id.clone(), "child-hash".to_string()),
+            ])
+            .expect("set export hashes");
+        let blocked_cache_entries = storage
+            .rebuild_blocked_cache(true)
+            .expect("rebuild blocked cache");
+        let child_counter_entries = storage
+            .with_write_transaction(|storage| storage.rebuild_child_counters_in_tx())
+            .expect("rebuild child counters");
+
+        RelationRichFixture {
+            _temp: temp,
+            storage,
+            import_result: ImportResult {
+                imported_count: 2,
+                created_count: 2,
+                labels_imported: 1,
+                dependencies_imported: 1,
+                comments_imported: 1,
+                export_hashes_recorded: 2,
+                blocked_cache_entries,
+                child_counter_entries,
+                ..ImportResult::default()
+            },
+        }
     }
 
     fn create_malformed_blocked_cache_db(db_path: &Path) {
@@ -5383,14 +5702,14 @@ routing:
     fn rebuilt_database_postconditions_reject_orphaned_issue_references() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("beads.db");
-        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        let storage = SqliteStorage::open(&db_path).expect("storage");
         let issue = Issue {
             id: "bd-kept".to_string(),
             title: "Kept issue".to_string(),
             ..Issue::default()
         };
         storage
-            .create_issue(&issue, "tester")
+            .upsert_issue_for_import(&issue)
             .expect("create issue");
         storage
             .execute_raw("PRAGMA foreign_keys = OFF")
@@ -5415,14 +5734,14 @@ routing:
     fn rebuilt_database_postconditions_allow_external_dependency_targets() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("beads.db");
-        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        let storage = SqliteStorage::open(&db_path).expect("storage");
         let issue = Issue {
             id: "bd-kept".to_string(),
             title: "Kept issue".to_string(),
             ..Issue::default()
         };
         storage
-            .create_issue(&issue, "tester")
+            .upsert_issue_for_import(&issue)
             .expect("create issue");
         storage
             .execute_raw(
@@ -5432,11 +5751,103 @@ routing:
             .expect("insert external dependency");
         let import_result = ImportResult {
             created_count: 1,
+            dependencies_imported: 1,
             ..ImportResult::default()
         };
 
         verify_rebuilt_database_postconditions(&storage, &import_result)
             .expect("external dependency targets should be allowed");
+    }
+
+    #[test]
+    fn rebuilt_database_postconditions_accept_relation_rich_state() {
+        let fixture = relation_rich_rebuild_fixture();
+
+        verify_rebuilt_database_postconditions(&fixture.storage, &fixture.import_result)
+            .expect("relation-rich rebuild state should satisfy postconditions");
+    }
+
+    #[test]
+    fn rebuilt_database_postconditions_reject_missing_labels() {
+        let fixture = relation_rich_rebuild_fixture();
+        fixture
+            .storage
+            .execute_raw("DELETE FROM labels")
+            .expect("delete labels");
+
+        let err = verify_rebuilt_database_postconditions(&fixture.storage, &fixture.import_result)
+            .expect_err("missing labels should fail validation");
+        assert!(
+            err.to_string().contains("labels row count mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rebuilt_database_postconditions_reject_missing_dependencies() {
+        let fixture = relation_rich_rebuild_fixture();
+        fixture
+            .storage
+            .execute_raw("DELETE FROM dependencies")
+            .expect("delete dependencies");
+
+        let err = verify_rebuilt_database_postconditions(&fixture.storage, &fixture.import_result)
+            .expect_err("missing dependencies should fail validation");
+        assert!(
+            err.to_string().contains("dependencies row count mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rebuilt_database_postconditions_reject_missing_comments() {
+        let fixture = relation_rich_rebuild_fixture();
+        fixture
+            .storage
+            .execute_raw("DELETE FROM comments")
+            .expect("delete comments");
+
+        let err = verify_rebuilt_database_postconditions(&fixture.storage, &fixture.import_result)
+            .expect_err("missing comments should fail validation");
+        assert!(
+            err.to_string().contains("comments row count mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rebuilt_database_postconditions_reject_stale_events() {
+        let fixture = relation_rich_rebuild_fixture();
+        fixture
+            .storage
+            .execute_raw(
+                "INSERT INTO events (issue_id, event_type, actor) VALUES ('bd-parent', 'created', 'tester')",
+            )
+            .expect("insert stale event");
+
+        let err = verify_rebuilt_database_postconditions(&fixture.storage, &fixture.import_result)
+            .expect_err("stale events should fail validation");
+        assert!(
+            err.to_string().contains("events row count mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rebuilt_database_postconditions_reject_child_counter_drift() {
+        let fixture = relation_rich_rebuild_fixture();
+        fixture
+            .storage
+            .execute_raw("UPDATE child_counters SET last_child = 99 WHERE parent_id = 'bd-parent'")
+            .expect("drift child counter");
+
+        let err = verify_rebuilt_database_postconditions(&fixture.storage, &fixture.import_result)
+            .expect_err("child counter drift should fail validation");
+        assert!(
+            err.to_string()
+                .contains("child_counters derived values differ"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
