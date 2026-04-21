@@ -194,7 +194,6 @@ pub struct RichDependencyTree<'a> {
     root_issue: &'a Issue,
     dependencies: &'a [(String, String)], // (from_id, to_id)
     issues_by_id: &'a std::collections::HashMap<String, &'a Issue>,
-    #[allow(dead_code)] // Reserved for future styling
     theme: &'a Theme,
 }
 
@@ -218,34 +217,41 @@ impl<'a> RichDependencyTree<'a> {
     /// Build a rich_rust Tree from the dependencies.
     #[must_use]
     pub fn build_tree(&self) -> Tree {
-        let root_label = format!(
-            "{} {} - {}",
-            format_status_icon(&self.root_issue.status),
-            self.root_issue.id,
-            truncate_title(&self.root_issue.title, 40)
-        );
-
-        let mut root = TreeNode::new(root_label);
+        let mut root = TreeNode::new(self.issue_label(self.root_issue, 40));
 
         // Find direct dependencies of root
         for (from_id, to_id) in self.dependencies {
             if from_id == &self.root_issue.id {
                 if let Some(dep_issue) = self.issues_by_id.get(to_id) {
-                    let dep_label = format!(
-                        "{} {} - {}",
-                        format_status_icon(&dep_issue.status),
-                        dep_issue.id,
-                        truncate_title(&dep_issue.title, 35)
-                    );
-                    root = root.child(TreeNode::new(dep_label));
+                    root = root.child(TreeNode::new(self.issue_label(dep_issue, 35)));
                 } else {
-                    let dep_label = format!("? {} - (unknown)", to_id);
-                    root = root.child(TreeNode::new(dep_label));
+                    root = root.child(TreeNode::new(self.unknown_issue_label(to_id)));
                 }
             }
         }
 
-        Tree::new(root)
+        Tree::new(root).guide_style(self.theme.dimmed.clone())
+    }
+
+    fn issue_label(&self, issue: &Issue, title_width: usize) -> Text {
+        let status_icon = format_status_icon(&issue.status);
+        let title = truncate_title(&issue.title, title_width);
+        let mut label = Text::new("");
+        label.append_styled(status_icon, self.theme.status_style(&issue.status));
+        label.append(" ");
+        label.append_styled(&issue.id, self.theme.issue_id.clone());
+        label.append_styled(" - ", self.theme.dimmed.clone());
+        label.append_styled(&title, self.theme.issue_title.clone());
+        label
+    }
+
+    fn unknown_issue_label(&self, issue_id: &str) -> Text {
+        let mut label = Text::new("");
+        label.append_styled("?", self.theme.warning.clone());
+        label.append(" ");
+        label.append_styled(issue_id, self.theme.issue_id.clone());
+        label.append_styled(" - (unknown)", self.theme.dimmed.clone());
+        label
     }
 }
 
@@ -385,6 +391,37 @@ mod tests {
         let theme = Theme::default();
         let panel = RichIssuePanel::new(&issue, &theme);
         let _ = panel.build_panel();
+    }
+
+    #[test]
+    fn test_rich_dependency_tree_uses_theme_styles() {
+        let root_issue = make_test_issue("test-root", "Root issue");
+        let dep_issue = make_test_issue("test-child", "Child issue");
+        let dependencies = vec![
+            (root_issue.id.clone(), dep_issue.id.clone()),
+            (root_issue.id.clone(), "test-missing".to_string()),
+        ];
+        let issues_by_id = std::collections::HashMap::from([(dep_issue.id.clone(), &dep_issue)]);
+        let theme = Theme::default();
+        let tree =
+            RichDependencyTree::new(&root_issue, &dependencies, &issues_by_id, &theme).build_tree();
+
+        assert_eq!(
+            tree.render_plain(),
+            "○ test-root - Root issue\n├── ○ test-child - Child issue\n└── ? test-missing - (unknown)\n"
+        );
+
+        let segments = tree.render();
+        assert!(segments.iter().any(|segment| {
+            segment.text.as_ref() == "test-root" && segment.style == Some(theme.issue_id.clone())
+        }));
+        assert!(segments.iter().any(|segment| {
+            segment.text.as_ref() == "Root issue"
+                && segment.style == Some(theme.issue_title.clone())
+        }));
+        assert!(segments.iter().any(|segment| {
+            segment.text.as_ref() == "?" && segment.style == Some(theme.warning.clone())
+        }));
     }
 
     #[test]
