@@ -536,9 +536,8 @@ mod tests {
         let stale_modified = now
             .checked_sub(ORPHANED_LOCK_FILE_STALE_AFTER + Duration::from_secs(1))
             .unwrap();
-        let recent_modified = now
-            .checked_sub(ORPHANED_LOCK_FILE_STALE_AFTER - Duration::from_secs(1))
-            .unwrap();
+        let recent_age = ORPHANED_LOCK_FILE_STALE_AFTER.saturating_sub(Duration::from_secs(1));
+        let recent_modified = now.checked_sub(recent_age).unwrap();
         let future_modified = now + Duration::from_secs(1);
 
         assert!(lock_modified_time_is_stale(stale_modified, now));
