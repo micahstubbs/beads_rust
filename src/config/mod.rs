@@ -54,6 +54,8 @@ const DEFAULT_JSONL_FILENAME: &str = "issues.jsonl";
 const LEGACY_JSONL_FILENAME: &str = "beads.jsonl";
 /// Directory used for automatic database recovery backups.
 const RECOVERY_DIR_NAME: &str = ".br_recovery";
+const SYMLINKED_DB_RECOVERY_ERROR_PREFIX: &str =
+    "refusing to rebuild symlinked SQLite database path";
 
 /// JSONL files that should never be treated as the main export file.
 /// Includes merge artifacts, deletion logs, and interaction logs.
@@ -1063,6 +1065,33 @@ pub(crate) fn repair_database_from_jsonl(
 
 fn should_surface_recovery_error(recovery_err: &BeadsError) -> bool {
     matches!(recovery_err, BeadsError::WithContext { .. })
+        || is_symlinked_database_recovery_error(recovery_err)
+}
+
+fn is_symlinked_database_recovery_error(error: &BeadsError) -> bool {
+    matches!(
+        error,
+        BeadsError::Config(message)
+            if message.starts_with(SYMLINKED_DB_RECOVERY_ERROR_PREFIX)
+    )
+}
+
+fn reject_symlinked_database_path_for_recovery(db_path: &Path) -> Result<()> {
+    match fs::symlink_metadata(db_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(BeadsError::Config(format!(
+            "{SYMLINKED_DB_RECOVERY_ERROR_PREFIX} '{}'; replace the symlink with a regular database file or run recovery against the resolved target explicitly",
+            db_path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(BeadsError::WithContext {
+            context: format!(
+                "Failed to inspect database path '{}' before recovery",
+                db_path.display()
+            ),
+            source: Box::new(err),
+        }),
+    }
 }
 
 fn recovery_restore_failure(
@@ -1916,6 +1945,7 @@ fn prepare_missing_database_cleanup_for_recovery(
     db_path: &Path,
     beads_dir: &Path,
 ) -> Result<RecoveryBackupSet> {
+    reject_symlinked_database_path_for_recovery(db_path)?;
     let stamp = Utc::now().format("%Y%m%d_%H%M%S_%f").to_string();
     let recovery_dir = recovery_dir_for_db_path(db_path, beads_dir);
     fs::create_dir_all(&recovery_dir)?;
@@ -1933,6 +1963,7 @@ fn move_database_family_to_recovery(
     beads_dir: &Path,
     stamp: &str,
 ) -> Result<RecoveryBackupSet> {
+    reject_symlinked_database_path_for_recovery(db_path)?;
     let recovery_dir = recovery_dir_for_db_path(db_path, beads_dir);
     fs::create_dir_all(&recovery_dir)?;
     let (files, verified_files) = rename_existing_paths_with_backup_verification(
@@ -6366,6 +6397,101 @@ routing:
         assert_eq!(
             backup_count, 0,
             "no recovery backup should be created when JSONL preflight fails"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_storage_with_cli_refuses_recovery_for_symlinked_db_path() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let external_dir = temp.path().join("external-db");
+        let db_path = beads_dir.join("beads.db");
+        let target_db_path = external_dir.join("target.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::create_dir_all(&external_dir).expect("create external dir");
+
+        fs::write(&target_db_path, b"not a sqlite database").expect("write corrupt target");
+        symlink(&target_db_path, &db_path).expect("symlink db path");
+        write_single_issue_jsonl(&jsonl_path, "bd-symln1", "Symlinked DB recovery payload");
+
+        let err =
+            open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect_err("should refuse");
+
+        assert!(
+            err.to_string().contains(SYMLINKED_DB_RECOVERY_ERROR_PREFIX),
+            "unexpected error: {err}"
+        );
+        assert!(
+            fs::symlink_metadata(&db_path)
+                .expect("stat db symlink")
+                .file_type()
+                .is_symlink(),
+            "recovery refusal must leave the live DB symlink in place"
+        );
+        assert_eq!(
+            fs::read_link(&db_path).expect("read db symlink"),
+            target_db_path
+        );
+        assert_eq!(
+            fs::read(&target_db_path).expect("read target bytes"),
+            b"not a sqlite database",
+            "recovery refusal must not rewrite the symlink target"
+        );
+        assert!(
+            !recovery_dir_for_db_path(&db_path, &beads_dir).exists(),
+            "refused recovery should not create backup artifacts"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deferred_jsonl_recovery_refuses_broken_symlinked_db_path() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let missing_target = temp.path().join("offline").join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        symlink(&missing_target, &db_path).expect("symlink db path to missing target");
+        write_single_issue_jsonl(
+            &jsonl_path,
+            "bd-symln2",
+            "Deferred symlink recovery payload",
+        );
+
+        let err =
+            open_storage_with_cli_deferred_jsonl_recovery(&beads_dir, &CliOverrides::default())
+                .expect_err("deferred recovery should refuse");
+
+        assert!(
+            err.to_string().contains(SYMLINKED_DB_RECOVERY_ERROR_PREFIX),
+            "unexpected error: {err}"
+        );
+        assert!(
+            fs::symlink_metadata(&db_path)
+                .expect("stat db symlink")
+                .file_type()
+                .is_symlink(),
+            "deferred recovery refusal must leave the broken symlink in place"
+        );
+        assert_eq!(
+            fs::read_link(&db_path).expect("read db symlink"),
+            missing_target
+        );
+        assert!(
+            !missing_target.exists(),
+            "deferred recovery must not materialize the missing external target"
+        );
+        assert!(
+            !recovery_dir_for_db_path(&db_path, &beads_dir).exists(),
+            "deferred refusal should not create backup artifacts"
         );
     }
 

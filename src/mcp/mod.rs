@@ -57,7 +57,7 @@ impl BeadsState {
         F: FnMut(&mut SqliteStorage) -> fastmcp_rust::McpResult<R>,
     {
         // 1. Acquire the cross-process write lock.
-        let _write_lock = crate::sync::blocking_write_lock(&self.beads_dir);
+        let _write_lock = crate::sync::blocking_write_lock(&self.beads_dir).map_err(to_mcp)?;
 
         // 2. Open storage.
         let mut storage = self.open_storage().map_err(to_mcp)?;

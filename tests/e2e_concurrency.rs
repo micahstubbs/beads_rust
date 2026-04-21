@@ -11,6 +11,7 @@ mod common;
 
 use assert_cmd::Command;
 use common::dataset_registry::{DatasetRegistry, IsolatedDataset, KnownDataset};
+use fsqlite::Connection;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::path::Path;
@@ -335,7 +336,7 @@ fn e2e_killed_writer_waiting_on_write_lock_does_not_poison_workspace() {
         after.stdout, after.stderr
     );
 
-    let list = run_br_in_dir(&root, ["list", "--json"]);
+    let list = run_br_in_dir(&root, ["--no-auto-import", "list", "--json"]);
     assert!(
         list.success,
         "list after killed writer failed: {}",
@@ -365,6 +366,195 @@ fn e2e_killed_writer_waiting_on_write_lock_does_not_poison_workspace() {
     );
 
     assert_doctor_healthy(&root);
+}
+
+/// A broken `.write.lock` path must fail closed. Mutating commands must not
+/// bypass cross-process serialization just because the advisory lock cannot be
+/// opened.
+#[test]
+#[cfg(unix)]
+fn e2e_mutating_command_fails_when_write_lock_path_unusable() {
+    let _log = common::test_log("e2e_mutating_command_fails_when_write_lock_path_unusable");
+
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let root = temp_dir.path().to_path_buf();
+
+    let init = run_br_in_dir(&root, ["init"]);
+    assert!(init.success, "init failed: {}", init.stderr);
+
+    let lock_path = root.join(".beads").join(".write.lock");
+    fs::create_dir_all(&lock_path).expect("replace write lock path with directory");
+
+    let create = run_br_in_dir(
+        &root,
+        ["create", "Should not bypass broken write lock", "--json"],
+    );
+    assert!(
+        !create.success,
+        "mutating command should fail when .write.lock is unusable; stdout={} stderr={}",
+        create.stdout, create.stderr
+    );
+    let combined = format!("{}{}", create.stdout, create.stderr);
+    assert!(
+        combined.contains("Failed to open write lock") && combined.contains(".write.lock"),
+        "error should explain the unusable write lock path: {combined}"
+    );
+
+    let list = run_br_in_dir(&root, ["--no-auto-import", "list", "--json"]);
+    assert!(
+        list.success,
+        "list after failed create failed: {}",
+        list.stderr
+    );
+    let issues = extract_issues_array(&list.stdout);
+    assert!(
+        issues
+            .iter()
+            .all(|issue| issue["title"].as_str() != Some("Should not bypass broken write lock")),
+        "failed lock acquisition must not create an issue: {}",
+        list.stdout
+    );
+}
+
+/// Auto-import runs before nominally read-only commands, but the import itself
+/// mutates SQLite. It must therefore serialize through `.write.lock` just like
+/// explicit write commands.
+#[test]
+#[cfg(unix)]
+#[allow(clippy::incompatible_msrv)]
+fn e2e_read_command_auto_import_waits_for_write_lock() {
+    let _log = common::test_log("e2e_read_command_auto_import_waits_for_write_lock");
+
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let root = temp_dir.path().to_path_buf();
+
+    let init = run_br_in_dir(&root, ["init"]);
+    assert!(init.success, "init failed: {}", init.stderr);
+
+    let seed = run_br_in_dir(&root, ["create", "Seed before auto-import"]);
+    assert!(seed.success, "seed create failed: {}", seed.stderr);
+
+    let flush = run_br_in_dir(&root, ["sync", "--flush-only"]);
+    assert!(flush.success, "flush failed: {}", flush.stderr);
+
+    let beads_dir = root.join(".beads");
+    let jsonl_path = beads_dir.join("issues.jsonl");
+    let jsonl = fs::read_to_string(&jsonl_path).expect("read issues jsonl");
+    let mut issue: serde_json::Value = serde_json::from_str(jsonl.trim()).expect("parse issue");
+    issue["title"] = serde_json::Value::String("Imported while waiting for write lock".to_string());
+    issue["updated_at"] = serde_json::Value::String("2999-01-01T00:00:00Z".to_string());
+    fs::write(
+        &jsonl_path,
+        format!(
+            "{}\n",
+            serde_json::to_string(&issue).expect("serialize modified issue")
+        ),
+    )
+    .expect("write stale jsonl");
+
+    let lock_path = beads_dir.join(".write.lock");
+    let write_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .expect("open .write.lock");
+    write_lock.lock().expect("hold .write.lock");
+
+    let mut blocked_list = spawn_br_child_in_dir(&root, ["list", "--json"]);
+    thread::sleep(Duration::from_millis(250));
+
+    let early_exit = blocked_list.try_wait().expect("poll blocked list");
+    assert!(
+        early_exit.is_none(),
+        "read command with pending auto-import should wait on .write.lock; status={early_exit:?}"
+    );
+
+    blocked_list.kill().expect("kill blocked list");
+    let killed = blocked_list
+        .wait_with_output()
+        .expect("collect killed list");
+    assert!(
+        !killed.status.success(),
+        "killed auto-import waiter must not report success"
+    );
+    drop(write_lock);
+
+    let list = run_br_in_dir(&root, ["list", "--json"]);
+    assert!(
+        list.success,
+        "list after releasing write lock failed: {}",
+        list.stderr
+    );
+    let issues = extract_issues_array(&list.stdout);
+    assert!(
+        issues.iter().any(|issue| {
+            issue["title"].as_str() == Some("Imported while waiting for write lock")
+        }),
+        "later list should import the preserved JSONL update: {}",
+        list.stdout
+    );
+}
+
+/// Refreshing a stale JSONL witness is a SQLite metadata write even when the
+/// JSONL itself is not newer. Read commands must serialize that path too.
+#[test]
+#[cfg(unix)]
+#[allow(clippy::incompatible_msrv)]
+fn e2e_read_command_witness_refresh_waits_for_write_lock() {
+    let _log = common::test_log("e2e_read_command_witness_refresh_waits_for_write_lock");
+
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let root = temp_dir.path().to_path_buf();
+
+    let init = run_br_in_dir(&root, ["init"]);
+    assert!(init.success, "init failed: {}", init.stderr);
+
+    let seed = run_br_in_dir(&root, ["create", "Seed before witness refresh"]);
+    assert!(seed.success, "seed create failed: {}", seed.stderr);
+
+    let flush = run_br_in_dir(&root, ["sync", "--flush-only"]);
+    assert!(flush.success, "flush failed: {}", flush.stderr);
+
+    let beads_dir = root.join(".beads");
+    let db_path = beads_dir.join("beads.db");
+    let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open beads db");
+    conn.execute("DELETE FROM metadata WHERE key = 'jsonl_size'")
+        .expect("delete jsonl_size witness");
+    conn.execute("INSERT INTO metadata (key, value) VALUES ('jsonl_size', '0')")
+        .expect("write stale jsonl_size witness");
+    drop(conn);
+
+    let lock_path = beads_dir.join(".write.lock");
+    let write_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .expect("open .write.lock");
+    write_lock.lock().expect("hold .write.lock");
+
+    let mut blocked_list = spawn_br_child_in_dir(&root, ["list", "--json"]);
+    thread::sleep(Duration::from_millis(250));
+
+    let early_exit = blocked_list.try_wait().expect("poll blocked list");
+    assert!(
+        early_exit.is_none(),
+        "read command refreshing JSONL witnesses should wait on .write.lock; status={early_exit:?}"
+    );
+
+    drop(write_lock);
+    let completed = blocked_list
+        .wait_with_output()
+        .expect("collect list after lock release");
+    assert!(
+        completed.status.success(),
+        "list after witness refresh failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&completed.stdout),
+        String::from_utf8_lossy(&completed.stderr)
+    );
 }
 
 /// Test that concurrent write operations respect `SQLite` locking.

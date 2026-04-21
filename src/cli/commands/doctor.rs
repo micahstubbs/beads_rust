@@ -414,6 +414,34 @@ fn append_count_mismatch_anomaly(check: &CheckResult, anomalies: &mut Vec<Anomal
     );
 }
 
+fn sidecar_presence_from_check(check: &CheckResult) -> (bool, bool) {
+    let findings = check
+        .details
+        .as_ref()
+        .and_then(|details| details.get("findings"))
+        .and_then(serde_json::Value::as_array);
+
+    if let Some(findings) = findings {
+        let has_wal = findings
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|finding| finding.starts_with("WAL sidecar"));
+        let has_shm = findings
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|finding| finding.starts_with("SHM sidecar"));
+        if has_wal || has_shm {
+            return (has_wal, has_shm);
+        }
+    }
+
+    let message = check.message.as_deref().unwrap_or_default().trim_start();
+    (
+        message.starts_with("WAL sidecar"),
+        message.starts_with("SHM sidecar"),
+    )
+}
+
 fn append_doctor_check_anomalies(check: &CheckResult, anomalies: &mut Vec<AnomalyClass>) {
     match check.name.as_str() {
         "db.exists" if matches!(check.status, CheckStatus::Error) => {
@@ -463,12 +491,10 @@ fn append_doctor_check_anomalies(check: &CheckResult, anomalies: &mut Vec<Anomal
             if message.contains("rollback journal") {
                 push_anomaly(anomalies, AnomalyClass::JournalSidecarPresent);
             } else {
+                let (has_wal, has_shm) = sidecar_presence_from_check(check);
                 push_anomaly(
                     anomalies,
-                    AnomalyClass::SidecarMismatch {
-                        has_wal: message.contains("WAL"),
-                        has_shm: message.contains("SHM"),
-                    },
+                    AnomalyClass::SidecarMismatch { has_wal, has_shm },
                 );
             }
         }
@@ -1066,22 +1092,42 @@ fn build_issue_write_probe_check(
     let mut details = serde_json::json!({ "issue_id": issue_id });
 
     match (update_result, rollback_result) {
-        (Ok(_), Ok(_)) => CheckResult {
-            name: "db.write_probe".to_string(),
-            status: CheckStatus::Ok,
-            message: Some(format!(
-                "Rollback-only issue write succeeded for {issue_id}"
-            )),
-            details: None,
-        },
-        (Ok(_), Err(rollback_err)) => {
+        (Ok(affected_rows), Ok(_)) => {
+            if affected_rows > 0 {
+                CheckResult {
+                    name: "db.write_probe".to_string(),
+                    status: CheckStatus::Ok,
+                    message: Some(format!(
+                        "Rollback-only issue write succeeded for {issue_id}"
+                    )),
+                    details: None,
+                }
+            } else {
+                details["affected_rows"] = serde_json::json!(affected_rows);
+                CheckResult {
+                    name: "db.write_probe".to_string(),
+                    status: CheckStatus::Error,
+                    message: Some(format!(
+                        "Rollback-only issue write affected 0 rows for {issue_id}"
+                    )),
+                    details: Some(details),
+                }
+            }
+        }
+        (Ok(affected_rows), Err(rollback_err)) => {
+            details["affected_rows"] = serde_json::json!(affected_rows);
             details["rollback_error"] = serde_json::json!(rollback_err.to_string());
+            let message = if affected_rows == 0 {
+                format!(
+                    "Rollback-only issue write affected 0 rows and rollback also failed: {rollback_err}"
+                )
+            } else {
+                format!("Rollback-only issue write succeeded but rollback failed: {rollback_err}")
+            };
             CheckResult {
                 name: "db.write_probe".to_string(),
                 status: CheckStatus::Error,
-                message: Some(format!(
-                    "Rollback-only issue write succeeded but rollback failed: {rollback_err}"
-                )),
+                message: Some(message),
                 details: Some(details),
             }
         }
@@ -3482,6 +3528,77 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_doctor_checks_preserves_shm_only_sidecar_presence() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let shm_path = PathBuf::from(format!("{}-shm", db_path.to_string_lossy()));
+        let checks = vec![CheckResult {
+            name: "db.sidecars".to_string(),
+            status: CheckStatus::Error,
+            message: Some(format!(
+                "SHM sidecar exists without a matching WAL sidecar at {}",
+                shm_path.display()
+            )),
+            details: Some(serde_json::json!({
+                "findings": [
+                    format!(
+                        "SHM sidecar exists without a matching WAL sidecar at {}",
+                        shm_path.display()
+                    )
+                ],
+                "quarantine_candidates": [shm_path.display().to_string()],
+            })),
+        }];
+
+        let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+        assert_eq!(classification.health, WorkspaceHealth::Degraded);
+        assert!(
+            classification.anomalies.iter().any(|anomaly| {
+                matches!(
+                    anomaly,
+                    AnomalyClass::SidecarMismatch {
+                        has_wal: false,
+                        has_shm: true
+                    }
+                )
+            }),
+            "expected SHM-only sidecar anomaly: {:?}",
+            classification.anomalies
+        );
+    }
+
+    #[test]
+    fn test_classify_doctor_checks_preserves_shm_only_sidecar_presence_without_details() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let checks = vec![CheckResult {
+            name: "db.sidecars".to_string(),
+            status: CheckStatus::Error,
+            message: Some("SHM sidecar exists without a matching WAL sidecar".to_string()),
+            details: None,
+        }];
+
+        let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+        assert!(
+            classification.anomalies.iter().any(|anomaly| {
+                matches!(
+                    anomaly,
+                    AnomalyClass::SidecarMismatch {
+                        has_wal: false,
+                        has_shm: true
+                    }
+                )
+            }),
+            "expected SHM-only sidecar anomaly: {:?}",
+            classification.anomalies
+        );
+    }
+
+    #[test]
     fn test_local_repair_audit_records_applied_actions_and_artifacts() {
         let repair = LocalRepairResult {
             blocked_cache_rebuilt: true,
@@ -4342,6 +4459,57 @@ mod tests {
             check.message
         );
         assert_eq!(check.details.unwrap()["issue_id"], "bd-probe");
+    }
+
+    #[test]
+    fn test_build_issue_write_probe_check_marks_zero_row_update_as_error() {
+        let check = build_issue_write_probe_check("bd-probe", Ok(0), Ok(0));
+
+        assert!(matches!(check.status, CheckStatus::Error));
+        assert!(
+            check
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("affected 0 rows")),
+            "unexpected check message: {:?}",
+            check.message
+        );
+        let details = check
+            .details
+            .expect("zero-row error should include details");
+        assert_eq!(details["issue_id"], "bd-probe");
+        assert_eq!(details["affected_rows"], 0);
+    }
+
+    #[test]
+    fn test_build_issue_write_probe_check_reports_zero_row_update_before_rollback_failure() {
+        let check = build_issue_write_probe_check(
+            "bd-probe",
+            Ok(0),
+            Err(FrankenError::Internal("rollback failed".to_string())),
+        );
+
+        assert!(matches!(check.status, CheckStatus::Error));
+        assert!(
+            check
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("affected 0 rows")),
+            "unexpected check message: {:?}",
+            check.message
+        );
+        let details = check
+            .details
+            .expect("rollback failure should include details");
+        assert_eq!(details["issue_id"], "bd-probe");
+        assert_eq!(details["affected_rows"], 0);
+        assert!(
+            details["rollback_error"]
+                .as_str()
+                .is_some_and(|message| message.contains("rollback failed")),
+            "unexpected rollback error detail: {}",
+            details["rollback_error"]
+        );
     }
 
     #[test]

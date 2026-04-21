@@ -45,10 +45,16 @@ fn main() {
     // concurrent writes to the same database file. Serialize all mutating
     // operations through a blocking flock on `.beads/.write.lock`. Read-only
     // commands skip this lock entirely. The lock is held until main() exits.
-    let _write_lock = if needs_write_lock(&cli.command) && ctx.is_initialized() {
-        ctx.beads_dir
+    let write_lock = if needs_write_lock(&cli.command) && ctx.is_initialized() {
+        match ctx
+            .beads_dir
             .as_deref()
-            .and_then(beads_rust::sync::blocking_write_lock)
+            .map(beads_rust::sync::blocking_write_lock)
+        {
+            Some(Ok(lock)) => Some(lock),
+            Some(Err(e)) => handle_error(&e, json_error_mode),
+            None => None,
+        }
     } else {
         None
     };
@@ -75,13 +81,27 @@ fn main() {
         None
     };
 
-    // Phase 3: Auto-Import. Probe staleness first and only take the advisory
-    // lock when JSONL may actually need to be imported.
+    // Phase 3: Auto-Import. The staleness probe can opportunistically refresh
+    // JSONL witness metadata, so read commands that reach this path also need
+    // the write lock before probing.
     if let (Some(res), Some(paths)) = (storage_result.as_mut(), ctx.paths.as_ref())
         && should_auto_import(&cli.command)
         && !cli.allow_stale
         && !ctx.no_auto_import()
     {
+        let _auto_import_write_lock = if write_lock.is_some() {
+            None
+        } else {
+            match ctx
+                .beads_dir
+                .as_deref()
+                .map(beads_rust::sync::blocking_write_lock)
+            {
+                Some(Ok(lock)) => Some(lock),
+                Some(Err(e)) => handle_error(&e, json_error_mode),
+                None => None,
+            }
+        };
         let should_attempt_auto_import =
             compute_staleness_refreshing_witnesses(&mut res.storage, &paths.jsonl_path)
                 .map_or(true, |staleness| staleness.jsonl_newer);

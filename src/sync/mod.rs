@@ -41,8 +41,7 @@ use std::path::{Path, PathBuf};
 /// `lock()` that waits indefinitely until the holder releases. The lock is
 /// held until the returned `File` drops.
 #[allow(clippy::incompatible_msrv)]
-#[must_use]
-pub fn blocking_write_lock(beads_dir: &Path) -> Option<File> {
+pub fn blocking_write_lock(beads_dir: &Path) -> Result<File> {
     let lock_path = beads_dir.join(".write.lock");
     let file = OpenOptions::new()
         .read(true)
@@ -50,20 +49,28 @@ pub fn blocking_write_lock(beads_dir: &Path) -> Option<File> {
         .create(true)
         .truncate(false)
         .open(&lock_path)
-        .ok()?;
+        .map_err(|err| {
+            BeadsError::Config(format!(
+                "Failed to open write lock at {}: {err}",
+                lock_path.display()
+            ))
+        })?;
 
     // Fast path: non-blocking try for the common uncontended case.
     if file.try_lock().is_ok() {
-        return Some(file);
+        return Ok(file);
     }
 
     // Contended: block until the current holder releases.
     tracing::debug!(".write.lock is held by another process; waiting for release");
     match file.lock() {
-        Ok(()) => Some(file),
+        Ok(()) => Ok(file),
         Err(e) => {
-            tracing::debug!("failed to acquire .write.lock: {e}; proceeding without lock");
-            None
+            tracing::debug!("failed to acquire .write.lock: {e}");
+            Err(BeadsError::Config(format!(
+                "Failed to acquire write lock at {}: {e}",
+                lock_path.display()
+            )))
         }
     }
 }
@@ -4431,6 +4438,24 @@ mod tests {
             dependencies: vec![],
             comments: vec![],
         }
+    }
+
+    #[test]
+    fn blocking_write_lock_errors_when_lock_path_cannot_open() {
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        fs::create_dir_all(beads_dir.join(".write.lock")).unwrap();
+
+        let err = blocking_write_lock(&beads_dir).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                BeadsError::Config(message)
+                    if message.contains("Failed to open write lock")
+                        && message.contains(".write.lock")
+            ),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
