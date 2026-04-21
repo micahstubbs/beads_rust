@@ -1503,7 +1503,7 @@ fn rebuild_database_family(
     // own `VACUUM INTO` produces. The subsequent atomic rename is
     // crash-safe on POSIX (within a filesystem) and keeps the database
     // family consistent with its sidecars, which we drop first.
-    compact_database_via_vacuum_into_in_place(&mut storage, db_path, lock_timeout);
+    storage = compact_database_via_vacuum_into_in_place(storage, db_path, lock_timeout)?;
     verify_rebuilt_database_postconditions(&storage, &import_result)?;
     Ok((storage, import_result))
 }
@@ -1770,8 +1770,8 @@ fn actual_child_counters(storage: &SqliteStorage) -> Result<HashMap<String, u32>
 }
 
 /// Compact a database at `db_path` by writing a fresh copy via `VACUUM
-/// INTO` to a temp file, atomically replacing the original, and reopening
-/// the storage connection in place.
+/// INTO` to a temp file, atomically replacing the original, and returning a
+/// reopened storage connection.
 ///
 /// Preconditions: the caller must pass a `storage` handle whose connection
 /// was opened against `db_path` (the helper names its temp file
@@ -1780,31 +1780,40 @@ fn actual_child_counters(storage: &SqliteStorage) -> Result<HashMap<String, u32>
 /// DB contents over db_path.
 ///
 /// Failure handling: on any failure (VACUUM INTO error, rename error, or
-/// reopen error after a successful rename) the helper leaves `*storage`
-/// in the best-available working state:
+/// reopen error after a successful rename) the helper returns either the
+/// best-available working handle or an error before the caller can continue:
 ///
-/// * VACUUM INTO failed — `*storage` is unchanged (still the
-///   pre-compaction connection).
-/// * Rename failed — `*storage` is reopened against the still-intact
+/// * VACUUM INTO failed — returns the unchanged pre-compaction connection.
+/// * Rename failed — returns a connection reopened against the still-intact
 ///   original `db_path`; the compacted temp file is removed.
-/// * Reopen failed after a successful rename — `*storage` is left as
-///   the in-memory placeholder handle we swapped in; the persistent
-///   DB on disk IS correctly compacted, so the caller's next attempt
-///   (or the next invocation of `br`) will find a clean file.
+/// * Reopen failed after replacing the handle — returns an error, ensuring
+///   live code cannot continue on a throwaway placeholder connection.
 ///
-/// This helper never returns a `Result` because its only value is
-/// cosmetic (the file size / integrity-check output). Correctness of
-/// the DB contents is established by the VACUUM/REINDEX that runs
-/// before compaction; a missed compaction surfaces as upstream
-/// sqlite3's `Page N: never used` diagnostic, not as data loss.
+/// Cosmetic compaction failures remain non-fatal when the original handle is
+/// still usable. Failures after the original connection has been closed are
+/// surfaced because the caller no longer has a valid persistent storage handle.
 ///
 /// This is called only in rebuild/force-import paths where the DB is
 /// known to have just been fully populated from JSONL.
 pub(crate) fn compact_database_via_vacuum_into_in_place(
-    storage: &mut SqliteStorage,
+    storage: SqliteStorage,
     db_path: &Path,
     lock_timeout: Option<u64>,
-) {
+) -> Result<SqliteStorage> {
+    compact_database_via_vacuum_into_in_place_with_reopener(
+        storage,
+        db_path,
+        lock_timeout,
+        SqliteStorage::open_with_timeout,
+    )
+}
+
+fn compact_database_via_vacuum_into_in_place_with_reopener(
+    storage: SqliteStorage,
+    db_path: &Path,
+    lock_timeout: Option<u64>,
+    reopen_storage: impl Fn(&Path, Option<u64>) -> Result<SqliteStorage>,
+) -> Result<SqliteStorage> {
     // Drain any WAL frames the prior VACUUM/REINDEX (run by the caller)
     // left behind, so `VACUUM INTO` sees the fully-committed on-disk
     // state instead of having to reach into a WAL that fsqlite's own
@@ -1850,22 +1859,13 @@ pub(crate) fn compact_database_via_vacuum_into_in_place(
             "`VACUUM INTO` compaction failed; keeping the in-place rebuild which may still show unused tail pages under upstream sqlite3"
         );
         let _ = fs::remove_file(&temp_path);
-        return;
+        return Ok(storage);
     }
 
-    // Replace `*storage` with a throwaway in-memory handle so we can close
-    // the on-disk connection (via `drop`) and swap its file under our own
-    // feet. On any failure in the remaining steps we reopen the original
-    // db_path to give the caller a working storage rather than leaving
-    // `*storage` pointing at an empty in-memory DB.
-    let Ok(placeholder) = SqliteStorage::open_memory() else {
-        // Extremely unlikely — open_memory only fails if we can't create a
-        // temp-dir file. Bail on the compaction path and keep the original.
-        let _ = fs::remove_file(&temp_path);
-        return;
-    };
-    let old = std::mem::replace(storage, placeholder);
-    drop(old);
+    // Close the on-disk connection before swapping its file under our own
+    // feet. This helper consumes and returns the storage handle so callers
+    // cannot keep using a throwaway placeholder if reopening fails.
+    drop(storage);
 
     // Atomic swap: rename `temp_path` onto `db_path`. On POSIX this
     // atomically replaces the target, so there is never a moment when
@@ -1884,11 +1884,16 @@ pub(crate) fn compact_database_via_vacuum_into_in_place(
         );
         let _ = fs::remove_file(&temp_path);
         // db_path is still the original file here (rename failed, so the
-        // old file is intact). Reopen it so *storage is a valid handle.
-        if let Ok(reopened) = SqliteStorage::open_with_timeout(db_path, lock_timeout) {
-            *storage = reopened;
-        }
-        return;
+        // old file is intact). Reopen it so the caller gets a valid handle.
+        return reopen_storage(db_path, lock_timeout).map_err(|reopen_err| {
+            BeadsError::WithContext {
+                context: format!(
+                    "Failed to reopen original database at '{}' after VACUUM INTO install failed ({err})",
+                    db_path.display()
+                ),
+                source: Box::new(reopen_err),
+            }
+        });
     }
 
     // Clean up the stale sidecars from the pre-compaction file. These
@@ -1910,16 +1915,13 @@ pub(crate) fn compact_database_via_vacuum_into_in_place(
         }
     }
 
-    match SqliteStorage::open_with_timeout(db_path, lock_timeout) {
-        Ok(reopened) => *storage = reopened,
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                db_path = %db_path.display(),
-                "Failed to reopen compacted database after VACUUM INTO; storage is now the placeholder in-memory handle"
-            );
-        }
-    }
+    reopen_storage(db_path, lock_timeout).map_err(|err| BeadsError::WithContext {
+        context: format!(
+            "Failed to reopen compacted database after VACUUM INTO at '{}'",
+            db_path.display()
+        ),
+        source: Box::new(err),
+    })
 }
 
 fn rebuild_database_family_with_backup<T, F>(
@@ -5527,6 +5529,54 @@ routing:
             }),
             "duplicate-config database should be preserved in the recovery directory"
         );
+    }
+
+    #[test]
+    fn vacuum_into_reopen_failure_returns_error_without_storage_handle() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("create storage");
+        let now = Utc::now();
+        let issue = Issue {
+            id: "bd-vacuum".to_string(),
+            title: "Survives compacted reopen failure".to_string(),
+            created_at: now,
+            updated_at: now,
+            ..Issue::default()
+        };
+        storage
+            .create_issue(&issue, "tester")
+            .expect("seed issue before compaction");
+
+        let result = compact_database_via_vacuum_into_in_place_with_reopener(
+            storage,
+            &db_path,
+            Some(50),
+            |_, _| -> Result<SqliteStorage> {
+                Err(BeadsError::Config("simulated reopen failure".to_string()))
+            },
+        );
+
+        assert!(result.is_err(), "reopen failure should be surfaced");
+        let Err(err) = result else {
+            return;
+        };
+        let err_debug = format!("{err:?}");
+        assert!(
+            matches!(err, BeadsError::WithContext { .. }),
+            "expected contextual reopen error, got {err_debug}"
+        );
+        if let BeadsError::WithContext { context, source } = err {
+            assert!(context.contains("Failed to reopen compacted database after VACUUM INTO"));
+            assert!(source.to_string().contains("simulated reopen failure"));
+        }
+
+        let reopened = SqliteStorage::open(&db_path).expect("compacted database remains readable");
+        let recovered = reopened
+            .get_issue("bd-vacuum")
+            .expect("query compacted database")
+            .expect("seeded issue should remain in compacted database");
+        assert_eq!(recovered.title, "Survives compacted reopen failure");
     }
 
     #[test]

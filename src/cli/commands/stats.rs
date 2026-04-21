@@ -1738,10 +1738,13 @@ mod tests {
     #[test]
     fn test_recent_activity_cache_valid_until_expires_at_boundary() {
         let earliest_commit_ts = 1_000_i64;
-        let RecentActivityCachePolicy::Cache { valid_until_epoch } =
-            recent_activity_cache_policy(1, Some(earliest_commit_ts), 24)
-        else {
-            panic!("expected cache entry");
+        let policy = recent_activity_cache_policy(1, Some(earliest_commit_ts), 24);
+        assert!(
+            matches!(policy, RecentActivityCachePolicy::Cache { .. }),
+            "expected cache entry"
+        );
+        let RecentActivityCachePolicy::Cache { valid_until_epoch } = policy else {
+            return;
         };
         let valid_until = valid_until_epoch.expect("expiry timestamp");
         assert_eq!(valid_until, earliest_commit_ts + 24 * 3600);

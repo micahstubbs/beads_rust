@@ -1643,10 +1643,26 @@ fn execute_import(
         // page count and layout matching what `sqlite3 "VACUUM INTO"`
         // would produce. The helper runs its own pre-VACUUM-INTO WAL
         // checkpoint to drain the frames the VACUUM/REINDEX above just
-        // wrote. Best-effort: on any failure the helper leaves
-        // `*storage` in the best working state it can recover, and we
-        // only miss the cosmetic compaction — never correctness.
-        config::compact_database_via_vacuum_into_in_place(storage, db_path, cli.lock_timeout);
+        // wrote. Once it closes the old handle, reopen failures must abort
+        // this import rather than letting subsequent metadata updates run
+        // against a throwaway placeholder.
+        let placeholder = crate::storage::SqliteStorage::open_memory()?;
+        let original_storage = std::mem::replace(storage, placeholder);
+        match config::compact_database_via_vacuum_into_in_place(
+            original_storage,
+            db_path,
+            cli.lock_timeout,
+        ) {
+            Ok(compacted_storage) => *storage = compacted_storage,
+            Err(err) => {
+                if let Ok(reopened) =
+                    crate::storage::SqliteStorage::open_with_timeout(db_path, cli.lock_timeout)
+                {
+                    *storage = reopened;
+                }
+                return Err(err);
+            }
+        }
     }
 
     // Update content hash
