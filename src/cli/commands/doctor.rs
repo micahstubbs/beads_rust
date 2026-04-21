@@ -96,6 +96,7 @@ struct RecoveryAuditRecord {
 }
 
 const BLOCKED_CACHE_STALE_FINDING: &str = "blocked_issues_cache is marked stale and needs rebuild";
+const JSONL_REBUILD_AUTHORITY_ERROR_PREFIX: &str = "Cannot repair: JSONL authority is unsafe";
 const ROOT_GITIGNORE_OFFENDING_PATTERNS: &[&str] = &[
     ".beads",
     ".beads/",
@@ -1033,6 +1034,8 @@ fn repair_database_from_jsonl(
     cli: &config::CliOverrides,
     show_progress: bool,
 ) -> Result<DoctorRepairResult> {
+    preflight_jsonl_rebuild_authority(jsonl_path)?;
+
     let bootstrap_layer = config::ConfigLayer::merge_layers(&[
         config::load_startup_config(beads_dir)?,
         cli.as_layer(),
@@ -1100,6 +1103,58 @@ fn repair_database_from_jsonl(
         skipped: import_result.skipped_count,
         fk_violations_cleaned: fk_violations,
     })
+}
+
+fn preflight_jsonl_rebuild_authority(jsonl_path: &Path) -> Result<()> {
+    let conflict_markers = scan_conflict_markers(jsonl_path)?;
+    if !conflict_markers.is_empty() {
+        let preview = conflict_markers
+            .iter()
+            .take(3)
+            .map(|marker| {
+                let branch = marker
+                    .branch
+                    .as_ref()
+                    .map_or(String::new(), |branch| format!(" ({branch})"));
+                format!("line {}: {:?}{branch}", marker.line, marker.marker_type)
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let suffix = if conflict_markers.len() > 3 {
+            " ..."
+        } else {
+            ""
+        };
+        return Err(BeadsError::Config(format!(
+            "{JSONL_REBUILD_AUTHORITY_ERROR_PREFIX}: found {} merge conflict marker(s): {preview}{suffix}. Resolve JSONL conflicts before rebuilding SQLite from it.",
+            conflict_markers.len()
+        )));
+    }
+
+    let validation = validate_jsonl_issue_records(jsonl_path)?;
+    if validation.invalid_count > 0 {
+        let preview = validation.preview_messages().join("; ");
+        let suffix = if validation.invalid_count > validation.failures.len() {
+            " ..."
+        } else {
+            ""
+        };
+        return Err(BeadsError::Config(format!(
+            "{JSONL_REBUILD_AUTHORITY_ERROR_PREFIX}: found {} invalid issue record(s): {preview}{suffix}. Fix JSONL before rebuilding SQLite from it.",
+            validation.invalid_count
+        )));
+    }
+
+    Ok(())
+}
+
+fn jsonl_rebuild_failure_outcome(err: &BeadsError) -> &'static str {
+    if let BeadsError::Config(message) = err
+        && message.starts_with(JSONL_REBUILD_AUTHORITY_ERROR_PREFIX)
+    {
+        return "refused";
+    }
+    "failed"
 }
 
 /// Best-effort snapshot of unflushed local tombstones, guarded on every
@@ -3070,13 +3125,17 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     ) {
         Ok(result) => result,
         Err(err) => {
+            let outcome = jsonl_rebuild_failure_outcome(&err);
             let recovery_audit = jsonl_rebuild_audit_record(
                 "doctor.jsonl_rebuild",
-                "failed",
+                outcome,
                 None,
                 Some(err.to_string()),
             );
             emit_recovery_audit_record(&recovery_audit);
+            if outcome == "refused" {
+                return Err(err);
+            }
             return Err(BeadsError::Config(format!(
                 "Repair import failed: {err}. \
              The JSONL file may be corrupt. \
@@ -4143,6 +4202,112 @@ mod tests {
         assert_eq!(
             backup_count, 0,
             "preflight failures should not create recovery backups"
+        );
+    }
+
+    #[test]
+    fn test_repair_database_from_jsonl_refuses_conflict_markers_without_backup() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        {
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            storage
+                .create_issue(&sample_issue("bd-keep", "Keep me"), "tester")
+                .unwrap();
+        }
+
+        fs::write(
+            &jsonl_path,
+            "<<<<<<< HEAD\n{\"id\":\"bd-keep\"}\n=======\n{\"id\":\"bd-other\"}\n>>>>>>> branch\n",
+        )
+        .unwrap();
+
+        let err = repair_database_from_jsonl(
+            &beads_dir,
+            &db_path,
+            &jsonl_path,
+            &config::CliOverrides::default(),
+            false,
+        )
+        .unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains(JSONL_REBUILD_AUTHORITY_ERROR_PREFIX)
+                && err_msg.contains("merge conflict marker"),
+            "unexpected error: {err_msg}"
+        );
+        assert_eq!(jsonl_rebuild_failure_outcome(&err), "refused");
+
+        let reopened = SqliteStorage::open(&db_path).unwrap();
+        let issue = reopened
+            .get_issue("bd-keep")
+            .unwrap()
+            .expect("original DB should remain untouched after refused repair");
+        assert_eq!(issue.title, "Keep me");
+
+        let recovery_dir = beads_dir.join(".br_recovery");
+        let backup_count =
+            fs::read_dir(&recovery_dir).map_or(0, |entries| entries.flatten().count());
+        assert_eq!(
+            backup_count, 0,
+            "JSONL authority preflight failures should not create recovery backups"
+        );
+    }
+
+    #[test]
+    fn test_repair_database_from_jsonl_refuses_duplicate_ids_without_backup() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        {
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            storage
+                .create_issue(&sample_issue("bd-keep", "Keep me"), "tester")
+                .unwrap();
+        }
+
+        let issue = sample_issue("bd-dup", "Duplicate");
+        let issue_json = serde_json::to_string(&issue).unwrap();
+        fs::write(&jsonl_path, format!("{issue_json}\n{issue_json}\n")).unwrap();
+
+        let err = repair_database_from_jsonl(
+            &beads_dir,
+            &db_path,
+            &jsonl_path,
+            &config::CliOverrides::default(),
+            false,
+        )
+        .unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains(JSONL_REBUILD_AUTHORITY_ERROR_PREFIX)
+                && err_msg.contains("Duplicate issue id 'bd-dup'"),
+            "unexpected error: {err_msg}"
+        );
+        assert_eq!(jsonl_rebuild_failure_outcome(&err), "refused");
+
+        let reopened = SqliteStorage::open(&db_path).unwrap();
+        let issue = reopened
+            .get_issue("bd-keep")
+            .unwrap()
+            .expect("original DB should remain untouched after refused repair");
+        assert_eq!(issue.title, "Keep me");
+
+        let recovery_dir = beads_dir.join(".br_recovery");
+        let backup_count =
+            fs::read_dir(&recovery_dir).map_or(0, |entries| entries.flatten().count());
+        assert_eq!(
+            backup_count, 0,
+            "JSONL authority preflight failures should not create recovery backups"
         );
     }
 
