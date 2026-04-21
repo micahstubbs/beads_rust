@@ -1,5 +1,8 @@
 use std::fmt;
 use std::path::Path;
+use std::time::{Duration, SystemTime};
+
+const ORPHANED_LOCK_FILE_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum WorkspaceHealth {
@@ -41,24 +44,57 @@ impl fmt::Display for WorkspaceHealth {
 pub enum AnomalyClass {
     DatabaseMissing,
     DatabaseNotSqlite,
-    DatabaseCorrupt { detail: String },
+    DatabaseCorrupt {
+        detail: String,
+    },
     WalCorrupt,
-    SidecarMismatch { has_wal: bool, has_shm: bool },
+    SidecarMismatch {
+        has_wal: bool,
+        has_shm: bool,
+    },
     TruncatedWal,
-    DuplicateSchemaRows { name: String, count: i64 },
-    DuplicateConfigKeys { key: String, count: i64 },
-    DuplicateMetadataKeys { key: String, count: i64 },
-    JsonlParseError { detail: String },
+    DuplicateSchemaRows {
+        name: String,
+        count: i64,
+    },
+    DuplicateConfigKeys {
+        key: String,
+        count: i64,
+    },
+    DuplicateMetadataKeys {
+        key: String,
+        count: i64,
+    },
+    JsonlParseError {
+        detail: String,
+    },
     JsonlConflictMarkers,
-    DbJsonlCountMismatch { db_count: usize, jsonl_count: usize },
+    DbJsonlCountMismatch {
+        db_count: usize,
+        jsonl_count: usize,
+    },
     JsonlNewer,
     DbNewer,
     StaleRecoveryArtifacts,
     BlockedCacheStale,
-    NullInNotNullColumn { table: String, column: String },
-    DirtyFlagMismatch { flag: String, expected: bool, actual: bool },
-    ExportHashMismatch { db_hash: String, jsonl_hash: String },
-    ChildCountDrift { issue_id: String, stored: i64, actual: i64 },
+    NullInNotNullColumn {
+        table: String,
+        column: String,
+    },
+    DirtyFlagMismatch {
+        flag: String,
+        expected: bool,
+        actual: bool,
+    },
+    ExportHashMismatch {
+        db_hash: String,
+        jsonl_hash: String,
+    },
+    ChildCountDrift {
+        issue_id: String,
+        stored: i64,
+        actual: i64,
+    },
     JournalSidecarPresent,
     OrphanedLockFile,
 }
@@ -140,13 +176,16 @@ impl fmt::Display for AnomalyClass {
                 expected,
                 actual,
             } => {
-                write!(f, "dirty flag '{flag}' mismatch (expected={expected}, actual={actual})")
-            }
-            Self::ExportHashMismatch { db_hash, jsonl_hash } => {
                 write!(
                     f,
-                    "export hash mismatch (db={db_hash}, jsonl={jsonl_hash})"
+                    "dirty flag '{flag}' mismatch (expected={expected}, actual={actual})"
                 )
+            }
+            Self::ExportHashMismatch {
+                db_hash,
+                jsonl_hash,
+            } => {
+                write!(f, "export hash mismatch (db={db_hash}, jsonl={jsonl_hash})")
             }
             Self::ChildCountDrift {
                 issue_id,
@@ -158,7 +197,9 @@ impl fmt::Display for AnomalyClass {
                     "child_count drift for '{issue_id}' (stored={stored}, actual={actual})"
                 )
             }
-            Self::JournalSidecarPresent => f.write_str("journal sidecar present (incomplete transaction)"),
+            Self::JournalSidecarPresent => {
+                f.write_str("journal sidecar present (incomplete transaction)")
+            }
             Self::OrphanedLockFile => f.write_str("orphaned lock file (.beads.lock) present"),
         }
     }
@@ -272,11 +313,25 @@ pub fn classify_file_state(db_path: &Path, jsonl_path: &Path) -> Vec<AnomalyClas
         .parent()
         .map(|p| p.join(".beads.lock"))
         .unwrap_or_else(|| db_path.with_file_name(".beads.lock"));
-    if lock_path.is_file() {
+    if lock_path.is_file() && is_orphaned_lock_file(&lock_path, SystemTime::now()) {
         anomalies.push(AnomalyClass::OrphanedLockFile);
     }
 
     anomalies
+}
+
+fn is_orphaned_lock_file(lock_path: &Path, now: SystemTime) -> bool {
+    std::fs::metadata(lock_path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .is_some_and(|modified| lock_modified_time_is_stale(modified, now))
+}
+
+fn lock_modified_time_is_stale(modified: SystemTime, now: SystemTime) -> bool {
+    matches!(
+        now.duration_since(modified),
+        Ok(age) if age >= ORPHANED_LOCK_FILE_STALE_AFTER
+    )
 }
 
 #[cfg(test)]
@@ -446,13 +501,17 @@ mod tests {
         std::fs::write(&journal_path, b"journal data").unwrap();
 
         let anomalies = classify_file_state(&db_path, &jsonl_path);
-        assert!(anomalies.iter().any(|a| matches!(a, AnomalyClass::JournalSidecarPresent)));
+        assert!(
+            anomalies
+                .iter()
+                .any(|a| matches!(a, AnomalyClass::JournalSidecarPresent))
+        );
         let c = WorkspaceClassification::from_anomalies(anomalies);
         assert_eq!(c.health, WorkspaceHealth::Degraded);
     }
 
     #[test]
-    fn orphaned_lock_file_detected() {
+    fn recent_lock_file_is_not_orphaned() {
         let (_dir, db_path, jsonl_path) = setup_workspace();
         let mut f = std::fs::File::create(&db_path).unwrap();
         f.write_all(b"SQLite format 3\0").unwrap();
@@ -462,9 +521,29 @@ mod tests {
         std::fs::write(&lock_path, "pid:12345").unwrap();
 
         let anomalies = classify_file_state(&db_path, &jsonl_path);
-        assert!(anomalies.iter().any(|a| matches!(a, AnomalyClass::OrphanedLockFile)));
+        assert!(
+            !anomalies
+                .iter()
+                .any(|a| matches!(a, AnomalyClass::OrphanedLockFile))
+        );
         let c = WorkspaceClassification::from_anomalies(anomalies);
-        assert_eq!(c.health, WorkspaceHealth::Degraded);
+        assert_eq!(c.health, WorkspaceHealth::Healthy);
+    }
+
+    #[test]
+    fn stale_lock_modified_time_is_orphaned() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(60 * 60);
+        let stale_modified = now
+            .checked_sub(ORPHANED_LOCK_FILE_STALE_AFTER + Duration::from_secs(1))
+            .unwrap();
+        let recent_modified = now
+            .checked_sub(ORPHANED_LOCK_FILE_STALE_AFTER - Duration::from_secs(1))
+            .unwrap();
+        let future_modified = now + Duration::from_secs(1);
+
+        assert!(lock_modified_time_is_stale(stale_modified, now));
+        assert!(!lock_modified_time_is_stale(recent_modified, now));
+        assert!(!lock_modified_time_is_stale(future_modified, now));
     }
 
     #[test]
@@ -474,14 +553,16 @@ mod tests {
                 flag: "needs_flush".to_string(),
                 expected: true,
                 actual: false,
-            }.severity(),
+            }
+            .severity(),
             WorkspaceHealth::Degraded
         );
         assert_eq!(
             AnomalyClass::ExportHashMismatch {
                 db_hash: "abc".to_string(),
                 jsonl_hash: "def".to_string(),
-            }.severity(),
+            }
+            .severity(),
             WorkspaceHealth::Degraded
         );
         assert_eq!(
@@ -489,10 +570,17 @@ mod tests {
                 issue_id: "x-1".to_string(),
                 stored: 3,
                 actual: 2,
-            }.severity(),
+            }
+            .severity(),
             WorkspaceHealth::Degraded
         );
-        assert_eq!(AnomalyClass::JournalSidecarPresent.severity(), WorkspaceHealth::Degraded);
-        assert_eq!(AnomalyClass::OrphanedLockFile.severity(), WorkspaceHealth::Degraded);
+        assert_eq!(
+            AnomalyClass::JournalSidecarPresent.severity(),
+            WorkspaceHealth::Degraded
+        );
+        assert_eq!(
+            AnomalyClass::OrphanedLockFile.severity(),
+            WorkspaceHealth::Degraded
+        );
     }
 }
