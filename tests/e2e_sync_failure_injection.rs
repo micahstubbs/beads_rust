@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions, Permissions};
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
 use std::thread;
@@ -1362,6 +1362,106 @@ fn cli_sync_flush_concurrent_export_race_serializes_jsonl_sidecars() {
     artifacts.log(
         "verification",
         "PASSED: concurrent sync flush children serialized cleanly and left one valid JSONL export",
+    );
+    artifacts.save();
+}
+
+/// Test: a workspace with `.beads` symlinked to external metadata storage
+/// should fail cleanly while the target is offline and recover after restore.
+#[test]
+#[cfg(unix)]
+fn cli_symlinked_beads_target_offline_recovers_after_restore() {
+    let _log = common::test_log("cli_symlinked_beads_target_offline_recovers_after_restore");
+    let mut artifacts = FailureTestArtifacts::new("cli_symlinked_beads_target_offline");
+
+    let workspace = BrWorkspace::new();
+    let external = TempDir::new().expect("create external metadata tempdir");
+    let external_parent = external.path().join("metadata-store");
+    let target = external_parent.join(".beads");
+    let offline_target = external_parent.join(".beads-offline");
+    fs::create_dir_all(&target).expect("create symlink target");
+    symlink(&target, workspace.root.join(".beads")).expect("symlink workspace .beads");
+
+    let symlink_meta =
+        fs::symlink_metadata(workspace.root.join(".beads")).expect("stat .beads symlink");
+    assert!(
+        symlink_meta.file_type().is_symlink(),
+        ".beads should be a symlink before init"
+    );
+
+    let init = run_br(&workspace, ["init"], "symlinked_beads_init");
+    assert_run_success(&init, "symlinked_beads_init");
+    let create = run_br(
+        &workspace,
+        ["create", "Symlinked beads target anchor", "--json"],
+        "symlinked_beads_create",
+    );
+    assert_run_success(&create, "symlinked_beads_create");
+    let create_json = parse_stdout_json(&create, "symlinked_beads_create");
+    let issue_id = create_json["id"].as_str().unwrap_or("").to_string();
+    assert!(
+        !issue_id.is_empty(),
+        "create should report an issue id in stdout: {}",
+        create.stdout
+    );
+
+    flush_and_assert_clean(&workspace, "symlinked_beads_baseline_flush");
+    let jsonl_path = target.join("issues.jsonl");
+    let baseline_hash = compute_file_hash(&jsonl_path).expect("baseline symlinked JSONL hash");
+    artifacts.snapshot_dir("before_target_offline", &workspace.root);
+
+    fs::rename(&target, &offline_target).expect("move symlink target offline");
+    assert!(
+        !workspace.root.join(".beads").exists(),
+        "broken .beads symlink should not resolve while target is offline"
+    );
+    let offline_meta =
+        fs::symlink_metadata(workspace.root.join(".beads")).expect("stat broken .beads symlink");
+    assert!(
+        offline_meta.file_type().is_symlink(),
+        "offline command must not replace the .beads symlink"
+    );
+
+    let offline_status = run_br(
+        &workspace,
+        ["sync", "--status", "--json"],
+        "symlinked_beads_status_offline",
+    );
+    assert_run_failure(&offline_status, "symlinked_beads_status_offline");
+    artifacts.log("offline_status_stdout", &offline_status.stdout);
+    artifacts.log("offline_status_stderr", &offline_status.stderr);
+    assert!(
+        fs::symlink_metadata(workspace.root.join(".beads"))
+            .expect("stat .beads after offline command")
+            .file_type()
+            .is_symlink(),
+        "offline command should not materialize replacement .beads state"
+    );
+    assert!(
+        !target.exists(),
+        "offline command should not recreate the missing symlink target"
+    );
+
+    fs::rename(&offline_target, &target).expect("restore symlink target");
+    assert!(
+        workspace.root.join(".beads").exists(),
+        "restored .beads symlink should resolve again"
+    );
+    assert_eq!(
+        baseline_hash,
+        compute_file_hash(&jsonl_path).expect("restored symlinked JSONL hash"),
+        "offline failure should not rewrite the external JSONL export"
+    );
+
+    let restored_status = sync_status_json(&workspace, "symlinked_beads_status_restored");
+    assert_clean_status(&restored_status, "restored symlinked .beads workspace");
+    assert_stale_show_finds(&workspace, &issue_id, "symlinked_beads_show_after_restore");
+    assert_doctor_healthy(&workspace, "symlinked_beads_final_doctor");
+
+    artifacts.snapshot_dir("after_target_restore", &workspace.root);
+    artifacts.log(
+        "verification",
+        "PASSED: symlinked .beads target offline failure left no replacement state and recovered after restore",
     );
     artifacts.save();
 }
