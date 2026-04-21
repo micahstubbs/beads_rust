@@ -1,6 +1,7 @@
 //! Dependency command implementation.
 
 use super::{
+    RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
     auto_import_storage_ctx_if_stale, resolve_issue_id, retry_mutation_with_jsonl_recovery,
 };
 use crate::cli::{
@@ -51,7 +52,7 @@ fn execute_dep_add(
     local_beads_dir: &Path,
 ) -> Result<()> {
     validate_dependency_target_route(local_beads_dir, &args.issue, &args.depends_on)?;
-    let (mut storage_ctx, route_cli, auto_flush_external) =
+    let (mut storage_ctx, route_cli, auto_flush_external, _routed_write_lock) =
         open_routed_storage_for_input(local_beads_dir, cli, &args.issue)?;
     let config_layer = storage_ctx.load_config(&route_cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
@@ -76,7 +77,7 @@ fn execute_dep_remove(
     local_beads_dir: &Path,
 ) -> Result<()> {
     validate_dependency_target_route(local_beads_dir, &args.issue, &args.depends_on)?;
-    let (mut storage_ctx, route_cli, auto_flush_external) =
+    let (mut storage_ctx, route_cli, auto_flush_external, _routed_write_lock) =
         open_routed_storage_for_input(local_beads_dir, cli, &args.issue)?;
     let config_layer = storage_ctx.load_config(&route_cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
@@ -99,7 +100,7 @@ fn execute_dep_list(
     ctx: &OutputContext,
     local_beads_dir: &Path,
 ) -> Result<()> {
-    let (storage_ctx, route_cli, _) =
+    let (storage_ctx, route_cli, _, _routed_write_lock) =
         open_routed_storage_for_input(local_beads_dir, cli, &args.issue)?;
     let config_layer = storage_ctx.load_config(&route_cli)?;
     let use_color = config::should_use_color(&config_layer);
@@ -127,7 +128,7 @@ fn execute_dep_tree(
     ctx: &OutputContext,
     local_beads_dir: &Path,
 ) -> Result<()> {
-    let (storage_ctx, route_cli, _) =
+    let (storage_ctx, route_cli, _, _routed_write_lock) =
         open_routed_storage_for_input(local_beads_dir, cli, &args.issue)?;
     let config_layer = storage_ctx.load_config(&route_cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
@@ -149,15 +150,22 @@ fn open_routed_storage_for_input(
     local_beads_dir: &Path,
     cli: &config::CliOverrides,
     issue_input: &str,
-) -> Result<(config::OpenStorageResult, config::CliOverrides, bool)> {
+) -> Result<(
+    config::OpenStorageResult,
+    config::CliOverrides,
+    bool,
+    RoutedWorkspaceWriteLock,
+)> {
     let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
     let mut route_cli = cli.clone();
     if route.is_external {
         route_cli.db = None;
     }
+    let routed_write_lock =
+        acquire_routed_workspace_write_lock(&route.beads_dir, route.is_external)?;
     let mut storage_ctx = config::open_storage_with_cli(&route.beads_dir, &route_cli)?;
     auto_import_storage_ctx_if_stale(&mut storage_ctx, &route_cli)?;
-    Ok((storage_ctx, route_cli, route.is_external))
+    Ok((storage_ctx, route_cli, route.is_external, routed_write_lock))
 }
 
 fn validate_dependency_target_route(

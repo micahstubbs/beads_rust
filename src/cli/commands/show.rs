@@ -1,6 +1,6 @@
 //! Show command implementation.
 
-use crate::cli::commands::auto_import_storage_ctx_if_stale;
+use crate::cli::commands::{acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale};
 use crate::cli::{ShowArgs, resolve_output_format_basic_with_outer_mode};
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -108,6 +108,8 @@ fn execute_routed(
             let use_preloaded = normalized_batch_beads_dir == normalized_local_beads_dir;
             let mut batch_cli = cli.clone();
             batch_cli.db = if use_preloaded { cli.db.clone() } else { None };
+            let _routed_write_lock =
+                acquire_routed_workspace_write_lock(&batch_beads_dir, !use_preloaded)?;
             let (batch_details, _) = load_issue_details_for_route(
                 &batch_args,
                 &batch_cli,
@@ -149,6 +151,8 @@ fn execute_routed(
         let use_preloaded = normalized_batch_beads_dir == normalized_local_beads_dir;
         let mut batch_cli = cli.clone();
         batch_cli.db = if use_preloaded { cli.db.clone() } else { None };
+        let _routed_write_lock =
+            acquire_routed_workspace_write_lock(&batch.beads_dir, !use_preloaded)?;
         let (batch_details, use_color) = load_issue_details_for_route(
             &batch_args,
             &batch_cli,

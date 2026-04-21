@@ -5,7 +5,9 @@
 //! - `br graph <issue-id>`: Show all dependents of an issue (what depends on it)
 //! - `br graph --all`: Show connected components for all nonterminal issues
 
-use super::{auto_import_storage_ctx_if_stale, resolve_issue_id};
+use super::{
+    acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale, resolve_issue_id,
+};
 use crate::cli::GraphArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -77,7 +79,7 @@ enum HumanGraphRenderMode {
 pub fn execute(args: &GraphArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let route_cli = routed_cli_for_graph(cli, args, &beads_dir)?;
-    let storage_ctx = open_storage_for_graph(args, &route_cli, &beads_dir)?;
+    let (storage_ctx, _routed_write_lock) = open_storage_for_graph(args, &route_cli, &beads_dir)?;
     execute_with_storage_ctx(args, &route_cli, ctx, &beads_dir, &storage_ctx)
 }
 
@@ -100,19 +102,22 @@ fn open_storage_for_graph(
     args: &GraphArgs,
     cli: &config::CliOverrides,
     local_beads_dir: &std::path::Path,
-) -> Result<config::OpenStorageResult> {
+) -> Result<(config::OpenStorageResult, super::RoutedWorkspaceWriteLock)> {
     if let Some(issue_input) = args.issue.as_deref()
         && !args.all
     {
         let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
+        let routed_write_lock =
+            acquire_routed_workspace_write_lock(&route.beads_dir, route.is_external)?;
         let mut storage_ctx = config::open_storage_with_cli(&route.beads_dir, cli)?;
         auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
-        return Ok(storage_ctx);
+        return Ok((storage_ctx, routed_write_lock));
     }
 
+    let routed_write_lock = super::RoutedWorkspaceWriteLock::local();
     let mut storage_ctx = config::open_storage_with_cli(local_beads_dir, cli)?;
     auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
-    Ok(storage_ctx)
+    Ok((storage_ctx, routed_write_lock))
 }
 
 /// Execute the graph command using storage that was already opened by the caller.
@@ -134,6 +139,7 @@ pub fn execute_with_storage_ctx(
         if route.is_external {
             let mut route_cli = cli.clone();
             route_cli.db = None;
+            let _routed_write_lock = acquire_routed_workspace_write_lock(&route.beads_dir, true)?;
             let mut routed_storage_ctx =
                 config::open_storage_with_cli(&route.beads_dir, &route_cli)?;
             auto_import_storage_ctx_if_stale(&mut routed_storage_ctx, &route_cli)?;

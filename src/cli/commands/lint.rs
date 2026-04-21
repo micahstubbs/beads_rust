@@ -2,7 +2,9 @@
 //!
 //! Checks issues for missing recommended template sections based on issue type.
 
-use super::{auto_import_storage_ctx_if_stale, resolve_issue_id};
+use super::{
+    acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale, resolve_issue_id,
+};
 use crate::cli::LintArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -287,6 +289,8 @@ fn resolve_issues(
 
     for batch in routed_batches {
         let batch_cli = routed_cli_for_batch(cli, batch.is_external);
+        let _routed_write_lock =
+            acquire_routed_workspace_write_lock(&batch.beads_dir, batch.is_external)?;
         let mut storage_ctx = config::open_storage_with_cli(&batch.beads_dir, &batch_cli)?;
         auto_import_storage_ctx_if_stale(&mut storage_ctx, &batch_cli)?;
         let config_layer = storage_ctx.load_config(&batch_cli)?;

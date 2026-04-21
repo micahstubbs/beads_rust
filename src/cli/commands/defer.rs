@@ -1,8 +1,8 @@
 //! Defer and Undefer command implementations.
 
 use crate::cli::commands::{
-    finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error, resolve_issue_ids,
-    update_issue_with_recovery,
+    acquire_routed_workspace_write_lock, finalize_batched_blocked_cache_refresh,
+    preserve_blocked_cache_on_error, resolve_issue_ids, update_issue_with_recovery,
 };
 use crate::cli::{DeferArgs, UndeferArgs};
 use crate::config;
@@ -187,6 +187,7 @@ fn execute_defer_route(
     beads_dir: &Path,
     auto_flush_external: bool,
 ) -> Result<DeferResult> {
+    let _routed_write_lock = acquire_routed_workspace_write_lock(beads_dir, auto_flush_external)?;
     let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
 
     let config_layer = storage_ctx.load_config(cli)?;
@@ -433,6 +434,7 @@ fn execute_undefer_route(
     beads_dir: &Path,
     auto_flush_external: bool,
 ) -> Result<UndeferResult> {
+    let _routed_write_lock = acquire_routed_workspace_write_lock(beads_dir, auto_flush_external)?;
     let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
 
     let config_layer = storage_ctx.load_config(cli)?;

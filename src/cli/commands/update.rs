@@ -1,6 +1,7 @@
 //! Update command implementation.
 
 use super::{
+    RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
     auto_import_storage_ctx_if_stale, finalize_batched_blocked_cache_refresh,
     preserve_blocked_cache_on_error, resolve_issue_id, resolve_issue_ids,
     retry_mutation_with_jsonl_recovery, update_issue_with_recovery,
@@ -141,6 +142,7 @@ struct PreparedUpdateRoute {
     valid_set_labels: Vec<String>,
     resolved_parent: ParentUpdatePlan,
     auto_flush_external: bool,
+    _routed_write_lock: RoutedWorkspaceWriteLock,
 }
 
 /// Execute the update command.
@@ -268,6 +270,7 @@ fn prepare_single_route(
     beads_dir: &Path,
     auto_flush_external: bool,
 ) -> Result<PreparedUpdateRoute> {
+    let routed_write_lock = acquire_routed_workspace_write_lock(beads_dir, auto_flush_external)?;
     let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
     auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
 
@@ -323,6 +326,7 @@ fn prepare_single_route(
         valid_set_labels,
         resolved_parent,
         auto_flush_external,
+        _routed_write_lock: routed_write_lock,
     })
 }
 
@@ -1141,13 +1145,15 @@ mod tests {
         let err = validate_mutable_target_issues(&storage, &["bd-tombstone".to_string()], true)
             .unwrap_err();
 
-        match err {
-            BeadsError::Validation { field, reason } => {
-                assert_eq!(field, "issue");
-                assert!(reason.contains("cannot update tombstone issue"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(err, BeadsError::Validation { .. }),
+            "unexpected error: {err:?}"
+        );
+        let BeadsError::Validation { field, reason } = err else {
+            return;
+        };
+        assert_eq!(field, "issue");
+        assert!(reason.contains("cannot update tombstone issue"));
 
         info!("test_validate_mutable_target_issues_rejects_tombstone: assertions passed");
     }
@@ -1309,6 +1315,7 @@ mod tests {
             valid_set_labels: Vec::new(),
             resolved_parent: ParentUpdatePlan::Unchanged,
             auto_flush_external: false,
+            _routed_write_lock: RoutedWorkspaceWriteLock::local(),
         };
 
         let ctx = OutputContext::from_flags(false, false, true);

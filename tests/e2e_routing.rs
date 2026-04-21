@@ -7,7 +7,7 @@
 //! - External DB reference safety and path normalization
 //! - Clear errors for missing/invalid routes
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -334,6 +334,62 @@ fn e2e_routing_routes_jsonl_external_route() {
     assert_eq!(shown.len(), 1);
     assert_eq!(shown[0]["id"].as_str(), Some(external_id.as_str()));
     assert_eq!(shown[0]["title"].as_str(), Some("External issue"));
+}
+
+#[test]
+fn e2e_routing_external_target_lock_blocks_routed_access() {
+    let _log = common::test_log("e2e_routing_external_target_lock_blocks_routed_access");
+
+    let main_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+    init_workspace(&main_workspace, "init_routed_lock_main");
+    init_workspace(&external_workspace, "init_routed_lock_external");
+    configure_external_route(&main_workspace, &external_workspace);
+
+    let external_id = create_issue_and_get_id(
+        &external_workspace,
+        "External issue behind held write lock",
+        "create_external_locked_target",
+    );
+    let lock_path = external_workspace.root.join(".beads").join(".write.lock");
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open external write lock");
+    lock_file.lock().expect("hold external write lock");
+
+    let routed_show = run_br(
+        &main_workspace,
+        ["show", &external_id, "--json"],
+        "show_routed_external_while_target_locked",
+    );
+    assert!(
+        !routed_show.status.success(),
+        "routed access should fail while target .write.lock is held"
+    );
+    assert!(
+        routed_show
+            .stderr
+            .contains("Routed external workspace is busy")
+            || routed_show.stderr.contains("target write lock"),
+        "expected target lock diagnostic, got stderr: {}",
+        routed_show.stderr
+    );
+
+    drop(lock_file);
+    let unlocked_show = run_br(
+        &main_workspace,
+        ["show", &external_id, "--json"],
+        "show_routed_external_after_target_unlock",
+    );
+    assert!(
+        unlocked_show.status.success(),
+        "routed access should succeed after target lock release: {}",
+        unlocked_show.stderr
+    );
 }
 
 #[test]

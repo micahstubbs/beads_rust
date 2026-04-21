@@ -1,6 +1,9 @@
 //! Audit command implementation.
 
-use super::{auto_import_storage_ctx_if_stale, resolve_issue_id};
+use super::{
+    RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
+    auto_import_storage_ctx_if_stale, resolve_issue_id,
+};
 use crate::cli::{AuditCommands, AuditLabelArgs, AuditLogArgs, AuditRecordArgs, AuditSummaryArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -146,7 +149,8 @@ fn execute_log(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let (storage_ctx, issue_id) = open_routed_storage_for_issue_input(beads_dir, cli, &args.id)?;
+    let (storage_ctx, issue_id, _routed_write_lock) =
+        open_routed_storage_for_issue_input(beads_dir, cli, &args.id)?;
     let events = storage_ctx.storage.get_events(&issue_id, 0)?;
 
     if ctx.is_quiet() {
@@ -184,13 +188,15 @@ fn open_routed_storage_for_issue_input(
     local_beads_dir: &Path,
     cli: &config::CliOverrides,
     issue_input: &str,
-) -> Result<(config::OpenStorageResult, String)> {
+) -> Result<(config::OpenStorageResult, String, RoutedWorkspaceWriteLock)> {
     let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
     let mut route_cli = cli.clone();
     if route.is_external {
         route_cli.db = None;
     }
 
+    let routed_write_lock =
+        acquire_routed_workspace_write_lock(&route.beads_dir, route.is_external)?;
     let mut storage_ctx = config::open_storage_with_cli(&route.beads_dir, &route_cli)?;
     auto_import_storage_ctx_if_stale(&mut storage_ctx, &route_cli)?;
     let config_layer = storage_ctx.load_config(&route_cli)?;
@@ -198,7 +204,7 @@ fn open_routed_storage_for_issue_input(
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     let issue_id = resolve_issue_id(&storage_ctx.storage, &resolver, issue_input)?;
 
-    Ok((storage_ctx, issue_id))
+    Ok((storage_ctx, issue_id, routed_write_lock))
 }
 
 fn execute_summary(
@@ -862,9 +868,9 @@ mod tests {
         symlink(&outside_path, beads_dir.join("interactions.jsonl")).expect("create symlink");
 
         let err = ensure_interactions_file(&beads_dir).unwrap_err();
-        match err {
-            BeadsError::Config(_) => {}
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
     }
 }

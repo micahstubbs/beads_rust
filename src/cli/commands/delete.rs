@@ -5,6 +5,7 @@
 
 use crate::cli::DeleteArgs;
 use crate::cli::commands::{
+    RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
     auto_import_storage_ctx_if_stale, resolve_issue_ids, retry_mutation_with_jsonl_recovery,
 };
 use crate::config;
@@ -63,6 +64,7 @@ struct PreparedDeleteRoute {
     cascade_delete: Vec<String>,
     final_delete_ids: Vec<String>,
     auto_flush_external: bool,
+    _routed_write_lock: RoutedWorkspaceWriteLock,
 }
 
 /// Execute the delete command.
@@ -495,6 +497,7 @@ fn prepare_delete_route(
     cli: &config::CliOverrides,
     auto_flush_external: bool,
 ) -> Result<PreparedDeleteRoute> {
+    let routed_write_lock = acquire_routed_workspace_write_lock(beads_dir, auto_flush_external)?;
     let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
     auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
     let config_layer = storage_ctx.load_config(cli)?;
@@ -527,6 +530,7 @@ fn prepare_delete_route(
         cascade_delete,
         final_delete_ids,
         auto_flush_external,
+        _routed_write_lock: routed_write_lock,
     })
 }
 

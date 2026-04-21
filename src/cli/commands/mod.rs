@@ -4,6 +4,8 @@ use crate::model::Issue;
 use crate::storage::{IssueUpdate, SqliteStorage};
 use crate::sync::auto_import_if_stale;
 use crate::util::id::IdResolver;
+use std::fs::{File, OpenOptions};
+use std::path::Path;
 
 pub mod agents;
 pub mod audit;
@@ -245,6 +247,51 @@ pub(super) fn auto_import_storage_ctx_if_stale(
         no_auto_import,
     )
     .map(|_| ())
+}
+
+pub(super) struct RoutedWorkspaceWriteLock {
+    _lock: Option<File>,
+}
+
+impl RoutedWorkspaceWriteLock {
+    #[must_use]
+    pub(super) const fn local() -> Self {
+        Self { _lock: None }
+    }
+}
+
+pub(super) fn acquire_routed_workspace_write_lock(
+    beads_dir: &Path,
+    is_external: bool,
+) -> crate::Result<RoutedWorkspaceWriteLock> {
+    if !is_external {
+        return Ok(RoutedWorkspaceWriteLock::local());
+    }
+
+    let lock_path = beads_dir.join(".write.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|err| {
+            BeadsError::Config(format!(
+                "Failed to open routed target write lock at {}: {err}",
+                lock_path.display()
+            ))
+        })?;
+
+    #[allow(clippy::incompatible_msrv)]
+    file.try_lock().map_err(|err| {
+        BeadsError::Config(format!(
+            "Routed external workspace is busy: could not acquire target write lock at {}: {err}. \
+             Retry after the target workspace command completes.",
+            lock_path.display()
+        ))
+    })?;
+
+    Ok(RoutedWorkspaceWriteLock { _lock: Some(file) })
 }
 
 pub(super) fn retry_mutation_with_jsonl_recovery<T, F>(

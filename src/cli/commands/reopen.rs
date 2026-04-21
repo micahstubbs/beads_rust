@@ -2,9 +2,9 @@
 
 use crate::cli::ReopenArgs;
 use crate::cli::commands::{
-    auto_import_storage_ctx_if_stale, finalize_batched_blocked_cache_refresh,
-    preserve_blocked_cache_on_error, resolve_issue_ids, retry_mutation_with_jsonl_recovery,
-    update_issue_with_recovery,
+    acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
+    finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error, resolve_issue_ids,
+    retry_mutation_with_jsonl_recovery, update_issue_with_recovery,
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -176,6 +176,7 @@ fn execute_route(
     beads_dir: &Path,
     auto_flush_external: bool,
 ) -> Result<ReopenResult> {
+    let _routed_write_lock = acquire_routed_workspace_write_lock(beads_dir, auto_flush_external)?;
     let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
     auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
 
