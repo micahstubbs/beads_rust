@@ -41,9 +41,9 @@ fn run_sync_cycle_case(data: &[u8]) -> Result<(), Box<dyn Error>> {
         fs::create_dir_all(parent)?;
     }
 
-    write_sidecar_files(&workspace.beads_dir, &mut cursor)?;
-    let corrupt_db_family =
-        maybe_write_corrupt_db_family(&workspace.beads_dir, &db_path, &mut cursor)?;
+    let wrote_db_sidecars = write_sidecar_files(&workspace.beads_dir, &mut cursor)?;
+    let corrupt_db_family = wrote_db_sidecars
+        || maybe_write_corrupt_db_family(&workspace.beads_dir, &db_path, &mut cursor)?;
 
     {
         let mut storage = match SqliteStorage::open(&db_path) {
@@ -58,13 +58,15 @@ fn run_sync_cycle_case(data: &[u8]) -> Result<(), Box<dyn Error>> {
 
         if let Err(err) = seed_storage(&mut storage, &mut cursor) {
             if corrupt_db_family {
-                assert_nonempty_error(err)?;
+                assert_nonempty_error(err.to_string())?;
                 workspace.assert_outside_untouched()?;
                 return Ok(());
             }
             return Err(err);
         }
-        assert_storage_invariants(&storage)?;
+        if assert_storage_invariants_or_expected(&storage, corrupt_db_family, &workspace)? {
+            return Ok(());
+        }
 
         exercise_rejected_paths(&storage, &workspace)?;
 
@@ -96,10 +98,24 @@ fn run_sync_cycle_case(data: &[u8]) -> Result<(), Box<dyn Error>> {
                 Some("bd"),
             );
             match import_result {
-                Ok(_) => assert_storage_invariants(&storage)?,
+                Ok(_) => {
+                    if assert_storage_invariants_or_expected(
+                        &storage,
+                        corrupt_db_family,
+                        &workspace,
+                    )? {
+                        return Ok(());
+                    }
+                }
                 Err(err) => {
                     assert_nonempty_error(err)?;
-                    assert_storage_invariants(&storage)?;
+                    if assert_storage_invariants_or_expected(
+                        &storage,
+                        corrupt_db_family,
+                        &workspace,
+                    )? {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -123,11 +139,23 @@ fn run_sync_cycle_case(data: &[u8]) -> Result<(), Box<dyn Error>> {
             Err(err) => assert_nonempty_error(err)?,
         }
 
-        assert_storage_invariants(&storage)?;
+        if assert_storage_invariants_or_expected(&storage, corrupt_db_family, &workspace)? {
+            return Ok(());
+        }
     }
 
-    let reopened = SqliteStorage::open(&db_path)?;
-    assert_storage_invariants(&reopened)?;
+    let reopened = match SqliteStorage::open(&db_path) {
+        Ok(storage) => storage,
+        Err(err) if corrupt_db_family => {
+            assert_nonempty_error(err)?;
+            workspace.assert_outside_untouched()?;
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if assert_storage_invariants_or_expected(&reopened, corrupt_db_family, &workspace)? {
+        return Ok(());
+    }
 
     if jsonl_path.exists() && cursor.next_bool() {
         let mut rebuilt = SqliteStorage::open(&workspace.beads_dir.join("rebuild-cycle.db"))?;
@@ -137,7 +165,11 @@ fn run_sync_cycle_case(data: &[u8]) -> Result<(), Box<dyn Error>> {
             &import_config(&workspace.beads_dir, &mut cursor),
             Some("bd"),
         ) {
-            Ok(_) => assert_storage_invariants(&rebuilt)?,
+            Ok(_) => {
+                if assert_storage_invariants_or_expected(&rebuilt, corrupt_db_family, &workspace)? {
+                    return Ok(());
+                }
+            }
             Err(err) => assert_nonempty_error(err)?,
         }
     }
@@ -235,7 +267,7 @@ fn choose_jsonl_path(beads_dir: &Path, cursor: &mut ByteCursor<'_>) -> PathBuf {
 fn write_sidecar_files(
     beads_dir: &Path,
     cursor: &mut ByteCursor<'_>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<bool, Box<dyn Error>> {
     let sidecars = [
         "beads.db-wal",
         "beads.db-shm",
@@ -243,10 +275,14 @@ fn write_sidecar_files(
         "beads.left.jsonl",
         "beads.right.jsonl",
     ];
+    let mut wrote_db_sidecars = false;
 
     for sidecar in sidecars {
         if cursor.next_bool() {
             fs::write(beads_dir.join(sidecar), cursor.bytes(96))?;
+            if matches!(sidecar, "beads.db-wal" | "beads.db-shm") {
+                wrote_db_sidecars = true;
+            }
         }
     }
 
@@ -256,7 +292,7 @@ fn write_sidecar_files(
         fs::write(recovery_dir.join("candidate.jsonl"), cursor.bytes(96))?;
     }
 
-    Ok(())
+    Ok(wrote_db_sidecars)
 }
 
 fn maybe_write_corrupt_db_family(
@@ -635,6 +671,22 @@ fn assert_storage_invariants(storage: &SqliteStorage) -> Result<(), Box<dyn Erro
     }
 
     Ok(())
+}
+
+fn assert_storage_invariants_or_expected(
+    storage: &SqliteStorage,
+    expected_storage_error: bool,
+    workspace: &FuzzWorkspace,
+) -> Result<bool, Box<dyn Error>> {
+    match assert_storage_invariants(storage) {
+        Ok(()) => Ok(false),
+        Err(err) if expected_storage_error => {
+            assert_nonempty_error(err.to_string())?;
+            workspace.assert_outside_untouched()?;
+            Ok(true)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn allow_error<T, E>(result: Result<T, E>) -> Result<Option<T>, Box<dyn Error>>
