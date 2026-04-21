@@ -36,6 +36,8 @@ Comprehensive reference for all `br` (beads_rust) commands.
 - [Sync & Config](#sync--config)
   - [sync](#sync)
   - [config](#config)
+- [Agent Integration](#agent-integration)
+  - [serve](#serve)
 - [Diagnostics & Info](#diagnostics--info)
   - [stats / status](#stats--status)
   - [doctor](#doctor)
@@ -738,6 +740,69 @@ br config set id.prefix=myproj
 # Edit in editor
 br config edit
 ```
+
+---
+
+## Agent Integration
+
+### serve
+
+Start an MCP (Model Context Protocol) server on stdio.
+
+```bash
+br serve [OPTIONS]
+```
+
+`serve` is only available in binaries built with the optional `mcp` feature:
+
+```bash
+cargo build --release --features mcp
+cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --features mcp
+```
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--actor <NAME>` | Actor name recorded for mutations (default: `mcp`) |
+
+**Transport:** stdio. An MCP client launches `br serve`; `br` does not open a
+network listener.
+
+**Tools:** `list_issues`, `show_issue`, `create_issue`, `update_issue`,
+`close_issue`, `manage_dependencies`, `project_overview`.
+
+**Resources:** `beads://project/info`, `beads://issues/{id}`,
+`beads://schema`, `beads://labels`, `beads://issues/ready`,
+`beads://issues/blocked`, `beads://issues/in_progress`,
+`beads://issues/deferred`, `beads://issues/bottlenecks`,
+`beads://graph/health`, `beads://events/recent`.
+
+**Prompts:** `triage`, `status_report`, `plan_next_work`, `polish_backlog`.
+
+**Safety:** MCP mutations use the same local storage, audit trail, `.write.lock`,
+and JSONL auto-flush behavior as CLI mutations. The server never runs git and
+does not synchronize repositories.
+
+**Example MCP client entry:**
+
+```json
+{
+  "mcpServers": {
+    "br": {
+      "command": "br",
+      "args": ["serve", "--actor", "codex"],
+      "env": {
+        "RUST_LOG": "error"
+      }
+    }
+  }
+}
+```
+
+Use `serve` when an MCP-native agent benefits from tool/resource discovery and
+structured recovery hints. Use `br --json ...` when a shell pipeline or `jq`
+script is simpler.
 
 ---
 

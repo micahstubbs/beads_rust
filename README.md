@@ -283,6 +283,31 @@ cargo build --release --no-default-features
 cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --no-default-features
 ```
 
+### Enable MCP Server Support
+
+`br serve` is optional and is not built by the default feature set. Build with
+the `mcp` feature when you want an AI agent to talk to `br` over the Model
+Context Protocol instead of shelling out to CLI commands.
+
+```bash
+cargo build --release --features mcp
+
+# Or install globally with MCP support
+cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --features mcp
+```
+
+Run it from an initialized beads workspace:
+
+```bash
+RUST_LOG=error br serve --actor codex
+```
+
+The server uses MCP over stdio. It is launched by an MCP client, does not listen
+on a network port, and uses the same SQLite database, JSONL export path, write
+locks, audit events, and no-git safety model as the normal CLI. Use shell/JSON
+commands for simple scripts; use MCP when an agent benefits from discoverable
+tools, resources, prompts, and structured recovery hints.
+
 ### Verify Installation
 
 ```bash
