@@ -28,6 +28,21 @@ br ready --format toon --limit 10
 br --json update bd-abc123 --status in_progress --claim
 ```
 
+If Agent Mail file reservations are unavailable, make the degraded claim visible
+before editing:
+
+```bash
+export AGENT_NAME="${AGENT_NAME:-codex-agent}"
+br --json update bd-abc123 --status in_progress --assignee "$AGENT_NAME"
+br --json comments add bd-abc123 --author "$AGENT_NAME" \
+  --message "degraded-coordination: Agent Mail unavailable; files: src/foo.rs"
+git status --short
+br --json list --status in_progress
+```
+
+Treat that comment as advisory, not as a lock. Avoid files already named by
+another active claim or dirty in the worktree.
+
 ## 4) Close + explain why
 
 ```bash

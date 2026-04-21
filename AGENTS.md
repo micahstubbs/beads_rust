@@ -470,6 +470,37 @@ Beads provides a lightweight, dependency-aware issue database and CLI (`br` - be
    ```
    Final Mail reply: `[br-123] Completed` with summary
 
+### Degraded Coordination When Agent Mail Is Unavailable
+
+Agent Mail reservations are the normal collision-avoidance mechanism. If Agent
+Mail is red or unreachable, keep moving but make the weaker coordination state
+visible in `br` before touching code:
+
+1. **Claim with an explicit actor:**
+   ```bash
+   br update <id> --status in_progress --assignee "$AGENT_NAME" --json
+   ```
+
+2. **Record intended file scope in the issue thread:**
+   ```bash
+   br comments add <id> --author "$AGENT_NAME" \
+     --message "degraded-coordination: Agent Mail unavailable; files: src/foo.rs, docs/bar.md" \
+     --json
+   ```
+
+3. **Check for collisions before editing:** inspect `git status --short`,
+   `br list --status in_progress --json`, and recent comments on the bead. If
+   another active agent names the same files, pick different work or narrow the
+   scope before editing.
+
+4. **Keep the fallback advisory:** this is not a lock. Use the smallest possible
+   file set, avoid broad globs, and update the comment if the edit surface
+   expands.
+
+5. **Finish normally:** close the bead, run `br sync --flush-only`, commit the
+   code and `.beads/` changes together, and mention in the close reason that the
+   work used degraded coordination. There is no Mail reservation to release.
+
 ### Mapping Cheat Sheet
 
 | Concept | Value |
@@ -485,7 +516,7 @@ Beads provides a lightweight, dependency-aware issue database and CLI (`br` - be
 
 bv is a graph-aware triage engine for Beads projects (`.beads/beads.jsonl`). It computes PageRank, betweenness, critical path, cycles, HITS, eigenvector, and k-core metrics deterministically.
 
-**Scope boundary:** bv handles *what to work on* (triage, priority, planning). For agent-to-agent coordination (messaging, work claiming, file reservations), use MCP Agent Mail.
+**Scope boundary:** bv handles *what to work on* (triage, priority, planning). For agent-to-agent coordination (messaging, work claiming, file reservations), use MCP Agent Mail. If Agent Mail is unavailable, use the degraded `br` comment protocol above until Mail is healthy again.
 
 **CRITICAL: Use ONLY `--robot-*` flags. Bare `bv` launches an interactive TUI that blocks your session.**
 

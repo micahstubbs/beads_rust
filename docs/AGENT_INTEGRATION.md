@@ -13,6 +13,7 @@ This guide covers how AI coding agents can effectively use `br` (beads_rust) for
 - [Parsing JSON Output](#parsing-json-output)
 - [Error Handling](#error-handling)
 - [Robot Mode Flags](#robot-mode-flags)
+- [Degraded Coordination Without Agent Mail](#degraded-coordination-without-agent-mail)
 - [Agent-Specific Configuration](#agent-specific-configuration)
 - [Best Practices](#best-practices)
 
@@ -229,6 +230,54 @@ Returns:
   "unblocked": ["bd-456", "bd-789"]
 }
 ```
+
+### Degraded Coordination Without Agent Mail
+
+The normal swarm workflow uses MCP Agent Mail for file reservations and
+threaded coordination. If Mail is unavailable, `br` still provides enough
+advisory state to avoid silent overlap. This fallback is intentionally weaker
+than Mail reservations, so keep scopes narrow and prefer another ready issue if
+there is any sign of collision.
+
+1. Confirm the coordination channel is actually degraded. For agents, that
+   usually means the Agent Mail health check or reservation call failed. Record
+   the failure in the bead, not just in the terminal transcript.
+
+2. Claim the bead with an actor or session identity:
+
+   ```bash
+   export AGENT_NAME="${AGENT_NAME:-codex-agent}"
+   br update <id> --status in_progress --assignee "$AGENT_NAME" --json
+   ```
+
+3. Add an issue comment naming the intended files before editing:
+
+   ```bash
+   br comments add <id> --author "$AGENT_NAME" \
+     --message "degraded-coordination: Agent Mail unavailable; files: src/foo.rs, tests/foo.rs" \
+     --json
+   ```
+
+4. Check the local collision surface:
+
+   ```bash
+   git status --short
+   br list --status in_progress --json
+   br comments list <id> --json
+   ```
+
+   If another live claim or comment names the same files, do not rely on the
+   fallback comment as a lock. Pick different ready work, split the file scope,
+   or wait for the other agent to finish.
+
+5. If the edit surface changes, add another comment before touching the new
+   files. At completion, close the bead with a reason that states Mail was
+   unavailable, then run `br sync --flush-only` and commit the code plus
+   `.beads/` changes together.
+
+This protocol does not replace Agent Mail. It is a shared audit trail for
+degraded sessions so abandoned work can be found through `br list --status
+in_progress --json`, `br comments list <id> --json`, and git history.
 
 ---
 
@@ -466,6 +515,7 @@ br update <id> --status in_progress --assignee copilot
 6. **Sync at session end** with `br sync --flush-only`
 7. **Use `br ready`** to find actionable work
 8. **Include reasons** when closing issues
+9. **Use degraded comments** only when Agent Mail reservations are unavailable
 
 ### DON'T
 

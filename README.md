@@ -791,6 +791,7 @@ br is designed for AI coding agents. See [AGENTS.md](AGENTS.md) for:
 - JSON output schemas
 - Workflow patterns
 - Integration with MCP Agent Mail
+- Degraded coordination when Agent Mail is unavailable
 - Robot mode flags
 - Best practices
 
