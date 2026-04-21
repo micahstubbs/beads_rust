@@ -9,11 +9,39 @@ use rich_rust::prelude::*;
 use serde_json::json;
 use similar::TextDiff;
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
 /// Result type for diff status: (status_string, diff_available, optional_size_tuple).
 type DiffStatusResult = (&'static str, bool, Option<(u64, u64)>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextDiffFallbackReason {
+    NonUtf8,
+    TooLarge,
+}
+
+impl TextDiffFallbackReason {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::NonUtf8 => "one or both files are not valid UTF-8",
+            Self::TooLarge => "one or both files exceed the text diff size limit",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TextDiffFallback {
+    status: &'static str,
+    current_size: u64,
+    backup_size: u64,
+    reason: TextDiffFallbackReason,
+}
+
+enum HistoryFileDiff {
+    Text(String),
+    Fallback(TextDiffFallback),
+}
 
 struct TempRestoreGuard {
     path: PathBuf,
@@ -42,6 +70,8 @@ impl Drop for TempRestoreGuard {
 }
 
 const MAX_RESTORE_ROLLBACK_PATH_ATTEMPTS: u64 = 1024;
+const MAX_HISTORY_TEXT_DIFF_BYTES: u64 = 8 * 1024 * 1024;
+const DIFF_COMPARE_BUFFER_SIZE: usize = 16 * 1024;
 const RESTORE_NOTE_DB_UNCHANGED: &str = "SQLite is unchanged until you run the import step.";
 const RESTORE_NOTE_TOMBSTONE_PROTECTION: &str =
     "Tombstone protection remains active; deleted issues are not resurrected by import.";
@@ -435,15 +465,21 @@ fn diff_backup(
         println!("Diffing current {current_name} vs {filename}...");
     }
 
-    let diff = unified_diff_for_files(&current_path, &backup_path)?;
-    if diff.is_empty() {
-        if ctx.is_rich() {
-            ctx.success("Files are identical.");
-        } else {
-            println!("Files are identical.");
+    match history_diff_for_files(&current_path, &backup_path)? {
+        HistoryFileDiff::Text(diff) => {
+            if diff.is_empty() {
+                if ctx.is_rich() {
+                    ctx.success("Files are identical.");
+                } else {
+                    println!("Files are identical.");
+                }
+            } else {
+                print!("{diff}");
+            }
         }
-    } else {
-        print!("{diff}");
+        HistoryFileDiff::Fallback(fallback) => {
+            emit_diff_fallback(ctx, fallback);
+        }
     }
 
     Ok(())
@@ -584,13 +620,69 @@ fn prune_backups(
 }
 
 fn diff_status_for_json(current_path: &Path, backup_path: &Path) -> Result<DiffStatusResult> {
-    let diff = unified_diff_for_files(current_path, backup_path)?;
-    let status = if diff.is_empty() {
-        "identical"
+    let summary = summarize_diff_files(current_path, backup_path)?;
+    if summary.diff_available {
+        Ok((summary.status, true, None))
     } else {
-        "different"
-    };
-    Ok((status, true, None))
+        Ok((
+            summary.status,
+            false,
+            Some((summary.current_size, summary.backup_size)),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DiffFileSummary {
+    status: &'static str,
+    diff_available: bool,
+    current_size: u64,
+    backup_size: u64,
+    fallback_reason: Option<TextDiffFallbackReason>,
+}
+
+fn summarize_diff_files(current_path: &Path, backup_path: &Path) -> Result<DiffFileSummary> {
+    let current_size = fs::metadata(current_path)?.len();
+    let backup_size = fs::metadata(backup_path)?.len();
+    let identical = files_are_byte_identical(current_path, backup_path, current_size, backup_size)?;
+    let status = if identical { "identical" } else { "different" };
+
+    if current_size > MAX_HISTORY_TEXT_DIFF_BYTES || backup_size > MAX_HISTORY_TEXT_DIFF_BYTES {
+        return Ok(DiffFileSummary {
+            status,
+            diff_available: false,
+            current_size,
+            backup_size,
+            fallback_reason: Some(TextDiffFallbackReason::TooLarge),
+        });
+    }
+
+    let diff_available = file_is_utf8(current_path)? && file_is_utf8(backup_path)?;
+    Ok(DiffFileSummary {
+        status,
+        diff_available,
+        current_size,
+        backup_size,
+        fallback_reason: if diff_available {
+            None
+        } else {
+            Some(TextDiffFallbackReason::NonUtf8)
+        },
+    })
+}
+
+fn history_diff_for_files(current_path: &Path, backup_path: &Path) -> Result<HistoryFileDiff> {
+    let summary = summarize_diff_files(current_path, backup_path)?;
+    if let Some(reason) = summary.fallback_reason {
+        return Ok(HistoryFileDiff::Fallback(TextDiffFallback {
+            status: summary.status,
+            current_size: summary.current_size,
+            backup_size: summary.backup_size,
+            reason,
+        }));
+    }
+
+    unified_diff_for_files(current_path, backup_path).map(HistoryFileDiff::Text)
 }
 
 fn unified_diff_for_files(current_path: &Path, backup_path: &Path) -> Result<String> {
@@ -604,6 +696,61 @@ fn unified_diff_for_files(current_path: &Path, backup_path: &Path) -> Result<Str
             &backup_path.display().to_string(),
         )
         .to_string())
+}
+
+fn emit_diff_fallback(ctx: &OutputContext, fallback: TextDiffFallback) {
+    let prefix = if fallback.status == "identical" {
+        "Files are byte-identical."
+    } else {
+        "Files differ."
+    };
+    let message = format!(
+        "{prefix} Text diff unavailable: {}. Current size: {}; backup size: {}.",
+        fallback.reason.message(),
+        format_size(fallback.current_size),
+        format_size(fallback.backup_size)
+    );
+
+    if ctx.is_rich() {
+        ctx.warning(&message);
+    } else {
+        println!("{message}");
+    }
+}
+
+fn file_is_utf8(path: &Path) -> Result<bool> {
+    let bytes = fs::read(path)?;
+    Ok(std::str::from_utf8(&bytes).is_ok())
+}
+
+fn files_are_byte_identical(
+    current_path: &Path,
+    backup_path: &Path,
+    current_size: u64,
+    backup_size: u64,
+) -> Result<bool> {
+    if current_size != backup_size {
+        return Ok(false);
+    }
+
+    let mut current = File::open(current_path)?;
+    let mut backup = File::open(backup_path)?;
+    let mut current_buf = [0_u8; DIFF_COMPARE_BUFFER_SIZE];
+    let mut backup_buf = [0_u8; DIFF_COMPARE_BUFFER_SIZE];
+
+    loop {
+        let current_read = current.read(&mut current_buf)?;
+        let backup_read = backup.read(&mut backup_buf)?;
+        if current_read != backup_read {
+            return Ok(false);
+        }
+        if current_read == 0 {
+            return Ok(true);
+        }
+        if current_buf[..current_read] != backup_buf[..backup_read] {
+            return Ok(false);
+        }
+    }
 }
 
 fn current_jsonl_path_for_backup(
@@ -831,6 +978,61 @@ mod tests {
             diff.is_empty(),
             "identical files should not emit diff: {diff}"
         );
+    }
+
+    #[test]
+    fn test_diff_status_for_json_falls_back_for_invalid_utf8() {
+        let temp = TempDir::new().unwrap();
+        let current = temp.path().join("current.jsonl");
+        let backup = temp.path().join("backup.jsonl");
+        fs::write(&current, [0xff, b'{', b'}']).unwrap();
+        fs::write(&backup, [b'{', b'}']).unwrap();
+
+        let (status, diff_available, sizes) = diff_status_for_json(&current, &backup).unwrap();
+
+        assert_eq!(status, "different");
+        assert!(!diff_available, "invalid UTF-8 cannot produce text diff");
+        assert_eq!(sizes, Some((3, 2)));
+    }
+
+    #[test]
+    fn test_history_diff_for_files_reports_identical_non_utf8_without_text_diff() {
+        let temp = TempDir::new().unwrap();
+        let current = temp.path().join("current.jsonl");
+        let backup = temp.path().join("backup.jsonl");
+        fs::write(&current, [0xff, 0x00, 0xfe]).unwrap();
+        fs::write(&backup, [0xff, 0x00, 0xfe]).unwrap();
+
+        let diff = history_diff_for_files(&current, &backup).unwrap();
+
+        assert!(
+            matches!(&diff, HistoryFileDiff::Fallback(_)),
+            "non-UTF-8 files should not produce text diff"
+        );
+        if let HistoryFileDiff::Fallback(fallback) = diff {
+            assert_eq!(fallback.status, "identical");
+            assert_eq!(fallback.current_size, 3);
+            assert_eq!(fallback.backup_size, 3);
+            assert_eq!(fallback.reason, TextDiffFallbackReason::NonUtf8);
+        }
+    }
+
+    #[test]
+    fn test_diff_status_for_json_falls_back_for_large_inputs() {
+        let temp = TempDir::new().unwrap();
+        let current = temp.path().join("current.jsonl");
+        let backup = temp.path().join("backup.jsonl");
+        let current_file = fs::File::create(&current).unwrap();
+        current_file
+            .set_len(MAX_HISTORY_TEXT_DIFF_BYTES + 1)
+            .unwrap();
+        fs::write(&backup, "small\n").unwrap();
+
+        let (status, diff_available, sizes) = diff_status_for_json(&current, &backup).unwrap();
+
+        assert_eq!(status, "different");
+        assert!(!diff_available, "large inputs should not build full diffs");
+        assert_eq!(sizes, Some((MAX_HISTORY_TEXT_DIFF_BYTES + 1, 6)));
     }
 
     #[test]
