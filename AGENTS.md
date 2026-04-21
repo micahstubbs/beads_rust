@@ -531,6 +531,47 @@ visible in `br` before touching code:
    code and `.beads/` changes together, and mention in the close reason that the
    work used degraded coordination. There is no Mail reservation to release.
 
+### Stale Claims and Reclaiming Abandoned Work
+
+`br ready` excludes `in_progress` beads, so a crashed or abandoned session can
+hide work indefinitely. Do not treat every old claim as free work. Reclaim only
+after you have evidence from the bead metadata and coordination trail.
+
+Use this rule of thumb:
+
+- Agent swarm claim: stale candidate after two hours without an `updated_at`
+  change, unless the human operator explicitly says the pane/session is dead.
+- Human or unclear claim: stale candidate after one business day.
+- Any claim with live Agent Mail reservations, recent comments, or visible dirty
+  work in the same files is not abandoned.
+
+Before reclaiming, inspect:
+
+```bash
+br show <id> --json
+br comments list <id> --json
+br list --status in_progress --json
+git status --short
+```
+
+If Agent Mail is healthy, also inspect the issue thread and active file
+reservations. Use `updated_at`, `assignee`, any session/pane/agent identity in
+comments, and named file scopes as evidence. If the previous owner may still be
+working, choose another ready bead or ask the human operator.
+
+When reclaiming, leave an audit comment first, then claim:
+
+```bash
+br comments add <id> --author "$AGENT_NAME" \
+  --message "reclaim: previous in_progress claim appears abandoned; evidence: updated_at=<timestamp>, assignee=<name>, no active reservation or pane" \
+  --json
+br update <id> --claim --json
+```
+
+If Agent Mail is unavailable, add or include the degraded-coordination intended
+file scope before editing. The newest assignee owns the claim, but if the old
+owner returns, coordinate in the bead thread instead of overwriting their work.
+
 ### Mapping Cheat Sheet
 
 | Concept | Value |

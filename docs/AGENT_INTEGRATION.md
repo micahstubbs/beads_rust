@@ -200,6 +200,46 @@ br update br-123 --claim --json
 br update br-123 --status in_progress --assignee "$BD_ACTOR" --json
 ```
 
+### Stale Claims and Abandoned Work
+
+`br ready` intentionally hides `in_progress` issues. That keeps agents from
+stealing active work, but it also means a crashed session can hide an otherwise
+ready issue. Treat an `in_progress` issue as an abandoned-claim candidate only
+after checking `updated_at`, the assignee, and the coordination trail.
+
+A claim is normally fresh if it was updated recently or the assignee is still
+reachable. In swarm sessions, wait at least two hours since `updated_at` unless
+the human operator explicitly says the pane is dead. For human-owned or unclear
+claims, use one business day as the default threshold.
+
+Before reclaiming:
+
+```bash
+br show <id> --json
+br comments list <id> --json
+git status --short
+```
+
+If Agent Mail is healthy, also check the thread and file reservations for the
+issue ID. If the stale owner left session metadata, pane IDs, intended files, or
+an Agent Mail name in comments, use that evidence when deciding whether the work
+is abandoned. Do not reclaim when the old claim is fresh, the owner is actively
+editing the same files, or the dirty tree contains unclear overlapping changes.
+
+When reclaiming abandoned work, leave an audit comment before touching files:
+
+```bash
+br comments add <id> --author "$BD_ACTOR" \
+  --message "reclaim: previous in_progress claim appears abandoned; evidence: updated_at=<timestamp>, assignee=<name>, no active reservation or pane" \
+  --json
+br update <id> --claim --json
+```
+
+If Agent Mail is down, include the intended file scope in the same comment or a
+follow-up degraded-coordination comment. The newest assignee owns the claim, but
+the old owner can still return; in that case, coordinate in the bead thread and
+split or hand off the work instead of silently overwriting each other.
+
 ### Creating Related Issues
 
 ```bash
@@ -275,6 +315,11 @@ there is any sign of collision.
    files. At completion, close the bead with a reason that states Mail was
    unavailable, then run `br sync --flush-only` and commit the code plus
    `.beads/` changes together.
+
+6. If you find old `in_progress` work while Mail is degraded, use the stale
+   claim protocol above. A stale claim is not automatically safe to take just
+   because Mail is unavailable; require age plus evidence that the owner is no
+   longer active.
 
 This protocol does not replace Agent Mail. It is a shared audit trail for
 degraded sessions so abandoned work can be found through `br list --status

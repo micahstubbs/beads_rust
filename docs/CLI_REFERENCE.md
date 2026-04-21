@@ -517,6 +517,36 @@ br stale [OPTIONS]
 |--------|-------------|
 | `--days <N>` | Issues not updated in N days (default: 14) |
 
+**Abandoned in-progress claims:**
+
+`br ready` does not show `in_progress` issues. To audit hidden work, combine
+`stale` with an explicit in-progress listing and inspect the claim evidence:
+
+```bash
+br stale --days 1 --json
+br list --status in_progress --json
+br show <id> --json
+br comments list <id> --json
+```
+
+An `in_progress` issue is a reclaim candidate when `updated_at` is old, the
+assignee or session metadata no longer points to an active worker, and recent
+comments or Agent Mail reservations do not show live work. Default thresholds
+are two hours for automated swarm claims and one business day for human or
+unclear claims.
+
+Before reclaiming, add an audit comment with the evidence, then claim:
+
+```bash
+br comments add <id> --author "$BD_ACTOR" \
+  --message "reclaim: previous in_progress claim appears abandoned; evidence: updated_at=<timestamp>, assignee=<name>, no active reservation or pane" \
+  --json
+br update <id> --claim --json
+```
+
+There is not a separate reclaim command; the audit comment plus `update --claim`
+is the documented recovery workflow.
+
 ---
 
 ## Organization Commands
