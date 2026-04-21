@@ -6,7 +6,8 @@
 use crate::cli::DeleteArgs;
 use crate::cli::commands::{
     RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
-    auto_import_storage_ctx_if_stale, resolve_issue_ids, retry_mutation_with_jsonl_recovery,
+    auto_import_storage_ctx_if_stale, report_auto_flush_failure, resolve_issue_ids,
+    retry_mutation_with_jsonl_recovery,
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -447,7 +448,7 @@ fn execute_routed(
 
     let mut result = DeleteResult::new();
     for route in &prepared_routes {
-        let batch_result = apply_delete_route(args, route)?;
+        let batch_result = apply_delete_route(args, route, ctx)?;
         merge_delete_result(&mut result, batch_result);
     }
     finalize_delete_result(&mut result);
@@ -535,7 +536,11 @@ fn prepare_delete_route(
     })
 }
 
-fn apply_delete_route(args: &DeleteArgs, route: &PreparedDeleteRoute) -> Result<DeleteResult> {
+fn apply_delete_route(
+    args: &DeleteArgs,
+    route: &PreparedDeleteRoute,
+    ctx: &OutputContext,
+) -> Result<DeleteResult> {
     let mut storage_ctx = config::open_storage_with_cli(&route.beads_dir, &route.route_cli)?;
     auto_import_storage_ctx_if_stale(&mut storage_ctx, &route.route_cli)?;
     let config_layer = storage_ctx.load_config(&route.route_cli)?;
@@ -597,10 +602,11 @@ fn apply_delete_route(args: &DeleteArgs, route: &PreparedDeleteRoute) -> Result<
     if route.auto_flush_external
         && let Err(error) = storage_ctx.auto_flush_if_enabled()
     {
-        tracing::debug!(
-            beads_dir = %storage_ctx.paths.beads_dir.display(),
-            error = %error,
-            "Routed auto-flush failed (non-fatal)"
+        report_auto_flush_failure(
+            ctx,
+            &storage_ctx.paths.beads_dir,
+            &storage_ctx.paths.jsonl_path,
+            &error,
         );
     }
 

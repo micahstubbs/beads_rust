@@ -1,4 +1,4 @@
-use super::{resolve_issue_id, retry_mutation_with_jsonl_recovery};
+use super::{report_auto_flush_failure, resolve_issue_id, retry_mutation_with_jsonl_recovery};
 use crate::cli::CreateArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -149,16 +149,17 @@ pub fn execute_with_storage(
     } else {
         ctx.success(&format!("Created {}: {}", issue.id, issue.title));
     }
-    auto_flush_after_create(&mut storage_ctx);
+    auto_flush_after_create(&mut storage_ctx, ctx);
     Ok(())
 }
 
-fn auto_flush_after_create(storage_ctx: &mut config::OpenStorageResult) {
+fn auto_flush_after_create(storage_ctx: &mut config::OpenStorageResult, ctx: &OutputContext) {
     if let Err(error) = storage_ctx.auto_flush_if_enabled() {
-        tracing::debug!(
-            beads_dir = %storage_ctx.paths.beads_dir.display(),
-            error = %error,
-            "Create auto-flush failed (non-fatal)"
+        report_auto_flush_failure(
+            ctx,
+            &storage_ctx.paths.beads_dir,
+            &storage_ctx.paths.jsonl_path,
+            &error,
         );
     }
 }
@@ -968,7 +969,7 @@ fn execute_import(
             ctx.print_line(&format!("  {id}: {title}"));
         }
     }
-    auto_flush_after_create(&mut storage_ctx);
+    auto_flush_after_create(&mut storage_ctx, ctx);
     Ok(())
 }
 

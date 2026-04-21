@@ -3,8 +3,9 @@
 use crate::cli::ReopenArgs;
 use crate::cli::commands::{
     acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
-    finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error, resolve_issue_ids,
-    retry_mutation_with_jsonl_recovery, update_issue_with_recovery,
+    finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
+    report_auto_flush_failure, resolve_issue_ids, retry_mutation_with_jsonl_recovery,
+    update_issue_with_recovery,
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -102,8 +103,13 @@ pub fn execute(
                 None
             };
 
-            let result =
-                execute_route(&batch_args, &batch_cli, &batch.beads_dir, batch.is_external)?;
+            let result = execute_route(
+                &batch_args,
+                &batch_cli,
+                ctx,
+                &batch.beads_dir,
+                batch.is_external,
+            )?;
             routed_outcomes.push((batch.issue_inputs.clone(), result.ordered_outcomes));
         }
 
@@ -121,7 +127,7 @@ pub fn execute(
     } else {
         let mut local_args = args.clone();
         local_args.ids = target_inputs;
-        let result = execute_route(&local_args, cli, &beads_dir, false)?;
+        let result = execute_route(&local_args, cli, ctx, &beads_dir, false)?;
         reopened_issues = result.reopened;
         skipped_issues = result.skipped;
     }
@@ -182,6 +188,7 @@ pub fn execute(
 fn execute_route(
     args: &ReopenArgs,
     cli: &config::CliOverrides,
+    ctx: &OutputContext,
     beads_dir: &Path,
     auto_flush_external: bool,
 ) -> Result<ReopenResult> {
@@ -312,10 +319,11 @@ fn execute_route(
 
     storage_ctx.flush_no_db_if_dirty()?;
     if auto_flush_external && let Err(error) = storage_ctx.auto_flush_if_enabled() {
-        tracing::debug!(
-            beads_dir = %storage_ctx.paths.beads_dir.display(),
-            error = %error,
-            "Routed auto-flush failed (non-fatal)"
+        report_auto_flush_failure(
+            ctx,
+            &storage_ctx.paths.beads_dir,
+            &storage_ctx.paths.jsonl_path,
+            &error,
         );
     }
 

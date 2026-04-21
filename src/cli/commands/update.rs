@@ -3,8 +3,8 @@
 use super::{
     RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
     auto_import_storage_ctx_if_stale, finalize_batched_blocked_cache_refresh,
-    preserve_blocked_cache_on_error, resolve_issue_id, resolve_issue_ids,
-    retry_mutation_with_jsonl_recovery, update_issue_with_recovery,
+    preserve_blocked_cache_on_error, report_auto_flush_failure, resolve_issue_id,
+    resolve_issue_ids, retry_mutation_with_jsonl_recovery, update_issue_with_recovery,
 };
 use crate::cli::UpdateArgs;
 use crate::config;
@@ -510,10 +510,11 @@ fn execute_prepared_route(
     if prepared.auto_flush_external
         && let Err(error) = prepared.storage_ctx.auto_flush_if_enabled()
     {
-        tracing::debug!(
-            beads_dir = %prepared.storage_ctx.paths.beads_dir.display(),
-            error = %error,
-            "Routed auto-flush failed (non-fatal)"
+        report_auto_flush_failure(
+            ctx,
+            &prepared.storage_ctx.paths.beads_dir,
+            &prepared.storage_ctx.paths.jsonl_path,
+            &error,
         );
     }
 

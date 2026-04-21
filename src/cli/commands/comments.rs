@@ -2,7 +2,8 @@
 
 use super::{
     RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
-    auto_import_storage_ctx_if_stale, resolve_issue_id, retry_mutation_with_jsonl_recovery,
+    auto_import_storage_ctx_if_stale, report_auto_flush_failure, resolve_issue_id,
+    retry_mutation_with_jsonl_recovery,
 };
 use crate::cli::{CommentAddArgs, CommentCommands, CommentsArgs};
 use crate::config;
@@ -71,10 +72,11 @@ fn execute_add(
     )?;
     storage_ctx.flush_no_db_if_dirty()?;
     if auto_flush_external && let Err(error) = storage_ctx.auto_flush_if_enabled() {
-        tracing::debug!(
-            beads_dir = %storage_ctx.paths.beads_dir.display(),
-            error = %error,
-            "Routed auto-flush failed (non-fatal)"
+        report_auto_flush_failure(
+            ctx,
+            &storage_ctx.paths.beads_dir,
+            &storage_ctx.paths.jsonl_path,
+            &error,
         );
     }
     crate::util::set_last_touched_id(beads_dir, &issue_id);

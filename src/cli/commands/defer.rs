@@ -2,7 +2,8 @@
 
 use crate::cli::commands::{
     acquire_routed_workspace_write_lock, finalize_batched_blocked_cache_refresh,
-    preserve_blocked_cache_on_error, resolve_issue_ids, update_issue_with_recovery,
+    preserve_blocked_cache_on_error, report_auto_flush_failure, resolve_issue_ids,
+    update_issue_with_recovery,
 };
 use crate::cli::{DeferArgs, UndeferArgs};
 use crate::config;
@@ -111,8 +112,13 @@ pub fn execute_defer(
                 None
             };
 
-            let result =
-                execute_defer_route(&batch_args, &batch_cli, &batch.beads_dir, batch.is_external)?;
+            let result = execute_defer_route(
+                &batch_args,
+                &batch_cli,
+                ctx,
+                &batch.beads_dir,
+                batch.is_external,
+            )?;
             routed_outcomes.push((batch.issue_inputs.clone(), result.ordered_outcomes));
         }
 
@@ -125,7 +131,7 @@ pub fn execute_defer(
             }
         }
     } else {
-        let result = execute_defer_route(args, cli, &beads_dir, false)?;
+        let result = execute_defer_route(args, cli, ctx, &beads_dir, false)?;
         deferred_issues = result.deferred;
         skipped_issues = result.skipped;
     }
@@ -193,6 +199,7 @@ fn render_defer_output(
 fn execute_defer_route(
     args: &DeferArgs,
     cli: &config::CliOverrides,
+    ctx: &OutputContext,
     beads_dir: &Path,
     auto_flush_external: bool,
 ) -> Result<DeferResult> {
@@ -304,10 +311,11 @@ fn execute_defer_route(
 
     storage_ctx.flush_no_db_if_dirty()?;
     if auto_flush_external && let Err(error) = storage_ctx.auto_flush_if_enabled() {
-        tracing::debug!(
-            beads_dir = %storage_ctx.paths.beads_dir.display(),
-            error = %error,
-            "Routed auto-flush failed (non-fatal)"
+        report_auto_flush_failure(
+            ctx,
+            &storage_ctx.paths.beads_dir,
+            &storage_ctx.paths.jsonl_path,
+            &error,
         );
     }
 
@@ -364,6 +372,7 @@ pub fn execute_undefer(
             let result = execute_undefer_route(
                 &batch_args,
                 &batch_cli,
+                ctx,
                 &batch.beads_dir,
                 batch.is_external,
             )?;
@@ -382,7 +391,7 @@ pub fn execute_undefer(
             }
         }
     } else {
-        let result = execute_undefer_route(args, cli, &beads_dir, false)?;
+        let result = execute_undefer_route(args, cli, ctx, &beads_dir, false)?;
         undeferred_issues = result.undeferred;
         skipped_issues = result.skipped;
     }
@@ -446,6 +455,7 @@ fn render_undefer_output(
 fn execute_undefer_route(
     args: &UndeferArgs,
     cli: &config::CliOverrides,
+    ctx: &OutputContext,
     beads_dir: &Path,
     auto_flush_external: bool,
 ) -> Result<UndeferResult> {
@@ -546,10 +556,11 @@ fn execute_undefer_route(
 
     storage_ctx.flush_no_db_if_dirty()?;
     if auto_flush_external && let Err(error) = storage_ctx.auto_flush_if_enabled() {
-        tracing::debug!(
-            beads_dir = %storage_ctx.paths.beads_dir.display(),
-            error = %error,
-            "Routed auto-flush failed (non-fatal)"
+        report_auto_flush_failure(
+            ctx,
+            &storage_ctx.paths.beads_dir,
+            &storage_ctx.paths.jsonl_path,
+            &error,
         );
     }
 

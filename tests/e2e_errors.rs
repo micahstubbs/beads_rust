@@ -1,7 +1,7 @@
 mod common;
 
 use beads_rust::storage::SqliteStorage;
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env};
 use serde_json::Value;
 use std::fs;
 
@@ -700,6 +700,72 @@ fn e2e_auto_flush_skips_silently_overwriting_conflict_markered_jsonl() {
     assert_eq!(
         before_bytes, after_bytes,
         "auto-flush must not rewrite a JSONL that contains unresolved merge-conflict markers"
+    );
+}
+
+#[test]
+fn e2e_auto_flush_failure_is_visible_in_json_mode() {
+    let _log = common::test_log("e2e_auto_flush_failure_is_visible_in_json_mode");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(&workspace, ["create", "Visible flush debt"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let issue_id = parse_created_id(&create.stdout);
+
+    let bad_jsonl = workspace
+        .root
+        .join(".beads")
+        .join("beads.db")
+        .join("issues.jsonl");
+    let bad_jsonl = bad_jsonl.to_string_lossy().to_string();
+
+    let update = run_br_with_env(
+        &workspace,
+        [
+            "--json",
+            "--no-auto-import",
+            "update",
+            &issue_id,
+            "--priority",
+            "1",
+        ],
+        [("BEADS_JSONL", bad_jsonl.as_str())],
+        "update_bad_auto_flush_jsonl",
+    );
+    assert!(
+        update.status.success(),
+        "mutation should still succeed while surfacing auto-flush debt: {}",
+        update.stderr
+    );
+
+    let warning_payload = extract_json_payload(&update.stderr);
+    let warning: Value =
+        serde_json::from_str(&warning_payload).expect("auto-flush warning should be JSON");
+    assert_eq!(
+        warning["warning"]["code"].as_str(),
+        Some("AUTO_FLUSH_FAILED")
+    );
+    assert!(
+        warning["warning"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Mutation succeeded")),
+        "warning should make the committed mutation explicit: {}",
+        update.stderr
+    );
+    assert!(
+        warning["warning"]["recovery"]
+            .as_str()
+            .is_some_and(|recovery| recovery.contains("br sync --flush-only")),
+        "warning should tell operators how to repair export debt: {}",
+        update.stderr
+    );
+    assert!(
+        update.stdout.contains(&issue_id),
+        "JSON stdout should still contain command output: {}",
+        update.stdout
     );
 }
 

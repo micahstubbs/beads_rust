@@ -590,6 +590,39 @@ br sync --flush-only -vv
 
 ---
 
+### "AUTO_FLUSH_FAILED" after a successful mutation
+
+**Cause:** The command updated SQLite successfully, but the automatic JSONL
+export that runs after mutating commands failed. The DB now contains newer data
+than `.beads/issues.jsonl`, so committing `.beads/` without repairing the export
+can commit stale issue state.
+
+**Diagnosis:**
+```bash
+# Confirm the DB/JSONL relationship
+br sync --status --json
+
+# Inspect the export target and its parent directory
+br where --json
+ls -la .beads .beads/issues.jsonl
+df -h .beads/
+```
+
+**Recovery:**
+```bash
+# Fix the reported filesystem/path/config problem first, then export explicitly
+br sync --flush-only
+
+# Confirm no export debt remains before committing
+br sync --status --json
+git add .beads/
+```
+
+If the warning came from a JSON or robot-mode command, the diagnostic is printed
+to stderr as structured JSON so stdout remains parseable.
+
+---
+
 ## Database Problems
 
 ### "Database is locked"

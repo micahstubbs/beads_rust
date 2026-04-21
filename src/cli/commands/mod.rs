@@ -1,6 +1,8 @@
 use crate::config::OpenStorageResult;
 use crate::error::BeadsError;
+use crate::format::sanitize_terminal_text;
 use crate::model::Issue;
+use crate::output::OutputContext;
 use crate::storage::{IssueUpdate, SqliteStorage};
 use crate::sync::auto_import_if_stale;
 use crate::util::id::IdResolver;
@@ -46,6 +48,60 @@ pub mod r#where;
 
 #[cfg(feature = "self_update")]
 pub mod upgrade;
+
+/// Report a post-mutation auto-flush failure without corrupting command stdout.
+///
+/// The data mutation has already succeeded by the time this is called. The
+/// safest remaining action is to make the sync debt visible on stderr and leave
+/// the operator with an explicit `sync --flush-only` recovery path.
+pub fn report_auto_flush_failure(
+    ctx: &OutputContext,
+    beads_dir: &Path,
+    jsonl_path: &Path,
+    error: &BeadsError,
+) {
+    tracing::warn!(
+        beads_dir = %beads_dir.display(),
+        jsonl_path = %jsonl_path.display(),
+        error = %error,
+        "Mutation succeeded but auto-flush failed"
+    );
+
+    if ctx.is_quiet() {
+        return;
+    }
+
+    let message = "Mutation succeeded, but automatic JSONL export failed. \
+                   Fix the export problem, run `br sync --flush-only`, then commit \
+                   the updated .beads/issues.jsonl.";
+    let error_text = error.to_string();
+
+    if ctx.is_json() || ctx.is_toon() {
+        let payload = serde_json::json!({
+            "warning": {
+                "code": "AUTO_FLUSH_FAILED",
+                "message": message,
+                "beads_dir": beads_dir.display().to_string(),
+                "jsonl_path": jsonl_path.display().to_string(),
+                "error": error_text,
+                "recovery": "Run br sync --flush-only after fixing the export problem before committing .beads/issues.jsonl"
+            }
+        });
+        eprintln!(
+            "{}",
+            serde_json::to_string(&payload).unwrap_or_else(|_| {
+                "{\"warning\":{\"code\":\"AUTO_FLUSH_FAILED\"}}".to_string()
+            })
+        );
+        return;
+    }
+
+    let warning = format!(
+        "Warning: {message} JSONL path: {}. Error: {error_text}",
+        jsonl_path.display()
+    );
+    eprintln!("{}", sanitize_terminal_text(&warning));
+}
 
 /// Resolve an issue ID from a potentially partial input.
 pub(super) fn resolve_issue_id(

@@ -4,7 +4,8 @@
 
 use super::{
     RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
-    auto_import_storage_ctx_if_stale, resolve_issue_id, retry_mutation_with_jsonl_recovery,
+    auto_import_storage_ctx_if_stale, report_auto_flush_failure, resolve_issue_id,
+    retry_mutation_with_jsonl_recovery,
 };
 use crate::cli::{LabelAddArgs, LabelCommands, LabelListArgs, LabelRemoveArgs, LabelRenameArgs};
 use crate::config;
@@ -134,7 +135,7 @@ fn execute_routed_label_add(
 
     for mut prepared_route in prepared_routes {
         let batch_inputs = prepared_route.issue_inputs.clone();
-        let batch_results = label_add(&mut prepared_route, &label)?;
+        let batch_results = label_add(&mut prepared_route, &label, ctx)?;
         routed_results.push((batch_inputs, batch_results));
     }
 
@@ -153,6 +154,7 @@ fn execute_routed_label_add(
 fn label_add(
     prepared_route: &mut PreparedLabelRoute,
     label: &str,
+    ctx: &OutputContext,
 ) -> Result<Vec<LabelActionResult>> {
     let mut results = Vec::new();
     let mut route_has_mutated = false;
@@ -186,10 +188,11 @@ fn label_add(
     if prepared_route.auto_flush_external
         && let Err(error) = prepared_route.storage_ctx.auto_flush_if_enabled()
     {
-        tracing::debug!(
-            beads_dir = %prepared_route.storage_ctx.paths.beads_dir.display(),
-            error = %error,
-            "Routed auto-flush failed (non-fatal)"
+        report_auto_flush_failure(
+            ctx,
+            &prepared_route.storage_ctx.paths.beads_dir,
+            &prepared_route.storage_ctx.paths.jsonl_path,
+            &error,
         );
     }
 
@@ -208,7 +211,7 @@ fn execute_routed_label_remove(
 
     for mut prepared_route in prepared_routes {
         let batch_inputs = prepared_route.issue_inputs.clone();
-        let batch_results = label_remove(&mut prepared_route, &label)?;
+        let batch_results = label_remove(&mut prepared_route, &label, ctx)?;
         routed_results.push((batch_inputs, batch_results));
     }
 
@@ -227,6 +230,7 @@ fn execute_routed_label_remove(
 fn label_remove(
     prepared_route: &mut PreparedLabelRoute,
     label: &str,
+    ctx: &OutputContext,
 ) -> Result<Vec<LabelActionResult>> {
     let mut results = Vec::new();
     let mut route_has_mutated = false;
@@ -256,10 +260,11 @@ fn label_remove(
     if prepared_route.auto_flush_external
         && let Err(error) = prepared_route.storage_ctx.auto_flush_if_enabled()
     {
-        tracing::debug!(
-            beads_dir = %prepared_route.storage_ctx.paths.beads_dir.display(),
-            error = %error,
-            "Routed auto-flush failed (non-fatal)"
+        report_auto_flush_failure(
+            ctx,
+            &prepared_route.storage_ctx.paths.beads_dir,
+            &prepared_route.storage_ctx.paths.jsonl_path,
+            &error,
         );
     }
 

@@ -9,7 +9,6 @@ use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
-use tracing::debug;
 
 #[allow(clippy::too_many_lines)]
 fn main() {
@@ -366,7 +365,12 @@ fn main() {
                 ),
             )
         {
-            debug!(?e, "Auto-flush failed (non-fatal)");
+            commands::report_auto_flush_failure(
+                &output_ctx,
+                &paths.beads_dir,
+                &paths.jsonl_path,
+                &e,
+            );
         }
     }
 }
