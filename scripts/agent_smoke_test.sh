@@ -21,6 +21,7 @@ need_cmd() {
 
 need_cmd jq
 need_cmd tru
+need_cmd grep
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -53,21 +54,35 @@ log "Create 3 issues"
 "$BR" create "Smoke two" --type bug --priority 0 --json >/dev/null
 "$BR" create "Smoke three" --type feature --priority 1 --json >/dev/null
 
-ID1=$("$BR" list --format json --limit 1 | jq -r ".[0].id")
+list_is_array_or_page='if type=="array" then true else (has("issues") and (.issues | type=="array")) end'
+first_issue_id='if type=="array" then .[0].id else .issues[0].id end'
+
+ID1=$("$BR" list --format json --limit 1 | jq -r "$first_issue_id")
 
 log "JSON: list/show parse"
-"$BR" list --format json --limit 5 | jq -e "type==\"array\"" >/dev/null
+"$BR" list --format json --limit 5 | jq -e "$list_is_array_or_page" >/dev/null
 "$BR" show "$ID1" --format json | jq -e 'if type=="array" then (.[0] | has("id") and has("title")) else (has("id") and has("title")) end' >/dev/null
 
+log "Docs: agent quickstarts do not put --format on mutation commands"
+if grep -En 'br (update|close|create|delete|reopen|defer|undefer|label add|label remove)\b.*--format' \
+    "$ROOT/docs/agent/QUICKSTART.md" "$ROOT/docs/agent/EXAMPLES.md"; then
+    log "Unsupported --format flag found on mutation-command examples"
+    exit 1
+fi
+
+log "JSON: mutation commands parse via global --json"
+"$BR" --json update "$ID1" --status in_progress --claim | jq -e 'if type=="array" then (.[0].status == "in_progress") else (.status == "in_progress") end' >/dev/null
+"$BR" --json close "$ID1" --reason "agent smoke test" | jq -e 'if type=="array" then (.[0].status == "closed") else (.status == "closed") end' >/dev/null
+
 log "TOON: list/show decode+parse"
-"$BR" list --format toon --limit 5 | tru --decode | jq -e "type==\"array\"" >/dev/null
+"$BR" list --format toon --limit 5 | tru --decode | jq -e "$list_is_array_or_page" >/dev/null
 "$BR" show "$ID1" --format toon | tru --decode | jq -e 'if type=="array" then (.[0] | has("id") and has("title")) else (has("id") and has("title")) end' >/dev/null
 
 log "Env: TOON_DEFAULT_FORMAT defaults output when --format not provided"
-TOON_DEFAULT_FORMAT=toon "$BR" list --limit 1 | tru --decode | jq -e "type==\"array\"" >/dev/null
+TOON_DEFAULT_FORMAT=toon "$BR" list --limit 1 | tru --decode | jq -e "$list_is_array_or_page" >/dev/null
 
 log "Env: BR_OUTPUT_FORMAT takes precedence over TOON_DEFAULT_FORMAT"
-BR_OUTPUT_FORMAT=json TOON_DEFAULT_FORMAT=toon "$BR" list --limit 1 | jq -e "type==\"array\"" >/dev/null
+BR_OUTPUT_FORMAT=json TOON_DEFAULT_FORMAT=toon "$BR" list --limit 1 | jq -e "$list_is_array_or_page" >/dev/null
 
 log "Error envelope (stderr JSON)"
 ERR_JSON="$WORKDIR/err.json"

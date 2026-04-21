@@ -25,13 +25,13 @@ br ready --format toon --limit 10
 ## 3) Claim + work
 
 ```bash
-br update bd-abc123 --status in_progress --claim --format json
+br --json update bd-abc123 --status in_progress --claim
 ```
 
 ## 4) Close + explain why
 
 ```bash
-br close bd-abc123 --reason "Implemented X; tests pass" --format json
+br --json close bd-abc123 --reason "Implemented X; tests pass"
 ```
 
 ## 5) Sync (end of session)
@@ -47,7 +47,7 @@ br sync --flush-only
 - Preferred flags:
   - Use `--format json` or `--format toon` when the command supports it.
   - `--json` always forces JSON.
-  - Some commands also accept `--robot` (alias for `--json`).
+  - For mutation commands such as `update` and `close`, prefer global `--json`; do not assume every mutation command has command-local `--format`.
 - When scripting, route stderr separately; errors may be emitted as structured JSON on stderr.
 
 ## Agent smoke test

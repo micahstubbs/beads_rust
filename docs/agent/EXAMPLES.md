@@ -15,7 +15,7 @@ br ready --format toon --limit 10 | tru --decode | jq '.[0]'
 ## Update status (JSON)
 
 ```bash
-br update bd-abc123 --status in_progress --format json | jq .
+br --json update bd-abc123 --status in_progress | jq .
 ```
 
 ## Determinism smoke check
