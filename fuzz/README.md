@@ -8,6 +8,12 @@ Run the JSONL import harness in bounded mode:
 cargo fuzz run jsonl_import -- -runs=10000 -max_len=65536
 ```
 
+Run the three-way merge harness in bounded mode:
+
+```bash
+cargo fuzz run merge_issue -- -runs=10000 -max_len=8192
+```
+
 Run the content-hash harness in bounded mode:
 
 ```bash
@@ -18,11 +24,20 @@ Run a compile check without fuzzing:
 
 ```bash
 cargo fuzz check jsonl_import
+cargo fuzz check merge_issue
 cargo fuzz check content_hash
 ```
 
 The harnesses create isolated temporary workspaces and must not read or write
 the repository's real `.beads/` directory.
+
+The `merge_issue` target feeds randomized base/local/external triples into the
+same sync merge logic used by `br sync --merge`. It checks deterministic
+termination, kept-issue content hashes, explicit conflict reporting for manual
+resolution, documented `--force-db`/`--force-jsonl` winners, and tombstone
+protection in the one-issue `three_way_merge` path. Hand-written JSON seeds live
+under `fuzz/corpus/merge_issue/` and can be promoted to normal regression tests
+if they expose a minimized failure.
 
 The `content_hash` target treats JSON serialization whitespace, JSON field
 order, unknown JSON fields, empty optional fields, labels, relationships, and
