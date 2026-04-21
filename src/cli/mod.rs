@@ -708,7 +708,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub allow_stale: bool,
 
-    /// `SQLite` busy timeout in ms
+    /// `SQLite` busy/write-lock timeout in ms
     #[arg(long, global = true)]
     pub lock_timeout: Option<u64>,
 

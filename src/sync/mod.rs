@@ -29,19 +29,36 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::RandomState};
 use std::fmt::Write as FmtWrite;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
+
+const DEFAULT_WRITE_LOCK_TIMEOUT_MS: u64 = 30_000;
+const WRITE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Acquire a blocking exclusive lock on `.beads/.write.lock`.
 ///
 /// This serializes all mutating operations across processes, preventing
 /// concurrent-write deadlocks in the underlying SQLite engine. Uses a fast-path
-/// `try_lock()` for the uncontended case, then falls back to a true blocking
-/// `lock()` that waits indefinitely until the holder releases. The lock is
-/// held until the returned `File` drops.
+/// `try_lock()` for the uncontended case, then polls with a bounded timeout for
+/// contended locks. The lock is held until the returned `File` drops.
 #[allow(clippy::incompatible_msrv)]
 pub fn blocking_write_lock(beads_dir: &Path) -> Result<File> {
+    blocking_write_lock_with_timeout(beads_dir, None)
+}
+
+/// Acquire a bounded exclusive lock on `.beads/.write.lock`.
+///
+/// `lock_timeout_ms` uses the same millisecond setting as `--lock-timeout`.
+/// When unset, a 30s default prevents a stuck writer from parking every
+/// subsequent mutating command indefinitely.
+#[allow(clippy::incompatible_msrv)]
+pub fn blocking_write_lock_with_timeout(
+    beads_dir: &Path,
+    lock_timeout_ms: Option<u64>,
+) -> Result<File> {
     let lock_path = beads_dir.join(".write.lock");
     let file = OpenOptions::new()
         .read(true)
@@ -57,22 +74,59 @@ pub fn blocking_write_lock(beads_dir: &Path) -> Result<File> {
         })?;
 
     // Fast path: non-blocking try for the common uncontended case.
-    if file.try_lock().is_ok() {
-        return Ok(file);
-    }
-
-    // Contended: block until the current holder releases.
-    tracing::debug!(".write.lock is held by another process; waiting for release");
-    match file.lock() {
-        Ok(()) => Ok(file),
-        Err(e) => {
-            tracing::debug!("failed to acquire .write.lock: {e}");
-            Err(BeadsError::Config(format!(
-                "Failed to acquire write lock at {}: {e}",
+    match file.try_lock() {
+        Ok(()) => return Ok(file),
+        Err(TryLockError::WouldBlock) => {}
+        Err(TryLockError::Error(err)) => {
+            return Err(BeadsError::Config(format!(
+                "Failed to acquire write lock at {}: {err}",
                 lock_path.display()
-            )))
+            )));
         }
     }
+
+    let timeout_ms = lock_timeout_ms.unwrap_or(DEFAULT_WRITE_LOCK_TIMEOUT_MS);
+    let timeout = Duration::from_millis(timeout_ms);
+    let start = Instant::now();
+    tracing::debug!(
+        timeout_ms,
+        lock_path = %lock_path.display(),
+        ".write.lock is held by another process; waiting with timeout"
+    );
+
+    loop {
+        if start.elapsed() >= timeout {
+            return Err(write_lock_timeout_error(&lock_path, timeout_ms));
+        }
+
+        let remaining = timeout.saturating_sub(start.elapsed());
+        thread::sleep(remaining.min(WRITE_LOCK_POLL_INTERVAL));
+
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Error(err)) => {
+                tracing::debug!("failed to acquire .write.lock: {err}");
+                return Err(BeadsError::Config(format!(
+                    "Failed to acquire write lock at {}: {err}",
+                    lock_path.display()
+                )));
+            }
+        }
+    }
+}
+
+fn write_lock_timeout_error(lock_path: &Path, timeout_ms: u64) -> BeadsError {
+    BeadsError::Config(format!(
+        "Timed out after {timeout_ms}ms waiting for write lock at {}. \
+         Another br process may be holding .write.lock; retry after it exits or investigate a stuck process.",
+        lock_path.display()
+    ))
+}
+
+#[must_use]
+pub const fn default_write_lock_timeout_ms() -> u64 {
+    DEFAULT_WRITE_LOCK_TIMEOUT_MS
 }
 
 /// Try to acquire an exclusive advisory lock on `.beads/.sync.lock`.
@@ -4474,6 +4528,45 @@ mod tests {
             ),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    #[allow(clippy::incompatible_msrv)]
+    fn blocking_write_lock_with_timeout_errors_when_lock_is_held() {
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let lock_path = beads_dir.join(".write.lock");
+        let held_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("open held write lock");
+        held_lock.lock().expect("hold write lock");
+
+        let start = Instant::now();
+        let err = blocking_write_lock_with_timeout(&beads_dir, Some(25)).unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "timeout should fail promptly"
+        );
+        assert!(
+            matches!(
+                &err,
+                BeadsError::Config(message)
+                    if message.contains("Timed out after 25ms")
+                        && message.contains(".write.lock")
+                        && message.contains("stuck process")
+            ),
+            "unexpected error: {err}"
+        );
+
+        drop(held_lock);
+        let acquired =
+            blocking_write_lock_with_timeout(&beads_dir, Some(25)).expect("lock after release");
+        drop(acquired);
     }
 
     #[test]

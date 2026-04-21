@@ -62,11 +62,10 @@ fn main() {
         if should_acquire_startup_write_lock(command_needs_write_lock, should_preopen_storage)
             && ctx.is_initialized()
         {
-            match ctx
-                .beads_dir
-                .as_deref()
-                .map(beads_rust::sync::blocking_write_lock)
-            {
+            let lock_timeout = ctx.write_lock_timeout();
+            match ctx.beads_dir.as_deref().map(|beads_dir| {
+                beads_rust::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout)
+            }) {
                 Some(Ok(lock)) => Some(lock),
                 Some(Err(e)) => handle_error(&e, json_error_mode),
                 None => None,
@@ -101,11 +100,10 @@ fn main() {
         let _auto_import_write_lock = if write_lock.is_some() {
             None
         } else {
-            match ctx
-                .beads_dir
-                .as_deref()
-                .map(beads_rust::sync::blocking_write_lock)
-            {
+            let lock_timeout = ctx.write_lock_timeout();
+            match ctx.beads_dir.as_deref().map(|beads_dir| {
+                beads_rust::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout)
+            }) {
                 Some(Ok(lock)) => Some(lock),
                 Some(Err(e)) => handle_error(&e, json_error_mode),
                 None => None,
@@ -433,6 +431,13 @@ impl StartupContext {
             .as_ref()
             .and_then(config::no_auto_flush_from_layer)
             .unwrap_or(false)
+    }
+
+    fn write_lock_timeout(&self) -> Option<u64> {
+        self.config
+            .as_ref()
+            .and_then(config::lock_timeout_from_layer)
+            .or(Some(beads_rust::sync::default_write_lock_timeout_ms()))
     }
 }
 

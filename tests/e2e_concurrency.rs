@@ -465,6 +465,69 @@ fn e2e_mutating_command_fails_when_write_lock_path_unusable() {
     );
 }
 
+/// A held `.write.lock` must fail with the configured timeout instead of
+/// parking the mutating command indefinitely.
+#[test]
+#[cfg(unix)]
+#[allow(clippy::incompatible_msrv)]
+fn e2e_write_lock_contention_respects_lock_timeout() {
+    let _log = common::test_log("e2e_write_lock_contention_respects_lock_timeout");
+
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let root = temp_dir.path().to_path_buf();
+
+    let init = run_br_in_dir(&root, ["init"]);
+    assert!(init.success, "init failed: {}", init.stderr);
+
+    let lock_path = root.join(".beads").join(".write.lock");
+    let write_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .expect("open .write.lock");
+    write_lock.lock().expect("hold .write.lock");
+
+    let start = Instant::now();
+    let create = run_br_in_dir(
+        &root,
+        [
+            "--lock-timeout",
+            "75",
+            "--json",
+            "create",
+            "Blocked by held write lock",
+        ],
+    );
+    let elapsed = start.elapsed();
+
+    assert!(
+        !create.success,
+        "mutating command should time out while write lock is held; stdout={} stderr={}",
+        create.stdout, create.stderr
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "write lock timeout should not block indefinitely; elapsed={elapsed:?}"
+    );
+    let combined = format!("{}{}", create.stdout, create.stderr);
+    assert!(
+        combined.contains("Timed out after 75ms")
+            && combined.contains("write lock")
+            && combined.contains(".write.lock"),
+        "error should include bounded write-lock diagnostics: {combined}"
+    );
+
+    drop(write_lock);
+    let after = run_br_in_dir(&root, ["create", "After write lock timeout", "--json"]);
+    assert!(
+        after.success,
+        "workspace should accept writes after lock release: stdout={} stderr={}",
+        after.stdout, after.stderr
+    );
+}
+
 /// Auto-import runs before nominally read-only commands, but the import itself
 /// mutates SQLite. It must therefore serialize through `.write.lock` just like
 /// explicit write commands.

@@ -3522,7 +3522,8 @@ fn resolve_db_override_from_layer(beads_dir: &Path, layer: &ConfigLayer) -> Opti
     })
 }
 
-fn lock_timeout_from_layer(layer: &ConfigLayer) -> Option<u64> {
+#[must_use]
+pub fn lock_timeout_from_layer(layer: &ConfigLayer) -> Option<u64> {
     get_startup_value(layer, &["lock-timeout", "lock_timeout"])
         .and_then(|value| value.trim().parse::<u64>().ok())
 }
