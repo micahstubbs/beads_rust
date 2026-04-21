@@ -2,8 +2,15 @@
 target/
 target*/
 
-# Cargo lock for library crates (keep for binary crates)
 # Cargo.lock
+# Intentionally ignored: scripts/dev-local-frankensqlite.toml (copied to
+# .cargo/config.toml) patches fsqlite* deps at sibling paths, which rewrites
+# registry sources / checksums in Cargo.lock on every local `cargo` invocation.
+# Committing that dev-local lockfile would break `cargo install beads_rust`
+# for end users (paths point at /data/projects/frankensqlite on the author's
+# workstation). Keep Cargo.lock untracked — crates.io publishes regenerate
+# the lockfile from Cargo.toml on install.
+Cargo.lock
 
 # IDE
 .idea/
