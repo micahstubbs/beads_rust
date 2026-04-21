@@ -913,16 +913,8 @@ fn dep_tree(
             let mut new_path = item.path.clone();
             new_path.push(item.id.clone());
 
-            // Get full issue details for sorting
-            // This is slightly inefficient (N queries), but necessary for sorting by priority.
-            // Optimization: fetch all at once or accept ID sort.
-            // For now, let's sort by ID to be deterministic, or fetch details.
-            // The original code sorted the FINAL list.
-            // To maintain DFS order with sorted siblings, we must sort here.
-
-            // Let's just sort by ID for stability and speed, priority sorting would require fetching issues.
-            dependencies.sort();
-            // Push in reverse order so first item pops first
+            sort_dep_tree_siblings(&mut dependencies, &metadata_cache);
+            // Push in reverse order so first sorted item pops first.
             for dep_id in dependencies.into_iter().rev() {
                 // No global visited check here
                 queue.push(QueueItem {
@@ -1006,6 +998,49 @@ fn render_dep_tree_mermaid(nodes: &[TreeNode]) {
         if let Some(parent_key) = node.parent_key.as_deref() {
             println!("    {parent_key} --> {}", node.node_key);
         }
+    }
+}
+
+fn sort_dep_tree_siblings(
+    dependencies: &mut [String],
+    metadata_cache: &HashMap<String, (String, i32, String)>,
+) {
+    dependencies.sort_by(|left, right| {
+        let left_meta = metadata_cache.get(left);
+        let right_meta = metadata_cache.get(right);
+
+        dep_tree_sibling_priority(left_meta)
+            .cmp(&dep_tree_sibling_priority(right_meta))
+            .then_with(|| {
+                dep_tree_sibling_status_rank(left_meta)
+                    .cmp(&dep_tree_sibling_status_rank(right_meta))
+            })
+            .then_with(|| dep_tree_sibling_title(left_meta).cmp(dep_tree_sibling_title(right_meta)))
+            .then_with(|| left.cmp(right))
+    });
+}
+
+fn dep_tree_sibling_priority(meta: Option<&(String, i32, String)>) -> i32 {
+    meta.map_or(i32::MAX, |(_, priority, _)| *priority)
+}
+
+fn dep_tree_sibling_title(meta: Option<&(String, i32, String)>) -> &str {
+    meta.map_or("", |(title, _, _)| title.as_str())
+}
+
+fn dep_tree_sibling_status_rank(meta: Option<&(String, i32, String)>) -> u8 {
+    let Some((_, _, status)) = meta else {
+        return u8::MAX;
+    };
+
+    match status.as_str() {
+        "open" => 0,
+        "in_progress" => 1,
+        "blocked" => 2,
+        "deferred" => 3,
+        "closed" => 4,
+        "deleted" | "tombstone" => 5,
+        _ => 6,
     }
 }
 
@@ -1759,6 +1794,50 @@ mod tests {
         assert!(dep_tree_truncated(2, 2, 1));
         assert!(!dep_tree_truncated(1, 2, 3));
         info!("test_dep_tree_truncated_only_when_children_are_omitted: assertions passed");
+    }
+
+    #[test]
+    fn test_sort_dep_tree_siblings_uses_metadata_cache() {
+        init_test_logging();
+        info!("test_sort_dep_tree_siblings_uses_metadata_cache: starting");
+        let mut dependencies = vec![
+            "bd-low".to_string(),
+            "bd-missing".to_string(),
+            "bd-active".to_string(),
+            "bd-alpha".to_string(),
+            "bd-high".to_string(),
+        ];
+        let mut metadata_cache = HashMap::new();
+        metadata_cache.insert(
+            "bd-low".to_string(),
+            ("Low priority".to_string(), 3, "open".to_string()),
+        );
+        metadata_cache.insert(
+            "bd-high".to_string(),
+            ("High priority".to_string(), 0, "open".to_string()),
+        );
+        metadata_cache.insert(
+            "bd-active".to_string(),
+            ("Active task".to_string(), 1, "in_progress".to_string()),
+        );
+        metadata_cache.insert(
+            "bd-alpha".to_string(),
+            ("Alpha task".to_string(), 1, "open".to_string()),
+        );
+
+        sort_dep_tree_siblings(&mut dependencies, &metadata_cache);
+
+        assert_eq!(
+            dependencies,
+            vec![
+                "bd-high".to_string(),
+                "bd-alpha".to_string(),
+                "bd-active".to_string(),
+                "bd-low".to_string(),
+                "bd-missing".to_string(),
+            ]
+        );
+        info!("test_sort_dep_tree_siblings_uses_metadata_cache: assertions passed");
     }
 
     #[test]
