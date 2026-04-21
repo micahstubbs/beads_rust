@@ -271,7 +271,7 @@ fn compute_summary(
     let mut open = 0;
     let mut in_progress = 0;
     let mut closed = 0;
-    let mut blocked_by_status = 0;
+    let mut status_blocked_ids = HashSet::new();
     let mut deferred = 0;
     let mut draft = 0;
     let mut tombstone = 0;
@@ -314,7 +314,9 @@ fn compute_summary(
                     lead_times.push(lead_time.num_hours() as f64);
                 }
             }
-            Status::Blocked => blocked_by_status += 1,
+            Status::Blocked => {
+                status_blocked_ids.insert(issue.id.as_str());
+            }
             Status::Deferred => deferred += 1,
             Status::Draft => draft += 1,
             Status::Tombstone => tombstone += 1,
@@ -349,8 +351,10 @@ fn compute_summary(
         })
         .count();
 
-    // Blocked count based on 'blocks' deps only (classic bd semantics).
-    let blocked = blocked_by_blocks.len();
+    // Blocked count includes both dependency-blocked issues and manual
+    // Status::Blocked issues, deduped by ID when both conditions apply.
+    status_blocked_ids.extend(blocked_by_blocks.iter().map(String::as_str));
+    let blocked = status_blocked_ids.len();
 
     // Epics eligible for closure: all children closed
     let epics_eligible = count_epics_eligible_for_closure(storage, &epics)?;
@@ -368,9 +372,6 @@ fn compute_summary(
         .iter()
         .filter(|i| i.status != Status::Tombstone)
         .count();
-
-    // blocked_by_status is unused but kept for potential future use
-    let _ = blocked_by_status;
 
     Ok(StatsSummary {
         total_issues: total,
@@ -1346,6 +1347,23 @@ mod tests {
 
         assert_eq!(summary.blocked_issues, 1);
         assert_eq!(summary.ready_issues, 1); // t-1 is ready, t-2 is blocked
+    }
+
+    #[test]
+    fn test_blocked_by_status_counts_without_dependency_blocker() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let blocked_issue = make_issue("t-1", Status::Blocked, IssueType::Task);
+
+        storage.create_issue(&blocked_issue, "tester").unwrap();
+
+        let all_issues = std::iter::once(&blocked_issue)
+            .map(stats_row)
+            .collect::<Vec<_>>();
+        let summary = compute_summary(&storage, &all_issues, None).unwrap();
+
+        assert_eq!(summary.blocked_issues, 1);
+        assert_eq!(summary.ready_issues, 0);
     }
 
     #[test]
