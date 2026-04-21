@@ -2132,11 +2132,6 @@ fn parse_jsonl_size_witness(value: &str) -> Option<u64> {
     value.parse().ok()
 }
 
-fn record_jsonl_witness_in_tx(storage: &SqliteStorage, jsonl_path: &Path) -> Result<()> {
-    let observed = observed_jsonl_witness(jsonl_path)?;
-    record_observed_jsonl_witness_in_tx(storage, &observed)
-}
-
 fn record_observed_jsonl_witness_in_tx(
     storage: &SqliteStorage,
     observed: &JsonlWitness,
@@ -2275,6 +2270,7 @@ pub fn finalize_export(
     jsonl_path: &Path,
 ) -> Result<()> {
     use chrono::Utc;
+    let observed_jsonl = observed_jsonl_witness(jsonl_path)?;
 
     storage.with_write_transaction(|storage| -> Result<()> {
         // Clear dirty flags for exported issues (safe version with timestamp validation)
@@ -2290,7 +2286,7 @@ pub fn finalize_export(
         // Update metadata
         storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, &result.content_hash)?;
         storage.set_metadata_in_tx(METADATA_LAST_EXPORT_TIME, &Utc::now().to_rfc3339())?;
-        record_jsonl_witness_in_tx(storage, jsonl_path)?;
+        record_observed_jsonl_witness_in_tx(storage, &observed_jsonl)?;
 
         // Keep the row stable and clear the flag in place so ordinary export
         // cycles avoid delete+insert churn on the metadata B-tree.
@@ -2438,6 +2434,18 @@ fn finalize_incremental_auto_flush(
     jsonl_path: Option<&Path>,
 ) -> Result<()> {
     use chrono::Utc;
+    let export_metadata = match content_hash {
+        Some(content_hash) => {
+            let jsonl_path = jsonl_path.ok_or_else(|| {
+                BeadsError::Config(
+                    "incremental auto-flush metadata update requires a JSONL path".to_string(),
+                )
+            })?;
+            Some((content_hash, observed_jsonl_witness(jsonl_path)?))
+        }
+        None => None,
+    };
+
     storage.with_write_transaction(|storage| -> Result<()> {
         if !clear_dirty_metadata.is_empty() {
             storage.clear_dirty_issues(clear_dirty_metadata)?;
@@ -2448,15 +2456,10 @@ fn finalize_incremental_auto_flush(
         if !issue_hashes.is_empty() {
             storage.set_export_hashes_in_tx(issue_hashes)?;
         }
-        if let Some(content_hash) = content_hash {
+        if let Some((content_hash, observed_jsonl)) = &export_metadata {
             storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, content_hash)?;
             storage.set_metadata_in_tx(METADATA_LAST_EXPORT_TIME, &Utc::now().to_rfc3339())?;
-            let jsonl_path = jsonl_path.ok_or_else(|| {
-                BeadsError::Config(
-                    "incremental auto-flush metadata update requires a JSONL path".to_string(),
-                )
-            })?;
-            record_jsonl_witness_in_tx(storage, jsonl_path)?;
+            record_observed_jsonl_witness_in_tx(storage, observed_jsonl)?;
         }
         storage.set_metadata_in_tx("needs_flush", "false")?;
         Ok(())
@@ -3387,6 +3390,7 @@ pub fn import_from_jsonl(
             }
         }
     }
+    let observed_jsonl = observed_jsonl_witness(input_path)?;
 
     // Phase 3: Execute Actions
     //
@@ -3458,7 +3462,7 @@ pub fn import_from_jsonl(
         storage
             .set_metadata_in_tx(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
         storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, &jsonl_hash)?;
-        record_jsonl_witness_in_tx(storage, input_path)?;
+        record_observed_jsonl_witness_in_tx(storage, &observed_jsonl)?;
 
         Ok(tx_result)
     });
