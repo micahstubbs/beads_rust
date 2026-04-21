@@ -181,6 +181,22 @@ pub(crate) fn export_temp_path(output_path: &Path) -> PathBuf {
     output_path.with_extension(format!("jsonl.{}.tmp", std::process::id()))
 }
 
+#[cfg(unix)]
+fn set_restrictive_jsonl_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(0o600);
+    if let Err(error) = fs::set_permissions(path, perms) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "Failed to set restrictive permissions on JSONL file"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn set_restrictive_jsonl_permissions(_path: &Path) {}
+
 /// Configuration for JSONL export.
 #[derive(Debug, Clone, Default)]
 #[allow(clippy::struct_excessive_bools)]
@@ -1690,6 +1706,7 @@ pub fn export_to_jsonl_with_policy(
             }
         })?;
     let mut temp_guard = TempFileGuard::new(temp_path.clone());
+    set_restrictive_jsonl_permissions(&temp_path);
     let mut writer = BufWriter::new(temp_file);
 
     // Write JSONL and compute hash
@@ -1787,23 +1804,9 @@ pub fn export_to_jsonl_with_policy(
         )?;
     }
 
-    // Atomic rename
-    fs::rename(&temp_path, output_path)?;
+    // Atomic rename plus parent-directory fsync for power-loss durability.
+    crate::util::durable_rename(&temp_path, output_path)?;
     temp_guard.persist();
-
-    // Set file permissions (0600)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        if let Err(e) = fs::set_permissions(output_path, perms) {
-            tracing::warn!(
-                path = %output_path.display(),
-                error = %e,
-                "Failed to set restrictive permissions on exported JSONL file"
-            );
-        }
-    }
 
     let result = ExportResult {
         exported_count: exported_ids.len(),
@@ -2571,6 +2574,7 @@ fn write_jsonl_lines_atomically(
             }
         })?;
     let mut temp_guard = TempFileGuard::new(temp_path.clone());
+    set_restrictive_jsonl_permissions(&temp_path);
     let mut writer = BufWriter::new(temp_file);
     let mut hasher = Sha256::new();
 
@@ -2610,21 +2614,8 @@ fn write_jsonl_lines_atomically(
         )?;
     }
 
-    fs::rename(&temp_path, output_path)?;
+    crate::util::durable_rename(&temp_path, output_path)?;
     temp_guard.persist();
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        if let Err(e) = fs::set_permissions(output_path, perms) {
-            tracing::warn!(
-                path = %output_path.display(),
-                error = %e,
-                "Failed to set restrictive permissions on exported JSONL file"
-            );
-        }
-    }
 
     Ok(format!("{:x}", hasher.finalize()))
 }
@@ -4070,7 +4061,7 @@ pub fn save_base_snapshot<S: ::std::hash::BuildHasher>(
         .sync_all()?;
     require_safe_sync_overwrite_path(&temp_path, jsonl_dir, false, "rename base snapshot")?;
     require_safe_sync_overwrite_path(&snapshot_path, jsonl_dir, false, "overwrite base snapshot")?;
-    fs::rename(&temp_path, &snapshot_path)?;
+    crate::util::durable_rename(&temp_path, &snapshot_path)?;
     temp_guard.persist();
     Ok(())
 }

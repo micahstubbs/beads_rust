@@ -101,6 +101,7 @@ fn create_restore_rollback_snapshot(
         io::copy(&mut reader, &mut writer)?;
         writer.sync_all()?;
         drop(writer);
+        crate::util::sync_parent_directory(&rollback_guard.path)?;
         return Ok(rollback_guard);
     }
 
@@ -124,7 +125,7 @@ where
         Err(rename_err) => {
             if let Some(rollback_guard) = rollback_guard {
                 if !target_path.exists() {
-                    return match fs::rename(&rollback_guard.path, target_path) {
+                    return match crate::util::durable_rename(&rollback_guard.path, target_path) {
                         Ok(()) => Err(BeadsError::Config(format!(
                             "Failed to replace '{}' with the restored backup: {rename_err}. The original target was restored.",
                             target_path.display()
@@ -555,7 +556,7 @@ fn restore_backup(
         &temp_path,
         &target_path,
         rollback_guard.as_mut(),
-        |from, to| fs::rename(from, to),
+        crate::util::durable_rename,
     )?;
     temp_guard.persist();
     emit_restore_output(ctx, &backup_name, &target_path, &target_name, beads_dir);

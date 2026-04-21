@@ -139,19 +139,19 @@ fn write_config_atomically(config_path: &Path, yaml: &str) -> Result<()> {
         .map(|metadata| metadata.permissions());
     let (temp_path, mut temp_file) = create_temp_config_file(config_path)?;
     let mut guard = TempConfigFileGuard::new(temp_path.clone());
-    temp_file.write_all(yaml.as_bytes())?;
-    temp_file.sync_all()?;
-    drop(temp_file);
-    fs::rename(&temp_path, config_path)?;
     if let Some(permissions) = existing_permissions
-        && let Err(error) = fs::set_permissions(config_path, permissions)
+        && let Err(error) = fs::set_permissions(&temp_path, permissions)
     {
         tracing::warn!(
             path = %config_path.display(),
             error = %error,
-            "Failed to restore original config file permissions after atomic rewrite"
+            "Failed to apply original config file permissions before atomic rewrite"
         );
     }
+    temp_file.write_all(yaml.as_bytes())?;
+    temp_file.sync_all()?;
+    drop(temp_file);
+    crate::util::durable_rename(&temp_path, config_path)?;
     guard.persist();
     Ok(())
 }

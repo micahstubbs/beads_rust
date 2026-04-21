@@ -329,6 +329,8 @@ fn write_backup_metadata(beads_dir: &Path, target_path: &Path, backup_path: &Pat
         return Err(err);
     }
 
+    crate::util::sync_parent_directory(&metadata_path).map_err(BeadsError::Io)?;
+
     Ok(())
 }
 
@@ -468,6 +470,7 @@ pub fn backup_before_export(
     let mut source = File::open(target_path).map_err(BeadsError::Io)?;
     io::copy(&mut source, &mut backup_file).map_err(BeadsError::Io)?;
     backup_file.sync_all().map_err(BeadsError::Io)?;
+    crate::util::sync_parent_directory(&backup_path).map_err(BeadsError::Io)?;
     write_backup_metadata(beads_dir, target_path, &backup_path)?;
     backup_guard.persist();
     tracing::debug!("Created backup: {}", backup_path.display());
@@ -1010,15 +1013,17 @@ mod tests {
         symlink(&outside_dir, &history_dir).unwrap();
 
         let err = list_backups(&history_dir, None).unwrap_err();
-        match err {
-            BeadsError::Config(message) => {
-                assert!(
-                    message.contains("must not be a symlink"),
-                    "unexpected message: {message}"
-                );
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let BeadsError::Config(message) = err else {
+            return;
+        };
+        assert!(
+            message.contains("must not be a symlink"),
+            "unexpected message: {message}"
+        );
     }
 
     #[test]
@@ -1039,15 +1044,17 @@ mod tests {
         fs::create_dir(backup_metadata_path(&backup_path)).unwrap();
 
         let err = prune_backups(&history_dir, 0, None).unwrap_err();
-        match err {
-            BeadsError::Config(msg) => {
-                assert!(
-                    msg.contains("Failed to delete backup"),
-                    "unexpected message: {msg}"
-                );
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let BeadsError::Config(message) = err else {
+            return;
+        };
+        assert!(
+            message.contains("Failed to delete backup"),
+            "unexpected message: {message}"
+        );
     }
 
     #[test]
@@ -1116,15 +1123,17 @@ mod tests {
 
         let err =
             backup_before_export(&beads_dir, &HistoryConfig::default(), &target_path).unwrap_err();
-        match err {
-            BeadsError::Config(message) => {
-                assert!(
-                    message.contains("must not be a symlink"),
-                    "unexpected message: {message}"
-                );
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let BeadsError::Config(message) = err else {
+            return;
+        };
+        assert!(
+            message.contains("must not be a symlink"),
+            "unexpected message: {message}"
+        );
 
         assert!(
             fs::read_dir(&outside_dir).unwrap().next().is_none(),

@@ -1130,7 +1130,7 @@ fn recovery_restore_failure(
 
 fn rollback_renamed_paths(renamed_paths: &[RecoveryBackupPath], operation: &str) -> Result<()> {
     for (original, renamed) in renamed_paths.iter().rev() {
-        fs::rename(renamed, original).with_context(|| {
+        crate::util::durable_rename(renamed, original).with_context(|| {
             format!(
                 "Failed to roll back {operation}: restore '{}' from '{}'",
                 original.display(),
@@ -1313,7 +1313,7 @@ where
             }
         }
 
-        if let Err(rename_err) = fs::rename(&original, &renamed) {
+        if let Err(rename_err) = crate::util::durable_rename(&original, &renamed) {
             if let Err(rollback_err) = rollback_renamed_paths(&renamed_paths, operation) {
                 warn!(
                     operation,
@@ -1394,7 +1394,7 @@ where
             }
         };
 
-        if let Err(rename_err) = fs::rename(&original, &renamed) {
+        if let Err(rename_err) = crate::util::durable_rename(&original, &renamed) {
             if let Err(rollback_err) = rollback_renamed_paths(&renamed_paths, operation) {
                 warn!(
                     operation,
@@ -1875,7 +1875,7 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
     // up AFTER the rename so any error there doesn't roll back the
     // successful swap — stale `-wal`/`-shm` left alongside a clean DB
     // are recovered automatically on next open.
-    if let Err(err) = fs::rename(&temp_path, db_path) {
+    if let Err(err) = crate::util::durable_rename(&temp_path, db_path) {
         tracing::warn!(
             error = %err,
             temp_path = %temp_path.display(),
