@@ -14,9 +14,9 @@ use crate::sync::{
     METADATA_LAST_IMPORT_TIME, MergeContext, OrphanMode, compute_jsonl_hash, compute_staleness,
     count_issues_in_jsonl, export_temp_path, export_to_jsonl_with_policy, finalize_export,
     get_issue_ids_from_jsonl, import_from_jsonl, load_base_snapshot, read_issues_from_jsonl,
-    require_safe_sync_overwrite_path, restore_tombstones_after_rebuild, save_base_snapshot,
-    scan_jsonl_for_tombstone_filter, snapshot_tombstones, three_way_merge,
-    tombstones_missing_from_jsonl_tombstones, validate_sync_path_with_external,
+    require_safe_sync_overwrite_path, restore_tombstones_after_rebuild,
+    save_base_snapshot_from_jsonl, scan_jsonl_for_tombstone_filter, snapshot_tombstones,
+    three_way_merge, tombstones_missing_from_jsonl_tombstones, validate_sync_path_with_external,
 };
 use crate::util::id::split_prefix_remainder;
 use rich_rust::prelude::*;
@@ -1802,14 +1802,6 @@ fn execute_merge(
     // the next child-ID allocation trusts them.
     storage.rebuild_child_counters_in_tx()?;
 
-    // Save Base Snapshot
-    let new_base: HashMap<_, _> = report
-        .kept
-        .iter()
-        .map(|i| (i.id.clone(), i.clone()))
-        .collect();
-    save_base_snapshot(&new_base, beads_dir)?;
-
     // Force Export to update JSONL (ensure sync)
     info!(path = %jsonl_path.display(), "Writing merged issues.jsonl");
     let export_config = ExportConfig {
@@ -1830,6 +1822,7 @@ fn execute_merge(
         Some(&export_result.issue_hashes),
         jsonl_path,
     )?;
+    save_base_snapshot_from_jsonl(jsonl_path, beads_dir)?;
 
     // Output success message
     if use_json {

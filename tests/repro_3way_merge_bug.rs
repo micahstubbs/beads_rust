@@ -98,6 +98,85 @@ fn repro_3way_merge_data_loss() {
 }
 
 #[test]
+fn repro_merge_base_snapshot_matches_finalized_export_with_notes() {
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_base_finalized");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let issue_id = create_issue_id(
+        &workspace,
+        "Base snapshot finality",
+        "create_base_finalized",
+    );
+
+    let flush = run_br(&workspace, ["sync", "--flush-only"], "flush_base_finalized");
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
+
+    let beads_dir = workspace.root.join(".beads");
+    let jsonl_path = beads_dir.join("issues.jsonl");
+    let base_snapshot_path = beads_dir.join("beads.base.jsonl");
+    let original_jsonl = fs::read_to_string(&jsonl_path).expect("read original jsonl");
+    fs::write(&base_snapshot_path, &original_jsonl).expect("seed base snapshot");
+
+    let local_update = run_br(
+        &workspace,
+        [
+            "update",
+            &issue_id,
+            "--description",
+            "Local description",
+            "--no-auto-flush",
+        ],
+        "local_update_base_finalized",
+    );
+    assert!(
+        local_update.status.success(),
+        "local update failed: {}",
+        local_update.stderr
+    );
+
+    let mut external_issue: serde_json::Value =
+        serde_json::from_str(original_jsonl.trim()).expect("parse original issue");
+    external_issue["description"] = serde_json::Value::String("External description".to_string());
+    external_issue["updated_at"] = serde_json::Value::String("2999-01-01T00:00:00Z".to_string());
+    fs::write(
+        &jsonl_path,
+        format!("{}\n", serde_json::to_string(&external_issue).unwrap()),
+    )
+    .expect("write external jsonl");
+
+    let merge = run_br(
+        &workspace,
+        ["sync", "--merge", "--force"],
+        "merge_base_finalized",
+    );
+    assert!(merge.status.success(), "merge failed: {}", merge.stderr);
+
+    let merged_jsonl = fs::read_to_string(&jsonl_path).expect("read merged jsonl");
+    let base_jsonl = fs::read_to_string(&base_snapshot_path).expect("read base snapshot");
+    assert_eq!(
+        base_jsonl, merged_jsonl,
+        "base snapshot should be copied from the finalized exported JSONL"
+    );
+
+    let base_issue: serde_json::Value =
+        serde_json::from_str(base_jsonl.trim()).expect("parse base issue");
+    let comments = base_issue["comments"]
+        .as_array()
+        .expect("base snapshot comments should be an array");
+    assert!(
+        comments.iter().any(|comment| {
+            comment["author"].as_str() == Some("br-sync")
+                && comment["text"]
+                    .as_str()
+                    .is_some_and(|body| body.contains("Both modified"))
+        }),
+        "base snapshot should include merge note comment from finalized export: {base_issue}"
+    );
+}
+
+#[test]
 fn repro_merge_tolerates_base_only_deleted_issue_absent_from_db() {
     let workspace = BrWorkspace::new();
 

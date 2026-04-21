@@ -3986,6 +3986,25 @@ pub fn save_base_snapshot<S: ::std::hash::BuildHasher>(
     Ok(())
 }
 
+/// Save the base snapshot from a finalized JSONL export.
+///
+/// This is used after a successful merge export so `beads.base.jsonl` reflects
+/// the exact JSONL state that reached disk, including DB-side merge notes or
+/// other derived fields added after the merge report was calculated.
+///
+/// # Errors
+///
+/// Returns an error if the finalized JSONL cannot be read or the base snapshot
+/// cannot be written.
+pub fn save_base_snapshot_from_jsonl(jsonl_path: &Path, jsonl_dir: &Path) -> Result<()> {
+    ensure_no_conflict_markers(jsonl_path)?;
+    let issues: std::collections::HashMap<String, Issue> = read_issues_from_jsonl(jsonl_path)?
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect();
+    save_base_snapshot(&issues, jsonl_dir)
+}
+
 /// Load the base snapshot from a file.
 ///
 /// Returns an empty map if the snapshot does not exist.
@@ -4690,6 +4709,39 @@ mod tests {
         let second: Issue = serde_json::from_str(&lines[1]).unwrap();
         assert_eq!(first.id, "bd-a");
         assert_eq!(second.id, "bd-z");
+    }
+
+    #[test]
+    fn test_save_base_snapshot_from_jsonl_uses_finalized_export_contents() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let issue = Issue {
+            id: "bd-final".to_string(),
+            title: "Finalized".to_string(),
+            comments: vec![Comment {
+                id: 1,
+                issue_id: "bd-final".to_string(),
+                author: "br-sync".to_string(),
+                body: "merge note written after report".to_string(),
+                created_at: Utc::now(),
+            }],
+            ..Issue::default()
+        };
+        fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+
+        save_base_snapshot_from_jsonl(&jsonl_path, &beads_dir).unwrap();
+
+        let base = load_base_snapshot(&beads_dir).unwrap();
+        let saved = base.get("bd-final").expect("saved base issue");
+        assert_eq!(saved.comments.len(), 1);
+        assert_eq!(saved.comments[0].body, "merge note written after report");
     }
 
     #[cfg(unix)]
