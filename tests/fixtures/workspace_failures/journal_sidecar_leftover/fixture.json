@@ -1,0 +1,29 @@
+{
+  "name": "journal_sidecar_leftover",
+  "family": "external_interference",
+  "description": "The workspace includes a leftover SQLite rollback journal sidecar from an interrupted writer or external filesystem interruption.",
+  "expected_classification": "healthy",
+  "expected_command_outcomes": [
+    {
+      "surface": "startup/open",
+      "outcome": "success"
+    },
+    {
+      "surface": "create",
+      "outcome": "success"
+    },
+    {
+      "surface": "doctor",
+      "outcome": "doctor_clean"
+    },
+    {
+      "surface": "sync --status",
+      "outcome": "status_in_sync"
+    }
+  ],
+  "source_hint": "Covers the interrupted atomic write / external filesystem interference branch from beads_rust-rsei.3.3.",
+  "notes": [
+    "The database and JSONL content are otherwise healthy so the fixture isolates the stale rollback journal signal.",
+    "Current posture is tolerated as clean by doctor; the fixture documents that behavior as an explicit replay contract."
+  ]
+}
