@@ -14,6 +14,7 @@ use crate::sync::{
     snapshot_tombstones, tombstones_missing_from_jsonl_tombstones, validate_jsonl_issue_records,
     validate_no_git_path, validate_sync_path, validate_sync_path_with_external,
 };
+use chrono::Utc;
 use fsqlite::Connection;
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
@@ -95,8 +96,17 @@ struct RecoveryAuditRecord {
     fk_violations_cleaned: Option<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PriorJsonlRebuildFailureEvidence {
+    path: PathBuf,
+    artifact_count: usize,
+}
+
 const BLOCKED_CACHE_STALE_FINDING: &str = "blocked_issues_cache is marked stale and needs rebuild";
 const JSONL_REBUILD_AUTHORITY_ERROR_PREFIX: &str = "Cannot repair: JSONL authority is unsafe";
+const JSONL_REBUILD_REPEAT_ERROR_PREFIX: &str =
+    "Cannot repair: previous JSONL rebuild verification failed";
+const JSONL_REBUILD_VERIFICATION_FAILED_SUFFIX: &str = ".verification-failed.json";
 const ROOT_GITIGNORE_OFFENDING_PATTERNS: &[&str] = &[
     ".beads",
     ".beads/",
@@ -916,36 +926,10 @@ fn check_recovery_artifacts(
     db_path: &Path,
     checks: &mut Vec<CheckResult>,
 ) -> Result<()> {
-    let recovery_dir = config::recovery_dir_for_db_path(db_path, beads_dir);
-    let db_prefix = db_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("beads.db");
-    let db_parent = db_path.parent().unwrap_or(beads_dir);
-    let mut artifacts = Vec::new();
-
-    if recovery_dir.is_dir() {
-        for entry in fs::read_dir(&recovery_dir)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with(db_prefix) {
-                artifacts.push(entry.path().display().to_string());
-            }
-        }
-    }
-
-    for entry in fs::read_dir(db_parent)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with(&format!("{db_prefix}.bad_")) {
-            artifacts.push(entry.path().display().to_string());
-        }
-    }
-
-    artifacts.sort();
-    artifacts.dedup();
+    let artifacts = recovery_artifacts_for_db_family(beads_dir, db_path)?
+        .into_iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
 
     if artifacts.is_empty() {
         push_check(checks, "db.recovery_artifacts", CheckStatus::Ok, None, None);
@@ -963,6 +947,91 @@ fn check_recovery_artifacts(
     }
 
     Ok(())
+}
+
+fn db_family_prefix(db_path: &Path) -> &str {
+    db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("beads.db")
+}
+
+fn recovery_artifacts_for_db_family(beads_dir: &Path, db_path: &Path) -> Result<Vec<PathBuf>> {
+    let recovery_dir = config::recovery_dir_for_db_path(db_path, beads_dir);
+    let db_prefix = db_family_prefix(db_path);
+    let db_parent = db_path.parent().unwrap_or(beads_dir);
+    let mut artifacts = Vec::new();
+
+    if recovery_dir.is_dir() {
+        for entry in fs::read_dir(&recovery_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(db_prefix) {
+                artifacts.push(entry.path());
+            }
+        }
+    }
+
+    for entry in fs::read_dir(db_parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&format!("{db_prefix}.bad_")) {
+            artifacts.push(entry.path());
+        }
+    }
+
+    artifacts.sort();
+    artifacts.dedup();
+    Ok(artifacts)
+}
+
+fn is_failed_jsonl_rebuild_artifact(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.contains(".rebuild-failed")
+                || name.ends_with(JSONL_REBUILD_VERIFICATION_FAILED_SUFFIX)
+        })
+}
+
+fn prior_jsonl_rebuild_failure_evidence(
+    beads_dir: &Path,
+    db_path: &Path,
+) -> Result<Option<PriorJsonlRebuildFailureEvidence>> {
+    let artifacts = recovery_artifacts_for_db_family(beads_dir, db_path)?;
+    let evidence_path = artifacts
+        .iter()
+        .find(|path| is_failed_jsonl_rebuild_artifact(path))
+        .cloned();
+
+    Ok(evidence_path.map(|path| PriorJsonlRebuildFailureEvidence {
+        path,
+        artifact_count: artifacts.len(),
+    }))
+}
+
+fn repeated_jsonl_rebuild_refusal_message(evidence: &PriorJsonlRebuildFailureEvidence) -> String {
+    format!(
+        "{JSONL_REBUILD_REPEAT_ERROR_PREFIX}: prior failed recovery evidence remains at '{}' among {} preserved database-family artifact(s). Inspect and preserve the recovery evidence before rerunning with --allow-repeated-repair.",
+        evidence.path.display(),
+        evidence.artifact_count
+    )
+}
+
+fn repeated_jsonl_rebuild_refusal_reason(
+    beads_dir: &Path,
+    db_path: &Path,
+    allow_repeated_repair: bool,
+) -> Result<Option<String>> {
+    if allow_repeated_repair {
+        return Ok(None);
+    }
+
+    Ok(prior_jsonl_rebuild_failure_evidence(beads_dir, db_path)?
+        .as_ref()
+        .map(repeated_jsonl_rebuild_refusal_message))
 }
 
 fn push_inspection_error(
@@ -1155,6 +1224,41 @@ fn jsonl_rebuild_failure_outcome(err: &BeadsError) -> &'static str {
         return "refused";
     }
     "failed"
+}
+
+fn write_jsonl_rebuild_verification_failed_marker(
+    beads_dir: &Path,
+    db_path: &Path,
+    post_repair: &DoctorRun,
+    repair_result: &DoctorRepairResult,
+) -> Result<PathBuf> {
+    let recovery_dir = config::recovery_dir_for_db_path(db_path, beads_dir);
+    fs::create_dir_all(&recovery_dir)?;
+    let stamp = Utc::now().format("%Y%m%d_%H%M%S_%f");
+    let marker_path = recovery_dir.join(format!(
+        "{}.{stamp}{JSONL_REBUILD_VERIFICATION_FAILED_SUFFIX}",
+        db_family_prefix(db_path)
+    ));
+    let failed_checks = post_repair
+        .report
+        .checks
+        .iter()
+        .filter(|check| matches!(check.status, CheckStatus::Error))
+        .collect::<Vec<_>>();
+    let payload = serde_json::json!({
+        "phase": "doctor.jsonl_rebuild",
+        "action": "jsonl_rebuild",
+        "outcome": "verification_failed",
+        "created_at": Utc::now().to_rfc3339(),
+        "db_path": db_path.display().to_string(),
+        "imported": repair_result.imported,
+        "skipped": repair_result.skipped,
+        "fk_violations_cleaned": repair_result.fk_violations_cleaned,
+        "workspace_health": post_repair.report.workspace_health.as_deref(),
+        "failed_checks": failed_checks,
+    });
+    fs::write(&marker_path, serde_json::to_vec_pretty(&payload)?)?;
+    Ok(marker_path)
 }
 
 /// Best-effort snapshot of unflushed local tombstones, guarded on every
@@ -3111,6 +3215,21 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         ));
     };
 
+    if let Some(reason) = repeated_jsonl_rebuild_refusal_reason(
+        &beads_dir,
+        &paths.db_path,
+        args.allow_repeated_repair,
+    )? {
+        let recovery_audit = jsonl_rebuild_audit_record(
+            "doctor.jsonl_rebuild",
+            "refused",
+            None,
+            Some(reason.clone()),
+        );
+        emit_recovery_audit_record(&recovery_audit);
+        return Err(BeadsError::Config(reason));
+    }
+
     if !ctx.is_json() {
         print_report(&initial.report, ctx)?;
         ctx.info("Repairing: rebuilding DB from JSONL...");
@@ -3145,6 +3264,22 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     };
 
     let post_repair = collect_doctor_report(&beads_dir, &paths)?;
+    let verification_failure_marker = if post_repair.report.ok {
+        None
+    } else {
+        Some(write_jsonl_rebuild_verification_failed_marker(
+            &beads_dir,
+            &paths.db_path,
+            &post_repair,
+            &repair_result,
+        )?)
+    };
+    let verification_failure_reason = verification_failure_marker.as_ref().map(|path| {
+        format!(
+            "post-repair verification failed; evidence marker written to '{}'",
+            path.display()
+        )
+    });
     let recovery_audit = jsonl_rebuild_audit_record(
         "doctor.jsonl_rebuild",
         if post_repair.report.ok {
@@ -3153,7 +3288,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             "verification_failed"
         },
         Some(&repair_result),
-        None,
+        verification_failure_reason.clone(),
     );
     emit_recovery_audit_record(&recovery_audit);
 
@@ -3168,12 +3303,18 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             "fk_violations_cleaned": repair_result.fk_violations_cleaned,
             "post_repair": post_repair.report,
             "verified": post_repair.report.ok,
+            "recovery_failure_marker": verification_failure_marker
+                .as_ref()
+                .map(|path| path.display().to_string()),
         }));
     } else {
         ctx.info(&format!(
             "Repair complete: imported {}, skipped {}",
             repair_result.imported, repair_result.skipped
         ));
+        if let Some(reason) = verification_failure_reason.as_deref() {
+            ctx.warning(reason);
+        }
         ctx.info("Post-repair verification:");
         print_report(&post_repair.report, ctx)?;
     }
@@ -3375,6 +3516,98 @@ mod tests {
         assert_eq!(audit.imported, Some(3));
         assert_eq!(audit.skipped, Some(1));
         assert_eq!(audit.fk_violations_cleaned, Some(2));
+    }
+
+    #[test]
+    fn test_repeated_jsonl_rebuild_refusal_reason_detects_failed_marker() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        fs::create_dir_all(&beads_dir)?;
+
+        let recovery_dir = config::recovery_dir_for_db_path(&db_path, &beads_dir);
+        fs::create_dir_all(&recovery_dir)?;
+        let marker = recovery_dir.join(format!(
+            "beads.db.20260421_120000_000000{}",
+            JSONL_REBUILD_VERIFICATION_FAILED_SUFFIX
+        ));
+        fs::write(&marker, b"{\"outcome\":\"verification_failed\"}")?;
+
+        let reason =
+            repeated_jsonl_rebuild_refusal_reason(&beads_dir, &db_path, false)?.expect("reason");
+        assert!(reason.contains(JSONL_REBUILD_REPEAT_ERROR_PREFIX));
+        assert!(reason.contains(&marker.display().to_string()));
+        assert!(reason.contains("--allow-repeated-repair"));
+
+        let allowed = repeated_jsonl_rebuild_refusal_reason(&beads_dir, &db_path, true)?;
+        assert!(allowed.is_none(), "explicit override should permit retry");
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_jsonl_rebuild_verification_failed_marker_records_failed_checks() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        fs::create_dir_all(&beads_dir)?;
+
+        let post_repair = DoctorRun {
+            report: DoctorReport {
+                ok: false,
+                workspace_health: Some("unsafe".to_string()),
+                reliability_audit: None,
+                checks: vec![
+                    CheckResult {
+                        name: "sqlite.integrity_check".to_string(),
+                        status: CheckStatus::Error,
+                        message: Some("database disk image is malformed".to_string()),
+                        details: None,
+                    },
+                    CheckResult {
+                        name: "jsonl.parse".to_string(),
+                        status: CheckStatus::Ok,
+                        message: Some("Parsed 1 records".to_string()),
+                        details: None,
+                    },
+                ],
+            },
+            jsonl_path: None,
+        };
+        let repair = DoctorRepairResult {
+            imported: 1,
+            skipped: 0,
+            fk_violations_cleaned: 0,
+        };
+
+        let marker = write_jsonl_rebuild_verification_failed_marker(
+            &beads_dir,
+            &db_path,
+            &post_repair,
+            &repair,
+        )?;
+        assert!(
+            marker
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(JSONL_REBUILD_VERIFICATION_FAILED_SUFFIX)),
+            "unexpected marker path: {}",
+            marker.display()
+        );
+
+        let payload: serde_json::Value = serde_json::from_slice(&fs::read(&marker)?)?;
+        assert_eq!(payload["outcome"], "verification_failed");
+        assert_eq!(payload["workspace_health"], "unsafe");
+        assert_eq!(payload["imported"], 1);
+        let failed_checks = payload["failed_checks"]
+            .as_array()
+            .expect("failed check array");
+        assert_eq!(failed_checks.len(), 1);
+        assert_eq!(failed_checks[0]["name"], "sqlite.integrity_check");
+
+        let evidence = prior_jsonl_rebuild_failure_evidence(&beads_dir, &db_path)?
+            .expect("marker should become repeated-repair evidence");
+        assert_eq!(evidence.path, marker);
+        Ok(())
     }
 
     #[test]

@@ -2396,6 +2396,10 @@ pub struct DoctorArgs {
     /// Attempt to repair detected issues (rebuilds DB from JSONL)
     #[arg(long)]
     pub repair: bool,
+
+    /// Allow another JSONL rebuild after prior failed recovery evidence
+    #[arg(long)]
+    pub allow_repeated_repair: bool,
 }
 
 /// Arguments for the upgrade command.
