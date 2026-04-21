@@ -16,7 +16,8 @@ use crate::sync::{
     get_issue_ids_from_jsonl, import_from_jsonl, load_base_snapshot, read_issues_from_jsonl,
     require_safe_sync_overwrite_path, restore_tombstones_after_rebuild,
     save_base_snapshot_from_jsonl, scan_jsonl_for_tombstone_filter, snapshot_tombstones,
-    three_way_merge, tombstones_missing_from_jsonl_tombstones, validate_sync_path_with_external,
+    three_way_merge, tombstones_missing_from_jsonl_tombstones, validate_no_git_path,
+    validate_sync_path_with_external,
 };
 use crate::util::id::split_prefix_remainder;
 use rich_rust::prelude::*;
@@ -77,6 +78,7 @@ struct SyncPathPolicy {
     manifest_path: PathBuf,
     beads_dir: PathBuf,
     is_external: bool,
+    allow_external_jsonl: bool,
 }
 
 /// Execute the sync command.
@@ -98,15 +100,19 @@ pub fn execute(
     // in the same invocation instead of being skipped by open-time recovery.
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let startup = config::load_startup_config_with_paths(&beads_dir, cli.db.as_ref())?;
-    let path_policy = validate_sync_paths(
-        &beads_dir,
-        &startup.paths.jsonl_path,
-        args.allow_external_jsonl,
-    )?;
+    let allow_external_jsonl = args.allow_external_jsonl
+        || config::implicit_external_jsonl_allowed(
+            &startup.paths.beads_dir,
+            &startup.paths.db_path,
+            &startup.paths.jsonl_path,
+        );
+    let path_policy =
+        validate_sync_paths(&beads_dir, &startup.paths.jsonl_path, allow_external_jsonl)?;
     debug!(
         jsonl_path = %path_policy.jsonl_path.display(),
         manifest_path = %path_policy.manifest_path.display(),
         external_jsonl = path_policy.is_external,
+        allow_external_jsonl = path_policy.allow_external_jsonl,
         "Resolved sync path policy"
     );
     let defer_jsonl_recovery =
@@ -356,6 +362,8 @@ fn validate_sync_paths(
         allow_external_jsonl,
         "Validating sync paths"
     );
+    validate_operator_requested_sync_path(beads_dir, jsonl_path)?;
+
     let canonical_beads = dunce::canonicalize(beads_dir).map_err(|e| {
         BeadsError::Config(format!(
             "Failed to resolve .beads directory {}: {e}",
@@ -424,7 +432,80 @@ fn validate_sync_paths(
         manifest_path,
         beads_dir: canonical_beads,
         is_external,
+        allow_external_jsonl,
     })
+}
+
+fn validate_operator_requested_sync_path(beads_dir: &Path, jsonl_path: &Path) -> Result<()> {
+    let git_check = validate_no_git_path(jsonl_path);
+    if !git_check.is_allowed() {
+        return Err(BeadsError::Config(
+            git_check
+                .rejection_reason()
+                .unwrap_or_else(|| "Git path access denied".to_string()),
+        ));
+    }
+
+    let canonical_beads = dunce::canonicalize(beads_dir).map_err(|e| {
+        BeadsError::Config(format!(
+            "Failed to resolve .beads directory {}: {e}",
+            beads_dir.display()
+        ))
+    })?;
+
+    let operator_path = if jsonl_path.is_absolute() {
+        jsonl_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(jsonl_path))
+            .map_err(|e| {
+                BeadsError::Config(format!(
+                    "Failed to resolve current directory for JSONL path {}: {e}",
+                    jsonl_path.display()
+                ))
+            })?
+    };
+
+    if !operator_path.starts_with(beads_dir) && !operator_path.starts_with(&canonical_beads) {
+        return Ok(());
+    }
+
+    let mut candidate = PathBuf::new();
+    for component in operator_path.components() {
+        candidate.push(component.as_os_str());
+        let Ok(metadata) = fs::symlink_metadata(&candidate) else {
+            continue;
+        };
+        if !metadata.file_type().is_symlink() {
+            continue;
+        }
+
+        let target = fs::read_link(&candidate).map_err(|e| {
+            BeadsError::Config(format!(
+                "Failed to inspect symlinked JSONL path component {}: {e}",
+                candidate.display()
+            ))
+        })?;
+        let absolute_target = if target.is_absolute() {
+            target
+        } else {
+            candidate
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .join(target)
+        };
+        let canonical_target =
+            dunce::canonicalize(&absolute_target).unwrap_or_else(|_| absolute_target.clone());
+        if !canonical_target.starts_with(&canonical_beads) {
+            return Err(BeadsError::Config(format!(
+                "Refusing to use JSONL path through symlink escaping .beads: {} -> {}",
+                candidate.display(),
+                canonical_target.display()
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn resolve_requested_sync_path(jsonl_path: &Path) -> Result<PathBuf> {
@@ -747,7 +828,7 @@ fn execute_flush(
         error_policy: export_policy,
         retention_days,
         beads_dir: Some(path_policy.beads_dir.clone()),
-        allow_external_jsonl: args.allow_external_jsonl,
+        allow_external_jsonl: path_policy.allow_external_jsonl,
         show_progress,
         history: HistoryConfig::default(),
     };
@@ -792,7 +873,7 @@ fn execute_flush(
         require_safe_sync_overwrite_path(
             &manifest_file,
             &path_policy.beads_dir,
-            args.allow_external_jsonl,
+            path_policy.allow_external_jsonl,
             "write manifest",
         )?;
         fs::write(&manifest_file, serde_json::to_string_pretty(&manifest)?)?;
@@ -1324,7 +1405,7 @@ fn execute_import(
         orphan_mode,
         force_upsert: args.force,
         beads_dir: Some(path_policy.beads_dir.clone()),
-        allow_external_jsonl: args.allow_external_jsonl,
+        allow_external_jsonl: path_policy.allow_external_jsonl,
         show_progress,
     };
 
@@ -1673,7 +1754,7 @@ fn detect_prefix_from_jsonl(jsonl_path: &Path) -> Option<String> {
 fn execute_merge(
     storage: &mut crate::storage::SqliteStorage,
     path_policy: &SyncPathPolicy,
-    args: &SyncArgs,
+    _args: &SyncArgs,
     use_json: bool,
     show_progress: bool,
     retention_days: Option<u64>,
@@ -1810,7 +1891,7 @@ fn execute_merge(
         error_policy: ExportErrorPolicy::Strict,
         retention_days,
         beads_dir: Some(path_policy.beads_dir.clone()),
-        allow_external_jsonl: args.allow_external_jsonl,
+        allow_external_jsonl: path_policy.allow_external_jsonl,
         show_progress,
         history: HistoryConfig::default(),
     };
@@ -1959,10 +2040,10 @@ mod tests {
     use super::{
         auto_rebuild_semantic_conflict_field, auto_rebuild_semantic_flag_conflict_reason,
         detect_prefix_from_jsonl, jsonl_contains_duplicate_external_refs,
-        jsonl_contains_prefix_mismatch, validate_sync_paths,
+        jsonl_contains_prefix_mismatch, validate_operator_requested_sync_path, validate_sync_paths,
     };
     use crate::cli::SyncArgs;
-    use crate::config::CliOverrides;
+    use crate::config::{self, CliOverrides};
     use crate::error::BeadsError;
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
@@ -2347,6 +2428,7 @@ mod tests {
 
         assert_eq!(policy.jsonl_path, jsonl_path);
         assert!(!policy.is_external);
+        assert!(!policy.allow_external_jsonl);
     }
 
     #[test]
@@ -2364,6 +2446,141 @@ mod tests {
 
         assert_eq!(policy.jsonl_path, jsonl_path);
         assert!(policy.is_external);
+        assert!(policy.allow_external_jsonl);
+    }
+
+    #[test]
+    fn test_validate_sync_paths_allows_external_db_family_effective_policy() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let external_dir = temp.path().join("external");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&external_dir).unwrap();
+
+        let db_path = external_dir.join("beads.db");
+        let jsonl_path = external_dir.join("issues.jsonl");
+        let allow_external_jsonl =
+            config::implicit_external_jsonl_allowed(&beads_dir, &db_path, &jsonl_path);
+        assert!(allow_external_jsonl);
+
+        let policy = validate_sync_paths(&beads_dir, &jsonl_path, allow_external_jsonl)
+            .expect("path policy");
+
+        assert_eq!(policy.jsonl_path, jsonl_path);
+        assert!(policy.is_external);
+        assert!(policy.allow_external_jsonl);
+    }
+
+    #[test]
+    fn test_validate_sync_paths_rejects_external_path_without_effective_policy() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let external_dir = temp.path().join("external");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&external_dir).unwrap();
+
+        let jsonl_path = external_dir.join("issues.jsonl");
+        let err = validate_sync_paths(&beads_dir, &jsonl_path, false).unwrap_err();
+
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let message = if let BeadsError::Config(message) = &err {
+            message.as_str()
+        } else {
+            ""
+        };
+        assert!(
+            message.contains("--allow-external-jsonl"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[test]
+    fn test_validate_operator_requested_sync_path_rejects_git_before_resolution() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let err =
+            validate_operator_requested_sync_path(&beads_dir, Path::new(".git/../issues.jsonl"))
+                .unwrap_err();
+
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let message = if let BeadsError::Config(message) = &err {
+            message.as_str()
+        } else {
+            ""
+        };
+        assert!(
+            message.contains(".git") || message.contains("git"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_sync_paths_rejects_internal_parent_symlink_escape_with_opt_in() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let external_dir = temp.path().join("external");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&external_dir).unwrap();
+
+        let symlink_parent = beads_dir.join("external-link");
+        symlink(&external_dir, &symlink_parent).unwrap();
+
+        let jsonl_path = symlink_parent.join("issues.jsonl");
+        let err = validate_sync_paths(&beads_dir, &jsonl_path, true).unwrap_err();
+
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let message = if let BeadsError::Config(message) = &err {
+            message.as_str()
+        } else {
+            ""
+        };
+        assert!(message.contains("symlink"), "unexpected message: {message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_sync_paths_rejects_symlinked_git_parent_with_opt_in() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let git_dir = temp.path().join(".git");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&git_dir).unwrap();
+
+        let git_link = temp.path().join("git-link");
+        symlink(&git_dir, &git_link).unwrap();
+
+        let jsonl_path = git_link.join("issues.jsonl");
+        let err = validate_sync_paths(&beads_dir, &jsonl_path, true).unwrap_err();
+
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let message = if let BeadsError::Config(message) = &err {
+            message.as_str()
+        } else {
+            ""
+        };
+        assert!(
+            message.contains(".git") || message.contains("git"),
+            "unexpected message: {message}"
+        );
     }
 
     #[test]
