@@ -35,3 +35,10 @@ path = "fuzz_targets/content_hash.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "sync_cycle"
+path = "fuzz_targets/sync_cycle.rs"
+test = false
+doc = false
+bench = false

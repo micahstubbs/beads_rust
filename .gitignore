@@ -46,6 +46,7 @@ a.out
 # Temp directories and crash reports
 temp_test*/
 rustc-ice-*.txt
+fuzz/artifacts/
 
 # Profiling data
 perf.data

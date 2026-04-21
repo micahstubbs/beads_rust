@@ -20,12 +20,19 @@ Run the content-hash harness in bounded mode:
 cargo fuzz run content_hash -- -runs=10000 -max_len=4096
 ```
 
+Run the sync-cycle harness in bounded mode:
+
+```bash
+cargo fuzz run sync_cycle -- -runs=10000 -max_len=16384
+```
+
 Run a compile check without fuzzing:
 
 ```bash
 cargo fuzz check jsonl_import
 cargo fuzz check merge_issue
 cargo fuzz check content_hash
+cargo fuzz check sync_cycle
 ```
 
 The harnesses create isolated temporary workspaces and must not read or write
@@ -44,3 +51,11 @@ order, unknown JSON fields, empty optional fields, labels, relationships, and
 metadata-only issue fields as formatting-insensitive. Whitespace inside included
 issue text fields such as title, description, design, acceptance criteria, and
 notes is intentionally treated as meaningful issue content.
+
+The `sync_cycle` target builds isolated temp workspaces and exercises broader
+sync state-machine paths: JSONL export, staleness/status checks, import
+preflight, import, re-export, DB reopen, rejected `.git` paths, symlink escape
+attempts, sidecar files, base snapshots, custom JSONL locations, and
+rebuild-style imports into a fresh database. It checks that invalid combinations
+return non-empty structured errors and that the outside sentinel directory is
+not modified.
