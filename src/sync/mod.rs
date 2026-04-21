@@ -3906,9 +3906,23 @@ pub fn three_way_merge(
 
         // Check tombstone protection: if issue is tombstoned and trying to resurrect
         if tombstones.contains(&id) {
-            // Issue is tombstoned - only allow if it exists in local (left)
-            if left.is_none() && right.is_some() {
-                // Trying to resurrect from external - skip
+            let local_tombstone =
+                left.is_some_and(|issue| issue.status == crate::model::Status::Tombstone);
+            let external_non_tombstone =
+                right.is_some_and(|issue| issue.status != crate::model::Status::Tombstone);
+
+            if local_tombstone && external_non_tombstone {
+                // Import paths never allow JSONL to resurrect a local tombstone.
+                // Merge winner flags must preserve that invariant too.
+                if let Some(issue) = left {
+                    report.kept.push(issue.clone());
+                }
+                report.tombstone_protected.push(id.clone());
+                continue;
+            }
+
+            if left.is_none() && external_non_tombstone {
+                // Trying to resurrect from external - skip.
                 report.tombstone_protected.push(id.clone());
                 continue;
             }
@@ -7439,6 +7453,42 @@ mod tests {
         // Should keep local even if tombstoned
         assert_eq!(report.kept.len(), 1);
         assert!(report.tombstone_protected.is_empty());
+    }
+
+    #[test]
+    fn test_three_way_merge_tombstone_protection_blocks_external_winner() {
+        let base = make_issue_with_hash("bd-tomb", "Base", fixed_time_merge(100), Some("base"));
+        let mut local_tombstone =
+            make_issue_with_hash("bd-tomb", "Deleted", fixed_time_merge(200), Some("deleted"));
+        local_tombstone.status = crate::model::Status::Tombstone;
+        local_tombstone.deleted_at = Some(fixed_time_merge(200));
+        let external = make_issue_with_hash(
+            "bd-tomb",
+            "Resurrection attempt",
+            fixed_time_merge(300),
+            Some("external"),
+        );
+
+        let mut base_map = std::collections::HashMap::new();
+        base_map.insert("bd-tomb".to_string(), base);
+        let mut left = std::collections::HashMap::new();
+        left.insert("bd-tomb".to_string(), local_tombstone);
+        let mut right = std::collections::HashMap::new();
+        right.insert("bd-tomb".to_string(), external);
+        let context = MergeContext::new(base_map, left, right);
+        let tombstones = std::collections::HashSet::from(["bd-tomb".to_string()]);
+
+        let report = three_way_merge(
+            &context,
+            ConflictResolution::PreferExternal,
+            Some(&tombstones),
+        );
+
+        assert!(report.conflicts.is_empty());
+        assert_eq!(report.tombstone_protected, vec!["bd-tomb".to_string()]);
+        assert_eq!(report.kept.len(), 1);
+        assert_eq!(report.kept[0].status, crate::model::Status::Tombstone);
+        assert_eq!(report.kept[0].title, "Deleted");
     }
 
     #[test]

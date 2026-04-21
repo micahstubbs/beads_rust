@@ -1866,7 +1866,17 @@ fn execute_merge(
     let context = MergeContext::new(base, left, right);
     let strategy = merge_conflict_resolution(args);
     let resolution = merge_conflict_resolution_label(strategy);
-    let tombstones = None;
+    let local_tombstones: HashSet<String> = context
+        .left
+        .values()
+        .filter(|issue| issue.status == crate::model::Status::Tombstone)
+        .map(|issue| issue.id.clone())
+        .collect();
+    let tombstones = if local_tombstones.is_empty() {
+        None
+    } else {
+        Some(&local_tombstones)
+    };
 
     let report = three_way_merge(&context, strategy, tombstones);
 

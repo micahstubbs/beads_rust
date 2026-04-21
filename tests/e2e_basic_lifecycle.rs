@@ -719,6 +719,100 @@ fn e2e_sync_merge_resolution_flags_choose_db_or_jsonl() {
 }
 
 #[test]
+fn e2e_sync_force_jsonl_merge_does_not_resurrect_local_tombstone() {
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_tombstone_merge");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Merge tombstone seed"],
+        "create_tombstone_merge",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let issue_id = parse_created_id(&create.stdout);
+    assert!(!issue_id.is_empty(), "missing created id");
+
+    let flush = run_br(
+        &workspace,
+        ["sync", "--flush-only"],
+        "flush_tombstone_merge",
+    );
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
+
+    let beads_dir = workspace.root.join(".beads");
+    let jsonl_path = beads_dir.join("issues.jsonl");
+    let base_snapshot_path = beads_dir.join("beads.base.jsonl");
+    fs::copy(&jsonl_path, &base_snapshot_path).expect("seed base snapshot");
+
+    let delete = run_br(
+        &workspace,
+        [
+            "delete",
+            &issue_id,
+            "--force",
+            "--reason",
+            "local tombstone before merge",
+            "--no-auto-flush",
+        ],
+        "delete_local_tombstone",
+    );
+    assert!(delete.status.success(), "delete failed: {}", delete.stderr);
+
+    let jsonl = fs::read_to_string(&jsonl_path).expect("read jsonl");
+    let mut issue: Value = serde_json::from_str(jsonl.trim()).expect("parse jsonl issue");
+    issue["title"] = Value::String("JSONL resurrection attempt".to_string());
+    issue["status"] = Value::String("open".to_string());
+    issue["updated_at"] = Value::String("2999-01-01T00:00:00Z".to_string());
+    fs::write(
+        &jsonl_path,
+        format!(
+            "{}\n",
+            serde_json::to_string(&issue).expect("serialize issue")
+        ),
+    )
+    .expect("write resurrection jsonl");
+
+    let merge = run_br(
+        &workspace,
+        ["sync", "--merge", "--force-jsonl", "--json"],
+        "merge_force_jsonl_tombstone",
+    );
+    assert!(
+        merge.status.success(),
+        "force-jsonl merge failed: stdout={} stderr={}",
+        merge.stdout,
+        merge.stderr
+    );
+
+    let show = run_br(
+        &workspace,
+        ["show", &issue_id, "--json"],
+        "show_tombstone_merge",
+    );
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    let payload = extract_json_payload(&show.stdout);
+    let issues: Vec<Value> = serde_json::from_str(&payload).expect("parse show json");
+    assert_eq!(
+        issues[0]["status"].as_str(),
+        Some("tombstone"),
+        "force-jsonl merge must not resurrect a local tombstone"
+    );
+    assert_ne!(
+        issues[0]["title"].as_str(),
+        Some("JSONL resurrection attempt"),
+        "resurrection attempt should not win the merge"
+    );
+
+    let merged_jsonl = fs::read_to_string(&jsonl_path).expect("read merged jsonl");
+    assert!(
+        merged_jsonl.contains("\"status\":\"tombstone\""),
+        "merged JSONL should export the protected tombstone: {merged_jsonl}"
+    );
+}
+
+#[test]
 fn e2e_no_db_read_write() {
     let workspace = BrWorkspace::new();
 
