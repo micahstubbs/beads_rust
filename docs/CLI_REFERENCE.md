@@ -7,6 +7,7 @@ Comprehensive reference for all `br` (beads_rust) commands.
 ## Table of Contents
 
 - [Global Options](#global-options)
+- [Cross-Project Routing](#cross-project-routing)
 - [Core Commands](#core-commands)
   - [init](#init)
   - [create](#create)
@@ -72,6 +73,46 @@ These options apply to all commands:
 | `--no-color` | Disable colored output |
 | `-h, --help` | Print help |
 | `-V, --version` | Print version |
+
+---
+
+## Cross-Project Routing
+
+`br` can route explicit issue IDs to another workspace when their prefix matches
+`.beads/routes.jsonl`. This is useful for town or multi-repository setups where
+one project needs to inspect or update an issue owned by another project.
+
+Each route is one JSON object per line:
+
+```jsonl
+{"prefix":"api-","path":"../api"}
+{"prefix":"ops-","path":"/srv/projects/ops/.beads"}
+```
+
+Route resolution:
+
+1. Extract the issue prefix before the first hyphen, including the hyphen.
+2. Search the local `.beads/routes.jsonl`.
+3. If a parent town root with `mayor/town.json` exists, search its
+   `.beads/routes.jsonl`.
+4. Resolve `path` as a project root or a direct `.beads`/`_beads` directory.
+5. Follow a target `.beads/redirect` file when present.
+
+Current route-aware commands include common issue-ID operations such as `show`,
+`update`, `close`, `reopen`, `delete`, `defer`, `comments`, `label`, `dep`,
+`graph`, `audit`, and `lint`. Routed write operations acquire the target
+workspace's `.write.lock` and mutate the target workspace, not the caller's
+local database.
+
+Safety boundaries:
+
+- Routing never runs git, copies repositories, or performs network sync.
+- Routing is not real-time collaboration; each affected repository still needs
+  its own normal `br sync --flush-only`/VCS commit flow.
+- Routes are prefix dispatch rules. They do not import external issues into the
+  local database.
+- Cross-project dependency status checks use explicit IDs such as
+  `external:api:api-123` plus config keys like `external_projects.api=../api`.
 
 ---
 
@@ -625,7 +666,7 @@ br sync [OPTIONS]
 
 **SAFETY GUARANTEES:**
 - NEVER executes git commands or auto-commits
-- NEVER modifies files outside `.beads/` (unless `--allow-external-jsonl`)
+- NEVER modifies files outside the selected workspace's `.beads/` (unless `--allow-external-jsonl`)
 - Uses atomic temp-file-then-rename pattern
 - Safety guards prevent accidental data loss
 

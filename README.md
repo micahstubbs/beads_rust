@@ -641,7 +641,7 @@ br intentionally does **not** support:
 | **Dolt backend** | SQLite + JSONL only |
 | **Linear/Jira sync** | Focused scope |
 | **Web UI** | CLI-first (see beads_viewer for TUI) |
-| **Multi-repo sync** | Single repo per workspace |
+| **Automatic multi-repo sync** | Route-aware commands can target configured workspaces, but git/VCS sync remains explicit per repo |
 | **Real-time collaboration** | Git-based async collaboration |
 
 ---
@@ -746,8 +746,41 @@ the default for newly created issues, not a restriction on existing IDs.
 ├── beads.db        # SQLite database (primary storage)
 ├── issues.jsonl    # JSONL export (for git)
 ├── config.yaml     # Project configuration
+├── routes.jsonl    # Optional cross-project prefix routes
 └── metadata.json   # Workspace metadata
 ```
+
+### Q: Can one workspace refer to issues in another workspace?
+
+Yes, with explicit cross-project routing. Add one JSON object per line to
+`.beads/routes.jsonl`:
+
+```jsonl
+{"prefix":"api-","path":"../api"}
+{"prefix":"ops-","path":"/srv/projects/ops/.beads"}
+```
+
+When an issue ID starts with a routed prefix, route-aware commands resolve that
+ID against the target workspace's `.beads` directory. The path can point at a
+project root or directly at a `.beads`/`_beads` directory; relative paths are
+resolved from the workspace root, and town-level routing can also be discovered
+from a parent with `mayor/town.json`.
+
+Common route-aware operations include `show`, `update`, `close`, `reopen`,
+`delete`, `defer`, `comments`, `label`, `dep`, `graph`, `audit`, and `lint`.
+Routed mutations acquire the target workspace write lock and update the target
+workspace's storage, not the caller's local database.
+
+This is not automatic multi-repo synchronization. `br` still does not run git,
+push or pull remote repositories, copy issues between repositories, or provide
+real-time collaboration. Routes are a local dispatch table for explicit
+cross-workspace operations. Commit and synchronize each affected repository's
+`.beads/` files through your normal VCS workflow.
+
+External dependency status checks use explicit dependency IDs such as
+`external:api:api-123` together with configured `external_projects.<name>` paths.
+They let `ready`, `blocked`, `show`, `dep`, and `stats` account for blockers in
+other workspaces without importing those issues into the local database.
 
 ---
 
