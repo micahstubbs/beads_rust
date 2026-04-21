@@ -22,6 +22,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+const WRITE_LOCK_WAIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+const WRITE_LOCK_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 /// Result of running a br command.
 #[derive(Debug)]
 struct BrResult {
@@ -72,6 +75,58 @@ where
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.spawn().expect("spawn br child")
+}
+
+#[cfg(target_os = "linux")]
+fn read_child_wait_channel(pid: u32) -> Option<String> {
+    fs::read_to_string(format!("/proc/{pid}/wchan"))
+        .ok()
+        .map(|channel| channel.trim().to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn is_write_lock_wait_channel(channel: &str) -> bool {
+    let channel = channel.to_ascii_lowercase();
+    channel.contains("lock") || channel.contains("flock")
+}
+
+fn wait_for_child_to_block_on_write_lock(child: &mut std::process::Child, label: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        let deadline = Instant::now() + WRITE_LOCK_WAIT_OBSERVATION_TIMEOUT;
+
+        loop {
+            let status = child.try_wait().expect("poll child while waiting for lock");
+            assert!(
+                status.is_none(),
+                "{label} exited before reaching .write.lock contention: {status:?}"
+            );
+
+            let wait_channel = read_child_wait_channel(child.id());
+            if wait_channel
+                .as_deref()
+                .is_some_and(is_write_lock_wait_channel)
+            {
+                return;
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "{label} stayed alive but was never observed blocked on .write.lock; last wait channel: {wait_channel:?}"
+            );
+            thread::sleep(WRITE_LOCK_WAIT_POLL_INTERVAL);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        thread::sleep(Duration::from_millis(250));
+        let status = child.try_wait().expect("poll child while waiting for lock");
+        assert!(
+            status.is_none(),
+            "{label} should still be waiting on .write.lock; status={status:?}"
+        );
+    }
 }
 
 /// Run br command in a specific directory.
@@ -311,13 +366,7 @@ fn e2e_killed_writer_waiting_on_write_lock_does_not_poison_workspace() {
         &root,
         ["create", "Killed while waiting for write lock", "--json"],
     );
-    thread::sleep(Duration::from_millis(250));
-
-    let early_exit = blocked_writer.try_wait().expect("poll blocked writer");
-    assert!(
-        early_exit.is_none(),
-        "writer should still be waiting on .write.lock; status={early_exit:?}"
-    );
+    wait_for_child_to_block_on_write_lock(&mut blocked_writer, "writer create");
 
     blocked_writer.kill().expect("kill blocked writer");
     let killed = blocked_writer
@@ -463,13 +512,7 @@ fn e2e_read_command_auto_import_waits_for_write_lock() {
     write_lock.lock().expect("hold .write.lock");
 
     let mut blocked_list = spawn_br_child_in_dir(&root, ["list", "--json"]);
-    thread::sleep(Duration::from_millis(250));
-
-    let early_exit = blocked_list.try_wait().expect("poll blocked list");
-    assert!(
-        early_exit.is_none(),
-        "read command with pending auto-import should wait on .write.lock; status={early_exit:?}"
-    );
+    wait_for_child_to_block_on_write_lock(&mut blocked_list, "auto-import list");
 
     blocked_list.kill().expect("kill blocked list");
     let killed = blocked_list
@@ -537,13 +580,7 @@ fn e2e_read_command_witness_refresh_waits_for_write_lock() {
     write_lock.lock().expect("hold .write.lock");
 
     let mut blocked_list = spawn_br_child_in_dir(&root, ["list", "--json"]);
-    thread::sleep(Duration::from_millis(250));
-
-    let early_exit = blocked_list.try_wait().expect("poll blocked list");
-    assert!(
-        early_exit.is_none(),
-        "read command refreshing JSONL witnesses should wait on .write.lock; status={early_exit:?}"
-    );
+    wait_for_child_to_block_on_write_lock(&mut blocked_list, "witness-refresh list");
 
     drop(write_lock);
     let completed = blocked_list

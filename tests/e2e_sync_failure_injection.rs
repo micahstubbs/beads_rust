@@ -37,6 +37,9 @@ use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 
+const WRITE_LOCK_WAIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+const WRITE_LOCK_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 /// Test artifacts for failure injection tests.
 struct FailureTestArtifacts {
     artifact_dir: PathBuf,
@@ -82,6 +85,58 @@ where
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.spawn().expect("spawn br child")
+}
+
+#[cfg(target_os = "linux")]
+fn read_child_wait_channel(pid: u32) -> Option<String> {
+    fs::read_to_string(format!("/proc/{pid}/wchan"))
+        .ok()
+        .map(|channel| channel.trim().to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn is_write_lock_wait_channel(channel: &str) -> bool {
+    let channel = channel.to_ascii_lowercase();
+    channel.contains("lock") || channel.contains("flock")
+}
+
+fn wait_for_child_to_block_on_write_lock(child: &mut std::process::Child, label: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        let deadline = std::time::Instant::now() + WRITE_LOCK_WAIT_OBSERVATION_TIMEOUT;
+
+        loop {
+            let status = child.try_wait().expect("poll child while waiting for lock");
+            assert!(
+                status.is_none(),
+                "{label} exited before reaching .write.lock contention: {status:?}"
+            );
+
+            let wait_channel = read_child_wait_channel(child.id());
+            if wait_channel
+                .as_deref()
+                .is_some_and(is_write_lock_wait_channel)
+            {
+                return;
+            }
+
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{label} stayed alive but was never observed blocked on .write.lock; last wait channel: {wait_channel:?}"
+            );
+            thread::sleep(WRITE_LOCK_WAIT_POLL_INTERVAL);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        thread::sleep(Duration::from_millis(250));
+        let status = child.try_wait().expect("poll child while waiting for lock");
+        assert!(
+            status.is_none(),
+            "{label} should still be waiting on .write.lock; status={status:?}"
+        );
+    }
 }
 
 impl FailureTestArtifacts {
@@ -1172,13 +1227,7 @@ fn cli_sync_flush_sigkill_while_waiting_for_write_lock_preserves_dirty_state() {
         &workspace,
         ["sync", "--flush-only", "--json", "--no-auto-import"],
     );
-    thread::sleep(Duration::from_millis(250));
-
-    let early_exit = blocked_flush.try_wait().expect("poll blocked flush");
-    assert!(
-        early_exit.is_none(),
-        "sync --flush-only should still be waiting on .write.lock; status={early_exit:?}"
-    );
+    wait_for_child_to_block_on_write_lock(&mut blocked_flush, "blocked sync flush");
 
     blocked_flush.kill().expect("kill blocked flush");
     let killed = blocked_flush
@@ -1299,14 +1348,8 @@ fn cli_sync_flush_concurrent_export_race_serializes_jsonl_sidecars() {
         &workspace,
         ["sync", "--flush-only", "--json", "--no-auto-import"],
     );
-    thread::sleep(Duration::from_millis(250));
-
-    let early_a = flush_a.try_wait().expect("poll first blocked flush");
-    let early_b = flush_b.try_wait().expect("poll second blocked flush");
-    assert!(
-        early_a.is_none() && early_b.is_none(),
-        "both sync --flush-only children should be queued on .write.lock; first={early_a:?} second={early_b:?}"
-    );
+    wait_for_child_to_block_on_write_lock(&mut flush_a, "first concurrent sync flush");
+    wait_for_child_to_block_on_write_lock(&mut flush_b, "second concurrent sync flush");
 
     drop(write_lock);
 
