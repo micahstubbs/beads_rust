@@ -25,6 +25,7 @@ Executable implementation: `src/health.rs`.
 | `DuplicateConfigKeys` | Recoverable | Config table duplicate probe | DELETE+INSERT dedup |
 | `DuplicateMetadataKeys` | Recoverable | Metadata table duplicate probe | DELETE+INSERT dedup |
 | `NullInNotNullColumn` | Degraded | Schema-aware NULL scan | Backfill or rebuild |
+| `WriteProbeFailed` | Recoverable | Rollback-only doctor write probe | Rebuild from JSONL before writes continue |
 
 ### Interchange Data (JSONL)
 
@@ -65,6 +66,7 @@ Each row is a workspace component; columns indicate which subsystem owns and val
 | SQLite header | storage | `open()` | - | - | integrity_check |
 | Schema version | storage | `apply_migrations()` | - | - | schema version match |
 | Issue rows | storage | - | `update_issue` | export | count / sample |
+| Issue writeability | storage | - | mutation transaction | - | rollback-only write probe |
 | Config KV | storage | `get_config` | `set_config` | - | duplicate probe |
 | Metadata KV | storage | `get_metadata` | `set_metadata` | - | duplicate probe |
 | WAL sidecar | fsqlite | implicit | implicit | - | existence + size |

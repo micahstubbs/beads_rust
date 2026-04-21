@@ -95,6 +95,9 @@ pub enum AnomalyClass {
         stored: i64,
         actual: i64,
     },
+    WriteProbeFailed {
+        detail: String,
+    },
     JournalSidecarPresent,
     OrphanedLockFile,
 }
@@ -110,7 +113,8 @@ impl AnomalyClass {
             | Self::DuplicateSchemaRows { .. }
             | Self::DuplicateConfigKeys { .. }
             | Self::DuplicateMetadataKeys { .. }
-            | Self::TruncatedWal => WorkspaceHealth::Recoverable,
+            | Self::TruncatedWal
+            | Self::WriteProbeFailed { .. } => WorkspaceHealth::Recoverable,
 
             Self::JsonlConflictMarkers | Self::JsonlParseError { .. } => WorkspaceHealth::Unsafe,
 
@@ -197,6 +201,7 @@ impl fmt::Display for AnomalyClass {
                     "child_count drift for '{issue_id}' (stored={stored}, actual={actual})"
                 )
             }
+            Self::WriteProbeFailed { detail } => write!(f, "write probe failed: {detail}"),
             Self::JournalSidecarPresent => {
                 f.write_str("journal sidecar present (incomplete transaction)")
             }
@@ -576,6 +581,13 @@ mod tests {
         assert_eq!(
             AnomalyClass::JournalSidecarPresent.severity(),
             WorkspaceHealth::Degraded
+        );
+        assert_eq!(
+            AnomalyClass::WriteProbeFailed {
+                detail: "write failed".to_string(),
+            }
+            .severity(),
+            WorkspaceHealth::Recoverable
         );
         assert_eq!(
             AnomalyClass::OrphanedLockFile.severity(),

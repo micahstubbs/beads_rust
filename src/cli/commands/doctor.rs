@@ -5,6 +5,7 @@
 use crate::cli::DoctorArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::health::{AnomalyClass, WorkspaceClassification};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::sync::{
@@ -159,6 +160,207 @@ fn has_error(checks: &[CheckResult]) -> bool {
     checks
         .iter()
         .any(|check| matches!(check.status, CheckStatus::Error))
+}
+
+fn push_anomaly(anomalies: &mut Vec<AnomalyClass>, anomaly: AnomalyClass) {
+    if !anomalies.contains(&anomaly) {
+        anomalies.push(anomaly);
+    }
+}
+
+fn check_message(check: &CheckResult) -> String {
+    check.message.clone().unwrap_or_else(|| check.name.clone())
+}
+
+fn check_findings(check: &CheckResult) -> Vec<String> {
+    check
+        .details
+        .as_ref()
+        .and_then(|details| details.get("findings"))
+        .and_then(serde_json::Value::as_array)
+        .map(|findings| {
+            findings
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_else(|| check.message.iter().cloned().collect())
+}
+
+fn append_recoverable_anomaly_findings(check: &CheckResult, anomalies: &mut Vec<AnomalyClass>) {
+    for finding in check_findings(check) {
+        if finding.contains("sqlite_master contains duplicate") {
+            push_anomaly(
+                anomalies,
+                AnomalyClass::DuplicateSchemaRows {
+                    name: "sqlite_master".to_string(),
+                    count: 2,
+                },
+            );
+        } else if finding.contains("config contains duplicate rows") {
+            push_anomaly(
+                anomalies,
+                AnomalyClass::DuplicateConfigKeys {
+                    key: "unknown".to_string(),
+                    count: 2,
+                },
+            );
+        } else if finding.contains("metadata contains duplicate rows") {
+            push_anomaly(
+                anomalies,
+                AnomalyClass::DuplicateMetadataKeys {
+                    key: "unknown".to_string(),
+                    count: 2,
+                },
+            );
+        } else if finding.contains(BLOCKED_CACHE_STALE_FINDING) {
+            push_anomaly(anomalies, AnomalyClass::BlockedCacheStale);
+        }
+    }
+}
+
+fn append_null_default_anomalies(check: &CheckResult, anomalies: &mut Vec<AnomalyClass>) {
+    let Some(findings) = check
+        .details
+        .as_ref()
+        .and_then(|details| details.get("findings"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+
+    for finding in findings {
+        let table = finding
+            .get("table")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let column = finding
+            .get("column")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        push_anomaly(
+            anomalies,
+            AnomalyClass::NullInNotNullColumn {
+                table: table.to_string(),
+                column: column.to_string(),
+            },
+        );
+    }
+}
+
+fn append_count_mismatch_anomaly(check: &CheckResult, anomalies: &mut Vec<AnomalyClass>) {
+    let Some(details) = check.details.as_ref() else {
+        return;
+    };
+    let Some(db_count) = details.get("db").and_then(serde_json::Value::as_i64) else {
+        return;
+    };
+    let Some(jsonl_count) = details.get("jsonl").and_then(serde_json::Value::as_u64) else {
+        return;
+    };
+    let Ok(db_count) = usize::try_from(db_count) else {
+        return;
+    };
+    let Ok(jsonl_count) = usize::try_from(jsonl_count) else {
+        return;
+    };
+
+    push_anomaly(
+        anomalies,
+        AnomalyClass::DbJsonlCountMismatch {
+            db_count,
+            jsonl_count,
+        },
+    );
+}
+
+fn append_doctor_check_anomalies(check: &CheckResult, anomalies: &mut Vec<AnomalyClass>) {
+    match check.name.as_str() {
+        "db.exists" if matches!(check.status, CheckStatus::Error) => {
+            push_anomaly(anomalies, AnomalyClass::DatabaseMissing);
+        }
+        "db.open"
+        | "schema.tables"
+        | "schema.columns"
+        | "sqlite.integrity_check"
+        | "sqlite3.integrity_check"
+            if matches!(check.status, CheckStatus::Error) =>
+        {
+            push_anomaly(
+                anomalies,
+                AnomalyClass::DatabaseCorrupt {
+                    detail: check_message(check),
+                },
+            );
+        }
+        "jsonl.parse" if matches!(check.status, CheckStatus::Error) => {
+            push_anomaly(
+                anomalies,
+                AnomalyClass::JsonlParseError {
+                    detail: check_message(check),
+                },
+            );
+        }
+        "sync_conflict_markers" if matches!(check.status, CheckStatus::Error) => {
+            push_anomaly(anomalies, AnomalyClass::JsonlConflictMarkers);
+        }
+        "counts.db_vs_jsonl" if matches!(check.status, CheckStatus::Warn) => {
+            append_count_mismatch_anomaly(check, anomalies);
+        }
+        "sync.metadata" => {
+            let message = check.message.as_deref().unwrap_or_default();
+            if message.contains("External changes pending import") {
+                push_anomaly(anomalies, AnomalyClass::JsonlNewer);
+            } else if message.contains("Local changes pending export") {
+                push_anomaly(anomalies, AnomalyClass::DbNewer);
+            }
+        }
+        "db.recovery_artifacts" if matches!(check.status, CheckStatus::Warn) => {
+            push_anomaly(anomalies, AnomalyClass::StaleRecoveryArtifacts);
+        }
+        "db.sidecars" if matches!(check.status, CheckStatus::Error) => {
+            let message = check.message.as_deref().unwrap_or_default();
+            if message.contains("rollback journal") {
+                push_anomaly(anomalies, AnomalyClass::JournalSidecarPresent);
+            } else {
+                push_anomaly(
+                    anomalies,
+                    AnomalyClass::SidecarMismatch {
+                        has_wal: message.contains("WAL"),
+                        has_shm: message.contains("SHM"),
+                    },
+                );
+            }
+        }
+        "db.recoverable_anomalies" if matches!(check.status, CheckStatus::Error) => {
+            append_recoverable_anomaly_findings(check, anomalies);
+        }
+        "db.null_defaults" if matches!(check.status, CheckStatus::Warn) => {
+            append_null_default_anomalies(check, anomalies);
+        }
+        "db.write_probe" if matches!(check.status, CheckStatus::Error) => {
+            push_anomaly(
+                anomalies,
+                AnomalyClass::WriteProbeFailed {
+                    detail: check_message(check),
+                },
+            );
+        }
+        _ => {}
+    }
+}
+
+fn classify_doctor_checks(
+    db_path: &Path,
+    jsonl_path: &Path,
+    checks: &[CheckResult],
+) -> WorkspaceClassification {
+    let mut anomalies = crate::health::classify_file_state(db_path, jsonl_path);
+    for check in checks {
+        append_doctor_check_anomalies(check, &mut anomalies);
+    }
+    WorkspaceClassification::from_anomalies(anomalies)
 }
 
 fn report_has_blocked_cache_stale_finding(report: &DoctorReport) -> bool {
@@ -1001,6 +1203,9 @@ fn print_report(report: &DoctorReport, ctx: &OutputContext) -> Result<()> {
 
 fn print_report_plain(report: &DoctorReport) {
     println!("br doctor");
+    if let Some(health) = &report.workspace_health {
+        println!("HEALTH workspace: {health}");
+    }
     for check in &report.checks {
         let label = match check.status {
             CheckStatus::Ok => "OK",
@@ -1040,6 +1245,12 @@ fn render_doctor_rich(report: &DoctorReport, ctx: &OutputContext) {
         content.append_styled("Issues found", theme.error.clone());
     }
     content.append("\n");
+
+    if let Some(health) = &report.workspace_health {
+        content.append_styled("Health: ", theme.dimmed.clone());
+        content.append_styled(health, theme.accent.clone());
+        content.append("\n");
+    }
 
     content.append_styled("Checks: ", theme.dimmed.clone());
     content.append_styled(
@@ -2315,10 +2526,7 @@ fn collect_doctor_report(beads_dir: &Path, paths: &config::ConfigPaths) -> Resul
         &mut checks,
     );
 
-    let file_anomalies =
-        crate::health::classify_file_state(&paths.db_path, &paths.jsonl_path);
-    let classification =
-        crate::health::WorkspaceClassification::from_anomalies(file_anomalies);
+    let classification = classify_doctor_checks(&paths.db_path, &paths.jsonl_path, &checks);
 
     Ok(DoctorRun {
         report: DoctorReport {
@@ -2702,6 +2910,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::health::{AnomalyClass, WorkspaceHealth};
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use chrono::Utc;
@@ -2755,6 +2964,88 @@ mod tests {
             dependencies: Vec::new(),
             comments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn test_classify_doctor_checks_marks_write_probe_failure_recoverable() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let checks = vec![CheckResult {
+            name: "db.write_probe".to_string(),
+            status: CheckStatus::Error,
+            message: Some(
+                "Rollback-only issue write failed: database disk image is malformed".to_string(),
+            ),
+            details: Some(serde_json::json!({ "issue_id": "bd-probe" })),
+        }];
+
+        let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+        assert_eq!(classification.health, WorkspaceHealth::Recoverable);
+        assert!(
+            classification
+                .anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::WriteProbeFailed { .. })),
+            "expected write-probe failure anomaly: {:?}",
+            classification.anomalies
+        );
+    }
+
+    #[test]
+    fn test_classify_doctor_checks_marks_invalid_jsonl_unsafe() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let checks = vec![CheckResult {
+            name: "jsonl.parse".to_string(),
+            status: CheckStatus::Error,
+            message: Some("Malformed or invalid issue records: 1".to_string()),
+            details: Some(serde_json::json!({ "path": jsonl_path.display().to_string() })),
+        }];
+
+        let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+        assert_eq!(classification.health, WorkspaceHealth::Unsafe);
+        assert!(
+            classification
+                .anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::JsonlParseError { .. })),
+            "expected JSONL parse anomaly: {:?}",
+            classification.anomalies
+        );
+    }
+
+    #[test]
+    fn test_classify_doctor_checks_marks_count_mismatch_degraded() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let checks = vec![CheckResult {
+            name: "counts.db_vs_jsonl".to_string(),
+            status: CheckStatus::Warn,
+            message: Some("DB and JSONL counts differ".to_string()),
+            details: Some(serde_json::json!({ "db": 2, "jsonl": 1 })),
+        }];
+
+        let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+        assert_eq!(classification.health, WorkspaceHealth::Degraded);
+        assert!(
+            classification.anomalies.iter().any(|anomaly| {
+                matches!(
+                    anomaly,
+                    AnomalyClass::DbJsonlCountMismatch {
+                        db_count: 2,
+                        jsonl_count: 1
+                    }
+                )
+            }),
+            "expected count mismatch anomaly: {:?}",
+            classification.anomalies
+        );
     }
 
     #[test]
