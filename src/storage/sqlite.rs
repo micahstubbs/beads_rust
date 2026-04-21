@@ -535,6 +535,44 @@ impl SqliteStorage {
     /// malformed states remain queryable enough to reach startup, then fail on
     /// the next single-row lookup.
     ///
+    /// Detect structured anomalies suitable for the canonical health classifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if probing the database fails.
+    pub fn detect_anomalies(&self) -> Result<Vec<crate::health::AnomalyClass>> {
+        use crate::health::AnomalyClass;
+        let mut anomalies = Vec::new();
+
+        let duplicate_schema_rows = self.conn.query(
+            "SELECT type, name, COUNT(*) AS row_count
+             FROM sqlite_master
+             WHERE name IN ('blocked_issues_cache', 'idx_blocked_cache_blocked_at')
+             GROUP BY type, name
+             HAVING COUNT(*) > 1
+             ORDER BY row_count DESC, name ASC",
+        )?;
+        for row in &duplicate_schema_rows {
+            let name = row
+                .get(1)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("unknown")
+                .to_string();
+            let count = row.get(2).and_then(SqliteValue::as_integer).unwrap_or(2);
+            anomalies.push(AnomalyClass::DuplicateSchemaRows { name, count });
+        }
+
+        if let Some((key, count)) = self.first_duplicate_kv_key("config")? {
+            anomalies.push(AnomalyClass::DuplicateConfigKeys { key, count });
+        }
+
+        if let Some((key, count)) = self.first_duplicate_kv_key("metadata")? {
+            anomalies.push(AnomalyClass::DuplicateMetadataKeys { key, count });
+        }
+
+        Ok(anomalies)
+    }
+
     /// # Errors
     ///
     /// Returns an error if probing the database fails.
@@ -11793,6 +11831,121 @@ mod tests {
         assert!(
             blocked_after.iter().any(|(i, _)| i.id == "proj-task3"),
             "task3 should still be blocked by task2"
+        );
+    }
+
+    /// Regression test for beads_rust-m06q: closing a blocker and then
+    /// immediately updating the newly-unblocked dependent must not trigger a
+    /// UNIQUE constraint violation in blocked_issues_cache.
+    #[test]
+    fn test_close_blocker_then_claim_unblocked_issue_no_unique_violation() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t = Utc::now();
+
+        let blocker =
+            make_issue("m06q-blocker", "Blocker", Status::Open, 1, Some("bug"), t, None);
+        let task = make_issue("m06q-task", "Task", Status::Open, 1, Some("task"), t, None);
+
+        storage.create_issue(&blocker, "tester").unwrap();
+        storage.create_issue(&task, "tester").unwrap();
+        storage
+            .add_dependency("m06q-task", "m06q-blocker", "blocks", "tester")
+            .unwrap();
+
+        // Verify task is blocked
+        let blocked = storage.get_blocked_issues().unwrap();
+        assert!(
+            blocked.iter().any(|(i, _)| i.id == "m06q-task"),
+            "task should be blocked initially"
+        );
+
+        // Close the blocker — triggers cache rebuild
+        let close_updates = IssueUpdate {
+            status: Some(Status::Closed),
+            close_reason: Some(Some("done".to_string())),
+            ..Default::default()
+        };
+        storage
+            .update_issue("m06q-blocker", &close_updates, "tester")
+            .unwrap();
+
+        // Immediately "claim" the now-unblocked task by updating its status.
+        // This used to fail with UNIQUE constraint on blocked_issues_cache.issue_id
+        // when the cache rebuild inserted a duplicate row.
+        let claim_updates = IssueUpdate {
+            status: Some(Status::InProgress),
+            ..Default::default()
+        };
+        let claimed = storage
+            .update_issue("m06q-task", &claim_updates, "tester")
+            .unwrap();
+        assert_eq!(claimed.status, Status::InProgress);
+
+        // Task should not appear in blocked list
+        let blocked_after = storage.get_blocked_issues().unwrap();
+        assert!(
+            !blocked_after.iter().any(|(i, _)| i.id == "m06q-task"),
+            "task should not be blocked after blocker was closed"
+        );
+    }
+
+    /// Extended regression for beads_rust-m06q: multiple blockers closed in
+    /// sequence with interleaved claims must not produce duplicate cache rows.
+    #[test]
+    fn test_multiple_close_claim_cycles_no_unique_violation() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t = Utc::now();
+
+        let b1 = make_issue("m06q-b1", "Blocker 1", Status::Open, 1, Some("bug"), t, None);
+        let b2 = make_issue("m06q-b2", "Blocker 2", Status::Open, 1, Some("bug"), t, None);
+        let task = make_issue("m06q-dual", "Dual blocked", Status::Open, 1, Some("task"), t, None);
+
+        storage.create_issue(&b1, "tester").unwrap();
+        storage.create_issue(&b2, "tester").unwrap();
+        storage.create_issue(&task, "tester").unwrap();
+        storage
+            .add_dependency("m06q-dual", "m06q-b1", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("m06q-dual", "m06q-b2", "blocks", "tester")
+            .unwrap();
+
+        // Task blocked by both
+        let blocked = storage.get_blocked_issues().unwrap();
+        assert!(blocked.iter().any(|(i, _)| i.id == "m06q-dual"));
+
+        // Close first blocker
+        let close = IssueUpdate {
+            status: Some(Status::Closed),
+            close_reason: Some(Some("done".to_string())),
+            ..Default::default()
+        };
+        storage.update_issue("m06q-b1", &close, "tester").unwrap();
+
+        // Task still blocked by b2
+        let blocked = storage.get_blocked_issues().unwrap();
+        assert!(
+            blocked.iter().any(|(i, _)| i.id == "m06q-dual"),
+            "task should still be blocked by second blocker"
+        );
+
+        // Close second blocker
+        storage.update_issue("m06q-b2", &close, "tester").unwrap();
+
+        // Immediately claim — should succeed without UNIQUE violation
+        let claim = IssueUpdate {
+            status: Some(Status::InProgress),
+            ..Default::default()
+        };
+        let claimed = storage
+            .update_issue("m06q-dual", &claim, "tester")
+            .unwrap();
+        assert_eq!(claimed.status, Status::InProgress);
+
+        let blocked_after = storage.get_blocked_issues().unwrap();
+        assert!(
+            !blocked_after.iter().any(|(i, _)| i.id == "m06q-dual"),
+            "task should be unblocked after both blockers closed"
         );
     }
 }

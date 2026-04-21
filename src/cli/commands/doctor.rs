@@ -45,6 +45,8 @@ struct CheckResult {
 #[derive(Debug, Clone, Serialize)]
 struct DoctorReport {
     ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_health: Option<String>,
     checks: Vec<CheckResult>,
 }
 
@@ -2313,9 +2315,15 @@ fn collect_doctor_report(beads_dir: &Path, paths: &config::ConfigPaths) -> Resul
         &mut checks,
     );
 
+    let file_anomalies =
+        crate::health::classify_file_state(&paths.db_path, &paths.jsonl_path);
+    let classification =
+        crate::health::WorkspaceClassification::from_anomalies(file_anomalies);
+
     Ok(DoctorRun {
         report: DoctorReport {
             ok: !has_error(&checks),
+            workspace_health: Some(classification.health.to_string()),
             checks,
         },
         jsonl_path,
@@ -2469,6 +2477,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         );
         let report = DoctorReport {
             ok: !has_error(&checks),
+            workspace_health: None,
             checks,
         };
         print_report(&report, ctx)?;
@@ -2488,6 +2497,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             );
             let report = DoctorReport {
                 ok: !has_error(&checks),
+                workspace_health: None,
                 checks,
             };
             print_report(&report, ctx)?;
@@ -3264,6 +3274,7 @@ mod tests {
 
         let report = DoctorReport {
             ok: false,
+            workspace_health: None,
             checks: vec![CheckResult {
                 name: "db.sidecars".to_string(),
                 status: CheckStatus::Error,
@@ -3307,6 +3318,7 @@ mod tests {
 
         let report = DoctorReport {
             ok: true, // Warn-only report is considered ok
+            workspace_health: None,
             checks: vec![CheckResult {
                 name: "db.sidecars".to_string(),
                 status: CheckStatus::Warn,
@@ -3338,6 +3350,7 @@ mod tests {
     fn test_report_has_blocked_cache_stale_finding_detects_detail_entry() {
         let report = DoctorReport {
             ok: false,
+            workspace_health: None,
             checks: vec![CheckResult {
                 name: "db.recoverable_anomalies".to_string(),
                 status: CheckStatus::Error,
@@ -3358,6 +3371,7 @@ mod tests {
     fn test_report_has_blocked_cache_stale_finding_ignores_other_recoverable_errors() {
         let report = DoctorReport {
             ok: false,
+            workspace_health: None,
             checks: vec![CheckResult {
                 name: "db.recoverable_anomalies".to_string(),
                 status: CheckStatus::Error,
@@ -3649,6 +3663,7 @@ mod tests {
         let db_path = temp.path().join("missing.db");
         let report = DoctorReport {
             ok: false,
+            workspace_health: None,
             checks: Vec::new(),
         };
 
@@ -3673,6 +3688,7 @@ mod tests {
         ] {
             let report = DoctorReport {
                 ok: true, // WARNs don't flip ok → false
+                workspace_health: None,
                 checks: vec![CheckResult {
                     name: "sqlite.integrity_check".to_string(),
                     status: CheckStatus::Warn,
@@ -3689,6 +3705,7 @@ mod tests {
         // sqlite3 binary variant should also match (the C sqlite3 cross-check).
         let report = DoctorReport {
             ok: true,
+            workspace_health: None,
             checks: vec![CheckResult {
                 name: "sqlite3.integrity_check".to_string(),
                 status: CheckStatus::Warn,
@@ -3704,6 +3721,7 @@ mod tests {
         // "missing from index" is a partial-index REINDEX case, not a VACUUM case.
         let report = DoctorReport {
             ok: true,
+            workspace_health: None,
             checks: vec![CheckResult {
                 name: "sqlite.integrity_check".to_string(),
                 status: CheckStatus::Warn,
@@ -3717,6 +3735,7 @@ mod tests {
         // not a VACUUM case.
         let report = DoctorReport {
             ok: true,
+            workspace_health: None,
             checks: vec![CheckResult {
                 name: "sqlite.integrity_check".to_string(),
                 status: CheckStatus::Warn,
@@ -3734,6 +3753,7 @@ mod tests {
         // specifically scoped to WARN-level residue left after light repair.
         let report = DoctorReport {
             ok: false,
+            workspace_health: None,
             checks: vec![CheckResult {
                 name: "sqlite.integrity_check".to_string(),
                 status: CheckStatus::Error,
@@ -3748,6 +3768,7 @@ mod tests {
     fn report_has_warn_level_page_anomaly_ignores_non_integrity_checks() {
         let report = DoctorReport {
             ok: true,
+            workspace_health: None,
             checks: vec![CheckResult {
                 name: "db.sidecars".to_string(),
                 status: CheckStatus::Warn,
