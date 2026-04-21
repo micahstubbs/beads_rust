@@ -57,7 +57,7 @@ You need to track issues for your project, but:
 br init                              # Initialize in your repo
 br create "Fix login timeout" -p 1   # Create high-priority issue
 br ready                             # See what's actionable
-br close bd-abc123                   # Close when done
+br close br-abc123                   # Close when done
 br sync --flush-only                 # Export for git commit
 ```
 
@@ -89,25 +89,25 @@ br agents --add --force
 
 # Create issues with priority (0=critical, 4=backlog)
 br create "Implement user auth" --type feature --priority 1
-# Created: bd-7f3a2c
+# Created: br-7f3a2c
 
 br create "Set up database schema" --type task --priority 1
-# Created: bd-e9b1d4
+# Created: br-e9b1d4
 
 # Auth depends on database schema
-br dep add bd-7f3a2c bd-e9b1d4
+br dep add br-7f3a2c br-e9b1d4
 
 # See what's ready to work on (not blocked)
 br ready
-# bd-e9b1d4  P1  task     Set up database schema
+# br-e9b1d4  P1  task     Set up database schema
 
 # Claim and complete work
-br update bd-e9b1d4 --status in_progress
-br close bd-e9b1d4 --reason "Schema implemented"
+br update br-e9b1d4 --status in_progress
+br close br-e9b1d4 --reason "Schema implemented"
 
 # Now auth is unblocked
 br ready
-# bd-7f3a2c  P1  feature  Implement user auth
+# br-7f3a2c  P1  feature  Implement user auth
 
 # Export to JSONL for git commit
 br sync --flush-only
@@ -140,7 +140,7 @@ br list --priority 0-1 --status open --assignee alice
 
 # Collaboration: JSONL merges cleanly in git
 git diff .beads/issues.jsonl
-# +{"id":"bd-abc123","title":"New feature",...}
+# +{"id":"br-abc123","title":"New feature",...}
 ```
 
 ### 3. Explicit Over Implicit
@@ -165,7 +165,7 @@ Every command supports `--json` for AI coding agents:
 ```bash
 br list --json | jq '.issues[] | select(.priority <= 1)'
 br ready --json  # Structured output for agents
-br show bd-abc123 --json
+br show br-abc123 --json
 ```
 
 For routine operator or agent use, prefer `RUST_LOG=error br ...` to suppress internal Rust dependency logs while preserving normal stdout/JSON output:
@@ -182,7 +182,7 @@ Interactive terminals get enhanced visual output:
 ```bash
 # Rich mode (default in TTY)
 br list           # Formatted tables with colors
-br show bd-abc    # Styled panels with metadata
+br show br-abc    # Styled panels with metadata
 
 # Plain mode (piped or --no-color)
 br list | cat     # Clean text, no ANSI codes
@@ -309,13 +309,13 @@ br create "Fix login timeout bug" \
   --type bug \
   --priority 1 \
   --description "Users report login times out after 30 seconds"
-# Created: bd-a1b2c3
+# Created: br-a1b2c3
 ```
 
 ### 3. Add Labels
 
 ```bash
-br label add bd-a1b2c3 backend auth
+br label add br-a1b2c3 backend auth
 ```
 
 ### 4. Check Ready Work
@@ -328,13 +328,13 @@ br ready
 ### 5. Claim and Work
 
 ```bash
-br update bd-a1b2c3 --status in_progress --assignee "$(git config user.email)"
+br update br-a1b2c3 --status in_progress --assignee "$(git config user.email)"
 ```
 
 ### 6. Close When Done
 
 ```bash
-br close bd-a1b2c3 --reason "Increased timeout to 60s, added retry logic"
+br close br-a1b2c3 --reason "Increased timeout to 60s, added retry logic"
 ```
 
 ### 7. Sync to Git
@@ -342,7 +342,7 @@ br close bd-a1b2c3 --reason "Increased timeout to 60s, added retry logic"
 ```bash
 br sync --flush-only        # Export DB to JSONL
 git add .beads/             # Stage changes
-git commit -m "Fix: login timeout (bd-a1b2c3)"
+git commit -m "Fix: login timeout (br-a1b2c3)"
 ```
 
 ---
@@ -356,11 +356,11 @@ git commit -m "Fix: login timeout (bd-a1b2c3)"
 | `init` | Initialize workspace | `br init` |
 | `create` | Create issue | `br create "Title" -p 1 --type bug` |
 | `q` | Quick capture (ID only) | `br q "Fix typo"` |
-| `show` | Show issue details | `br show bd-abc123` |
-| `update` | Update issue | `br update bd-abc123 --priority 0` |
-| `close` | Close issue | `br close bd-abc123 --reason "Done"` |
-| `reopen` | Reopen closed issue | `br reopen bd-abc123` |
-| `delete` | Delete issue (tombstone) | `br delete bd-abc123` |
+| `show` | Show issue details | `br show br-abc123` |
+| `update` | Update issue | `br update br-abc123 --priority 0` |
+| `close` | Close issue | `br close br-abc123 --reason "Done"` |
+| `reopen` | Reopen closed issue | `br reopen br-abc123` |
+| `delete` | Delete issue (tombstone) | `br delete br-abc123` |
 
 ### Querying
 
@@ -377,27 +377,27 @@ git commit -m "Fix: login timeout (bd-a1b2c3)"
 
 | Command | Description | Example |
 |---------|-------------|---------|
-| `dep add` | Add dependency | `br dep add bd-child bd-parent` |
-| `dep remove` | Remove dependency | `br dep remove bd-child bd-parent` |
-| `dep list` | List dependencies | `br dep list bd-abc123` |
-| `dep tree` | Dependency tree | `br dep tree bd-abc123` |
+| `dep add` | Add dependency | `br dep add br-child br-parent` |
+| `dep remove` | Remove dependency | `br dep remove br-child br-parent` |
+| `dep list` | List dependencies | `br dep list br-abc123` |
+| `dep tree` | Dependency tree | `br dep tree br-abc123` |
 | `dep cycles` | Find cycles | `br dep cycles` |
 
 ### Labels
 
 | Command | Description | Example |
 |---------|-------------|---------|
-| `label add` | Add labels | `br label add bd-abc123 backend urgent` |
-| `label remove` | Remove label | `br label remove bd-abc123 urgent` |
-| `label list` | List issue labels | `br label list bd-abc123` |
+| `label add` | Add labels | `br label add br-abc123 backend urgent` |
+| `label remove` | Remove label | `br label remove br-abc123 urgent` |
+| `label list` | List issue labels | `br label list br-abc123` |
 | `label list-all` | All labels in project | `br label list-all` |
 
 ### Comments
 
 | Command | Description | Example |
 |---------|-------------|---------|
-| `comments add` | Add comment | `br comments add bd-abc123 "Found root cause"` |
-| `comments list` | List comments | `br comments list bd-abc123` |
+| `comments add` | Add comment | `br comments add br-abc123 "Found root cause"` |
+| `comments list` | List comments | `br comments list br-abc123` |
 
 ### Sync & System
 
@@ -571,7 +571,7 @@ br sync --status  # Safe read-only check
 
 ```bash
 # Check if issue exists
-br list --json | jq '.issues[] | select(.id == "bd-abc123")'
+br list --json | jq '.issues[] | select(.id == "br-abc123")'
 
 # Check for similar IDs
 br list | grep -i "abc"
@@ -668,7 +668,7 @@ Yes! br is designed for AI agent integration:
 # Agents can use --json for structured output
 br list --json
 br ready --json
-br show bd-abc123 --json
+br show br-abc123 --json
 
 # Create issues programmatically
 br create "Title" --json  # Returns created issue as JSON
@@ -699,16 +699,16 @@ br sync --import-only
 
 ```bash
 # Issue A depends on Issue B (A is blocked until B is closed)
-br dep add bd-A bd-B
+br dep add br-A br-B
 
-# Now bd-A won't appear in `br ready` until bd-B is closed
-br ready  # Only shows bd-B
+# Now br-A won't appear in `br ready` until br-B is closed
+br ready  # Only shows br-B
 
 # Close the blocker
-br close bd-B
+br close br-B
 
-# Now bd-A is ready
-br ready  # Shows bd-A
+# Now br-A is ready
+br ready  # Shows br-A
 ```
 
 ### Q: How do I handle merge conflicts in JSONL?
@@ -814,9 +814,9 @@ Quick example:
 ```bash
 # Agent workflow
 br ready --json | jq '.[0]'           # Get top priority
-br update bd-abc --status in_progress # Claim work
+br update br-abc --status in_progress # Claim work
 # ... do work ...
-br close bd-abc --reason "Completed"  # Done
+br close br-abc --reason "Completed"  # Done
 br sync --flush-only                  # Export for git
 ```
 

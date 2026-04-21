@@ -43,18 +43,18 @@ This guide covers how AI coding agents can effectively use `br` (beads_rust) for
 
 ```bash
 # Initialize (if needed)
-br init --prefix myproj
+br init
 
 # Find work
 br ready --json --limit 5
 
 # Claim and work
-br update bd-123 --claim --json
+br update br-123 --claim --json
 # ... do the work ...
-br close bd-123 --reason "Implemented feature X" --json
+br close br-123 --reason "Implemented feature X" --json
 
 # Create discovered work
-br create "Found bug during implementation" -t bug -p 1 --deps discovered-from:bd-123 --json
+br create "Found bug during implementation" -t bug -p 1 --deps discovered-from:br-123 --json
 
 # Session end
 br sync --flush-only
@@ -69,7 +69,7 @@ br sync --flush-only
 ```bash
 # Flag on any command
 br list --json
-br show bd-123 --json
+br show br-123 --json
 br create "Title" --json
 
 # Equivalent (when the command supports --format)
@@ -78,7 +78,7 @@ br ready --format json
 
 # Robot mode alias (same as --json)
 br ready --robot
-br close bd-123 --robot
+br close br-123 --robot
 ```
 
 ### TOON Output (Token-Efficient)
@@ -87,7 +87,7 @@ Many read-style commands support TOON output via `--format toon`:
 
 ```bash
 br ready --format toon --limit 10
-br show bd-123 --format toon
+br show br-123 --format toon
 ```
 
 Decode TOON to JSON when you need to pipe into JSON tools:
@@ -128,7 +128,7 @@ $ br ready --json --limit 2
 ```json
 [
   {
-    "id": "bd-abc123",
+    "id": "br-abc123",
     "title": "Implement user auth",
     "status": "open",
     "priority": 1,
@@ -138,7 +138,7 @@ $ br ready --json --limit 2
     "dependent_count": 2
   },
   {
-    "id": "bd-def456",
+    "id": "br-def456",
     "title": "Fix login bug",
     "status": "open",
     "priority": 0,
@@ -193,10 +193,10 @@ $ br ready --json --limit 2
 
 ```bash
 # Atomic claim (recommended)
-br update bd-123 --claim --json
+br update br-123 --claim --json
 
 # Manual claim (equivalent)
-br update bd-123 --status in_progress --assignee "$BD_ACTOR" --json
+br update br-123 --status in_progress --assignee "$BD_ACTOR" --json
 ```
 
 ### Creating Related Issues
@@ -206,13 +206,13 @@ br update bd-123 --status in_progress --assignee "$BD_ACTOR" --json
 br create "Edge case causes crash" \
   -t bug \
   -p 1 \
-  --deps discovered-from:bd-123 \
+  --deps discovered-from:br-123 \
   --json
 
 # Subtask for epic
 br create "Implement auth middleware" \
   -t task \
-  --parent bd-epic-456 \
+  --parent br-epic-456 \
   --json
 ```
 
@@ -220,14 +220,14 @@ br create "Implement auth middleware" \
 
 ```bash
 # Close and get next unblocked work
-br close bd-123 --suggest-next --json
+br close br-123 --suggest-next --json
 ```
 
 Returns:
 ```json
 {
-  "closed": "bd-123",
-  "unblocked": ["bd-456", "bd-789"]
+  "closed": "br-123",
+  "unblocked": ["br-456", "br-789"]
 }
 ```
 
@@ -401,11 +401,11 @@ With `--json`, successful command data is written to stdout. Structured errors a
 {
   "error": {
     "code": "ISSUE_NOT_FOUND",
-    "message": "Issue not found: bd-xyz999",
+    "message": "Issue not found: br-xyz999",
     "hint": "Run 'br list' to see available issues.",
     "retryable": false,
     "context": {
-      "searched_id": "bd-xyz999"
+      "searched_id": "br-xyz999"
     }
   }
 }
@@ -445,10 +445,10 @@ These flags enable machine-friendly output:
 ```bash
 # Machine-friendly create
 br create "New issue" --silent
-# Output: bd-abc123
+# Output: br-abc123
 
 # Quiet mode with JSON
-br close bd-123 --quiet --json
+br close br-123 --quiet --json
 # Outputs JSON, no status messages
 ```
 
@@ -575,13 +575,13 @@ See [AGENTS.md](../AGENTS.md) for detailed bv integration.
 
 **"Database not initialized"**
 ```bash
-br init --prefix myproj
+br init
 ```
 
 **"Issue not found"**
 ```bash
 # Use partial ID matching
-br show abc  # Matches bd-abc123
+br show abc  # Matches br-abc123
 
 # List to find correct ID
 br list --json | jq '.issues[].id'
@@ -599,7 +599,7 @@ br list --json --lock-timeout 10000
 br dep cycles --json
 
 # Remove problematic dependency
-br dep remove bd-123 bd-456
+br dep remove br-123 br-456
 ```
 
 ### Debug Logging

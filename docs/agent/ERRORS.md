@@ -5,7 +5,7 @@ Most commands return non-zero exit codes on failure and may emit a structured er
 Example (captured with stderr redirection):
 
 ```bash
-br show bd-NOTEXIST --format json > /dev/null 2>err.json || true
+br show br-NOTEXIST --format json > /dev/null 2>err.json || true
 cat err.json | jq .
 ```
 
@@ -13,7 +13,7 @@ Minimal regression check:
 
 ```bash
 set +e
-br show bd-NOTEXIST --json >out.json 2>err.json
+br show br-NOTEXIST --json >out.json 2>err.json
 status=$?
 set -e
 test "$status" -eq 3
@@ -27,10 +27,10 @@ Shape:
 {
   "error": {
     "code": "ISSUE_NOT_FOUND",
-    "message": "Issue not found: bd-NOTEXIST",
+    "message": "Issue not found: br-NOTEXIST",
     "hint": "Run 'br list' to see available issues.",
     "retryable": false,
-    "context": { "searched_id": "bd-NOTEXIST" }
+    "context": { "searched_id": "br-NOTEXIST" }
   }
 }
 ```

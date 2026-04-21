@@ -5,7 +5,7 @@ Goal: in under 30 seconds, list actionable work, claim it, complete it, and sync
 ## 1) Initialize (once per repo)
 
 ```bash
-br init --prefix bd
+br init
 ```
 
 ## 2) Find work
@@ -25,7 +25,7 @@ br ready --format toon --limit 10
 ## 3) Claim + work
 
 ```bash
-br --json update bd-abc123 --status in_progress --claim
+br --json update br-abc123 --status in_progress --claim
 ```
 
 If Agent Mail file reservations are unavailable, make the degraded claim visible
@@ -33,8 +33,8 @@ before editing:
 
 ```bash
 export AGENT_NAME="${AGENT_NAME:-codex-agent}"
-br --json update bd-abc123 --status in_progress --assignee "$AGENT_NAME"
-br --json comments add bd-abc123 --author "$AGENT_NAME" \
+br --json update br-abc123 --status in_progress --assignee "$AGENT_NAME"
+br --json comments add br-abc123 --author "$AGENT_NAME" \
   --message "degraded-coordination: Agent Mail unavailable; files: src/foo.rs"
 git status --short
 br --json list --status in_progress
@@ -46,7 +46,7 @@ another active claim or dirty in the worktree.
 ## 4) Close + explain why
 
 ```bash
-br --json close bd-abc123 --reason "Implemented X; tests pass"
+br --json close br-abc123 --reason "Implemented X; tests pass"
 ```
 
 ## 5) Sync (end of session)
