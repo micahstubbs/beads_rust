@@ -7,6 +7,7 @@ use crate::cli::commands::{
 use crate::cli::{DeferArgs, UndeferArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::sanitize_terminal_inline;
 use crate::model::{Issue, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::IssueUpdate;
@@ -162,7 +163,11 @@ fn render_defer_output(
         render_defer_rich(deferred_issues, skipped_issues, ctx);
     } else {
         for deferred in deferred_issues {
-            print!("\u{23f1} Deferred {}: {}", deferred.id, deferred.title);
+            print!(
+                "\u{23f1} Deferred {}: {}",
+                deferred.id,
+                sanitize_terminal_inline(&deferred.title)
+            );
             if let Some(ref until) = deferred.defer_until {
                 println!(" (until {until})");
             } else {
@@ -170,7 +175,11 @@ fn render_defer_output(
             }
         }
         for skipped in skipped_issues {
-            println!("\u{2298} Skipped {}: {}", skipped.id, skipped.reason);
+            println!(
+                "\u{2298} Skipped {}: {}",
+                skipped.id,
+                sanitize_terminal_inline(&skipped.reason)
+            );
         }
         if deferred_issues.is_empty() && skipped_issues.is_empty() {
             println!("No issues to defer.");
@@ -413,11 +422,17 @@ fn render_undefer_output(
         for undeferred in undeferred_issues {
             println!(
                 "\u{2713} Undeferred {}: {} (now {})",
-                undeferred.id, undeferred.title, undeferred.status
+                undeferred.id,
+                sanitize_terminal_inline(&undeferred.title),
+                undeferred.status
             );
         }
         for skipped in skipped_issues {
-            println!("\u{2298} Skipped {}: {}", skipped.id, skipped.reason);
+            println!(
+                "\u{2298} Skipped {}: {}",
+                skipped.id,
+                sanitize_terminal_inline(&skipped.reason)
+            );
         }
         if undeferred_issues.is_empty() && skipped_issues.is_empty() {
             println!("No issues to undefer.");
@@ -625,7 +640,7 @@ fn render_defer_rich(deferred: &[DeferredIssue], skipped: &[SkippedIssue], ctx: 
             content.append_styled("Deferred ", theme.warning.clone());
             content.append_styled(&item.id, theme.emphasis.clone());
             content.append(": ");
-            content.append(&item.title);
+            content.append(sanitize_terminal_inline(&item.title).as_ref());
             content.append("\n");
             content.append_styled("  Status: ", theme.dimmed.clone());
             content.append_styled(&item.previous_status, theme.success.clone());
@@ -684,7 +699,7 @@ fn render_undefer_rich(
             content.append_styled("Undeferred ", theme.success.clone());
             content.append_styled(&item.id, theme.emphasis.clone());
             content.append(": ");
-            content.append(&item.title);
+            content.append(sanitize_terminal_inline(&item.title).as_ref());
             content.append("\n");
             content.append_styled("  Status: ", theme.dimmed.clone());
             content.append_styled(&item.previous_status, theme.warning.clone());

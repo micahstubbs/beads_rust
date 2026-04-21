@@ -11,6 +11,7 @@ use super::{
 use crate::cli::GraphArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::sanitize_terminal_inline;
 use crate::model::{DependencyType, Issue, Priority, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
@@ -458,7 +459,7 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
                             "{}{}: {} [P{}] [{}]{}{}",
                             indent,
                             node.id,
-                            node.title,
+                            sanitize_terminal_inline(&node.title),
                             node.priority,
                             node.status,
                             root_marker,
@@ -944,7 +945,7 @@ fn render_single_graph_plain(nodes: &[GraphNode], edges: &[(String, String)], ro
     println!(
         "  {}: {} [P{}] [{}] (root)",
         root_issue.id,
-        root_issue.title,
+        sanitize_terminal_inline(&root_issue.title),
         root_issue.priority.0,
         root_issue.status.as_str()
     );
@@ -954,7 +955,12 @@ fn render_single_graph_plain(nodes: &[GraphNode], edges: &[(String, String)], ro
         let parents = format_parent_list(parent_map.get(&node.id).map(Vec::as_slice));
         println!(
             "{}← {}: {} [P{}] [{}]{}",
-            indent, node.id, node.title, node.priority, node.status, parents
+            indent,
+            node.id,
+            sanitize_terminal_inline(&node.title),
+            node.priority,
+            node.status,
+            parents
         );
     }
 }
@@ -981,7 +987,10 @@ fn render_single_graph_rich(
     content.append_styled("Root: ", theme.dimmed.clone());
     content.append_styled(&root_issue.id, theme.issue_id.clone());
     content.append(" ");
-    content.append_styled(&root_issue.title, theme.emphasis.clone());
+    content.append_styled(
+        sanitize_terminal_inline(&root_issue.title).as_ref(),
+        theme.emphasis.clone(),
+    );
     content.append("\n\n");
 
     // Dependent count
@@ -1016,7 +1025,7 @@ fn render_single_graph_rich(
         content.append(" ");
 
         // Title
-        content.append(&node.title);
+        content.append(sanitize_terminal_inline(&node.title).as_ref());
         content.append(" ");
 
         // Priority badge
@@ -1057,7 +1066,7 @@ fn render_no_dependents_rich(root_id: &str, root_issue: &Issue, ctx: &OutputCont
     content.append_styled("● ", theme.success.clone());
     content.append_styled(root_id, theme.issue_id.clone());
     content.append(" ");
-    content.append(&root_issue.title);
+    content.append(sanitize_terminal_inline(&root_issue.title).as_ref());
     content.append("\n\n");
     content.append_styled("No dependents found", theme.dimmed.clone());
     content.append("\n");
@@ -1133,7 +1142,7 @@ fn render_all_graph_rich(
             let title = if UnicodeWidthStr::width(node.title.as_str()) > 40 {
                 crate::format::truncate_title(&node.title, 40)
             } else {
-                node.title.clone()
+                sanitize_terminal_inline(&node.title).into_owned()
             };
             content.append(&title);
             content.append(" ");

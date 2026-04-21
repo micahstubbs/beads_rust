@@ -334,7 +334,7 @@ fn print_text_output(
     storage: &crate::storage::SqliteStorage,
     max_width: usize,
 ) {
-    use crate::format::truncate_title;
+    use crate::format::{sanitize_terminal_inline, truncate_title};
 
     if blocked_issues.is_empty() {
         // Match bd format
@@ -352,7 +352,7 @@ fn print_text_output(
         let prefix_len = 10 + bi.issue.id.len();
         let title = if max_width == 0 {
             // No wrap - use full title
-            bi.issue.title.clone()
+            sanitize_terminal_inline(&bi.issue.title).into_owned()
         } else {
             // When wrapping, truncate for initial display
             truncate_title(&bi.issue.title, max_width.saturating_sub(prefix_len))
@@ -369,7 +369,7 @@ fn print_text_output(
                     let blocker_title = if max_width > 0 {
                         truncate_title(&blocker.title, max_width.saturating_sub(30))
                     } else {
-                        blocker.title.clone()
+                        sanitize_terminal_inline(&blocker.title).into_owned()
                     };
                     println!(
                         "    • {}: {} [P{}] [{}]",
@@ -411,7 +411,7 @@ fn render_blocked_rich(
     storage: &crate::storage::SqliteStorage,
     max_width: usize,
 ) {
-    use crate::format::truncate_title;
+    use crate::format::{sanitize_terminal_inline, truncate_title};
     use rich_rust::Text;
     use rich_rust::prelude::*;
 
@@ -458,7 +458,7 @@ fn render_blocked_rich(
             let available = max_width.saturating_sub(prefix_len + suffix_len);
             truncate_title(&bi.issue.title, available)
         } else {
-            bi.issue.title.clone()
+            sanitize_terminal_inline(&bi.issue.title).into_owned()
         };
 
         let mut line = Text::new("");
@@ -487,7 +487,7 @@ fn render_blocked_rich(
                     let blocker_title = if max_width > 0 {
                         truncate_title(&blocker.title, max_width.saturating_sub(40))
                     } else {
-                        blocker.title.clone()
+                        sanitize_terminal_inline(&blocker.title).into_owned()
                     };
                     blocker_line.append(": ");
                     blocker_line.append(&blocker_title);

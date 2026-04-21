@@ -8,6 +8,7 @@ use crate::cli::commands::auto_import_storage_ctx_if_stale;
 use crate::cli::commands::close::{self, CloseArgs};
 use crate::config;
 use crate::error::Result;
+use crate::format::sanitize_terminal_inline;
 use crate::model::{Issue, Status};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
 use crate::storage::ListFilters;
@@ -254,12 +255,13 @@ fn execute_inner(
                     idx + 1,
                     orphan.status,
                     orphan.issue_id,
-                    orphan.title
+                    sanitize_terminal_inline(&orphan.title)
                 );
                 if args.details {
                     println!(
                         "   Commit: {} {}",
-                        orphan.latest_commit, orphan.latest_commit_message
+                        sanitize_terminal_inline(&orphan.latest_commit),
+                        sanitize_terminal_inline(&orphan.latest_commit_message)
                     );
                 }
             }
@@ -270,7 +272,11 @@ fn execute_inner(
         println!();
         println!("Interactive close mode:");
         for orphan in &orphans {
-            print!("Close {} ({})? [y/N] ", orphan.issue_id, orphan.title);
+            print!(
+                "Close {} ({})? [y/N] ",
+                orphan.issue_id,
+                sanitize_terminal_inline(&orphan.title)
+            );
             io::stdout().flush()?;
 
             let mut input = String::new();

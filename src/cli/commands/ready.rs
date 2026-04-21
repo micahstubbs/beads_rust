@@ -285,10 +285,10 @@ fn format_ready_line(
         issue.id
     );
     let title = if wrap {
-        issue.title.clone()
+        crate::format::sanitize_terminal_inline(&issue.title).into_owned()
     } else {
         max_width.map_or_else(
-            || issue.title.clone(),
+            || crate::format::sanitize_terminal_inline(&issue.title).into_owned(),
             |width| {
                 let max_title = width.saturating_sub(UnicodeWidthStr::width(prefix_plain.as_str()));
                 truncate_title(&issue.title, max_title)

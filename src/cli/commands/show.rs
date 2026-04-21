@@ -6,6 +6,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{
     IssueDetails, IssueWithDependencyMetadata, format_priority_label, format_status_icon_colored,
+    sanitize_terminal_inline, sanitize_terminal_text,
 };
 use crate::model::{Dependency, Issue, Priority, Status};
 use crate::output::{IssuePanel, OutputContext, OutputMode};
@@ -691,12 +692,13 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
     let status_icon = format_status_icon_colored(&issue.status, use_color);
     let priority_label = format_priority_label(&issue.priority, use_color);
     let status_upper = issue.status.as_str().to_uppercase();
+    let title = sanitize_terminal_inline(&issue.title);
 
     // Match bd format: {status_icon} {id} · {title}   [● {priority} · {STATUS}]
     let _ = writeln!(
         output,
         "{} {} · {}   [● {} · {}]",
-        status_icon, issue.id, issue.title, priority_label, status_upper
+        status_icon, issue.id, title, priority_label, status_upper
     );
 
     // Owner/Type line: Owner: {owner} · Type: {type}
@@ -704,6 +706,7 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
         .owner
         .clone()
         .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "unknown".to_string()));
+    let owner = sanitize_terminal_inline(&owner);
     let _ = writeln!(
         output,
         "Owner: {} · Type: {}",
@@ -720,17 +723,23 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
     );
 
     if let Some(assignee) = &issue.assignee {
-        let _ = writeln!(output, "Assignee: {assignee}");
+        let _ = writeln!(output, "Assignee: {}", sanitize_terminal_inline(assignee));
     }
 
     if !details.labels.is_empty() {
-        let _ = writeln!(output, "Labels: {}", details.labels.join(", "));
+        let labels = details
+            .labels
+            .iter()
+            .map(|label| sanitize_terminal_inline(label).into_owned())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(output, "Labels: {labels}");
     }
 
     if let Some(ext_ref) = &issue.external_ref
         && !ext_ref.is_empty()
     {
-        let _ = writeln!(output, "Ref: {ext_ref}");
+        let _ = writeln!(output, "Ref: {}", sanitize_terminal_inline(ext_ref));
     }
 
     if let Some(due) = &issue.due_at {
@@ -761,13 +770,13 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
             output,
             "Closed: {} ({})",
             closed.format("%Y-%m-%d"),
-            reason_str
+            sanitize_terminal_inline(reason_str)
         );
     }
 
     if let Some(desc) = &issue.description {
         output.push('\n');
-        let _ = writeln!(output, "{desc}");
+        let _ = writeln!(output, "{}", sanitize_terminal_text(desc));
     }
 
     if let Some(design) = &issue.design
@@ -775,7 +784,7 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
     {
         output.push('\n');
         let _ = writeln!(output, "Design:");
-        let _ = writeln!(output, "{design}");
+        let _ = writeln!(output, "{}", sanitize_terminal_text(design));
     }
 
     if let Some(ac) = &issue.acceptance_criteria
@@ -783,7 +792,7 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
     {
         output.push('\n');
         let _ = writeln!(output, "Acceptance Criteria:");
-        let _ = writeln!(output, "{ac}");
+        let _ = writeln!(output, "{}", sanitize_terminal_text(ac));
     }
 
     if let Some(notes) = &issue.notes
@@ -791,14 +800,20 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
     {
         output.push('\n');
         let _ = writeln!(output, "Notes:");
-        let _ = writeln!(output, "{notes}");
+        let _ = writeln!(output, "{}", sanitize_terminal_text(notes));
     }
 
     if !details.dependencies.is_empty() {
         output.push('\n');
         let _ = writeln!(output, "Dependencies:");
         for dep in &details.dependencies {
-            let _ = writeln!(output, "  -> {} ({}) - {}", dep.id, dep.dep_type, dep.title);
+            let _ = writeln!(
+                output,
+                "  -> {} ({}) - {}",
+                sanitize_terminal_inline(&dep.id),
+                dep.dep_type,
+                sanitize_terminal_inline(&dep.title)
+            );
         }
     }
 
@@ -806,7 +821,13 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
         output.push('\n');
         let _ = writeln!(output, "Dependents:");
         for dep in &details.dependents {
-            let _ = writeln!(output, "  <- {} ({}) - {}", dep.id, dep.dep_type, dep.title);
+            let _ = writeln!(
+                output,
+                "  <- {} ({}) - {}",
+                sanitize_terminal_inline(&dep.id),
+                dep.dep_type,
+                sanitize_terminal_inline(&dep.title)
+            );
         }
     }
 
@@ -818,8 +839,8 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
                 output,
                 "  [{}] {}: {}",
                 comment.created_at.format("%Y-%m-%d %H:%M UTC"),
-                comment.author,
-                comment.body
+                sanitize_terminal_inline(&comment.author),
+                sanitize_terminal_text(&comment.body)
             );
         }
     }

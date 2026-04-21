@@ -10,6 +10,7 @@ use crate::cli::commands::{
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::sanitize_terminal_inline;
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::util::id::{IdResolver, ResolverConfig};
@@ -232,7 +233,7 @@ pub fn execute(
                     .storage
                     .get_issue(id)?
                     .ok_or_else(|| BeadsError::IssueNotFound { id: id.clone() })?;
-                println!("  - {}: {}", id, issue.title);
+                println!("  - {}: {}", id, sanitize_terminal_inline(&issue.title));
             }
             if !cascade_ids.is_empty() {
                 println!(
@@ -828,7 +829,7 @@ fn render_dependents_warning_rich(
         content.append_styled(dep_id, theme.issue_id.clone());
         if let Some(issue) = issues_by_id.get(dep_id) {
             content.append_styled(": ", theme.dimmed.clone());
-            content.append(&issue.title);
+            content.append(sanitize_terminal_inline(&issue.title).as_ref());
         }
         content.append("\n");
     }
@@ -853,7 +854,7 @@ fn render_dependents_warning_rich(
             content.append_styled(dep_id, theme.issue_id.clone());
             if let Some(issue) = issues_by_id.get(*dep_id) {
                 content.append_styled(": ", theme.dimmed.clone());
-                content.append(&issue.title);
+                content.append(sanitize_terminal_inline(&issue.title).as_ref());
             }
             content.append("\n");
         }
@@ -920,7 +921,7 @@ fn render_dry_run_rich(
         content.append_styled(id, theme.issue_id.clone());
         if let Some(issue) = issues_by_id.get(id) {
             content.append_styled(": ", theme.dimmed.clone());
-            content.append(&issue.title);
+            content.append(sanitize_terminal_inline(&issue.title).as_ref());
         }
         content.append("\n");
     }
@@ -937,7 +938,7 @@ fn render_dry_run_rich(
             content.append_styled(id, theme.issue_id.clone());
             if let Some(issue) = issues_by_id.get(id) {
                 content.append_styled(": ", theme.dimmed.clone());
-                content.append(&issue.title);
+                content.append(sanitize_terminal_inline(&issue.title).as_ref());
             }
             content.append("\n");
         }
@@ -955,7 +956,7 @@ fn render_dry_run_rich(
             content.append_styled(id, theme.issue_id.clone());
             if let Some(issue) = issues_by_id.get(id) {
                 content.append_styled(": ", theme.dimmed.clone());
-                content.append(&issue.title);
+                content.append(sanitize_terminal_inline(&issue.title).as_ref());
             }
             content.append("\n");
         }
@@ -999,7 +1000,7 @@ fn render_delete_result_rich(result: &DeleteResult, storage: &SqliteStorage, ctx
         content.append_styled(id, theme.issue_id.clone());
         if let Some(issue) = issues_by_id.get(id) {
             content.append_styled(": ", theme.dimmed.clone());
-            content.append(&issue.title);
+            content.append(sanitize_terminal_inline(&issue.title).as_ref());
         }
         content.append("\n");
     }
@@ -1030,7 +1031,7 @@ fn render_delete_result_rich(result: &DeleteResult, storage: &SqliteStorage, ctx
             content.append_styled(id, theme.issue_id.clone());
             if let Some(issue) = issues_by_id.get(id) {
                 content.append_styled(": ", theme.dimmed.clone());
-                content.append(&issue.title);
+                content.append(sanitize_terminal_inline(&issue.title).as_ref());
             }
             content.append("\n");
         }

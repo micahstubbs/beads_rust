@@ -1,3 +1,4 @@
+use crate::format::sanitize_terminal_inline;
 use crate::model::Issue;
 use crate::output::Theme;
 use rich_rust::prelude::*;
@@ -73,6 +74,9 @@ impl<'a> DependencyTree<'a> {
 }
 
 fn truncate(s: &str, max: usize) -> String {
+    let s = sanitize_terminal_inline(s);
+    let s = s.as_ref();
+
     let width = UnicodeWidthStr::width(s);
     if width <= max {
         s.to_string()

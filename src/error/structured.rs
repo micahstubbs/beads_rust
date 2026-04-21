@@ -19,6 +19,7 @@
 #![allow(clippy::option_if_let_else, clippy::manual_map, clippy::manual_find)]
 
 use crate::error::BeadsError;
+use crate::format::sanitize_terminal_text;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -506,7 +507,7 @@ impl StructuredError {
             output.push_str("Error: ");
         }
 
-        output.push_str(&self.message);
+        output.push_str(&sanitize_terminal_text(&self.message));
 
         if let Some(hint) = &self.hint {
             output.push('\n');
@@ -516,7 +517,7 @@ impl StructuredError {
             } else {
                 output.push_str("Hint: ");
             }
-            output.push_str(hint);
+            output.push_str(&sanitize_terminal_text(hint));
         }
 
         output

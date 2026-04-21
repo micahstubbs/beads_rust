@@ -1,5 +1,6 @@
 use super::Theme;
 use crate::cli::{Cli, InheritedOutputMode, OutputFormat, command_requests_robot_json};
+use crate::format::{sanitize_terminal_inline, sanitize_terminal_text};
 use rich_rust::prelude::*;
 use rich_rust::renderables::Renderable;
 use serde::Serialize;
@@ -213,18 +214,23 @@ impl OutputContext {
     // ─────────────────────────────────────────────────────────────
 
     pub fn print(&self, content: &str) {
+        let content = sanitize_terminal_text(content);
         match self.mode {
             OutputMode::Rich | OutputMode::Plain => {
-                self.console().print(content);
+                self.console()
+                    .print_renderable(&Text::new(content.into_owned()));
             }
             OutputMode::Quiet | OutputMode::Json | OutputMode::Toon => {} // No console access - zero overhead
         }
     }
 
     pub fn print_line(&self, content: &str) {
+        let content = sanitize_terminal_text(content);
         match self.mode {
             OutputMode::Rich => {
-                self.console().print(&format!("{content}\n"));
+                let mut text = Text::new(content.into_owned());
+                text.append("\n");
+                self.console().print_renderable(&text);
             }
             OutputMode::Plain => println!("{content}"),
             OutputMode::Quiet | OutputMode::Json | OutputMode::Toon => {}
@@ -365,10 +371,15 @@ impl OutputContext {
     // ─────────────────────────────────────────────────────────────
 
     pub fn success(&self, message: &str) {
+        let message = sanitize_terminal_inline(message);
         match self.mode {
             OutputMode::Rich => {
-                self.console()
-                    .print(&format!("[bold green]✓[/] {}\n", message));
+                let mut text = Text::new("");
+                text.append_styled("✓", self.theme().success.clone().bold());
+                text.append(" ");
+                text.append(message.as_ref());
+                text.append("\n");
+                self.console().print_renderable(&text);
             }
             OutputMode::Plain => println!("✓ {}", message),
             OutputMode::Quiet | OutputMode::Json | OutputMode::Toon => {} //
@@ -376,9 +387,10 @@ impl OutputContext {
     }
 
     pub fn error(&self, message: &str) {
+        let message = sanitize_terminal_text(message);
         match self.mode {
             OutputMode::Rich => {
-                let panel = Panel::from_text(message)
+                let panel = Panel::from_text(message.as_ref())
                     .title(Text::new("Error"))
                     .border_style(self.theme().error.clone());
                 self.console().print_renderable(&panel);
@@ -389,10 +401,15 @@ impl OutputContext {
     }
 
     pub fn warning(&self, message: &str) {
+        let message = sanitize_terminal_inline(message);
         match self.mode {
             OutputMode::Rich => {
-                self.console()
-                    .print(&format!("[bold yellow]⚠[/] [yellow]{}[/]\n", message));
+                let mut text = Text::new("");
+                text.append_styled("⚠", self.theme().warning.clone().bold());
+                text.append(" ");
+                text.append_styled(message.as_ref(), self.theme().warning.clone());
+                text.append("\n");
+                self.console().print_renderable(&text);
             }
             OutputMode::Plain => eprintln!("Warning: {}", message),
             OutputMode::Quiet | OutputMode::Json | OutputMode::Toon => {} //
@@ -400,9 +417,15 @@ impl OutputContext {
     }
 
     pub fn info(&self, message: &str) {
+        let message = sanitize_terminal_inline(message);
         match self.mode {
             OutputMode::Rich => {
-                self.console().print(&format!("[blue]ℹ[/] {}\n", message));
+                let mut text = Text::new("");
+                text.append_styled("ℹ", self.theme().info.clone());
+                text.append(" ");
+                text.append(message.as_ref());
+                text.append("\n");
+                self.console().print_renderable(&text);
             }
             OutputMode::Plain => println!("{}", message),
             OutputMode::Quiet | OutputMode::Json | OutputMode::Toon => {} //
@@ -410,8 +433,10 @@ impl OutputContext {
     }
 
     pub fn section(&self, title: &str) {
+        let title = sanitize_terminal_inline(title);
         if self.is_rich() {
-            let rule = Rule::with_title(Text::new(title)).style(self.theme().section.clone());
+            let rule =
+                Rule::with_title(Text::new(title.into_owned())).style(self.theme().section.clone());
             self.console().print_renderable(&rule);
         } else if self.is_plain() {
             println!("\n─── {} ───\n", title);
@@ -425,23 +450,25 @@ impl OutputContext {
     }
 
     pub fn error_panel(&self, title: &str, description: &str, suggestions: &[&str]) {
+        let title = sanitize_terminal_inline(title);
+        let description = sanitize_terminal_text(description);
         match self.mode {
             OutputMode::Rich => {
-                let mut text = Text::from(description);
+                let mut text = Text::from(description.as_ref());
                 text.append("\n\nSuggestions:\n");
                 for suggestion in suggestions {
-                    text.append(&format!("• {}\n", suggestion));
+                    text.append(&format!("• {}\n", sanitize_terminal_inline(suggestion)));
                 }
 
                 let panel = Panel::from_rich_text(&text, self.width())
-                    .title(Text::new(title))
+                    .title(Text::new(title.as_ref()))
                     .border_style(self.theme().error.clone());
                 self.console().print_renderable(&panel);
             }
             OutputMode::Plain => {
                 eprintln!("Error: {} - {}", title, description);
                 for suggestion in suggestions {
-                    eprintln!("  Suggestion: {}", suggestion);
+                    eprintln!("  Suggestion: {}", sanitize_terminal_inline(suggestion));
                 }
             }
             OutputMode::Quiet => eprintln!("Error: {}", description),

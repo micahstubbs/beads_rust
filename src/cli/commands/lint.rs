@@ -8,6 +8,7 @@ use super::{
 use crate::cli::LintArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::sanitize_terminal_inline;
 use crate::model::{Issue, IssueType, Status};
 use crate::output::OutputContext;
 use crate::storage::{ListFilters, SqliteStorage};
@@ -155,7 +156,12 @@ pub fn execute(
             summary.warnings
         );
         for result in &summary.results {
-            println!("{} [{}]: {}", result.id, result.issue_type, result.title);
+            println!(
+                "{} [{}]: {}",
+                result.id,
+                result.issue_type,
+                sanitize_terminal_inline(&result.title)
+            );
             for suggestion in &result.suggestions {
                 println!("  ⚠ Missing: {} - {}", suggestion.section, suggestion.hint);
             }
@@ -213,7 +219,10 @@ fn render_lint_rich(summary: &LintSummary, ctx: &OutputContext) {
                     &format!("[{}] ", result.issue_type),
                     issue_type_style(theme, &result.issue_type),
                 );
-                content.append_styled(&result.title, theme.issue_title.clone());
+                content.append_styled(
+                    sanitize_terminal_inline(&result.title).as_ref(),
+                    theme.issue_title.clone(),
+                );
                 content.append("\n");
 
                 for suggestion in &result.suggestions {

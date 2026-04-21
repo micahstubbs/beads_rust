@@ -6,6 +6,7 @@
 use crate::cli::ChangelogArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::sanitize_terminal_inline;
 use crate::model::{Issue, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::ListFilters;
@@ -236,7 +237,12 @@ fn print_text_output(output: &ChangelogOutput) {
         println!();
         println!("{}:", group.label);
         for entry in &group.issues {
-            println!("- [{}] {} {}", entry.priority, entry.id, entry.title);
+            println!(
+                "- [{}] {} {}",
+                entry.priority,
+                entry.id,
+                sanitize_terminal_inline(&entry.title)
+            );
         }
     }
 }
@@ -265,7 +271,7 @@ fn render_changelog_rich(output: &ChangelogOutput, ctx: &OutputContext) {
             // Issue entries
             for entry in &group.issues {
                 content.append_styled("  • ", theme.dimmed.clone());
-                content.append(&entry.title);
+                content.append(sanitize_terminal_inline(&entry.title).as_ref());
                 content.append_styled(&format!(" ({})", entry.id), theme.issue_id.clone());
                 content.append("\n");
             }

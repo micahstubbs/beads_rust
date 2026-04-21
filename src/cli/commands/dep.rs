@@ -10,7 +10,7 @@ use crate::cli::{
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::format::truncate_title;
+use crate::format::{sanitize_terminal_inline, truncate_title};
 use crate::model::DependencyType;
 use crate::output::{OutputContext, OutputMode, Theme};
 use crate::storage::SqliteStorage;
@@ -969,7 +969,12 @@ fn dep_tree(
             };
             ctx.print_line(&format!(
                 "{}{}{}: {} [P{}] [{}]",
-                indent, prefix, node.id, node.title, node.priority, node.status
+                indent,
+                prefix,
+                node.id,
+                sanitize_terminal_inline(&node.title),
+                node.priority,
+                node.status
             ));
         }
     }

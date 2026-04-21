@@ -7,6 +7,7 @@ use super::{
 use crate::cli::{CommentAddArgs, CommentCommands, CommentsArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::{sanitize_terminal_inline, sanitize_terminal_text};
 use crate::model::Comment;
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
@@ -197,8 +198,15 @@ fn list_comments_by_id(
     println!("Comments for {issue_id}:");
     for comment in comments {
         let timestamp = comment.created_at.format("%Y-%m-%d %H:%M UTC");
-        println!("[{}] at {}", comment.author, timestamp);
-        println!("{}", comment.body.trim_end_matches('\n'));
+        println!(
+            "[{}] at {}",
+            sanitize_terminal_inline(&comment.author),
+            timestamp
+        );
+        println!(
+            "{}",
+            sanitize_terminal_text(comment.body.trim_end_matches('\n'))
+        );
         println!();
     }
 
@@ -241,7 +249,10 @@ fn render_comments_list_rich(
         }
 
         // Author and timestamp
-        content.append_styled(&format!("@{}", comment.author), theme.username.clone());
+        content.append_styled(
+            &format!("@{}", sanitize_terminal_inline(&comment.author)),
+            theme.username.clone(),
+        );
         content.append_styled(" \u{2022} ", theme.dimmed.clone());
         content.append_styled(
             &format_relative_time(comment.created_at, now),
@@ -250,7 +261,7 @@ fn render_comments_list_rich(
         content.append("\n");
 
         // Comment body
-        content.append(comment.body.trim_end_matches('\n'));
+        content.append(sanitize_terminal_text(comment.body.trim_end_matches('\n')).as_ref());
         content.append("\n\n");
     }
 
@@ -295,10 +306,13 @@ fn render_comment_added_rich(issue_id: &str, comment: &Comment, ctx: &OutputCont
 
     // Show the comment that was added
     let mut comment_text = Text::new("");
-    comment_text.append_styled(&format!("@{}", comment.author), theme.username.clone());
+    comment_text.append_styled(
+        &format!("@{}", sanitize_terminal_inline(&comment.author)),
+        theme.username.clone(),
+    );
     comment_text.append_styled(" \u{2022} just now", theme.timestamp.clone());
     comment_text.append("\n");
-    comment_text.append(comment.body.trim_end_matches('\n'));
+    comment_text.append(sanitize_terminal_text(comment.body.trim_end_matches('\n')).as_ref());
     console.print_renderable(&comment_text);
 }
 

@@ -7,6 +7,7 @@ use super::{
 use crate::cli::{AuditCommands, AuditLabelArgs, AuditLogArgs, AuditRecordArgs, AuditSummaryArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::{sanitize_terminal_inline, sanitize_terminal_text};
 use crate::model::EventType;
 use crate::output::{OutputContext, Theme};
 use crate::sync::require_valid_sync_path;
@@ -607,7 +608,10 @@ fn render_audit_log_rich(issue_id: &str, events: &[crate::model::Event], ctx: &O
         let time_str = event.created_at.format("%Y-%m-%d %H:%M").to_string();
         content.append_styled(&time_str, theme.dimmed.clone());
         content.append("  ");
-        content.append_styled(&format!("@{:<10}", event.actor), theme.accent.clone());
+        content.append_styled(
+            &format!("@{:<10}", sanitize_terminal_inline(&event.actor)),
+            theme.accent.clone(),
+        );
         content.append("  ");
 
         // Event Type
@@ -619,12 +623,16 @@ fn render_audit_log_rich(issue_id: &str, events: &[crate::model::Event], ctx: &O
         let mut details = String::new();
         if let Some(old) = &event.old_value {
             if let Some(new) = &event.new_value {
-                details.push_str(&format!("   {old} → {new}"));
+                details.push_str(&format!(
+                    "   {} → {}",
+                    sanitize_terminal_inline(old),
+                    sanitize_terminal_inline(new)
+                ));
             } else {
-                details.push_str(&format!("   Removed: {old}"));
+                details.push_str(&format!("   Removed: {}", sanitize_terminal_inline(old)));
             }
         } else if let Some(new) = &event.new_value {
-            details.push_str(&format!("   Set: {new}"));
+            details.push_str(&format!("   Set: {}", sanitize_terminal_inline(new)));
         }
 
         if !details.is_empty() {
@@ -633,7 +641,10 @@ fn render_audit_log_rich(issue_id: &str, events: &[crate::model::Event], ctx: &O
         }
 
         if let Some(comment) = &event.comment {
-            content.append_styled(&format!("   \"{comment}\"\n"), theme.comment.clone());
+            content.append_styled(
+                &format!("   \"{}\"\n", sanitize_terminal_text(comment)),
+                theme.comment.clone(),
+            );
         }
 
         content.append("\n");
@@ -657,22 +668,26 @@ fn render_audit_log_plain(issue_id: &str, events: &[crate::model::Event]) {
         println!(
             "{}  @{:<10}  {}",
             event.created_at.format("%Y-%m-%d %H:%M"),
-            event.actor,
+            sanitize_terminal_inline(&event.actor),
             event.event_type.as_str()
         );
 
         if let Some(old) = &event.old_value {
             if let Some(new) = &event.new_value {
-                println!("   {} -> {}", old, new);
+                println!(
+                    "   {} -> {}",
+                    sanitize_terminal_inline(old),
+                    sanitize_terminal_inline(new)
+                );
             } else {
-                println!("   Removed: {}", old);
+                println!("   Removed: {}", sanitize_terminal_inline(old));
             }
         } else if let Some(new) = &event.new_value {
-            println!("   Set: {}", new);
+            println!("   Set: {}", sanitize_terminal_inline(new));
         }
 
         if let Some(comment) = &event.comment {
-            println!("   \"{}\"", comment);
+            println!("   \"{}\"", sanitize_terminal_text(comment));
         }
         println!();
     }

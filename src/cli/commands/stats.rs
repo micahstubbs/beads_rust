@@ -7,7 +7,8 @@ use crate::cli::{OutputFormat, StatsArgs, resolve_output_format_basic_with_outer
 use crate::config;
 use crate::error::Result;
 use crate::format::{
-    Breakdown, BreakdownEntry, RecentActivity, Statistics, StatsSummary, truncate_title,
+    Breakdown, BreakdownEntry, RecentActivity, Statistics, StatsSummary, sanitize_terminal_inline,
+    truncate_title,
 };
 use crate::model::{Issue, IssueType, Status};
 use crate::output::{OutputContext, OutputMode};
@@ -938,7 +939,11 @@ fn print_text_output(output: &Statistics) {
     for breakdown in &output.breakdowns {
         println!("\nBy {}:", breakdown.dimension);
         for entry in &breakdown.counts {
-            println!("  {}: {}", entry.key, entry.count);
+            println!(
+                "  {}: {}",
+                sanitize_terminal_inline(&entry.key),
+                entry.count
+            );
         }
     }
 

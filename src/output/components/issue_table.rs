@@ -1,4 +1,4 @@
-use crate::format::truncate_title;
+use crate::format::{sanitize_terminal_inline, sanitize_terminal_text, truncate_title};
 use crate::model::Issue;
 use crate::output::Theme;
 use regex::{Regex, RegexBuilder};
@@ -214,7 +214,7 @@ impl<'a> IssueTable<'a> {
             }
             if self.columns.title {
                 let title = if self.wrap {
-                    issue.title.clone()
+                    sanitize_terminal_inline(&issue.title).into_owned()
                 } else {
                     truncate_title(&issue.title, title_max_width)
                 };
@@ -223,13 +223,28 @@ impl<'a> IssueTable<'a> {
             }
             if self.columns.assignee {
                 cells.push(
-                    Cell::new(Text::new(issue.assignee.clone().unwrap_or_default()))
-                        .style(self.theme.username.clone()),
+                    Cell::new(Text::new(
+                        issue
+                            .assignee
+                            .as_deref()
+                            .map_or_else(String::new, |assignee| {
+                                sanitize_terminal_inline(assignee).into_owned()
+                            }),
+                    ))
+                    .style(self.theme.username.clone()),
                 );
             }
             if self.columns.labels {
                 cells.push(
-                    Cell::new(Text::new(issue.labels.join(", "))).style(self.theme.label.clone()),
+                    Cell::new(Text::new(
+                        issue
+                            .labels
+                            .iter()
+                            .map(|label| sanitize_terminal_inline(label).into_owned())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    ))
+                    .style(self.theme.label.clone()),
                 );
             }
             if self.columns.created {
@@ -250,7 +265,12 @@ impl<'a> IssueTable<'a> {
                     .as_ref()
                     .and_then(|snippets| snippets.get(&issue.id))
                     .map_or("", String::as_str);
-                let snippet_text = highlight_text(snippet, highlight_regex.as_ref(), self.theme);
+                let sanitized_snippet = sanitize_terminal_text(snippet);
+                let snippet_text = highlight_text(
+                    sanitized_snippet.as_ref(),
+                    highlight_regex.as_ref(),
+                    self.theme,
+                );
                 cells.push(Cell::new(snippet_text).style(self.theme.muted.clone()));
             }
 

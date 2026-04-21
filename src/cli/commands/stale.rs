@@ -1,7 +1,7 @@
 use crate::cli::StaleArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::format::StaleIssue;
+use crate::format::{StaleIssue, sanitize_terminal_inline};
 use crate::model::{Issue, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
@@ -102,7 +102,7 @@ fn execute_inner(args: &StaleArgs, ctx: &OutputContext, storage: &SqliteStorage)
                     status,
                     days_stale,
                     issue.id,
-                    issue.title
+                    sanitize_terminal_inline(&issue.title)
                 );
             } else {
                 println!(
@@ -111,7 +111,7 @@ fn execute_inner(args: &StaleArgs, ctx: &OutputContext, storage: &SqliteStorage)
                     status,
                     days_stale,
                     issue.id,
-                    issue.title
+                    sanitize_terminal_inline(&issue.title)
                 );
             }
         }
@@ -191,11 +191,17 @@ fn render_stale_rich(
         line.append(" ");
 
         // Title
-        line.append_styled(&issue.title, theme.issue_title.clone());
+        line.append_styled(
+            sanitize_terminal_inline(&issue.title).as_ref(),
+            theme.issue_title.clone(),
+        );
 
         // Assignee if present
         if let Some(ref assignee) = issue.assignee {
-            line.append_styled(&format!(" (@{})", assignee), theme.dimmed.clone());
+            line.append_styled(
+                &format!(" (@{})", sanitize_terminal_inline(assignee)),
+                theme.dimmed.clone(),
+            );
         }
 
         ctx.render(&line);

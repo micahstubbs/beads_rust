@@ -1,4 +1,6 @@
-use crate::format::{IssueDetails, IssueWithDependencyMetadata};
+use crate::format::{
+    IssueDetails, IssueWithDependencyMetadata, sanitize_terminal_inline, sanitize_terminal_text,
+};
 use crate::model::{Comment, Dependency, Issue};
 use crate::output::{OutputContext, Theme};
 use rich_rust::prelude::*;
@@ -75,13 +77,19 @@ impl<'a> IssuePanel<'a> {
         );
 
         // Title
-        content.append_styled(&self.issue.title, self.theme.issue_title.clone());
+        content.append_styled(
+            sanitize_terminal_inline(&self.issue.title).as_ref(),
+            self.theme.issue_title.clone(),
+        );
         content.append("\n");
 
         // Description
         if let Some(ref desc) = self.issue.description {
             content.append("\n");
-            content.append_styled(desc, self.theme.issue_description.clone());
+            content.append_styled(
+                sanitize_terminal_text(desc).as_ref(),
+                self.theme.issue_description.clone(),
+            );
             content.append("\n");
         }
 
@@ -94,7 +102,10 @@ impl<'a> IssuePanel<'a> {
         // Assignee
         if let Some(ref assignee) = self.issue.assignee {
             content.append_styled("Assignee: ", self.theme.dimmed.clone());
-            content.append_styled(&format!("{}\n", assignee), self.theme.username.clone());
+            content.append_styled(
+                &format!("{}\n", sanitize_terminal_inline(assignee)),
+                self.theme.username.clone(),
+            );
         }
 
         // Labels
@@ -107,7 +118,10 @@ impl<'a> IssuePanel<'a> {
                 if i > 0 {
                     content.append(", ");
                 }
-                content.append_styled(label, self.theme.label.clone());
+                content.append_styled(
+                    sanitize_terminal_inline(label).as_ref(),
+                    self.theme.label.clone(),
+                );
             }
             content.append("\n");
         }
@@ -184,9 +198,15 @@ impl<'a> IssuePanel<'a> {
                 self.theme.timestamp.clone(),
             );
             content.append(" ");
-            content.append_styled(&comment.author, self.theme.username.clone());
+            content.append_styled(
+                sanitize_terminal_inline(&comment.author).as_ref(),
+                self.theme.username.clone(),
+            );
             content.append_styled(": ", self.theme.dimmed.clone());
-            content.append_styled(&comment.body, self.theme.comment.clone());
+            content.append_styled(
+                sanitize_terminal_text(&comment.body).as_ref(),
+                self.theme.comment.clone(),
+            );
             content.append("\n");
         }
     }
@@ -230,7 +250,10 @@ fn render_dependency_list(
             theme.status_style(&dep.status),
         );
         content.append(" ");
-        content.append_styled(&dep.title, theme.issue_title.clone());
+        content.append_styled(
+            sanitize_terminal_inline(&dep.title).as_ref(),
+            theme.issue_title.clone(),
+        );
         content.append(" ");
         content.append_styled(&format!("({})", dep.dep_type), theme.muted.clone());
         content.append("\n");

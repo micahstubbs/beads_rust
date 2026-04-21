@@ -8,6 +8,7 @@ use crate::cli::commands::{
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::sanitize_terminal_inline;
 use crate::model::Status;
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::IssueUpdate;
@@ -152,7 +153,11 @@ pub fn execute(
         );
     } else {
         for reopened in &reopened_issues {
-            print!("\u{2713} Reopened {}: {}", reopened.id, reopened.title);
+            print!(
+                "\u{2713} Reopened {}: {}",
+                reopened.id,
+                sanitize_terminal_inline(&reopened.title)
+            );
             if let Some(ref reason) = args.reason {
                 println!(" ({reason})");
             } else {
@@ -160,7 +165,11 @@ pub fn execute(
             }
         }
         for skipped in &skipped_issues {
-            println!("\u{2298} Skipped {}: {}", skipped.id, skipped.reason);
+            println!(
+                "\u{2298} Skipped {}: {}",
+                skipped.id,
+                sanitize_terminal_inline(&skipped.reason)
+            );
         }
         if reopened_issues.is_empty() && skipped_issues.is_empty() {
             println!("No issues to reopen.");
@@ -386,7 +395,7 @@ fn render_reopen_rich(
             content.append_styled("Reopened ", theme.success.clone());
             content.append_styled(&item.id, theme.emphasis.clone());
             content.append(": ");
-            content.append(&item.title);
+            content.append(sanitize_terminal_inline(&item.title).as_ref());
             if let Some(r) = reason {
                 content.append_styled(&format!(" ({r})"), theme.dimmed.clone());
             }

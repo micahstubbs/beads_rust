@@ -1,6 +1,7 @@
 use crate::cli::QuickArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::sanitize_terminal_inline;
 use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::util::id::{IdGenerator, IdResolver, ResolverConfig, child_id};
@@ -238,7 +239,7 @@ fn render_quick_created_rich(id: &str, title: &str, ctx: &OutputContext) {
     content.append_styled(id, theme.emphasis.clone());
     content.append("\n");
     content.append_styled("  \"", theme.dimmed.clone());
-    content.append(title);
+    content.append(sanitize_terminal_inline(title).as_ref());
     content.append_styled("\"", theme.dimmed.clone());
     content.append("\n");
 

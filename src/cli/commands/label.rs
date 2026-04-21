@@ -9,6 +9,7 @@ use super::{
 use crate::cli::{LabelAddArgs, LabelCommands, LabelListArgs, LabelRemoveArgs, LabelRenameArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::sanitize_terminal_inline;
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
 use crate::util::id::{IdResolver, ResolverConfig};
@@ -354,25 +355,29 @@ fn render_label_action_results(
                 ("add", "added") => {
                     println!(
                         "\u{2713} Added label {} to {}",
-                        result.label, result.issue_id
+                        sanitize_terminal_inline(&result.label),
+                        result.issue_id
                     );
                 }
                 ("add", _) => {
                     println!(
                         "\u{2713} Label {} already exists on {}",
-                        result.label, result.issue_id
+                        sanitize_terminal_inline(&result.label),
+                        result.issue_id
                     );
                 }
                 ("remove", "removed") => {
                     println!(
                         "\u{2713} Removed label {} from {}",
-                        result.label, result.issue_id
+                        sanitize_terminal_inline(&result.label),
+                        result.issue_id
                     );
                 }
                 ("remove", _) => {
                     println!(
                         "\u{2713} Label {} not found on {} (no-op)",
-                        result.label, result.issue_id
+                        sanitize_terminal_inline(&result.label),
+                        result.issue_id
                     );
                 }
                 _ => {}
@@ -406,7 +411,7 @@ fn label_list(
         } else {
             println!("Labels for {issue_id}:");
             for label in &labels {
-                println!("  {label}");
+                println!("  {}", sanitize_terminal_inline(label));
             }
         }
     } else {
@@ -427,7 +432,7 @@ fn label_list(
         } else {
             println!("Labels ({} total):", unique_labels.len());
             for label in &unique_labels {
-                println!("  {label}");
+                println!("  {}", sanitize_terminal_inline(label));
             }
         }
     }
@@ -461,7 +466,7 @@ fn label_list_all(storage: &SqliteStorage, _json: bool, ctx: &OutputContext) -> 
         for lc in &label_counts {
             println!(
                 "  {} ({} issue{})",
-                lc.label,
+                sanitize_terminal_inline(&lc.label),
                 lc.count,
                 if lc.count == 1 { "" } else { "s" }
             );
@@ -503,7 +508,7 @@ fn label_rename(
         } else {
             println!(
                 "Label '{}' already has that name; no changes made.",
-                args.old_name
+                sanitize_terminal_inline(&args.old_name)
             );
         }
         return Ok(());
@@ -677,7 +682,7 @@ fn render_label_action_results_rich(
 
         text.append_styled(&format!("{icon} {verb} label "), style);
         text.append_styled(
-            &result.label,
+            sanitize_terminal_inline(&result.label).as_ref(),
             Style::new().color(label_color(&result.label)),
         );
         text.append(if action == "add" { " on " } else { " from " });
@@ -712,7 +717,10 @@ fn render_labels_for_issue_rich(issue_id: &str, labels: &[String], ctx: &OutputC
         if i > 0 {
             label_line.append("  ");
         }
-        label_line.append_styled(label, Style::new().color(label_color(label)));
+        label_line.append_styled(
+            sanitize_terminal_inline(label).as_ref(),
+            Style::new().color(label_color(label)),
+        );
     }
     console.print_renderable(&label_line);
 }
@@ -739,7 +747,10 @@ fn render_unique_labels_rich(labels: &[String], ctx: &OutputContext) {
         if i > 0 {
             label_line.append("  ");
         }
-        label_line.append_styled(label, Style::new().color(label_color(label)));
+        label_line.append_styled(
+            sanitize_terminal_inline(label).as_ref(),
+            Style::new().color(label_color(label)),
+        );
     }
     console.print_renderable(&label_line);
 }
@@ -765,7 +776,7 @@ fn render_label_counts_rich(label_counts: &[LabelCount], ctx: &OutputContext) {
             content.append("\n");
         }
         content.append_styled(
-            &format!("{:<20}", lc.label),
+            &format!("{:<20}", sanitize_terminal_inline(&lc.label)),
             Style::new().color(label_color(&lc.label)),
         );
         content.append_styled(
@@ -805,7 +816,10 @@ fn render_rename_not_found_rich(old_name: &str, ctx: &OutputContext) {
     let mut text = Text::new("");
     text.append_styled("\u{26a0} ", theme.warning.clone());
     text.append("Label ");
-    text.append_styled(old_name, Style::new().color(label_color(old_name)));
+    text.append_styled(
+        sanitize_terminal_inline(old_name).as_ref(),
+        Style::new().color(label_color(old_name)),
+    );
     text.append_styled(" not found on any issues.", theme.dimmed.clone());
 
     console.print_renderable(&text);
@@ -819,7 +833,10 @@ fn render_rename_noop_rich(label: &str, ctx: &OutputContext) {
     let mut text = Text::new("");
     text.append_styled("\u{2139} ", theme.dimmed.clone());
     text.append("Label ");
-    text.append_styled(label, Style::new().color(label_color(label)));
+    text.append_styled(
+        sanitize_terminal_inline(label).as_ref(),
+        Style::new().color(label_color(label)),
+    );
     text.append_styled(
         " already has that name; no changes made.",
         theme.dimmed.clone(),
@@ -836,9 +853,15 @@ fn render_rename_result_rich(old_name: &str, new_name: &str, count: usize, ctx: 
     let mut text = Text::new("");
     text.append_styled("\u{2713} ", theme.success.clone());
     text.append("Renamed ");
-    text.append_styled(old_name, Style::new().color(label_color(old_name)).dim());
+    text.append_styled(
+        sanitize_terminal_inline(old_name).as_ref(),
+        Style::new().color(label_color(old_name)).dim(),
+    );
     text.append(" \u{2192} ");
-    text.append_styled(new_name, Style::new().color(label_color(new_name)).bold());
+    text.append_styled(
+        sanitize_terminal_inline(new_name).as_ref(),
+        Style::new().color(label_color(new_name)).bold(),
+    );
     text.append_styled(
         &format!(" on {} issue{}", count, if count == 1 { "" } else { "s" }),
         theme.dimmed.clone(),

@@ -35,7 +35,10 @@
 //! }
 //! ```
 
-use crate::format::text::{format_priority, format_status_icon, truncate_title};
+use crate::format::text::{
+    format_priority, format_status_icon, sanitize_terminal_inline, sanitize_terminal_text,
+    truncate_title,
+};
 use crate::model::{Issue, Status};
 use crate::output::Theme;
 use rich_rust::prelude::*;
@@ -93,9 +96,10 @@ impl<'a> RichIssueTable<'a> {
         for issue in self.issues {
             let status_icon = format_status_icon(&issue.status);
             let priority = format_priority(&issue.priority);
-            let title = self
-                .max_title_width
-                .map_or_else(|| issue.title.clone(), |w| truncate_title(&issue.title, w));
+            let title = self.max_title_width.map_or_else(
+                || sanitize_terminal_inline(&issue.title).into_owned(),
+                |w| truncate_title(&issue.title, w),
+            );
 
             let mut cells = Vec::new();
 
@@ -118,7 +122,7 @@ impl<'a> RichIssueTable<'a> {
             }
 
             // Title
-            cells.push(Cell::new(title));
+            cells.push(Cell::new(sanitize_terminal_inline(&title).into_owned()));
 
             table = table.with_row(Row::new(cells));
         }
@@ -159,7 +163,11 @@ impl<'a> RichIssuePanel<'a> {
 
         // Header line: status icon + title
         let status_icon = format_status_icon(&self.issue.status);
-        content.push_str(&format!("{} {}\n", status_icon, self.issue.title));
+        content.push_str(&format!(
+            "{} {}\n",
+            status_icon,
+            sanitize_terminal_inline(&self.issue.title)
+        ));
 
         // Metadata line
         let priority = format_priority(&self.issue.priority);
@@ -172,7 +180,7 @@ impl<'a> RichIssuePanel<'a> {
             && let Some(desc) = &self.issue.description
         {
             content.push('\n');
-            content.push_str(desc);
+            content.push_str(&sanitize_terminal_text(desc));
         }
 
         let status_style = self.theme.status_style(&self.issue.status);
@@ -184,7 +192,7 @@ impl<'a> RichIssuePanel<'a> {
             .collect();
 
         Panel::new(content_lines)
-            .title(self.issue.id.clone())
+            .title(sanitize_terminal_inline(&self.issue.id).into_owned())
             .border_style(status_style)
     }
 }
@@ -239,9 +247,15 @@ impl<'a> RichDependencyTree<'a> {
         let mut label = Text::new("");
         label.append_styled(status_icon, self.theme.status_style(&issue.status));
         label.append(" ");
-        label.append_styled(&issue.id, self.theme.issue_id.clone());
+        label.append_styled(
+            sanitize_terminal_inline(&issue.id).as_ref(),
+            self.theme.issue_id.clone(),
+        );
         label.append_styled(" - ", self.theme.dimmed.clone());
-        label.append_styled(&title, self.theme.issue_title.clone());
+        label.append_styled(
+            sanitize_terminal_inline(&title).as_ref(),
+            self.theme.issue_title.clone(),
+        );
         label
     }
 
@@ -249,7 +263,10 @@ impl<'a> RichDependencyTree<'a> {
         let mut label = Text::new("");
         label.append_styled("?", self.theme.warning.clone());
         label.append(" ");
-        label.append_styled(issue_id, self.theme.issue_id.clone());
+        label.append_styled(
+            sanitize_terminal_inline(issue_id).as_ref(),
+            self.theme.issue_id.clone(),
+        );
         label.append_styled(" - (unknown)", self.theme.dimmed.clone());
         label
     }
