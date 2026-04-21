@@ -467,15 +467,20 @@ done
 
 **Solutions:**
 ```bash
-# Manual fix: edit the file
+# Capture current classification before changing the file
+br doctor --json
+br sync --status --json
+
+# Manual fix: edit the malformed line(s)
 $EDITOR .beads/issues.jsonl
 
-# Or restore from backup
+# Or restore a known-good JSONL history entry after reviewing it
 br history list
 br history restore <backup>
 
-# Skip bad lines (lossy)
-br sync --import-only --error-policy best-effort
+# Validate and import only after the JSONL is parseable
+jq -c '.' .beads/issues.jsonl >/dev/null
+br sync --import-only --json
 ```
 
 ---
@@ -511,11 +516,14 @@ br config set id.prefix=bd
 # Check sync status
 br sync --status --json
 
-# Export current state first (backup)
-br sync --flush-only
+# Inspect both sides before choosing an authority
+br --no-auto-import --allow-stale list --json
 
-# Force import (overwrites local)
+# If JSONL is authoritative, import it explicitly
 br sync --import-only --force
+
+# If SQLite is authoritative, export it explicitly
+br sync --flush-only --force
 ```
 
 ---
@@ -595,11 +603,11 @@ br sync --flush-only -vv
 # Wait and retry with timeout
 br list --lock-timeout 10000
 
-# Find locking process
+# Identify the locking process, then coordinate with its owner
 fuser .beads/beads.db
 
-# Kill if stuck (careful!)
-# fuser -k .beads/beads.db
+# Re-check workspace health after the writer finishes
+br doctor --json
 ```
 
 **Prevention:**
@@ -620,15 +628,16 @@ fuser .beads/beads.db
 # Check br version
 br version
 
-# Try automatic migration
-br doctor
+# Classify the workspace and projected repair
+br doctor --json
+br doctor --repair --dry-run --json
 
-# Manual migration (if supported)
+# Use the supported migration path if available
 br upgrade --migrate-db
 
-# Last resort: reinitialize
-mv .beads/beads.db .beads/beads.db.backup
-br sync --import-only
+# Otherwise preserve evidence and escalate with the doctor output
+br where --json
+br config list -v
 ```
 
 ---
@@ -657,25 +666,21 @@ br sync --import-only
 
 **Diagnosis:**
 ```bash
-# Check integrity
-sqlite3 .beads/beads.db "PRAGMA integrity_check;"
+# Classify corruption and related sidecar/metadata state
+br doctor --json
 
-# Check for missing tables
-sqlite3 .beads/beads.db ".tables"
+# Preview the repair plan without changing files
+br doctor --repair --dry-run --json
 ```
 
 **Recovery:**
 ```bash
-# Backup current state
-cp .beads/beads.db .beads/beads.db.corrupt
+# Let br preserve the DB family and rebuild only from valid JSONL
+br doctor --repair --json
 
-# Try repair
-sqlite3 .beads/beads.db "REINDEX;"
-sqlite3 .beads/beads.db "VACUUM;"
-
-# Or rebuild from JSONL
-rm .beads/beads.db
-br sync --import-only
+# Verify the repaired workspace before writing
+br doctor --json
+br sync --status --json
 ```
 
 ---
@@ -696,9 +701,9 @@ cat .beads/beads.yaml | python3 -c "import yaml,sys; yaml.safe_load(sys.stdin)"
 # Find config paths
 br config path
 
-# Reset to defaults
-rm .beads/beads.yaml
-br init
+# Repair the YAML in place, then verify the effective config
+$EDITOR .beads/beads.yaml
+br config list -v
 ```
 
 ---
@@ -841,8 +846,9 @@ br list --limit 50
 # Use specific filters
 br list -s open -t bug
 
-# Vacuum database
-sqlite3 .beads/beads.db "VACUUM;"
+# Check whether derived-state repair is needed
+br doctor --json
+br doctor --repair --dry-run --json
 ```
 
 ---
@@ -939,82 +945,113 @@ br --actor "my-agent" update bd-123 --claim
 
 ## Recovery Procedures
 
-### Complete workspace recovery from JSONL
+Recovery starts with classification and evidence preservation. Do not delete,
+rename, or partially overwrite `.beads/` files as a first response. The repair
+path should either prove that JSONL is authoritative and rebuild from it, or
+stop and preserve the evidence needed for manual repair.
+
+### Capture the incident bundle
+
+Run these commands before attempting repair:
 
 ```bash
-# Backup current state
-mv .beads .beads.backup
-
-# Reinitialize
-br init --prefix <your-prefix>
-
-# Import from JSONL
-cp .beads.backup/issues.jsonl .beads/
-br sync --import-only
-
-# Verify
-br stats
-br doctor
+br doctor --json
+br doctor --repair --dry-run --json
+br sync --status --json
+br where --json
+br config list -v
 ```
 
----
+Also preserve the failing command, exact stdout/stderr, `.beads/issues.jsonl`,
+`.beads/metadata.json`, directory listings for `.beads/`, `.beads/.br_recovery/`,
+and `.beads/.br_history/`, plus the presence and hashes of `beads.db`,
+`beads.db-wal`, `beads.db-shm`, and `beads.db-journal` when present.
 
-### Recovery from corrupted database
+### Recoverable database family with valid JSONL
+
+Use this when `br doctor` classifies the DB family as recoverable and JSONL is
+parseable, conflict-free, and pointed at the intended workspace.
 
 ```bash
-# 1. Backup everything
-cp -r .beads .beads.backup.$(date +%Y%m%d)
+# Preview what repair will do
+br doctor --repair --dry-run --json
 
-# 2. Export what we can
-br sync --flush-only --error-policy best-effort || true
+# Execute the supported repair path
+br doctor --repair --json
 
-# 3. Check JSONL integrity
-jq -c '.' .beads/issues.jsonl >/dev/null && echo "JSONL OK"
-
-# 4. Rebuild database
-rm .beads/beads.db
-br sync --import-only
-
-# 5. Verify
-br doctor
-br stats
+# Verify health and freshness before mutating issues
+br doctor --json
+br sync --status --json
+br list --json
 ```
 
----
+Expected behavior: `br` preserves the original DB family under
+`.beads/.br_recovery/`, rebuilds from valid JSONL, and verifies the repaired
+workspace instead of asking the operator to remove individual database files.
 
-### Recovery from git merge conflicts
+### Unsafe JSONL or merge-conflict state
+
+Use this when JSONL contains conflict markers, malformed lines, mixed prefixes,
+or data from the wrong workspace. Automatic import/rebuild is not safe until the
+interchange file is corrected.
 
 ```bash
-# 1. Identify conflicts
-grep -l "<<<<<<" .beads/*.jsonl
+# Find conflict markers or invalid JSONL
+grep -n "^<<<<<<\|^======\|^>>>>>>" .beads/issues.jsonl
+jq -c '.' .beads/issues.jsonl >/dev/null
 
-# 2. Resolve manually or use ours/theirs
-git checkout --ours .beads/issues.jsonl
-# OR
-git checkout --theirs .beads/issues.jsonl
+# Edit the JSONL to one valid record per line, with the intended prefix
+$EDITOR .beads/issues.jsonl
 
-# 3. Import resolved file
+# Re-validate and import after the file is unambiguous
+jq -c '.' .beads/issues.jsonl >/dev/null
+br sync --import-only --json
+br doctor --json
+```
+
+Do not use raw `git checkout --ours` or `git checkout --theirs` as a recovery
+shortcut unless the operator has already decided which side is authoritative and
+has accepted the data-loss consequence. The safer default is line-level conflict
+resolution followed by import.
+
+### SQLite/JSONL drift authority decision
+
+Use this when both sides are readable but disagree.
+
+```bash
+# Classify freshness and path metadata first
+br sync --status --json
+br where --json
+br config list -v
+
+# If JSONL is authoritative
 br sync --import-only --force
 
-# 4. Mark resolved
-git add .beads/issues.jsonl
+# If SQLite is authoritative
+br sync --flush-only --force
+
+# Verify after the chosen direction succeeds
+br sync --status --json
+br doctor --json
 ```
 
----
+The important part is the explicit direction choice. Do not run a force flag as
+a generic fix; it is an assertion about which side should win.
 
-### Emergency database reset
+### JSONL-only emergency read path
 
-**Warning:** This loses any changes not in JSONL.
+`--no-db` is useful when the SQLite family is unavailable and the operator needs
+to inspect valid JSONL, but it is not the normal recovery path for writes.
 
 ```bash
-# Nuclear option
-rm .beads/beads.db
-br sync --import-only
-
-# Verify nothing lost
-br stats
-br list --limit 0 | wc -l
+br --no-db list --json
+br --no-db show <issue-id> --json
+br --no-db ready --json
 ```
+
+After inspection, return to the supported repair/import/export flows above.
+Avoid repeating JSONL-only writes after a partial failure unless the previous
+command result has been reconciled against the JSONL contents.
 
 ---
 
