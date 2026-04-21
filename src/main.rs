@@ -125,7 +125,9 @@ fn main() {
             force,
             backend: _,
         } => commands::init::execute(prefix, force, None, &output_ctx),
-        Commands::Create(args) => commands::create::execute(&args, &overrides, &output_ctx),
+        Commands::Create(args) => {
+            execute_create_command(&args, &overrides, &output_ctx, &mut storage_result)
+        }
         Commands::Update(args) => commands::update::execute(&args, &overrides, &output_ctx),
         Commands::Delete(args) => {
             commands::delete::execute(&args, cli.json, &overrides, &output_ctx)
@@ -416,6 +418,15 @@ fn resolve_auto_import_expected_prefix(
 ) -> Result<String> {
     let layer = storage_result.load_config(cli)?;
     Ok(config::id_config_from_layer(&layer).prefix)
+}
+
+fn execute_create_command(
+    args: &beads_rust::cli::CreateArgs,
+    overrides: &config::CliOverrides,
+    output_ctx: &OutputContext,
+    storage_result: &mut Option<config::OpenStorageResult>,
+) -> Result<()> {
+    commands::create::execute_with_storage(args, overrides, output_ctx, storage_result.take())
 }
 
 const fn should_preopen_storage(
@@ -875,6 +886,61 @@ mod tests {
 
         assert_eq!(storage_ctx.paths.jsonl_path, first_jsonl);
         assert_ne!(storage_ctx.paths.jsonl_path, second_jsonl);
+    }
+
+    #[test]
+    fn create_dispatch_reuses_preopened_storage_context() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let first_db = beads_dir.join("first.db");
+        let second_db = beads_dir.join("second.db");
+        let metadata_path = beads_dir.join("metadata.json");
+        fs::write(
+            &metadata_path,
+            format!(
+                r#"{{"database":"{}","jsonl_export":"issues.jsonl"}}"#,
+                first_db.display()
+            ),
+        )
+        .expect("write initial metadata");
+
+        let overrides = config::CliOverrides::default();
+        let startup =
+            config::load_startup_config_with_paths(&beads_dir, None).expect("startup context");
+
+        fs::write(
+            &metadata_path,
+            format!(
+                r#"{{"database":"{}","jsonl_export":"issues.jsonl"}}"#,
+                second_db.display()
+            ),
+        )
+        .expect("rewrite metadata");
+
+        let cli = Cli::parse_from(["br", "--json", "create", "Use preopened storage"]);
+        let output_ctx = OutputContext::from_args(&cli);
+        let Commands::Create(args) = cli.command else {
+            unreachable!("expected create command");
+        };
+        let mut storage_result = Some(
+            config::open_storage_with_startup_config(startup, &overrides, false)
+                .expect("preopened storage"),
+        );
+
+        execute_create_command(&args, &overrides, &output_ctx, &mut storage_result)
+            .expect("create should use preopened storage");
+
+        assert!(storage_result.is_none());
+
+        let first_storage =
+            beads_rust::storage::SqliteStorage::open(&first_db).expect("open first db");
+        assert_eq!(first_storage.count_issues().expect("count first db"), 1);
+        assert!(
+            !second_db.exists(),
+            "create dispatch reopened storage from rewritten metadata instead of using preopened context"
+        );
     }
 
     #[test]

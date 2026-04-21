@@ -71,7 +71,7 @@ pub fn execute_with_storage(
                 "--dry-run is not supported with --file",
             ));
         }
-        return execute_import(file_path, args, cli, ctx);
+        return execute_import(file_path, args, cli, ctx, pre_opened);
     }
 
     // 1. Open storage (reuse pre-opened if available)
@@ -149,7 +149,18 @@ pub fn execute_with_storage(
     } else {
         ctx.success(&format!("Created {}: {}", issue.id, issue.title));
     }
+    auto_flush_after_create(&mut storage_ctx);
     Ok(())
+}
+
+fn auto_flush_after_create(storage_ctx: &mut config::OpenStorageResult) {
+    if let Err(error) = storage_ctx.auto_flush_if_enabled() {
+        tracing::debug!(
+            beads_dir = %storage_ctx.paths.beads_dir.display(),
+            error = %error,
+            "Create auto-flush failed (non-fatal)"
+        );
+    }
 }
 
 /// Core logic for creating an issue.
@@ -540,6 +551,7 @@ fn execute_import(
     args: &CreateArgs,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
+    pre_opened: Option<config::OpenStorageResult>,
 ) -> Result<()> {
     let parsed_issues = parse_markdown_file(path)?;
     if parsed_issues.is_empty() {
@@ -552,8 +564,12 @@ fn execute_import(
         return Ok(());
     }
 
-    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    let mut storage_ctx = if let Some(ctx) = pre_opened {
+        ctx
+    } else {
+        let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+        config::open_storage_with_cli(&beads_dir, cli)?
+    };
     let layer = storage_ctx.load_config(cli)?;
 
     let id_config = config::id_config_from_layer(&layer);
@@ -952,6 +968,7 @@ fn execute_import(
             ctx.print_line(&format!("  {id}: {title}"));
         }
     }
+    auto_flush_after_create(&mut storage_ctx);
     Ok(())
 }
 
