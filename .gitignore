@@ -154,3 +154,11 @@ report.json
 .codex-local-check/
 .codex-bench/
 .codex-tmp/
+
+# Claude Code runtime lockfile for the /schedule skill
+.claude/scheduled_tasks.lock
+
+# NTM agent pane runtime logs (also covered globally in ~/.gitignore,
+# but repeat here so they stay ignored on fresh clones or machines
+# without the global entry).
+.ntm/logs/*.log
