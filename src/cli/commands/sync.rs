@@ -1906,7 +1906,7 @@ fn execute_merge(
     );
 
     if report.has_conflicts() {
-        // For now, fail on conflicts. Future: interactive resolution or force flags.
+        // Require an explicit merge winner instead of guessing when both sides changed.
         if ctx.is_rich() {
             render_merge_conflicts_rich(&report.conflicts, ctx);
         }
