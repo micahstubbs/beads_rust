@@ -197,6 +197,16 @@ pub(super) fn update_issue_with_recovery(
     )
 }
 
+fn should_attempt_mutation_jsonl_recovery(
+    storage_ctx: &OpenStorageResult,
+    operation_err: &BeadsError,
+    probe_err: Option<&BeadsError>,
+) -> bool {
+    matches!(operation_err, BeadsError::Database(_))
+        && (storage_ctx.should_attempt_jsonl_recovery(operation_err)
+            || probe_err.is_some_and(|err| storage_ctx.should_attempt_jsonl_recovery(err)))
+}
+
 pub(super) fn auto_import_storage_ctx_if_stale(
     storage_ctx: &mut OpenStorageResult,
     cli: &crate::config::CliOverrides,
@@ -254,7 +264,8 @@ where
                 return Err(operation_err);
             }
 
-            let mut recovery_signal = storage_ctx.should_attempt_jsonl_recovery(&operation_err);
+            let mut recovery_signal =
+                should_attempt_mutation_jsonl_recovery(storage_ctx, &operation_err, None);
             let mut probe_error: Option<BeadsError> = None;
 
             if !recovery_signal && let Some(issue_id) = probe_issue_id {
@@ -264,7 +275,11 @@ where
                 {
                     Ok(()) => return Err(operation_err),
                     Err(probe_err) => {
-                        recovery_signal = storage_ctx.should_attempt_jsonl_recovery(&probe_err);
+                        recovery_signal = should_attempt_mutation_jsonl_recovery(
+                            storage_ctx,
+                            &operation_err,
+                            Some(&probe_err),
+                        );
                         probe_error = Some(probe_err);
                     }
                 }
@@ -317,8 +332,9 @@ mod tests {
     use super::{
         finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
         rebuild_blocked_cache_after_partial_mutation, retry_mutation_with_jsonl_recovery,
+        should_attempt_mutation_jsonl_recovery,
     };
-    use crate::config::{CliOverrides, open_storage_with_cli};
+    use crate::config::{CliOverrides, OpenStorageResult, open_storage_with_cli};
     use crate::error::BeadsError;
     use crate::model::Issue;
     use crate::storage::SqliteStorage;
@@ -327,6 +343,39 @@ mod tests {
     use fsqlite_error::FrankenError;
     use std::fs;
     use tempfile::TempDir;
+
+    fn storage_ctx_with_exported_issue() -> (TempDir, OpenStorageResult) {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        // Scope the initial storage so the connection is closed before
+        // recovery opens a new one at the same path.  fsqlite tracks pages
+        // by file path, so an older connection causes BusySnapshot.
+        {
+            let mut storage = SqliteStorage::open(&db_path).expect("storage");
+            let issue = Issue {
+                id: "bd-1".to_string(),
+                title: "test".to_string(),
+                ..Issue::default()
+            };
+            storage
+                .create_issue(&issue, "tester")
+                .expect("create issue");
+            let export_config = ExportConfig {
+                beads_dir: Some(beads_dir.clone()),
+                ..Default::default()
+            };
+            export_to_jsonl_with_policy(&storage, &jsonl_path, &export_config)
+                .expect("export jsonl");
+        }
+
+        let storage_ctx =
+            open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage ctx");
+        (temp, storage_ctx)
+    }
 
     #[test]
     fn partial_mutation_rebuild_skips_clean_state() {
@@ -364,12 +413,13 @@ mod tests {
         let err = preserve_blocked_cache_on_error::<()>(&mut storage, true, "reopen", result)
             .expect_err("rebuild failure should be surfaced");
 
-        match err {
-            BeadsError::WithContext { context, .. } => {
-                assert!(context.contains("partial reopen mutation"));
-                assert!(context.contains("Validation failed: ids: boom"));
-            }
-            other => panic!("expected WithContext, got {other:?}"),
+        assert!(
+            matches!(err, BeadsError::WithContext { .. }),
+            "expected WithContext, got {err:?}"
+        );
+        if let BeadsError::WithContext { context, .. } = err {
+            assert!(context.contains("partial reopen mutation"));
+            assert!(context.contains("Validation failed: ids: boom"));
         }
 
         let metadata_probe = storage.get_metadata("blocked_cache_state");
@@ -427,35 +477,7 @@ mod tests {
 
     #[test]
     fn retry_mutation_recovers_from_recoverable_database_error() {
-        let temp = TempDir::new().expect("tempdir");
-        let beads_dir = temp.path().join(".beads");
-        fs::create_dir_all(&beads_dir).expect("create beads dir");
-        let db_path = beads_dir.join("beads.db");
-        let jsonl_path = beads_dir.join("issues.jsonl");
-
-        // Scope the initial storage so the connection is closed before
-        // recovery opens a new one at the same path.  fsqlite tracks pages
-        // by file path, so an older connection causes BusySnapshot.
-        {
-            let mut storage = SqliteStorage::open(&db_path).expect("storage");
-            let issue = Issue {
-                id: "bd-1".to_string(),
-                title: "test".to_string(),
-                ..Issue::default()
-            };
-            storage
-                .create_issue(&issue, "tester")
-                .expect("create issue");
-            let export_config = ExportConfig {
-                beads_dir: Some(beads_dir.clone()),
-                ..Default::default()
-            };
-            export_to_jsonl_with_policy(&storage, &jsonl_path, &export_config)
-                .expect("export jsonl");
-        }
-
-        let mut storage_ctx =
-            open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage ctx");
+        let (_temp, mut storage_ctx) = storage_ctx_with_exported_issue();
         let mut attempts = 0;
 
         let result = retry_mutation_with_jsonl_recovery(
@@ -484,6 +506,26 @@ mod tests {
                 .get_issue("bd-1")
                 .expect("load issue")
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn mutation_recovery_can_be_signaled_by_probe_after_constraint_style_error() {
+        let (_temp, storage_ctx) = storage_ctx_with_exported_issue();
+        let operation_err = BeadsError::Database(FrankenError::Internal(
+            "constraint verification failed".to_string(),
+        ));
+        let probe_err = BeadsError::Database(FrankenError::Internal(
+            "database disk image is malformed".to_string(),
+        ));
+
+        assert!(
+            !should_attempt_mutation_jsonl_recovery(&storage_ctx, &operation_err, None),
+            "constraint-style write errors should not recover without a corruption probe"
+        );
+        assert!(
+            should_attempt_mutation_jsonl_recovery(&storage_ctx, &operation_err, Some(&probe_err)),
+            "a recoverable rollback-only write probe should trigger JSONL recovery"
         );
     }
 }
