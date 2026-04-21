@@ -548,6 +548,8 @@ fn dep_list(
         OutputFormat::Text | OutputFormat::Csv => {}
     }
 
+    sort_dep_list_items_for_human(&mut items);
+
     if items.is_empty() {
         let direction_str = match args.direction {
             DepDirection::Down => "dependencies",
@@ -743,6 +745,16 @@ fn apply_external_dep_list_metadata(
             );
         }
     }
+}
+
+fn sort_dep_list_items_for_human(items: &mut [DepListItem]) {
+    items.sort_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| left.issue_id.cmp(&right.issue_id))
+            .then_with(|| left.depends_on_id.cmp(&right.depends_on_id))
+            .then_with(|| left.dep_type.cmp(&right.dep_type))
+    });
 }
 
 fn resolve_dep_tree_node_metadata(
@@ -1212,6 +1224,17 @@ mod tests {
         }
     }
 
+    fn test_dep_list_item(issue_id: &str, depends_on_id: &str, priority: i32) -> DepListItem {
+        DepListItem {
+            issue_id: issue_id.to_string(),
+            depends_on_id: depends_on_id.to_string(),
+            dep_type: "blocks".to_string(),
+            title: depends_on_id.to_string(),
+            status: "open".to_string(),
+            priority,
+        }
+    }
+
     #[test]
     fn test_dependency_type_parsing() {
         init_test_logging();
@@ -1491,6 +1514,46 @@ mod tests {
         assert!(json.contains("\"type\":\"blocks\"")); // Renamed field
         assert!(json.contains("\"priority\":2"));
         info!("test_dep_list_item_json: assertions passed");
+    }
+
+    #[test]
+    fn test_sort_dep_list_items_for_human_orders_by_priority() {
+        init_test_logging();
+        info!("test_sort_dep_list_items_for_human_orders_by_priority: starting");
+        let mut items = vec![
+            test_dep_list_item("bd-root", "bd-low", 4),
+            test_dep_list_item("bd-root", "bd-critical", 0),
+            test_dep_list_item("bd-root", "bd-medium", 2),
+        ];
+
+        sort_dep_list_items_for_human(&mut items);
+
+        let sorted_ids: Vec<_> = items
+            .iter()
+            .map(|item| item.depends_on_id.as_str())
+            .collect();
+        assert_eq!(sorted_ids, ["bd-critical", "bd-medium", "bd-low"]);
+        info!("test_sort_dep_list_items_for_human_orders_by_priority: assertions passed");
+    }
+
+    #[test]
+    fn test_sort_dep_list_items_for_human_uses_ids_as_tiebreakers() {
+        init_test_logging();
+        info!("test_sort_dep_list_items_for_human_uses_ids_as_tiebreakers: starting");
+        let mut items = vec![
+            test_dep_list_item("bd-root", "bd-b", 1),
+            test_dep_list_item("bd-root", "bd-a", 1),
+            test_dep_list_item("bd-root", "bd-c", 1),
+        ];
+
+        sort_dep_list_items_for_human(&mut items);
+
+        let sorted_ids: Vec<_> = items
+            .iter()
+            .map(|item| item.depends_on_id.as_str())
+            .collect();
+        assert_eq!(sorted_ids, ["bd-a", "bd-b", "bd-c"]);
+        info!("test_sort_dep_list_items_for_human_uses_ids_as_tiebreakers: assertions passed");
     }
 
     #[test]
