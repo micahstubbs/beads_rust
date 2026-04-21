@@ -1852,7 +1852,7 @@ impl OpenStorageResult {
 /// # Errors
 ///
 /// Returns an error if JSONL import or storage setup fails.
-pub(crate) fn open_storage_with_startup_config(
+pub fn open_storage_with_startup_config(
     startup: StartupConfig,
     cli: &CliOverrides,
     defer_jsonl_recovery: bool,

@@ -29,7 +29,7 @@ fn main() {
     let overrides = build_cli_overrides(&cli);
 
     // Phase 1: Startup & Discovery (One-time)
-    let ctx = match StartupContext::init(&overrides) {
+    let mut ctx = match StartupContext::init(&overrides) {
         Ok(ctx) => ctx,
         Err(e) => {
             if needs_bootstrap_context {
@@ -62,7 +62,7 @@ fn main() {
         should_auto_flush_now,
     );
     let mut storage_result = if should_preopen_storage {
-        match open_storage_from_ctx(&ctx) {
+        match open_storage_from_ctx(&mut ctx) {
             Ok(res) => Some(res),
             Err(e) => {
                 if needs_bootstrap_context {
@@ -344,6 +344,7 @@ fn main() {
 
 struct StartupContext {
     overrides: config::CliOverrides,
+    startup: Option<config::StartupConfig>,
     beads_dir: Option<PathBuf>,
     paths: Option<config::ConfigPaths>,
     config: Option<config::ConfigLayer>,
@@ -357,11 +358,13 @@ impl StartupContext {
         // Merge startup config with CLI overrides to form the effective bootstrap config
         let mut final_config = startup.merged_config.clone();
         final_config.merge_from(&overrides.as_layer());
+        let paths = startup.paths.clone();
 
         Ok(Self {
             overrides: overrides.clone(),
+            startup: Some(startup),
             beads_dir: Some(beads_dir),
-            paths: Some(startup.paths),
+            paths: Some(paths),
             config: Some(final_config),
         })
     }
@@ -369,6 +372,7 @@ impl StartupContext {
     fn empty(overrides: config::CliOverrides) -> Self {
         Self {
             overrides,
+            startup: None,
             beads_dir: None,
             paths: None,
             config: None,
@@ -401,9 +405,9 @@ impl StartupContext {
     }
 }
 
-fn open_storage_from_ctx(ctx: &StartupContext) -> Result<config::OpenStorageResult> {
-    let beads_dir = ctx.beads_dir.as_ref().ok_or(BeadsError::NotInitialized)?;
-    config::open_storage_with_cli(beads_dir, &ctx.overrides)
+fn open_storage_from_ctx(ctx: &mut StartupContext) -> Result<config::OpenStorageResult> {
+    let startup = ctx.startup.take().ok_or(BeadsError::NotInitialized)?;
+    config::open_storage_with_startup_config(startup, &ctx.overrides, false)
 }
 
 fn resolve_auto_import_expected_prefix(
@@ -837,6 +841,40 @@ mod tests {
                 .expect("resolve prefix");
 
         assert_eq!(prefix, "document-intelligence");
+    }
+
+    #[test]
+    fn preopened_storage_reuses_startup_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let first_jsonl = beads_dir.join("first.jsonl");
+        let second_jsonl = beads_dir.join("second.jsonl");
+        let metadata_path = beads_dir.join("metadata.json");
+        fs::write(
+            &metadata_path,
+            r#"{"database":"beads.db","jsonl_export":"first.jsonl"}"#,
+        )
+        .expect("write initial metadata");
+
+        let overrides = config::CliOverrides {
+            db: Some(beads_dir.join("beads.db")),
+            no_db: Some(true),
+            ..config::CliOverrides::default()
+        };
+        let mut ctx = StartupContext::init(&overrides).expect("startup context");
+
+        fs::write(
+            &metadata_path,
+            r#"{"database":"beads.db","jsonl_export":"second.jsonl"}"#,
+        )
+        .expect("rewrite metadata");
+
+        let storage_ctx = open_storage_from_ctx(&mut ctx).expect("preopened storage");
+
+        assert_eq!(storage_ctx.paths.jsonl_path, first_jsonl);
+        assert_ne!(storage_ctx.paths.jsonl_path, second_jsonl);
     }
 
     #[test]
