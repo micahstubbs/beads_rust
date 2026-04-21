@@ -10,6 +10,15 @@ on:
         description: 'Tag to release (e.g., v0.1.0)'
         required: true
         type: string
+      skip_reliability_gates:
+        description: 'Emergency only: skip reliability gates after recording a reason'
+        required: false
+        type: boolean
+        default: false
+      reliability_override_reason:
+        description: 'Required when skip_reliability_gates is true'
+        required: false
+        type: string
 
 # Ensure only one release runs at a time
 concurrency:
@@ -27,10 +36,6 @@ permissions:
   attestations: write  # Required for artifact attestations
 
 jobs:
-  # Pre-flight: only verify tag matches Cargo.toml version.
-  # Formatting, clippy, and tests are already enforced by ci.yml on push to main.
-  # Duplicating them here caused release failures for cosmetic issues (e.g. cargo fmt
-  # diffs, flaky tests) even when the code was functionally correct.
   preflight:
     name: Pre-flight Checks
     runs-on: ubuntu-latest
@@ -48,11 +53,98 @@ jobs:
           fi
           echo "Version check passed: $CARGO_VERSION"
 
+  reliability-gates:
+    name: Release Reliability Gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    needs: preflight
+    steps:
+      - name: Validate reliability override
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_reliability_gates }}
+        env:
+          RELIABILITY_OVERRIDE_REASON: ${{ inputs.reliability_override_reason }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RELIABILITY_OVERRIDE_REASON" ]; then
+            echo "::error::reliability_override_reason is required when skip_reliability_gates is true"
+            exit 1
+          fi
+          {
+            echo "## Release Reliability Gates"
+            echo ""
+            echo "Reliability gates were explicitly skipped for this manual release."
+            echo ""
+            echo "Reason: $RELIABILITY_OVERRIDE_REASON"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
+
+      - name: Install Rust toolchain
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+
+      - name: Cache cargo
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2.9.1
+
+      - name: Failure-corpus replay and doctor/recovery postconditions
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
+        run: cargo test --test workspace_failure_replay -- --nocapture
+        env:
+          RUST_LOG: beads_rust=debug
+
+      - name: Crash-injection sync matrix
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
+        run: cargo test --test e2e_sync_failure_injection -- --nocapture
+        env:
+          HARNESS_ARTIFACTS: 1
+          NO_COLOR: 1
+
+      - name: Long-lived single-workspace stress
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
+        run: cargo test --test e2e_workspace_scenarios scenario_long_lived_single_workspace_stress_suite -- --nocapture
+        env:
+          BR_LONG_STRESS_ITERATIONS: 8
+          HARNESS_ARTIFACTS: 1
+          NO_COLOR: 1
+
+      - name: Concurrent command-family integrity stress
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
+        run: cargo test --test e2e_concurrency e2e_interleaved_command_families_preserve_workspace_integrity -- --nocapture
+        env:
+          HARNESS_ARTIFACTS: 1
+          NO_COLOR: 1
+
+      - name: Record reliability gate outcome
+        if: ${{ always() && (github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates) }}
+        run: |
+          {
+            echo "## Release Reliability Gates"
+            echo ""
+            echo "Mandatory release reliability gates ran before artifact build:"
+            echo "- failure-corpus replay"
+            echo "- crash-injection sync matrix"
+            echo "- long-lived single-workspace stress"
+            echo "- concurrent command-family integrity stress"
+            echo "- doctor/recovery postcondition checks"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload reliability artifacts
+        if: ${{ always() && (github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates) }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: release-reliability-gate-artifacts
+          path: target/test-artifacts/
+          if-no-files-found: ignore
+
   build-release:
     name: Build (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
-    needs: preflight
+    needs: reliability-gates
     strategy:
       fail-fast: false
       matrix:
@@ -310,6 +402,9 @@ jobs:
 
       - name: Generate changelog
         id: changelog
+        env:
+          RELIABILITY_OVERRIDE_REASON: ${{ inputs.reliability_override_reason }}
+          SKIP_RELIABILITY_GATES: ${{ inputs.skip_reliability_gates }}
         run: |
           # Get the previous tag
           PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
@@ -345,6 +440,24 @@ jobs:
             fi
           fi
 
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "$SKIP_RELIABILITY_GATES" = "true" ]; then
+            RELIABILITY_SECTION="## Release Verification
+
+          Reliability gates were explicitly skipped for this manual release.
+
+          Reason: $RELIABILITY_OVERRIDE_REASON
+
+          "
+          else
+            RELIABILITY_SECTION="## Release Verification
+
+          Release reliability gates completed before artifacts were built:
+          failure-corpus replay, crash-injection sync matrix, long-lived single-workspace stress,
+          concurrent command-family integrity stress, and doctor/recovery postcondition checks.
+
+          "
+          fi
+
           # Create release notes file
           cat << EOF > RELEASE_NOTES.md
           ## What's Changed
@@ -353,8 +466,11 @@ jobs:
 
           EOF
           echo "$COMMITS" >> RELEASE_NOTES.md
-          cat << 'EOF' >> RELEASE_NOTES.md
+          cat << EOF >> RELEASE_NOTES.md
 
+          ${RELIABILITY_SECTION}
+          EOF
+          cat << 'EOF' >> RELEASE_NOTES.md
           ## Platforms
 
           | Platform | Architecture | File |

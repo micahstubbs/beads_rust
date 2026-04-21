@@ -95,6 +95,54 @@ jobs:
       - name: Run doc tests
         run: cargo test --doc
 
+  reliability-gates:
+    name: Reliability Gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: check
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2.9.1
+
+      - name: Failure-corpus replay and doctor/recovery postconditions
+        run: cargo test --test workspace_failure_replay -- --nocapture
+        env:
+          RUST_LOG: beads_rust=debug
+
+      - name: Crash-injection sync matrix
+        run: cargo test --test e2e_sync_failure_injection -- --nocapture
+        env:
+          HARNESS_ARTIFACTS: 1
+          NO_COLOR: 1
+
+      - name: Long-lived single-workspace stress
+        run: cargo test --test e2e_workspace_scenarios scenario_long_lived_single_workspace_stress_suite -- --nocapture
+        env:
+          BR_LONG_STRESS_ITERATIONS: 8
+          HARNESS_ARTIFACTS: 1
+          NO_COLOR: 1
+
+      - name: Concurrent command-family integrity stress
+        run: cargo test --test e2e_concurrency e2e_interleaved_command_families_preserve_workspace_integrity -- --nocapture
+        env:
+          HARNESS_ARTIFACTS: 1
+          NO_COLOR: 1
+
+      - name: Upload reliability artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: reliability-gate-artifacts
+          path: target/test-artifacts/
+          if-no-files-found: ignore
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest

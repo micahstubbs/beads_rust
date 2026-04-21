@@ -88,6 +88,21 @@ Each row is a workspace component; columns indicate which subsystem owns and val
 
 The same records are emitted through `tracing` with target `br::reliability` so field logs can be correlated with doctor JSON, quarantined artifacts, and replay fixtures.
 
+## Reliability Gate Contract
+
+CI and release verification must run these suites before a change can ship:
+
+- `cargo test --test workspace_failure_replay -- --nocapture`
+- `cargo test --test e2e_sync_failure_injection -- --nocapture`
+- `BR_LONG_STRESS_ITERATIONS=8 cargo test --test e2e_workspace_scenarios scenario_long_lived_single_workspace_stress_suite -- --nocapture`
+- `cargo test --test e2e_concurrency e2e_interleaved_command_families_preserve_workspace_integrity -- --nocapture`
+
+These gates cover the failure-corpus replay, crash-injection matrix, long-lived
+workspace stress, concurrent command-family stress, and doctor/recovery
+postconditions. Release builds depend on the gate job by default; the manual
+release workflow exposes an emergency override that requires a written reason
+before artifacts can be built without the gates.
+
 ## Evidence Bundle (Incident Capture)
 
 When a field failure occurs, the following artifacts should be collected for diagnosis:
