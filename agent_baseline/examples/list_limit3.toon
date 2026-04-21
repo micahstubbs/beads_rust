@@ -1,41 +1,45 @@
-[3]:
-  - id: bd-vgf
+issues[3]:
+  - id: bd-p35
     title: Two
     status: open
     priority: 0
     issue_type: bug
-    created_at: "2026-01-25T16:39:26.217202643Z"
+    created_at: "2026-04-21T21:18:56.624111256Z"
     created_by: ubuntu
-    updated_at: "2026-01-25T16:39:26.217202643Z"
+    updated_at: "2026-04-21T21:18:56.624111256Z"
     source_repo: .
     compaction_level: 0
     original_size: 0
     dependency_count: 0
     dependent_count: 0
-  - id: bd-2l5
+  - id: bd-u2b
     title: Three
     status: open
     priority: 1
     issue_type: feature
-    created_at: "2026-01-25T16:39:26.776158132Z"
+    created_at: "2026-04-21T21:18:56.654476226Z"
     created_by: ubuntu
-    updated_at: "2026-01-25T16:39:26.776158132Z"
+    updated_at: "2026-04-21T21:18:56.654476226Z"
     source_repo: .
     compaction_level: 0
     original_size: 0
     dependency_count: 0
     dependent_count: 0
-  - id: bd-nqs
+  - id: bd-tap
     title: One
     description: Short desc
     status: open
     priority: 2
     issue_type: task
-    created_at: "2026-01-25T16:39:25.606499876Z"
+    created_at: "2026-04-21T21:18:56.596482753Z"
     created_by: ubuntu
-    updated_at: "2026-01-25T16:39:25.606499876Z"
+    updated_at: "2026-04-21T21:18:56.596482753Z"
     source_repo: .
     compaction_level: 0
     original_size: 0
     dependency_count: 0
     dependent_count: 0
+total: 3
+limit: 3
+offset: 0
+has_more: false

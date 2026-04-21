@@ -1,25 +1,63 @@
 {
   "tool": "br",
-  "generated_at": "2026-01-25T16:38:43.099577642Z",
+  "generated_at": "2026-04-21T21:18:56.531455763Z",
   "schemas": {
     "IssueDetails": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "IssueDetails",
       "description": "Issue details with full relations for show view.",
       "type": "object",
-      "required": [
-        "created_at",
-        "id",
-        "title",
-        "updated_at"
-      ],
       "properties": {
+        "id": {
+          "description": "Unique ID (e.g., \"bd-abc123\").",
+          "type": "string"
+        },
+        "title": {
+          "description": "Title (1-500 chars).",
+          "type": "string"
+        },
+        "description": {
+          "description": "Detailed description.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "design": {
+          "description": "Technical design notes.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "acceptance_criteria": {
           "description": "Acceptance criteria.",
           "type": [
             "string",
             "null"
           ]
+        },
+        "notes": {
+          "description": "Additional notes.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "description": "Workflow status.",
+          "$ref": "#/$defs/Status",
+          "default": "open"
+        },
+        "priority": {
+          "description": "Priority (0=Critical, 4=Backlog).",
+          "$ref": "#/$defs/Priority",
+          "default": 2
+        },
+        "issue_type": {
+          "description": "Issue type (bug, feature, etc.).",
+          "$ref": "#/$defs/IssueType",
+          "default": "task"
         },
         "assignee": {
           "description": "Assigned user.",
@@ -28,49 +66,15 @@
             "null"
           ]
         },
-        "close_reason": {
-          "description": "Reason for closure.",
+        "owner": {
+          "description": "Issue owner.",
           "type": [
             "string",
             "null"
           ]
         },
-        "closed_at": {
-          "description": "Closure timestamp.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "format": "date-time"
-        },
-        "closed_by_session": {
-          "description": "Session ID that closed this issue.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "comments": {
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/Comment"
-          }
-        },
-        "compacted_at": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "format": "date-time"
-        },
-        "compacted_at_commit": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "compaction_level": {
-          "default": 0,
+        "estimated_minutes": {
+          "description": "Estimated effort in minutes.",
           "type": [
             "integer",
             "null"
@@ -89,6 +93,41 @@
             "null"
           ]
         },
+        "updated_at": {
+          "description": "Last update timestamp.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "closed_at": {
+          "description": "Closure timestamp.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "close_reason": {
+          "description": "Reason for closure.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "closed_by_session": {
+          "description": "Session ID that closed this issue.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "due_at": {
+          "description": "Due date.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
         "defer_until": {
           "description": "Defer until date.",
           "type": [
@@ -97,7 +136,22 @@
           ],
           "format": "date-time"
         },
-        "delete_reason": {
+        "external_ref": {
+          "description": "External reference (e.g., JIRA-123).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_system": {
+          "description": "Source system for imported issues.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_repo": {
+          "description": "Source repository for multi-repo support.",
           "type": [
             "string",
             "null"
@@ -116,88 +170,34 @@
             "null"
           ]
         },
-        "dependencies": {
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/Dependency"
-          }
-        },
-        "dependents": {
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/IssueWithDependencyMetadata"
-          }
-        },
-        "description": {
-          "description": "Detailed description.",
+        "delete_reason": {
           "type": [
             "string",
             "null"
           ]
         },
-        "design": {
-          "description": "Technical design notes.",
+        "original_type": {
           "type": [
             "string",
             "null"
           ]
         },
-        "due_at": {
-          "description": "Due date.",
+        "compaction_level": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32",
+          "default": 0
+        },
+        "compacted_at": {
           "type": [
             "string",
             "null"
           ],
           "format": "date-time"
         },
-        "ephemeral": {
-          "type": "boolean"
-        },
-        "estimated_minutes": {
-          "description": "Estimated effort in minutes.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "int32"
-        },
-        "events": {
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/Event"
-          }
-        },
-        "external_ref": {
-          "description": "External reference (e.g., JIRA-123).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "id": {
-          "description": "Unique ID (e.g., \"bd-abc123\").",
-          "type": "string"
-        },
-        "is_template": {
-          "type": "boolean"
-        },
-        "issue_type": {
-          "description": "Issue type (bug, feature, etc.).",
-          "default": "task",
-          "allOf": [
-            {
-              "$ref": "#/definitions/IssueType"
-            }
-          ]
-        },
-        "labels": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "notes": {
-          "description": "Additional notes.",
+        "compacted_at_commit": {
           "type": [
             "string",
             "null"
@@ -210,114 +210,127 @@
           ],
           "format": "int32"
         },
-        "original_type": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "owner": {
-          "description": "Issue owner.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "parent": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "pinned": {
-          "type": "boolean"
-        },
-        "priority": {
-          "description": "Priority (0=Critical, 4=Backlog).",
-          "default": 0,
-          "type": "integer",
-          "format": "int32"
-        },
         "sender": {
           "type": [
             "string",
             "null"
           ]
         },
-        "source_repo": {
-          "description": "Source repository for multi-repo support.",
+        "ephemeral": {
+          "type": "boolean"
+        },
+        "pinned": {
+          "type": "boolean"
+        },
+        "is_template": {
+          "type": "boolean"
+        },
+        "labels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/IssueWithDependencyMetadata"
+          }
+        },
+        "comments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Comment"
+          }
+        },
+        "dependents": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/IssueWithDependencyMetadata"
+          }
+        },
+        "events": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Event"
+          }
+        },
+        "parent": {
           "type": [
             "string",
             "null"
           ]
-        },
-        "source_system": {
-          "description": "Source system for imported issues.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "status": {
-          "description": "Workflow status.",
-          "default": "open",
-          "allOf": [
-            {
-              "$ref": "#/definitions/Status"
-            }
-          ]
-        },
-        "title": {
-          "description": "Title (1-500 chars).",
-          "type": "string"
-        },
-        "updated_at": {
-          "description": "Last update timestamp.",
-          "type": "string",
-          "format": "date-time"
         }
       },
-      "definitions": {
-        "Comment": {
-          "description": "A comment on an issue.",
-          "type": "object",
-          "required": [
-            "author",
-            "created_at",
-            "id",
-            "issue_id",
-            "text"
-          ],
-          "properties": {
-            "author": {
-              "type": "string"
-            },
-            "created_at": {
+      "required": [
+        "id",
+        "title",
+        "created_at",
+        "updated_at"
+      ],
+      "$defs": {
+        "Status": {
+          "description": "Issue lifecycle status.",
+          "anyOf": [
+            {
               "type": "string",
-              "format": "date-time"
+              "enum": [
+                "open",
+                "in_progress",
+                "blocked",
+                "deferred",
+                "draft",
+                "closed",
+                "tombstone",
+                "pinned"
+              ]
             },
-            "id": {
-              "type": "integer",
-              "format": "int64"
-            },
-            "issue_id": {
-              "type": "string"
-            },
-            "text": {
+            {
               "type": "string"
             }
-          }
+          ]
+        },
+        "Priority": {
+          "description": "Issue priority (0=Critical, 4=Backlog).",
+          "type": "integer",
+          "format": "int32"
+        },
+        "IssueType": {
+          "description": "Issue type category.",
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "task",
+                "bug",
+                "feature",
+                "epic",
+                "chore",
+                "docs",
+                "question"
+              ]
+            },
+            {
+              "type": "string"
+            }
+          ]
         },
         "Dependency": {
           "description": "Relationship between two issues.",
           "type": "object",
-          "required": [
-            "created_at",
-            "depends_on_id",
-            "issue_id",
-            "type"
-          ],
           "properties": {
+            "issue_id": {
+              "description": "The issue that has the dependency (source).",
+              "type": "string"
+            },
+            "depends_on_id": {
+              "description": "The issue being depended on (target).",
+              "type": "string"
+            },
+            "type": {
+              "description": "Type of dependency.",
+              "$ref": "#/$defs/DependencyType"
+            },
             "created_at": {
               "description": "Creation timestamp.",
               "type": "string",
@@ -329,14 +342,6 @@
                 "string",
                 "null"
               ]
-            },
-            "depends_on_id": {
-              "description": "The issue being depended on (target).",
-              "type": "string"
-            },
-            "issue_id": {
-              "description": "The issue that has the dependency (source).",
-              "type": "string"
             },
             "metadata": {
               "description": "Optional metadata (JSON).",
@@ -351,20 +356,18 @@
                 "string",
                 "null"
               ]
-            },
-            "type": {
-              "description": "Type of dependency.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/DependencyType"
-                }
-              ]
             }
-          }
+          },
+          "required": [
+            "issue_id",
+            "depends_on_id",
+            "type",
+            "created_at"
+          ]
         },
         "DependencyType": {
           "description": "Dependency relationship type.",
-          "oneOf": [
+          "anyOf": [
             {
               "type": "string",
               "enum": [
@@ -382,32 +385,95 @@
               ]
             },
             {
-              "type": "object",
-              "required": [
-                "custom"
-              ],
-              "properties": {
-                "custom": {
-                  "type": "string"
-                }
-              },
-              "additionalProperties": false
+              "type": "string"
             }
+          ]
+        },
+        "Comment": {
+          "description": "A comment on an issue.",
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "issue_id": {
+              "type": "string"
+            },
+            "author": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "created_at": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          "required": [
+            "id",
+            "issue_id",
+            "author",
+            "text",
+            "created_at"
+          ]
+        },
+        "IssueWithDependencyMetadata": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "title": {
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/$defs/Status"
+            },
+            "priority": {
+              "$ref": "#/$defs/Priority"
+            },
+            "dependency_type": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "title",
+            "status",
+            "priority",
+            "dependency_type"
           ]
         },
         "Event": {
           "description": "An event in the issue's history (audit log).",
           "type": "object",
-          "required": [
-            "actor",
-            "created_at",
-            "event_type",
-            "id",
-            "issue_id"
-          ],
           "properties": {
+            "id": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "issue_id": {
+              "type": "string"
+            },
+            "event_type": {
+              "$ref": "#/$defs/EventType"
+            },
             "actor": {
               "type": "string"
+            },
+            "old_value": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "new_value": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "comment": {
               "type": [
@@ -418,119 +484,18 @@
             "created_at": {
               "type": "string",
               "format": "date-time"
-            },
-            "event_type": {
-              "$ref": "#/definitions/EventType"
-            },
-            "id": {
-              "type": "integer",
-              "format": "int64"
-            },
-            "issue_id": {
-              "type": "string"
-            },
-            "new_value": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "old_value": {
-              "type": [
-                "string",
-                "null"
-              ]
             }
-          }
+          },
+          "required": [
+            "id",
+            "issue_id",
+            "event_type",
+            "actor",
+            "created_at"
+          ]
         },
         "EventType": {
           "type": "string"
-        },
-        "IssueType": {
-          "description": "Issue type category.",
-          "oneOf": [
-            {
-              "type": "string",
-              "enum": [
-                "task",
-                "bug",
-                "feature",
-                "epic",
-                "chore",
-                "docs",
-                "question"
-              ]
-            },
-            {
-              "type": "object",
-              "required": [
-                "custom"
-              ],
-              "properties": {
-                "custom": {
-                  "type": "string"
-                }
-              },
-              "additionalProperties": false
-            }
-          ]
-        },
-        "IssueWithDependencyMetadata": {
-          "type": "object",
-          "required": [
-            "dependency_type",
-            "id",
-            "priority",
-            "status",
-            "title"
-          ],
-          "properties": {
-            "dependency_type": {
-              "type": "string"
-            },
-            "id": {
-              "type": "string"
-            },
-            "priority": {
-              "type": "integer",
-              "format": "int32"
-            },
-            "status": {
-              "$ref": "#/definitions/Status"
-            },
-            "title": {
-              "type": "string"
-            }
-          }
-        },
-        "Status": {
-          "description": "Issue lifecycle status.",
-          "oneOf": [
-            {
-              "type": "string",
-              "enum": [
-                "open",
-                "in_progress",
-                "blocked",
-                "deferred",
-                "closed",
-                "tombstone",
-                "pinned"
-              ]
-            },
-            {
-              "type": "object",
-              "required": [
-                "custom"
-              ],
-              "properties": {
-                "custom": {
-                  "type": "string"
-                }
-              },
-              "additionalProperties": false
-            }
-          ]
         }
       }
     }

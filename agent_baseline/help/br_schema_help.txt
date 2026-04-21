@@ -1,5 +1,7 @@
 Emit JSON Schemas for br output types (for agent/tooling integration)
 
+IMPORTANT: br schema is not a stable API and is subject to change. Use at your own risk.
+
 Usage: br schema [OPTIONS] [TARGET]
 
 Arguments:
@@ -22,7 +24,7 @@ Arguments:
 
 Options:
       --format <FORMAT>
-          Output format (text, json, toon)
+          Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT
 
           Possible values:
           - text: Human-readable text (default)
@@ -54,7 +56,7 @@ Options:
           Allow stale DB (bypass freshness check warning)
 
       --lock-timeout <LOCK_TIMEOUT>
-          `SQLite` busy timeout in ms
+          `SQLite` busy/write-lock timeout in ms
 
       --no-db
           JSONL-only mode (no DB connection)

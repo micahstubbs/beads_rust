@@ -34,6 +34,14 @@ As a fallback, this repo also includes a captured snapshot bundle under:
 
 - `agent_baseline/schemas/`
 
+Those snapshots are checked against the built binary by the
+`agent_baseline_snapshots_match_current_binary` test. After intentional schema
+changes, regenerate them with:
+
+```bash
+UPDATE_AGENT_BASELINE=1 cargo test --test e2e_schema agent_baseline_snapshots_match_current_binary -- --nocapture
+```
+
 ## Key folding (TOON)
 
 When emitting TOON, br may "fold" nested keys into dotted keys (safe folding) to save tokens.
