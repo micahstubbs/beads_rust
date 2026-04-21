@@ -495,6 +495,16 @@ fn e2e_lint_json_output_structure() {
             result.get("missing").is_some(),
             "result missing 'missing' field"
         );
+        let suggestions = result["suggestions"]
+            .as_array()
+            .expect("result missing 'suggestions' array");
+        assert!(
+            suggestions.iter().any(|suggestion| {
+                suggestion["section"].as_str() == Some("## Steps to Reproduce")
+                    && suggestion["hint"].as_str() == Some("Describe how to reproduce the bug")
+            }),
+            "result suggestions should include section-specific hints: {suggestions:?}"
+        );
     }
 }
 
@@ -540,6 +550,10 @@ fn e2e_lint_text_output_warnings() {
     assert!(
         lint.stdout.contains("Missing") || lint.stdout.contains("warning"),
         "text output should indicate missing sections"
+    );
+    assert!(
+        lint.stdout.contains("Describe how to reproduce the bug"),
+        "text output should include section hint"
     );
 }
 

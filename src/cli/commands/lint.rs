@@ -26,6 +26,14 @@ struct LintResult {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     missing: Vec<String>,
     warnings: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    suggestions: Vec<LintSuggestion>,
+}
+
+#[derive(Debug, Serialize)]
+struct LintSuggestion {
+    section: String,
+    hint: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -55,7 +63,6 @@ impl LintSummary {
 #[derive(Debug, Clone, Copy)]
 struct RequiredSection {
     heading: &'static str,
-    #[allow(dead_code)] // Kept for future use in suggestions
     hint: &'static str,
 }
 
@@ -149,8 +156,8 @@ pub fn execute(
         );
         for result in &summary.results {
             println!("{} [{}]: {}", result.id, result.issue_type, result.title);
-            for missing in &result.missing {
-                println!("  ⚠ Missing: {missing}");
+            for suggestion in &result.suggestions {
+                println!("  ⚠ Missing: {} - {}", suggestion.section, suggestion.hint);
             }
             println!();
         }
@@ -209,9 +216,11 @@ fn render_lint_rich(summary: &LintSummary, ctx: &OutputContext) {
                 content.append_styled(&result.title, theme.issue_title.clone());
                 content.append("\n");
 
-                for missing in &result.missing {
+                for suggestion in &result.suggestions {
                     content.append_styled("    missing: ", theme.dimmed.clone());
-                    content.append_styled(missing, theme.warning.clone());
+                    content.append_styled(&suggestion.section, theme.warning.clone());
+                    content.append_styled(" - ", theme.dimmed.clone());
+                    content.append_styled(&suggestion.hint, theme.dimmed.clone());
                     content.append("\n");
                 }
             }
@@ -377,12 +386,25 @@ fn lint_issue(issue: &Issue) -> Option<LintResult> {
         return None;
     }
 
+    let missing_headings = missing
+        .iter()
+        .map(|section| section.heading.to_string())
+        .collect();
+    let suggestions = missing
+        .iter()
+        .map(|section| LintSuggestion {
+            section: section.heading.to_string(),
+            hint: section.hint.to_string(),
+        })
+        .collect();
+
     Some(LintResult {
         id: issue.id.clone(),
         title: issue.title.clone(),
         issue_type: issue.issue_type.as_str().to_string(),
         warnings: missing.len(),
-        missing: missing.into_iter().map(|m| m.heading.to_string()).collect(),
+        missing: missing_headings,
+        suggestions,
     })
 }
 
@@ -482,6 +504,14 @@ mod tests {
                 .missing
                 .contains(&"## Acceptance Criteria".to_string())
         );
+        assert!(result.suggestions.iter().any(|suggestion| {
+            suggestion.section == "## Steps to Reproduce"
+                && suggestion.hint == "Describe how to reproduce the bug"
+        }));
+        assert!(result.suggestions.iter().any(|suggestion| {
+            suggestion.section == "## Acceptance Criteria"
+                && suggestion.hint == "Define criteria to verify the fix"
+        }));
     }
 
     #[test]
