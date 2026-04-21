@@ -1364,8 +1364,11 @@ mod tests {
                 "db_jsonl_disagreement",
                 "duplicate_config_rows",
                 "interrupted_rebuild_leftovers",
+                "journal_sidecar_leftover",
                 "jsonl_conflict_markers",
                 "metadata_custom_paths",
+                "orphan_shm_sidecar",
+                "orphaned_lock_file",
                 "sidecar_wal_without_shm",
             ]
         );
