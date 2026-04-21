@@ -477,7 +477,12 @@ fn parse_timestamp(s: &str) -> McpResult<(chrono::DateTime<chrono::Utc>, Option<
 
     // Try parsing date-only (YYYY-MM-DD → start of day UTC)
     if let Ok(date) = chrono::NaiveDate::parse_from_str(&normalized, "%Y-%m-%d") {
-        let dt = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let Some(midnight) = date.and_hms_opt(0, 0, 0) else {
+            return Err(McpError::invalid_params(format!(
+                "Cannot normalize date '{s}' to midnight UTC"
+            )));
+        };
+        let dt = midnight.and_utc();
         return Ok((
             dt,
             Some(format!("'{s}' interpreted as '{}'", dt.to_rfc3339())),
@@ -536,6 +541,87 @@ fn nullable_str(args: &serde_json::Value, key: &str) -> McpResult<Option<Option<
     }
 }
 
+fn required_str_arg(args: &serde_json::Value, key: &str) -> McpResult<String> {
+    match args.get(key) {
+        None => Err(McpError::invalid_params(format!("'{key}' is required"))),
+        Some(v) => v.as_str().map_or_else(
+            || {
+                Err(McpError::invalid_params(format!(
+                    "'{key}' must be a string, got {v}"
+                )))
+            },
+            |s| Ok(s.to_string()),
+        ),
+    }
+}
+
+fn optional_str_arg(args: &serde_json::Value, key: &str) -> McpResult<Option<String>> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(v) => v.as_str().map_or_else(
+            || {
+                Err(McpError::invalid_params(format!(
+                    "'{key}' must be a string, got {v}"
+                )))
+            },
+            |s| Ok(Some(s.to_string())),
+        ),
+    }
+}
+
+fn optional_bool_arg(args: &serde_json::Value, key: &str) -> McpResult<Option<bool>> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(v) => v.as_bool().map_or_else(
+            || {
+                Err(McpError::invalid_params(format!(
+                    "'{key}' must be a boolean, got {v}"
+                )))
+            },
+            |b| Ok(Some(b)),
+        ),
+    }
+}
+
+fn optional_u64_arg(args: &serde_json::Value, key: &str) -> McpResult<Option<u64>> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(v) => v.as_u64().map_or_else(
+            || {
+                Err(McpError::invalid_params(format!(
+                    "'{key}' must be a non-negative integer, got {v}"
+                )))
+            },
+            |n| Ok(Some(n)),
+        ),
+    }
+}
+
+fn optional_string_array_arg(args: &serde_json::Value, key: &str) -> McpResult<Vec<String>> {
+    let Some(value) = args.get(key) else {
+        return Ok(Vec::new());
+    };
+
+    let array = value.as_array().ok_or_else(|| {
+        McpError::invalid_params(format!("'{key}' must be an array of strings, got {value}"))
+    })?;
+
+    array
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            value.as_str().map_or_else(
+                || {
+                    Err(McpError::invalid_params(format!(
+                        "'{key}[{idx}]' must be a string, got {value}"
+                    )))
+                },
+                |s| Ok(s.to_string()),
+            )
+        })
+        .collect()
+}
+
 /// Parse update fields from JSON args into an `IssueUpdate` + coercion warnings.
 /// Extracted to keep `UpdateIssueTool::call` under the line limit.
 #[allow(clippy::too_many_lines)]
@@ -546,15 +632,15 @@ fn parse_update_fields(
     let mut coercions: Vec<String> = Vec::new();
     let mut updates = IssueUpdate::default();
 
-    if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
+    if let Some(title) = optional_str_arg(args, "title")? {
         if title.is_empty() || title.len() > 500 {
             return Err(McpError::invalid_params("Title must be 1-500 characters"));
         }
-        updates.title = Some(title.to_string());
+        updates.title = Some(title);
     }
     updates.description = nullable_str(args, "description")?;
-    if let Some(s) = args.get("status").and_then(|v| v.as_str()) {
-        let (status, warning) = parse_status(s)?;
+    if let Some(s) = optional_str_arg(args, "status")? {
+        let (status, warning) = parse_status(&s)?;
 
         // Intercept status→closed: redirect to close_issue
         if status == Status::Closed {
@@ -578,15 +664,15 @@ fn parse_update_fields(
         }
         updates.status = Some(status);
     }
-    if let Some(p) = args.get("priority").and_then(|v| v.as_str()) {
-        let (priority, warning) = parse_priority(p)?;
+    if let Some(p) = optional_str_arg(args, "priority")? {
+        let (priority, warning) = parse_priority(&p)?;
         if let Some(w) = warning {
             coercions.push(w);
         }
         updates.priority = Some(priority);
     }
-    if let Some(t) = args.get("type").and_then(|v| v.as_str()) {
-        let (issue_type, warning) = parse_issue_type(t);
+    if let Some(t) = optional_str_arg(args, "type")? {
+        let (issue_type, warning) = parse_issue_type(&t);
         if let Some(w) = warning {
             coercions.push(w);
         }
@@ -667,9 +753,7 @@ fn build_list_filters(
     args: &serde_json::Value,
     coercions: &mut Vec<String>,
 ) -> McpResult<ListFilters> {
-    let statuses = args
-        .get("status")
-        .and_then(|v| v.as_str())
+    let statuses = optional_str_arg(args, "status")?
         .map(|s| {
             s.split(',')
                 .map(|p| {
@@ -683,7 +767,7 @@ fn build_list_filters(
         })
         .transpose()?;
 
-    let types = args.get("type").and_then(|v| v.as_str()).map(|s| {
+    let types = optional_str_arg(args, "type")?.map(|s| {
         s.split(',')
             .map(|p| {
                 let (t, warning) = parse_issue_type(p.trim());
@@ -695,9 +779,7 @@ fn build_list_filters(
             .collect::<Vec<_>>()
     });
 
-    let priorities = args
-        .get("priority")
-        .and_then(|v| v.as_str())
+    let priorities = optional_str_arg(args, "priority")?
         .map(|s| {
             s.split(',')
                 .map(|p| {
@@ -711,26 +793,20 @@ fn build_list_filters(
         })
         .transpose()?;
 
-    let labels = args.get("labels").and_then(|v| v.as_str()).map(|s| {
+    let labels = optional_str_arg(args, "labels")?.map(|s| {
         s.split(',')
             .map(|l| l.trim().to_string())
             .collect::<Vec<_>>()
     });
 
-    let include_closed = args
-        .get("include_closed")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+    let include_closed = optional_bool_arg(args, "include_closed")?.unwrap_or(false);
 
-    let raw_limit = args
-        .get("limit")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(50);
+    let raw_limit = optional_u64_arg(args, "limit")?.unwrap_or(50);
     let limit = Some(raw_limit.min(500) as usize);
 
-    let sort = args.get("sort").and_then(|v| v.as_str()).map(String::from);
+    let sort = optional_str_arg(args, "sort")?;
 
-    let title_contains = args.get("title").and_then(|v| v.as_str()).map(String::from);
+    let title_contains = optional_str_arg(args, "title")?;
 
     // Forgive by Default: if the status filter explicitly includes Closed or
     // Deferred, automatically enable the corresponding include flag so the
@@ -748,10 +824,7 @@ fn build_list_filters(
         statuses,
         types,
         priorities,
-        assignee: args
-            .get("assignee")
-            .and_then(|v| v.as_str())
-            .map(String::from),
+        assignee: optional_str_arg(args, "assignee")?,
         include_closed,
         include_deferred,
         limit,
@@ -849,9 +922,9 @@ impl ToolHandler for ListIssuesTool {
         let mut coercions: Vec<String> = Vec::new();
         let filters = build_list_filters(&args, &mut coercions)?;
 
-        let search_query = args.get("search").and_then(|v| v.as_str());
+        let search_query = optional_str_arg(&args, "search")?;
 
-        let issues = if let Some(raw_q) = search_query {
+        let issues = if let Some(raw_q) = search_query.as_deref() {
             if let Some(q) = sanitize_search(raw_q) {
                 storage.search_issues(&q, &filters).map_err(beads_to_mcp)?
             } else {
@@ -942,22 +1015,19 @@ impl ToolHandler for ShowIssueTool {
     }
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
-        let id = args
-            .get("id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| McpError::invalid_params("'id' is required"))?;
+        let id = required_str_arg(&args, "id")?;
 
         // Placeholder detection before any DB work
-        if let Some(err) = detect_placeholder(id) {
+        if let Some(err) = detect_placeholder(&id) {
             return Err(err);
         }
 
         let storage = open(&self.0)?;
 
         let details = storage
-            .get_issue_details(id, true, true, 20)
+            .get_issue_details(&id, true, true, 20)
             .map_err(beads_to_mcp)?
-            .ok_or_else(|| issue_not_found_err(&storage, id))?;
+            .ok_or_else(|| issue_not_found_err(&storage, &id))?;
 
         let mut result = serde_json::to_value(&details.issue).unwrap_or_default();
         if let Some(obj) = result.as_object_mut() {
@@ -1127,10 +1197,7 @@ impl ToolHandler for CreateIssueTool {
     // count helps.
     #[allow(clippy::too_many_lines)]
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
-        let title = args
-            .get("title")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| McpError::invalid_params("'title' is required"))?;
+        let title = required_str_arg(&args, "title")?;
 
         if title.is_empty() || title.len() > 500 {
             return Err(McpError::invalid_params("Title must be 1-500 characters"));
@@ -1138,17 +1205,15 @@ impl ToolHandler for CreateIssueTool {
 
         let mut coercions: Vec<String> = Vec::new();
 
-        let (issue_type, type_warning) = args
-            .get("type")
-            .and_then(|v| v.as_str())
+        let (issue_type, type_warning) = optional_str_arg(&args, "type")?
+            .as_deref()
             .map_or((IssueType::Task, None), parse_issue_type);
         if let Some(w) = type_warning {
             coercions.push(w);
         }
 
-        let (priority, prio_warning) = args
-            .get("priority")
-            .and_then(|v| v.as_str())
+        let (priority, prio_warning) = optional_str_arg(&args, "priority")?
+            .as_deref()
             .map(parse_priority)
             .transpose()?
             .unwrap_or((Priority::MEDIUM, None));
@@ -1156,20 +1221,11 @@ impl ToolHandler for CreateIssueTool {
             coercions.push(w);
         }
 
-        let parent_id = args
-            .get("parent")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+        let parent_id = optional_str_arg(&args, "parent")?;
+        let description = optional_str_arg(&args, "description")?;
+        let assignee = optional_str_arg(&args, "assignee")?;
 
-        let labels_to_add: Vec<String> = args
-            .get("labels")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|val| val.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let labels_to_add = optional_string_array_arg(&args, "labels")?;
 
         let id = self.0.with_mutation(|storage| {
             let now = chrono::Utc::now();
@@ -1194,25 +1250,19 @@ impl ToolHandler for CreateIssueTool {
                 let id_gen = crate::util::id::IdGenerator::new(
                     crate::util::id::IdConfig::with_prefix(prefix),
                 );
-                id_gen.generate(title, None, Some(&self.0.actor), now, 0, |candidate| {
+                id_gen.generate(&title, None, Some(&self.0.actor), now, 0, |candidate| {
                     storage.id_exists(candidate).unwrap_or(false)
                 })
             };
 
             let issue = Issue {
                 id: id.clone(),
-                title: title.to_string(),
-                description: args
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
+                title: title.clone(),
+                description: description.clone(),
                 status: Status::Open,
                 priority,
                 issue_type: issue_type.clone(),
-                assignee: args
-                    .get("assignee")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
+                assignee: assignee.clone(),
                 created_by: Some(self.0.actor.clone()),
                 created_at: now,
                 updated_at: now,
@@ -1375,37 +1425,30 @@ impl ToolHandler for UpdateIssueTool {
     }
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
-        let id = args
-            .get("id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| McpError::invalid_params("'id' is required"))?;
+        let id = required_str_arg(&args, "id")?;
 
-        let (updates, coercions) = parse_update_fields(id, &args)?;
+        let (updates, coercions) = parse_update_fields(&id, &args)?;
+        let labels_to_add = optional_string_array_arg(&args, "labels_add")?;
+        let labels_to_remove = optional_string_array_arg(&args, "labels_remove")?;
+        let comment = optional_str_arg(&args, "comment")?;
 
         let issue = self.0.with_mutation(|storage| {
             // Validate ID exists before attempting update (placeholder + existence check)
-            require_valid_issue(storage, id)?;
+            require_valid_issue(storage, &id)?;
 
             let has_field_updates = UPDATE_FIELD_KEYS.iter().any(|k| args.get(k).is_some());
-            let has_side_effects = args
-                .get("labels_add")
-                .and_then(|v| v.as_array())
-                .is_some_and(|a| !a.is_empty())
-                || args
-                    .get("labels_remove")
-                    .and_then(|v| v.as_array())
-                    .is_some_and(|a| !a.is_empty())
-                || args
-                    .get("comment")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|s| !s.is_empty());
+            let has_side_effects = !labels_to_add.is_empty()
+                || !labels_to_remove.is_empty()
+                || comment.as_deref().is_some_and(|s| !s.is_empty());
 
             let issue = if has_field_updates {
-                storage.update_issue(id, &updates, &self.0.actor).map_err(beads_to_mcp)?
+                storage
+                    .update_issue(&id, &updates, &self.0.actor)
+                    .map_err(beads_to_mcp)?
             } else if has_side_effects {
                 storage
-                    .get_issue_details(id, false, false, 0).map_err(beads_to_mcp)?
-                    .ok_or_else(|| issue_not_found_err(storage, id))?
+                    .get_issue_details(&id, false, false, 0).map_err(beads_to_mcp)?
+                    .ok_or_else(|| issue_not_found_err(storage, &id))?
                     .issue
             } else {
                 return Err(McpError::with_data(
@@ -1423,26 +1466,18 @@ impl ToolHandler for UpdateIssueTool {
             };
 
             // Handle label mutations
-            if let Some(labels) = args.get("labels_add").and_then(|v| v.as_array()) {
-                for label_val in labels {
-                    if let Some(label) = label_val.as_str() {
-                        let _ = storage.add_label(id, label, &self.0.actor);
-                    }
-                }
+            for label in &labels_to_add {
+                let _ = storage.add_label(&id, label, &self.0.actor);
             }
-            if let Some(labels) = args.get("labels_remove").and_then(|v| v.as_array()) {
-                for label_val in labels {
-                    if let Some(label) = label_val.as_str() {
-                        let _ = storage.remove_label(id, label, &self.0.actor);
-                    }
-                }
+            for label in &labels_to_remove {
+                let _ = storage.remove_label(&id, label, &self.0.actor);
             }
 
             // Add comment if provided
-            if let Some(comment) = args.get("comment").and_then(|v| v.as_str())
+            if let Some(comment) = comment.as_deref()
                 && !comment.is_empty()
             {
-                let _ = storage.add_comment(id, &self.0.actor, comment);
+                let _ = storage.add_comment(&id, &self.0.actor, comment);
             }
 
             Ok(issue)
@@ -1525,23 +1560,17 @@ impl ToolHandler for CloseIssueTool {
     }
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
-        let id = args
-            .get("id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| McpError::invalid_params("'id' is required"))?;
+        let id = required_str_arg(&args, "id")?;
 
-        let reason = args
-            .get("reason")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        let reason = optional_str_arg(&args, "reason")?;
 
         let (issue, our_blockers, dependents) = self.0.with_mutation(|storage| {
             // Validate ID exists (with placeholder detection + fuzzy suggestions)
-            require_valid_issue(storage, id)?;
+            require_valid_issue(storage, &id)?;
 
             // Idempotency: if already closed, return existing state without error
             if let Some(details) = storage
-                .get_issue_details(id, false, false, 0)
+                .get_issue_details(&id, false, false, 0)
                 .map_err(beads_to_mcp)?
                 && details.issue.status == Status::Closed
             {
@@ -1557,14 +1586,14 @@ impl ToolHandler for CloseIssueTool {
             };
 
             let issue = storage
-                .update_issue(id, &close_update, &self.0.actor)
+                .update_issue(&id, &close_update, &self.0.actor)
                 .map_err(beads_to_mcp)?;
 
             // Check for blockers this issue had (warn about closing a blocked issue)
-            let our_blockers = storage.get_blockers(id).unwrap_or_default();
+            let our_blockers = storage.get_blockers(&id).unwrap_or_default();
 
             // Check what this issue was blocking (now potentially unblocked)
-            let dependents = storage.get_blocked_issue_ids(id).unwrap_or_default();
+            let dependents = storage.get_blocked_issue_ids(&id).unwrap_or_default();
 
             Ok((issue, Some(our_blockers), Some(dependents)))
         })?;
@@ -1695,32 +1724,26 @@ impl ToolHandler for ManageDependenciesTool {
     // win.
     #[allow(clippy::too_many_lines)]
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
-        let action = args
-            .get("action")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                McpError::with_data(
-                    McpErrorCode::InvalidParams,
-                    "'action' is required",
-                    json!({
-                        "error_type": "REQUIRED_FIELD",
-                        "available_options": ["add", "remove", "list"],
-                        "fix_hint": "Provide action: 'list' to view, 'add' to create, 'remove' to delete"
-                    }),
-                )
-            })?;
+        let action = required_str_arg(&args, "action").map_err(|err| {
+            McpError::with_data(
+                McpErrorCode::InvalidParams,
+                err.to_string(),
+                json!({
+                    "error_type": "REQUIRED_FIELD",
+                    "available_options": ["add", "remove", "list"],
+                    "fix_hint": "Provide action: 'list' to view, 'add' to create, 'remove' to delete"
+                }),
+            )
+        })?;
 
-        let id = args
-            .get("id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| McpError::invalid_params("'id' is required"))?;
+        let id = required_str_arg(&args, "id")?;
 
-        match action {
+        match action.as_str() {
             "list" => {
                 let storage = open(&self.0)?;
-                require_valid_issue(&storage, id)?;
-                let deps = storage.get_dependencies_full(id).map_err(beads_to_mcp)?;
-                let dependents = storage.get_dependents(id).map_err(beads_to_mcp)?;
+                require_valid_issue(&storage, &id)?;
+                let deps = storage.get_dependencies_full(&id).map_err(beads_to_mcp)?;
+                let dependents = storage.get_dependents(&id).map_err(beads_to_mcp)?;
 
                 Ok(vec![Content::text(
                     json!({
@@ -1737,28 +1760,22 @@ impl ToolHandler for ManageDependenciesTool {
                 )])
             }
             "add" => {
-                let depends_on =
-                    args.get("depends_on")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            McpError::invalid_params("'depends_on' is required for action 'add'")
-                        })?;
+                let depends_on = required_str_arg(&args, "depends_on")
+                    .map_err(|err| McpError::invalid_params(format!("{err} for action 'add'")))?;
 
-                let dep_type_raw = args
-                    .get("dep_type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("blocks");
-                let (dep_type_str, dep_coercion) = parse_dep_type(dep_type_raw)?;
+                let dep_type_raw =
+                    optional_str_arg(&args, "dep_type")?.unwrap_or_else(|| "blocks".to_string());
+                let (dep_type_str, dep_coercion) = parse_dep_type(&dep_type_raw)?;
 
                 // Read-only pre-validation
                 {
                     let storage = open(&self.0)?;
-                    require_valid_issue(&storage, id)?;
-                    require_valid_issue(&storage, depends_on)?;
+                    require_valid_issue(&storage, &id)?;
+                    require_valid_issue(&storage, &depends_on)?;
 
                     // Check for cycles with structured error
                     if storage
-                        .would_create_cycle(id, depends_on, true)
+                        .would_create_cycle(&id, &depends_on, true)
                         .map_err(beads_to_mcp)?
                     {
                         return Err(McpError::with_data(
@@ -1781,7 +1798,7 @@ impl ToolHandler for ManageDependenciesTool {
 
                 let added = self.0.with_mutation(|storage| {
                     storage
-                        .add_dependency(id, depends_on, &dep_type_str, &self.0.actor)
+                        .add_dependency(&id, &depends_on, &dep_type_str, &self.0.actor)
                         .map_err(beads_to_mcp)
                 })?;
 
@@ -1798,27 +1815,24 @@ impl ToolHandler for ManageDependenciesTool {
                 Ok(vec![Content::text(result.to_string())])
             }
             "remove" => {
-                let depends_on =
-                    args.get("depends_on")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            McpError::invalid_params("'depends_on' is required for action 'remove'")
-                        })?;
+                let depends_on = required_str_arg(&args, "depends_on").map_err(|err| {
+                    McpError::invalid_params(format!("{err} for action 'remove'"))
+                })?;
 
                 // Validate target ID (placeholder check only — it might have been deleted)
-                if let Some(err) = detect_placeholder(depends_on) {
+                if let Some(err) = detect_placeholder(&depends_on) {
                     return Err(err);
                 }
 
                 // Pre-validate source ID
                 {
                     let storage = open(&self.0)?;
-                    require_valid_issue(&storage, id)?;
+                    require_valid_issue(&storage, &id)?;
                 }
 
                 let removed = self.0.with_mutation(|storage| {
                     storage
-                        .remove_dependency(id, depends_on, &self.0.actor)
+                        .remove_dependency(&id, &depends_on, &self.0.actor)
                         .map_err(beads_to_mcp)
                 })?;
 
@@ -1988,5 +2002,58 @@ impl ToolHandler for ProjectOverviewTool {
         });
 
         Ok(vec![Content::text(result.to_string())])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_list_filters, optional_string_array_arg, parse_update_fields};
+    use serde_json::json;
+
+    #[test]
+    fn parse_update_fields_rejects_non_string_priority() {
+        let err = parse_update_fields("beads_rust-1234", &json!({"priority": 0}))
+            .expect_err("numeric priority must be rejected");
+
+        assert!(err.to_string().contains("'priority' must be a string"));
+    }
+
+    #[test]
+    fn parse_update_fields_rejects_non_string_title() {
+        let err = parse_update_fields("beads_rust-1234", &json!({"title": ["bad"]}))
+            .expect_err("array title must be rejected");
+
+        assert!(err.to_string().contains("'title' must be a string"));
+    }
+
+    #[test]
+    fn optional_string_array_arg_rejects_non_array_values() {
+        let err = optional_string_array_arg(&json!({"labels": "bug"}), "labels")
+            .expect_err("string labels value must be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("'labels' must be an array of strings")
+        );
+    }
+
+    #[test]
+    fn optional_string_array_arg_rejects_non_string_entries() {
+        let err = optional_string_array_arg(&json!({"labels": ["bug", 42]}), "labels")
+            .expect_err("non-string label entries must be rejected");
+
+        assert!(err.to_string().contains("'labels[1]' must be a string"));
+    }
+
+    #[test]
+    fn build_list_filters_rejects_wrong_limit_type() {
+        let mut coercions = Vec::new();
+        let err = build_list_filters(&json!({"limit": "10"}), &mut coercions)
+            .expect_err("string limit must be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("'limit' must be a non-negative integer")
+        );
     }
 }
