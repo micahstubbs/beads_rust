@@ -664,6 +664,7 @@ pub fn normalize_jsonl(contents: &str) -> String {
 
 mod cli_output;
 mod error_messages;
+mod history_diff_output;
 mod json_output;
 mod jsonl_format;
 mod robot_output;
