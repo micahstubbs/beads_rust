@@ -27,10 +27,14 @@ use common::cli::{BrRun, BrWorkspace, extract_json_payload, parse_created_id, ru
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fs::{self, Permissions};
+use std::ffi::OsStr;
+use std::fs::{self, OpenOptions, Permissions};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command as StdCommand, Stdio};
+use std::thread;
+use std::time::Duration;
 use tempfile::TempDir;
 
 /// Test artifacts for failure injection tests.
@@ -43,6 +47,41 @@ struct FailureTestArtifacts {
 
 fn export_temp_path_for_test(output_path: &Path) -> PathBuf {
     output_path.with_extension(format!("jsonl.{}.tmp", std::process::id()))
+}
+
+fn should_clear_inherited_br_env(key: &OsStr) -> bool {
+    let key = key.to_string_lossy();
+    key.starts_with("BD_")
+        || key.starts_with("BEADS_")
+        || matches!(
+            key.as_ref(),
+            "BR_OUTPUT_FORMAT" | "TOON_DEFAULT_FORMAT" | "TOON_STATS"
+        )
+}
+
+fn clear_inherited_br_env(cmd: &mut StdCommand) {
+    for (key, _) in std::env::vars_os() {
+        if should_clear_inherited_br_env(&key) {
+            cmd.env_remove(&key);
+        }
+    }
+}
+
+fn spawn_br_child<I, S>(workspace: &BrWorkspace, args: I) -> std::process::Child
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut cmd = StdCommand::new(assert_cmd::cargo::cargo_bin!("br"));
+    cmd.current_dir(&workspace.root);
+    cmd.args(args);
+    clear_inherited_br_env(&mut cmd);
+    cmd.env("NO_COLOR", "1");
+    cmd.env("RUST_BACKTRACE", "1");
+    cmd.env("HOME", &workspace.root);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.spawn().expect("spawn br child")
 }
 
 impl FailureTestArtifacts {
@@ -212,6 +251,26 @@ fn flush_and_assert_clean(workspace: &BrWorkspace, label: &str) {
     assert_run_success(&flush, label);
     let status = sync_status_json(workspace, &format!("{label}_status"));
     assert_clean_status(&status, label);
+}
+
+fn assert_doctor_healthy(workspace: &BrWorkspace, label: &str) {
+    let doctor = run_br(workspace, ["doctor", "--json"], label);
+    if doctor.status.success() {
+        return;
+    }
+
+    let repair_label = format!("{label}_repair");
+    let repair = run_br(workspace, ["doctor", "--repair", "--json"], &repair_label);
+    assert!(
+        repair.status.success(),
+        "{label} failed and doctor --repair could not recover it\n\
+         initial stdout={}\ninitial stderr={}\n\
+         repair stdout={}\nrepair stderr={}",
+        doctor.stdout,
+        doctor.stderr,
+        repair.stdout,
+        repair.stderr
+    );
 }
 
 fn assert_stale_show_finds(workspace: &BrWorkspace, issue_id: &str, label: &str) {
@@ -986,6 +1045,130 @@ fn cli_sync_crash_boundary_matrix_preserves_artifacts() {
     artifacts.log(
         "verification",
         "PASSED: temp-file failure, post-rename dirty state, and import validation failure were visible and recoverable",
+    );
+    artifacts.save();
+}
+
+/// Test: A killed `sync --flush-only` process must not silently mark dirty
+/// state as exported or mutate JSONL before it owns the write-side lock.
+#[test]
+#[cfg(unix)]
+#[allow(clippy::incompatible_msrv)]
+fn cli_sync_flush_sigkill_while_waiting_for_write_lock_preserves_dirty_state() {
+    let _log = common::test_log(
+        "cli_sync_flush_sigkill_while_waiting_for_write_lock_preserves_dirty_state",
+    );
+    let mut artifacts = FailureTestArtifacts::new("cli_sync_flush_sigkill_waiting_write_lock");
+
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "sigkill_flush_init");
+    assert_run_success(&init, "sigkill_flush_init");
+
+    let create = run_br(
+        &workspace,
+        ["create", "SIGKILL sync flush anchor", "--json"],
+        "sigkill_flush_create",
+    );
+    assert_run_success(&create, "sigkill_flush_create");
+    let create_json = parse_stdout_json(&create, "sigkill_flush_create");
+    let issue_id = create_json["id"].as_str().unwrap_or("").to_string();
+    assert!(
+        !issue_id.is_empty(),
+        "create should report an issue id in stdout: {}",
+        create.stdout
+    );
+
+    flush_and_assert_clean(&workspace, "sigkill_flush_baseline");
+
+    let beads_dir = workspace.root.join(".beads");
+    let jsonl_path = beads_dir.join("issues.jsonl");
+    let baseline_hash = compute_file_hash(&jsonl_path).expect("baseline jsonl hash");
+
+    let update = run_br(
+        &workspace,
+        [
+            "update",
+            &issue_id,
+            "--status",
+            "in_progress",
+            "--json",
+            "--no-auto-flush",
+        ],
+        "sigkill_flush_dirty_update",
+    );
+    assert_run_success(&update, "sigkill_flush_dirty_update");
+
+    let dirty_before_kill = sync_status_json(&workspace, "sigkill_flush_dirty_before_kill");
+    assert_dirty_status(&dirty_before_kill, "dirty update before killed flush");
+    assert_eq!(
+        baseline_hash,
+        compute_file_hash(&jsonl_path).expect("hash before killed flush"),
+        "dirty DB update should not rewrite JSONL before explicit flush"
+    );
+
+    let lock_path = beads_dir.join(".write.lock");
+    let write_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .expect("open .write.lock");
+    write_lock.lock().expect("hold .write.lock");
+
+    let mut blocked_flush = spawn_br_child(
+        &workspace,
+        ["sync", "--flush-only", "--json", "--no-auto-import"],
+    );
+    thread::sleep(Duration::from_millis(250));
+
+    let early_exit = blocked_flush.try_wait().expect("poll blocked flush");
+    assert!(
+        early_exit.is_none(),
+        "sync --flush-only should still be waiting on .write.lock; status={early_exit:?}"
+    );
+
+    blocked_flush.kill().expect("kill blocked flush");
+    let killed = blocked_flush
+        .wait_with_output()
+        .expect("collect killed flush");
+    assert!(
+        !killed.status.success(),
+        "killed flush must not report success"
+    );
+    artifacts.log(
+        "killed_flush_stdout",
+        &String::from_utf8_lossy(&killed.stdout),
+    );
+    artifacts.log(
+        "killed_flush_stderr",
+        &String::from_utf8_lossy(&killed.stderr),
+    );
+
+    drop(write_lock);
+
+    assert_eq!(
+        baseline_hash,
+        compute_file_hash(&jsonl_path).expect("hash after killed flush"),
+        "killed blocked flush must preserve the pre-flush JSONL"
+    );
+    let dirty_after_kill = sync_status_json(&workspace, "sigkill_flush_dirty_after_kill");
+    assert_dirty_status(&dirty_after_kill, "dirty update after killed flush");
+    assert_stale_show_finds(&workspace, &issue_id, "sigkill_flush_stale_show_after_kill");
+
+    flush_and_assert_clean(&workspace, "sigkill_flush_recovery");
+    let final_hash = compute_file_hash(&jsonl_path).expect("final jsonl hash");
+    assert_ne!(
+        baseline_hash, final_hash,
+        "recovery flush should export the dirty update into JSONL"
+    );
+
+    assert_doctor_healthy(&workspace, "sigkill_flush_final_doctor");
+
+    artifacts.snapshot_dir("after_recovery", &workspace.root);
+    artifacts.log(
+        "verification",
+        "PASSED: killed blocked sync flush preserved dirty state and later explicit flush recovered",
     );
     artifacts.save();
 }
