@@ -23,7 +23,8 @@ mod common;
 use beads_rust::model::Issue;
 use beads_rust::storage::{ListFilters, SqliteStorage};
 use beads_rust::sync::{ExportConfig, ImportConfig, export_to_jsonl, import_from_jsonl};
-use common::cli::{BrWorkspace, run_br};
+use common::cli::{BrRun, BrWorkspace, extract_json_payload, parse_created_id, run_br};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, Permissions};
@@ -128,6 +129,123 @@ fn compute_file_hash(path: &Path) -> Option<String> {
     } else {
         None
     }
+}
+
+fn parse_stdout_json(run: &BrRun, context: &str) -> Value {
+    let payload = extract_json_payload(&run.stdout);
+    let parsed = serde_json::from_str(&payload);
+    let parse_error = match parsed.as_ref() {
+        Ok(_) => String::new(),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        parsed.is_ok(),
+        "{context} should emit valid JSON on stdout: {parse_error}\nstdout={}\nstderr={}",
+        run.stdout,
+        run.stderr
+    );
+    parsed.unwrap_or(Value::Null)
+}
+
+fn assert_run_success(run: &BrRun, context: &str) {
+    assert!(
+        run.status.success(),
+        "{context} failed\nstdout={}\nstderr={}",
+        run.stdout,
+        run.stderr
+    );
+    assert!(
+        run.log_path.exists(),
+        "{context} should leave a command log at {}",
+        run.log_path.display()
+    );
+}
+
+fn assert_run_failure(run: &BrRun, context: &str) {
+    assert!(
+        !run.status.success(),
+        "{context} unexpectedly succeeded\nstdout={}\nstderr={}",
+        run.stdout,
+        run.stderr
+    );
+    assert!(
+        run.log_path.exists(),
+        "{context} should leave a failure log at {}",
+        run.log_path.display()
+    );
+}
+
+fn sync_status_json(workspace: &BrWorkspace, label: &str) -> Value {
+    let run = run_br(workspace, ["sync", "--status", "--json"], label);
+    assert_run_success(&run, label);
+    parse_stdout_json(&run, label)
+}
+
+fn dirty_count(status: &Value) -> u64 {
+    let count = status["dirty_count"].as_u64();
+    assert!(count.is_some(), "sync status missing dirty_count: {status}");
+    count.unwrap_or(0)
+}
+
+fn assert_dirty_status(status: &Value, context: &str) {
+    assert!(
+        dirty_count(status) > 0 || status["db_newer"].as_bool() == Some(true),
+        "{context} should be visibly dirty or DB-newer, not silently clean: {status}"
+    );
+}
+
+fn assert_clean_status(status: &Value, context: &str) {
+    assert_eq!(
+        dirty_count(status),
+        0,
+        "{context} should clear dirty issues after explicit recovery: {status}"
+    );
+    assert_eq!(
+        status["db_newer"].as_bool(),
+        Some(false),
+        "{context} should not remain DB-newer after explicit recovery: {status}"
+    );
+}
+
+fn flush_and_assert_clean(workspace: &BrWorkspace, label: &str) {
+    let flush = run_br(workspace, ["sync", "--flush-only", "--json"], label);
+    assert_run_success(&flush, label);
+    let status = sync_status_json(workspace, &format!("{label}_status"));
+    assert_clean_status(&status, label);
+}
+
+fn assert_stale_show_finds(workspace: &BrWorkspace, issue_id: &str, label: &str) {
+    let show = run_br(
+        workspace,
+        [
+            "show",
+            issue_id,
+            "--no-auto-import",
+            "--allow-stale",
+            "--json",
+        ],
+        label,
+    );
+    assert_run_success(&show, label);
+    let json = parse_stdout_json(&show, label);
+    let found = json["id"].as_str() == Some(issue_id)
+        || json.as_array().is_some_and(|issues| {
+            issues
+                .iter()
+                .any(|issue| issue["id"].as_str() == Some(issue_id))
+        });
+    assert!(
+        found,
+        "{label} should keep {issue_id} visible after restart-style stale read: {json}"
+    );
+}
+
+fn run_dirty_mutation(workspace: &BrWorkspace, args: Vec<String>, label: &str) {
+    let run = run_br(workspace, args, label);
+    assert_run_success(&run, label);
+    let dirty_status = sync_status_json(workspace, &format!("{label}_dirty_status"));
+    assert_dirty_status(&dirty_status, label);
+    flush_and_assert_clean(workspace, &format!("{label}_recover_flush"));
 }
 
 /// Test: Export to read-only directory fails gracefully, original JSONL intact.
@@ -577,6 +695,301 @@ fn cli_import_malformed_preserves_db() {
     );
 }
 
+/// Test: Mutation crash boundaries remain visible until explicit recovery.
+///
+/// The simulated crash point is "after the primary DB write but before the
+/// automatic JSONL flush/dirty-clear path": every mutating command runs in a
+/// fresh process with `--no-auto-flush`, then a second process verifies the
+/// workspace is visibly dirty/stale and can be recovered by `sync --flush-only`.
+#[test]
+fn cli_mutation_crash_boundary_matrix_marks_dirty_until_recovered() {
+    let _log = common::test_log("cli_mutation_crash_boundary_matrix_marks_dirty_until_recovered");
+    let mut artifacts = FailureTestArtifacts::new("cli_mutation_crash_boundary_matrix");
+
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "matrix_init");
+    assert_run_success(&init, "matrix_init");
+
+    let create = run_br(
+        &workspace,
+        ["create", "Crash matrix anchor", "--no-auto-flush"],
+        "matrix_create_primary_write",
+    );
+    assert_run_success(&create, "matrix_create_primary_write");
+    let issue_id = parse_created_id(&create.stdout);
+    assert!(
+        !issue_id.is_empty(),
+        "create should report an issue id in stdout: {}",
+        create.stdout
+    );
+
+    let create_dirty = sync_status_json(&workspace, "matrix_create_dirty_status");
+    assert_dirty_status(&create_dirty, "create after primary write");
+    assert_stale_show_finds(&workspace, &issue_id, "matrix_create_stale_show");
+    flush_and_assert_clean(&workspace, "matrix_create_recover_flush");
+
+    let cases = [
+        (
+            "update",
+            vec![
+                "update".to_string(),
+                issue_id.clone(),
+                "--status".to_string(),
+                "in_progress".to_string(),
+                "--json".to_string(),
+                "--no-auto-flush".to_string(),
+            ],
+        ),
+        (
+            "label_add",
+            vec![
+                "label".to_string(),
+                "add".to_string(),
+                issue_id.clone(),
+                "crash-matrix".to_string(),
+                "--json".to_string(),
+                "--no-auto-flush".to_string(),
+            ],
+        ),
+        (
+            "comment_add",
+            vec![
+                "comments".to_string(),
+                "add".to_string(),
+                issue_id.clone(),
+                "crash boundary note".to_string(),
+                "--json".to_string(),
+                "--no-auto-flush".to_string(),
+            ],
+        ),
+        (
+            "close",
+            vec![
+                "close".to_string(),
+                issue_id.clone(),
+                "--reason".to_string(),
+                "crash boundary close".to_string(),
+                "--json".to_string(),
+                "--no-auto-flush".to_string(),
+            ],
+        ),
+        (
+            "reopen",
+            vec![
+                "reopen".to_string(),
+                issue_id.clone(),
+                "--reason".to_string(),
+                "crash boundary reopen".to_string(),
+                "--json".to_string(),
+                "--no-auto-flush".to_string(),
+            ],
+        ),
+        (
+            "defer",
+            vec![
+                "defer".to_string(),
+                issue_id.clone(),
+                "--until".to_string(),
+                "+1h".to_string(),
+                "--json".to_string(),
+                "--no-auto-flush".to_string(),
+            ],
+        ),
+        (
+            "undefer",
+            vec![
+                "undefer".to_string(),
+                issue_id.clone(),
+                "--json".to_string(),
+                "--no-auto-flush".to_string(),
+            ],
+        ),
+    ];
+
+    for (operation, args) in cases {
+        let label = format!("matrix_{operation}_primary_write");
+        run_dirty_mutation(&workspace, args, &label);
+        assert_stale_show_finds(
+            &workspace,
+            &issue_id,
+            &format!("matrix_{operation}_stale_show"),
+        );
+        artifacts.log(operation, "dirty state detected and recovered");
+    }
+
+    run_dirty_mutation(
+        &workspace,
+        vec![
+            "delete".to_string(),
+            issue_id,
+            "--reason".to_string(),
+            "crash boundary delete".to_string(),
+            "--json".to_string(),
+            "--no-auto-flush".to_string(),
+        ],
+        "matrix_delete_primary_write",
+    );
+
+    artifacts.log(
+        "verification",
+        "PASSED: create/update/label/comment/close/reopen/defer/undefer/delete dirty states were visible and recoverable",
+    );
+    artifacts.save();
+}
+
+/// Test: Sync crash boundaries preserve evidence and require explicit recovery.
+///
+/// This covers the observable sync-side crash phases:
+/// - during temp-file creation/write
+/// - after JSONL rename but before dirty flags are cleared
+/// - during import/rebuild input validation
+#[test]
+fn cli_sync_crash_boundary_matrix_preserves_artifacts() {
+    let _log = common::test_log("cli_sync_crash_boundary_matrix_preserves_artifacts");
+    let mut artifacts = FailureTestArtifacts::new("cli_sync_crash_boundary_matrix");
+
+    let temp_failure_workspace = TempDir::new().expect("temp failure workspace");
+    let temp_failure_beads_dir = temp_failure_workspace.path().join(".beads");
+    fs::create_dir_all(&temp_failure_beads_dir).expect("temp failure beads dir");
+    let temp_failure_jsonl = temp_failure_beads_dir.join("issues.jsonl");
+    fs::write(&temp_failure_jsonl, "{\"id\":\"old\",\"title\":\"Old\"}\n")
+        .expect("write preserved jsonl");
+    let temp_failure_hash = compute_file_hash(&temp_failure_jsonl).expect("temp failure hash");
+    let blocked_temp_path = export_temp_path_for_test(&temp_failure_jsonl);
+    fs::create_dir_all(&blocked_temp_path).expect("block direct export temp path");
+
+    let mut temp_failure_storage = SqliteStorage::open_memory().expect("temp failure storage");
+    let temp_failure_issue = create_test_issue("test-temp-failure", "Temp failure issue");
+    temp_failure_storage
+        .create_issue(&temp_failure_issue, "tester")
+        .expect("create temp failure issue");
+    let temp_failure_config = ExportConfig {
+        beads_dir: Some(temp_failure_beads_dir.clone()),
+        ..Default::default()
+    };
+    let temp_failure = export_to_jsonl(
+        &temp_failure_storage,
+        &temp_failure_jsonl,
+        &temp_failure_config,
+    );
+    assert!(
+        temp_failure.is_err(),
+        "direct export should fail when the exact temp path is unavailable"
+    );
+    assert_eq!(
+        temp_failure_hash,
+        compute_file_hash(&temp_failure_jsonl).expect("hash after temp failure"),
+        "failed temp-file write must preserve the pre-existing JSONL"
+    );
+    artifacts.snapshot_dir("after_temp_file_failure", temp_failure_workspace.path());
+
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "sync_matrix_init");
+    assert_run_success(&init, "sync_matrix_init");
+
+    let create = run_br(
+        &workspace,
+        ["create", "Sync crash matrix anchor", "--no-auto-flush"],
+        "sync_matrix_create_anchor",
+    );
+    assert_run_success(&create, "sync_matrix_create_anchor");
+    let issue_id = parse_created_id(&create.stdout);
+    assert!(
+        !issue_id.is_empty(),
+        "create should report an issue id in stdout: {}",
+        create.stdout
+    );
+
+    let beads_dir = workspace.root.join(".beads");
+    let jsonl_path = beads_dir.join("issues.jsonl");
+
+    flush_and_assert_clean(&workspace, "sync_matrix_baseline_flush");
+    let baseline_hash = compute_file_hash(&jsonl_path).expect("baseline hash");
+    artifacts.log("baseline_hash", &baseline_hash);
+
+    let update = run_br(
+        &workspace,
+        [
+            "update",
+            &issue_id,
+            "--status",
+            "in_progress",
+            "--json",
+            "--no-auto-flush",
+        ],
+        "sync_matrix_dirty_update",
+    );
+    assert_run_success(&update, "sync_matrix_dirty_update");
+    let dirty_before_temp_failure = sync_status_json(&workspace, "sync_matrix_dirty_before_temp");
+    assert_dirty_status(
+        &dirty_before_temp_failure,
+        "dirty update before temp failure",
+    );
+    assert_eq!(
+        baseline_hash,
+        compute_file_hash(&jsonl_path).expect("hash before direct export"),
+        "the dirty DB write should not rewrite JSONL before explicit export"
+    );
+
+    let storage = SqliteStorage::open(&beads_dir.join("beads.db")).expect("open workspace db");
+    let config = ExportConfig {
+        beads_dir: Some(beads_dir.clone()),
+        force: true,
+        ..Default::default()
+    };
+    let direct_export = export_to_jsonl(&storage, &jsonl_path, &config)
+        .expect("direct export simulates post-rename crash point");
+    artifacts.log("direct_export_hash", &direct_export.content_hash);
+    let dirty_after_direct_export = sync_status_json(&workspace, "sync_matrix_after_direct_export");
+    assert_dirty_status(
+        &dirty_after_direct_export,
+        "after rename before dirty-clear simulation",
+    );
+    drop(storage);
+    flush_and_assert_clean(&workspace, "sync_matrix_clear_dirty_after_direct_export");
+
+    let recovered_jsonl = fs::read_to_string(&jsonl_path).expect("read recovered jsonl");
+    fs::write(
+        &jsonl_path,
+        "<<<<<<< HEAD\n{\"id\":\"broken\"}\n=======\n{}\n>>>>>>> branch\n",
+    )
+    .expect("write conflict marker jsonl");
+    let failed_import = run_br(
+        &workspace,
+        ["sync", "--import-only", "--force", "--json"],
+        "sync_matrix_import_validation_failure",
+    );
+    assert_run_failure(&failed_import, "sync import validation failure");
+    assert_stale_show_finds(
+        &workspace,
+        &issue_id,
+        "sync_matrix_show_after_import_failure",
+    );
+    let import_failure_status =
+        sync_status_json(&workspace, "sync_matrix_status_after_import_fail");
+    assert!(
+        import_failure_status["jsonl_newer"].as_bool() == Some(true)
+            || dirty_count(&import_failure_status) > 0,
+        "failed import should leave visible drift, not a silent clean bill: {import_failure_status}"
+    );
+
+    fs::write(&jsonl_path, recovered_jsonl).expect("restore valid jsonl");
+    let repair_import = run_br(
+        &workspace,
+        ["sync", "--import-only", "--force", "--json"],
+        "sync_matrix_import_recovery",
+    );
+    assert_run_success(&repair_import, "sync import recovery");
+    let final_status = sync_status_json(&workspace, "sync_matrix_final_status");
+    assert_clean_status(&final_status, "sync matrix final recovery");
+
+    artifacts.log(
+        "verification",
+        "PASSED: temp-file failure, post-rename dirty state, and import validation failure were visible and recoverable",
+    );
+    artifacts.save();
+}
+
 /// Test: Simulate disk-full by filling temp file quota (where feasible).
 /// This test creates a large existing JSONL and verifies it survives export failure.
 #[test]
@@ -775,8 +1188,18 @@ fn atomic_write_pipeline_produces_valid_output() {
     assert_eq!(lines.len(), 10, "Should have 10 issues exported");
 
     for (i, line) in lines.iter().enumerate() {
-        let parsed: serde_json::Value = serde_json::from_str(line)
-            .unwrap_or_else(|e| panic!("Line {} is not valid JSON: {}", i, e));
+        let parsed = serde_json::from_str(line);
+        let parse_error = match parsed.as_ref() {
+            Ok(_) => String::new(),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            parsed.is_ok(),
+            "Line {} is not valid JSON: {}",
+            i,
+            parse_error
+        );
+        let parsed: serde_json::Value = parsed.unwrap_or(serde_json::Value::Null);
         assert!(
             parsed.get("id").is_some(),
             "Line {} should have an id field",
