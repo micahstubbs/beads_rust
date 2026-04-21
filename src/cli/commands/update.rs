@@ -8,7 +8,7 @@ use super::{
 use crate::cli::UpdateArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::model::{Issue, Status};
+use crate::model::{Issue, IssueType, Priority, Status};
 use crate::output::OutputContext;
 use crate::storage::{IssueUpdate, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
@@ -41,13 +41,75 @@ impl From<&Issue> for UpdatedIssueOutput {
     }
 }
 
+/// Snapshot of which fields the caller explicitly requested to change and
+/// the post-mutation values they produced, captured directly from the
+/// validated pre-mutation `issue_before` + the `IssueUpdate` struct that was
+/// applied.
+///
+/// We deliberately do NOT derive the post-mutation values from a second
+/// `get_issue(id)` read after the write transaction commits.  Doing so has
+/// surfaced as an "unrelated bead's fields leak into the diff" bug in the
+/// wild (see issue #256): a rare, yet-to-be-fully-root-caused read-path
+/// inconsistency (e.g. fsqlite prepared-statement / pager cache edge case,
+/// or a concurrent external writer touching the JSONL between the two
+/// reads) can cause the post-update `get_issue` to return data that belongs
+/// to a different row while the on-disk write is still correct.
+///
+/// By pairing the pre-mutation snapshot (whose `id` is guarded by
+/// `get_issue_from_conn`'s post-condition check to match the requested id)
+/// with the exact `IssueUpdate` struct the user passed, the rendered diff
+/// is guaranteed to reference only the target bead and only the fields the
+/// user explicitly asked to change.  Ghost fields like `status: open →
+/// closed` can no longer appear on a `--priority 1` no-op.
+#[derive(Debug, Default, Clone)]
+struct UpdateDiff {
+    status: Option<(Status, Status)>,
+    priority: Option<(Priority, Priority)>,
+    issue_type: Option<(IssueType, IssueType)>,
+    assignee: Option<(Option<String>, Option<String>)>,
+    owner: Option<(Option<String>, Option<String>)>,
+}
+
+impl UpdateDiff {
+    fn from_before_and_update(before: &Issue, update: &IssueUpdate) -> Self {
+        let mut diff = Self::default();
+        if let Some(ref new_status) = update.status
+            && before.status != *new_status
+        {
+            diff.status = Some((before.status.clone(), new_status.clone()));
+        }
+        if let Some(new_priority) = update.priority
+            && before.priority != new_priority
+        {
+            diff.priority = Some((before.priority, new_priority));
+        }
+        if let Some(ref new_type) = update.issue_type
+            && before.issue_type != *new_type
+        {
+            diff.issue_type = Some((before.issue_type.clone(), new_type.clone()));
+        }
+        if let Some(ref new_assignee_opt) = update.assignee {
+            let before_assignee = before.assignee.clone();
+            if before_assignee != *new_assignee_opt {
+                diff.assignee = Some((before_assignee, new_assignee_opt.clone()));
+            }
+        }
+        if let Some(ref new_owner_opt) = update.owner {
+            let before_owner = before.owner.clone();
+            if before_owner != *new_owner_opt {
+                diff.owner = Some((before_owner, new_owner_opt.clone()));
+            }
+        }
+        diff
+    }
+}
+
 #[derive(Debug)]
 enum UpdateRenderItem {
     Summary {
         id: String,
         title: String,
-        before: Box<Option<Issue>>,
-        after: Box<Issue>,
+        diff: Box<UpdateDiff>,
     },
     NoUpdates {
         id: String,
@@ -382,7 +444,11 @@ fn execute_prepared_route(
             blocked_cache_dirty = true;
         }
 
-        // Get issue after update for output
+        // Re-read post-mutation state for JSON/TOON machine output only.
+        // For human-readable diff rendering we synthesize the diff from
+        // `(issue_before, update)` below instead of trusting a second read,
+        // to defend against the "unrelated bead's fields leak into diff"
+        // regression reported in issue #256.
         let issue_after_result = prepared.storage_ctx.storage.get_issue(id);
         let issue_after = preserve_blocked_cache_on_error(
             &mut prepared.storage_ctx.storage,
@@ -391,20 +457,40 @@ fn execute_prepared_route(
             issue_after_result,
         )?;
 
-        if let Some(issue) = issue_after {
-            if ctx.is_json() || ctx.is_toon() {
-                updated_issues.push(UpdatedIssueOutput::from(&issue));
-            } else if ctx.is_quiet() {
-            } else if prepared.has_updates {
-                render_items.push(UpdateRenderItem::Summary {
-                    id: id.clone(),
-                    title: issue.title.clone(),
-                    before: Box::new(issue_before),
-                    after: Box::new(issue),
-                });
-            } else {
-                render_items.push(UpdateRenderItem::NoUpdates { id: id.clone() });
+        if ctx.is_json() || ctx.is_toon() {
+            if let Some(ref issue) = issue_after {
+                updated_issues.push(UpdatedIssueOutput::from(issue));
             }
+        } else if ctx.is_quiet() {
+            // No rendering in quiet mode.
+        } else if prepared.has_updates {
+            // Derive the rendered title and diff from the validated
+            // pre-mutation snapshot + the user's requested update.  If a
+            // title change was requested use the requested new title, else
+            // fall back to the authoritative `issue_before.title` (whose
+            // row id has been post-condition-checked to equal `id`).  Only
+            // if we have no `issue_before` at all (it was deleted / did
+            // not exist before our write, which should not happen on the
+            // `update` command path) do we fall back to the post-read.
+            let title = prepared
+                .update
+                .title
+                .clone()
+                .or_else(|| issue_before.as_ref().map(|b| b.title.clone()))
+                .or_else(|| issue_after.as_ref().map(|i| i.title.clone()))
+                .unwrap_or_default();
+            let diff = issue_before
+                .as_ref()
+                .map_or_else(UpdateDiff::default, |before| {
+                    UpdateDiff::from_before_and_update(before, &prepared.update)
+                });
+            render_items.push(UpdateRenderItem::Summary {
+                id: id.clone(),
+                title,
+                diff: Box::new(diff),
+            });
+        } else {
+            render_items.push(UpdateRenderItem::NoUpdates { id: id.clone() });
         }
     }
 
@@ -543,54 +629,40 @@ fn validate_transition_to_in_progress(
 }
 
 /// Print a summary of what changed for the issue.
-fn print_update_summary(id: &str, title: &str, before: Option<&Issue>, after: &Issue) {
+fn print_update_summary(id: &str, title: &str, diff: &UpdateDiff) {
     println!("Updated {id}: {title}");
 
-    if let Some(before) = before {
-        // Status change
-        if before.status != after.status {
-            println!(
-                "  status: {} → {}",
-                before.status.as_str(),
-                after.status.as_str()
-            );
-        }
-        // Priority change
-        if before.priority != after.priority {
-            println!("  priority: P{} → P{}", before.priority.0, after.priority.0);
-        }
-        // Type change
-        if before.issue_type != after.issue_type {
-            println!(
-                "  type: {} → {}",
-                before.issue_type.as_str(),
-                after.issue_type.as_str()
-            );
-        }
-        // Assignee change
-        if before.assignee != after.assignee {
-            let before_assignee = before.assignee.as_deref().unwrap_or("(none)");
-            let after_assignee = after.assignee.as_deref().unwrap_or("(none)");
-            println!("  assignee: {before_assignee} → {after_assignee}");
-        }
-        // Owner change
-        if before.owner != after.owner {
-            let before_owner = before.owner.as_deref().unwrap_or("(none)");
-            let after_owner = after.owner.as_deref().unwrap_or("(none)");
-            println!("  owner: {before_owner} → {after_owner}");
-        }
+    if let Some((old_status, new_status)) = &diff.status {
+        println!(
+            "  status: {} → {}",
+            old_status.as_str(),
+            new_status.as_str()
+        );
+    }
+    if let Some((old_priority, new_priority)) = &diff.priority {
+        println!("  priority: P{} → P{}", old_priority.0, new_priority.0);
+    }
+    if let Some((old_type, new_type)) = &diff.issue_type {
+        println!("  type: {} → {}", old_type.as_str(), new_type.as_str());
+    }
+    if let Some((old_assignee, new_assignee)) = &diff.assignee {
+        let before_assignee = old_assignee.as_deref().unwrap_or("(none)");
+        let after_assignee = new_assignee.as_deref().unwrap_or("(none)");
+        println!("  assignee: {before_assignee} → {after_assignee}");
+    }
+    if let Some((old_owner, new_owner)) = &diff.owner {
+        let before_owner = old_owner.as_deref().unwrap_or("(none)");
+        let after_owner = new_owner.as_deref().unwrap_or("(none)");
+        println!("  owner: {before_owner} → {after_owner}");
     }
 }
 
 fn print_render_items(render_items: &[UpdateRenderItem]) {
     for item in render_items {
         match item {
-            UpdateRenderItem::Summary {
-                id,
-                title,
-                before,
-                after,
-            } => print_update_summary(id, title, before.as_ref().as_ref(), after.as_ref()),
+            UpdateRenderItem::Summary { id, title, diff } => {
+                print_update_summary(id, title, diff.as_ref());
+            }
             UpdateRenderItem::NoUpdates { id } => println!("No updates specified for {id}"),
         }
     }
