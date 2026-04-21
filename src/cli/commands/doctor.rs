@@ -5,7 +5,7 @@
 use crate::cli::DoctorArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::health::{AnomalyClass, WorkspaceClassification};
+use crate::health::{AnomalyClass, ReliabilityAuditRecord, WorkspaceClassification};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::sync::{
@@ -48,6 +48,8 @@ struct DoctorReport {
     ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     workspace_health: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reliability_audit: Option<ReliabilityAuditRecord>,
     checks: Vec<CheckResult>,
 }
 
@@ -72,6 +74,25 @@ struct LocalRepairResult {
     vacuumed: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     quarantined_artifacts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RecoveryAuditRecord {
+    phase: String,
+    action: String,
+    outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    applied_actions: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    quarantined_artifacts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    imported: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skipped: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fk_violations_cleaned: Option<usize>,
 }
 
 const BLOCKED_CACHE_STALE_FINDING: &str = "blocked_issues_cache is marked stale and needs rebuild";
@@ -119,6 +140,104 @@ impl LocalRepairResult {
             || self.vacuumed
             || !self.quarantined_artifacts.is_empty()
     }
+}
+
+fn local_repair_applied_actions(repair: &LocalRepairResult) -> Vec<String> {
+    let mut actions = Vec::new();
+    if repair.blocked_cache_rebuilt {
+        actions.push("blocked_cache_rebuilt".to_string());
+    }
+    if repair.wal_checkpoint_completed {
+        actions.push("wal_checkpoint_completed".to_string());
+    }
+    if repair.indexes_reindexed {
+        actions.push("indexes_reindexed".to_string());
+    }
+    if repair.vacuumed {
+        actions.push("vacuumed".to_string());
+    }
+    if !repair.quarantined_artifacts.is_empty() {
+        actions.push("quarantined_artifacts".to_string());
+    }
+    actions
+}
+
+fn local_repair_audit_record(
+    phase: &str,
+    outcome: &str,
+    repair: &LocalRepairResult,
+    reason: Option<String>,
+) -> RecoveryAuditRecord {
+    RecoveryAuditRecord {
+        phase: phase.to_string(),
+        action: "local_repair".to_string(),
+        outcome: outcome.to_string(),
+        reason,
+        applied_actions: local_repair_applied_actions(repair),
+        quarantined_artifacts: repair.quarantined_artifacts.clone(),
+        imported: None,
+        skipped: None,
+        fk_violations_cleaned: None,
+    }
+}
+
+fn jsonl_rebuild_audit_record(
+    phase: &str,
+    outcome: &str,
+    repair: Option<&DoctorRepairResult>,
+    reason: Option<String>,
+) -> RecoveryAuditRecord {
+    RecoveryAuditRecord {
+        phase: phase.to_string(),
+        action: "jsonl_rebuild".to_string(),
+        outcome: outcome.to_string(),
+        reason,
+        applied_actions: Vec::new(),
+        quarantined_artifacts: Vec::new(),
+        imported: repair.map(|result| result.imported),
+        skipped: repair.map(|result| result.skipped),
+        fk_violations_cleaned: repair.map(|result| result.fk_violations_cleaned),
+    }
+}
+
+fn no_op_repair_audit_record(repaired_gitignore: bool) -> RecoveryAuditRecord {
+    let applied_actions = if repaired_gitignore {
+        vec!["gitignore_repaired".to_string()]
+    } else {
+        Vec::new()
+    };
+    RecoveryAuditRecord {
+        phase: "doctor.noop".to_string(),
+        action: "repair".to_string(),
+        outcome: if repaired_gitignore {
+            "gitignore_repaired".to_string()
+        } else {
+            "nothing_to_repair".to_string()
+        },
+        reason: None,
+        applied_actions,
+        quarantined_artifacts: Vec::new(),
+        imported: None,
+        skipped: None,
+        fk_violations_cleaned: None,
+    }
+}
+
+fn emit_recovery_audit_record(record: &RecoveryAuditRecord) {
+    let applied_actions = record.applied_actions.join(",");
+    tracing::info!(
+        target: "br::reliability",
+        phase = %record.phase,
+        action = %record.action,
+        outcome = %record.outcome,
+        reason = record.reason.as_deref().unwrap_or(""),
+        applied_actions = %applied_actions,
+        quarantined_artifacts = record.quarantined_artifacts.len(),
+        imported = record.imported.unwrap_or(0),
+        skipped = record.skipped.unwrap_or(0),
+        fk_violations_cleaned = record.fk_violations_cleaned.unwrap_or(0),
+        "doctor recovery audit record"
+    );
 }
 
 impl FilesystemPathKind {
@@ -361,6 +480,33 @@ fn classify_doctor_checks(
         append_doctor_check_anomalies(check, &mut anomalies);
     }
     WorkspaceClassification::from_anomalies(anomalies)
+}
+
+fn emit_doctor_reliability_audit(
+    phase: &str,
+    report_ok: bool,
+    audit: &ReliabilityAuditRecord,
+    checks: &[CheckResult],
+) {
+    let warning_count = checks
+        .iter()
+        .filter(|check| matches!(check.status, CheckStatus::Warn))
+        .count();
+    let error_count = checks
+        .iter()
+        .filter(|check| matches!(check.status, CheckStatus::Error))
+        .count();
+    audit.emit_tracing(phase, if report_ok { "ok" } else { "findings" });
+    tracing::info!(
+        target: "br::reliability",
+        phase,
+        ok = report_ok,
+        workspace_health = %audit.health,
+        anomaly_count = audit.anomaly_count,
+        warning_count,
+        error_count,
+        "doctor check summary"
+    );
 }
 
 fn report_has_blocked_cache_stale_finding(report: &DoctorReport) -> bool {
@@ -2527,11 +2673,15 @@ fn collect_doctor_report(beads_dir: &Path, paths: &config::ConfigPaths) -> Resul
     );
 
     let classification = classify_doctor_checks(&paths.db_path, &paths.jsonl_path, &checks);
+    let reliability_audit = classification.audit_record("doctor.inspect");
+    let ok = !has_error(&checks);
+    emit_doctor_reliability_audit("inspect", ok, &reliability_audit, &checks);
 
     Ok(DoctorRun {
         report: DoctorReport {
-            ok: !has_error(&checks),
+            ok,
             workspace_health: Some(classification.health.to_string()),
+            reliability_audit: Some(reliability_audit),
             checks,
         },
         jsonl_path,
@@ -2686,6 +2836,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         let report = DoctorReport {
             ok: !has_error(&checks),
             workspace_health: None,
+            reliability_audit: None,
             checks,
         };
         print_report(&report, ctx)?;
@@ -2706,6 +2857,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             let report = DoctorReport {
                 ok: !has_error(&checks),
                 workspace_health: None,
+                reliability_audit: None,
                 checks,
             };
             print_report(&report, ctx)?;
@@ -2746,11 +2898,23 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 Some(&repair),
                 Some(REINDEX_INCOMPLETE_MESSAGE),
             );
+            let recovery_audit = local_repair_audit_record(
+                "doctor.partial_index_repair",
+                if post_reindex.report.ok {
+                    "verified"
+                } else {
+                    "verification_failed"
+                },
+                &repair,
+                None,
+            );
+            emit_recovery_audit_record(&recovery_audit);
             if ctx.is_json() {
                 ctx.json(&serde_json::json!({
                     "report": initial.report,
                     "repaired": gitignore_repaired || repair.applied(),
                     "local_repair": repair,
+                    "recovery_audit": recovery_audit,
                     "message": repair_message,
                     "post_repair": post_reindex.report,
                     "verified": post_reindex.report.ok,
@@ -2761,15 +2925,20 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 ctx.info("Post-repair verification:");
                 print_report(&post_reindex.report, ctx)?;
             }
-        } else if ctx.is_json() {
-            ctx.json(&serde_json::json!({
-                "report": initial.report,
-                "repaired": gitignore_repaired,
-                "message": repair_outcome_message(gitignore_repaired, None, None)
-            }));
         } else {
-            print_report(&initial.report, ctx)?;
-            ctx.info(&repair_outcome_message(gitignore_repaired, None, None));
+            let recovery_audit = no_op_repair_audit_record(gitignore_repaired);
+            emit_recovery_audit_record(&recovery_audit);
+            if ctx.is_json() {
+                ctx.json(&serde_json::json!({
+                    "report": initial.report,
+                    "repaired": gitignore_repaired,
+                    "recovery_audit": recovery_audit,
+                    "message": repair_outcome_message(gitignore_repaired, None, None)
+                }));
+            } else {
+                print_report(&initial.report, ctx)?;
+                ctx.info(&repair_outcome_message(gitignore_repaired, None, None));
+            }
         }
         return Ok(());
     }
@@ -2828,6 +2997,13 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         // declaring success.
         let write_probe_ok = write_probe_after_repair(&paths.db_path);
         if !write_probe_ok {
+            let recovery_audit = local_repair_audit_record(
+                "doctor.local_repair",
+                "write_probe_failed",
+                &local_repair,
+                Some("rollback-only write probe failed after local repair".to_string()),
+            );
+            emit_recovery_audit_record(&recovery_audit);
             tracing::warn!(
                 "Post-repair write probe failed — local repair insufficient, \
                  falling through to full JSONL rebuild"
@@ -2836,11 +3012,15 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         } else {
             let repair_message =
                 repair_outcome_message(gitignore_repaired, Some(&local_repair), None);
+            let recovery_audit =
+                local_repair_audit_record("doctor.local_repair", "verified", &local_repair, None);
+            emit_recovery_audit_record(&recovery_audit);
             if ctx.is_json() {
                 ctx.json(&serde_json::json!({
                     "report": initial.report,
                     "repaired": gitignore_repaired || local_repair.applied(),
                     "local_repair": local_repair,
+                    "recovery_audit": recovery_audit,
                     "message": repair_message,
                     "post_repair": after_local_repair.report,
                     "verified": true,
@@ -2853,9 +3033,24 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             }
             return Ok(());
         }
+    } else if local_repair.applied() {
+        let recovery_audit = local_repair_audit_record(
+            "doctor.local_repair",
+            "needs_jsonl_rebuild",
+            &local_repair,
+            Some("local repair did not clear doctor errors".to_string()),
+        );
+        emit_recovery_audit_record(&recovery_audit);
     }
 
     let Some(jsonl_path) = initial.jsonl_path.as_ref() else {
+        let recovery_audit = jsonl_rebuild_audit_record(
+            "doctor.jsonl_rebuild",
+            "refused",
+            None,
+            Some("no JSONL file found to rebuild from".to_string()),
+        );
+        emit_recovery_audit_record(&recovery_audit);
         return Err(BeadsError::Config(
             "Cannot repair: no JSONL file found to rebuild from".to_string(),
         ));
@@ -2866,23 +3061,49 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         ctx.info("Repairing: rebuilding DB from JSONL...");
     }
 
-    let repair_result =
-        repair_database_from_jsonl(&beads_dir, &paths.db_path, jsonl_path, cli, !ctx.is_json())
-            .map_err(|err| {
-                BeadsError::Config(format!(
-                    "Repair import failed: {err}. \
+    let repair_result = match repair_database_from_jsonl(
+        &beads_dir,
+        &paths.db_path,
+        jsonl_path,
+        cli,
+        !ctx.is_json(),
+    ) {
+        Ok(result) => result,
+        Err(err) => {
+            let recovery_audit = jsonl_rebuild_audit_record(
+                "doctor.jsonl_rebuild",
+                "failed",
+                None,
+                Some(err.to_string()),
+            );
+            emit_recovery_audit_record(&recovery_audit);
+            return Err(BeadsError::Config(format!(
+                "Repair import failed: {err}. \
              The JSONL file may be corrupt. \
              Try manually editing the JSONL to fix invalid records."
-                ))
-            })?;
+            )));
+        }
+    };
 
     let post_repair = collect_doctor_report(&beads_dir, &paths)?;
+    let recovery_audit = jsonl_rebuild_audit_record(
+        "doctor.jsonl_rebuild",
+        if post_repair.report.ok {
+            "verified"
+        } else {
+            "verification_failed"
+        },
+        Some(&repair_result),
+        None,
+    );
+    emit_recovery_audit_record(&recovery_audit);
 
     if ctx.is_json() {
         ctx.json(&serde_json::json!({
             "report": initial.report,
             "repaired": true,
             "local_repair": local_repair,
+            "recovery_audit": recovery_audit,
             "imported": repair_result.imported,
             "skipped": repair_result.skipped,
             "fk_violations_cleaned": repair_result.fk_violations_cleaned,
@@ -3046,6 +3267,55 @@ mod tests {
             "expected count mismatch anomaly: {:?}",
             classification.anomalies
         );
+    }
+
+    #[test]
+    fn test_local_repair_audit_records_applied_actions_and_artifacts() {
+        let repair = LocalRepairResult {
+            blocked_cache_rebuilt: true,
+            wal_checkpoint_completed: false,
+            indexes_reindexed: true,
+            vacuumed: false,
+            quarantined_artifacts: vec![".beads/.br_recovery/beads.db-shm.test".to_string()],
+        };
+
+        let audit = local_repair_audit_record(
+            "doctor.local_repair",
+            "verified",
+            &repair,
+            Some("post-repair checks passed".to_string()),
+        );
+
+        assert_eq!(audit.phase, "doctor.local_repair");
+        assert_eq!(audit.action, "local_repair");
+        assert_eq!(audit.outcome, "verified");
+        assert_eq!(
+            audit.applied_actions,
+            vec![
+                "blocked_cache_rebuilt".to_string(),
+                "indexes_reindexed".to_string(),
+                "quarantined_artifacts".to_string()
+            ]
+        );
+        assert_eq!(audit.quarantined_artifacts.len(), 1);
+        assert_eq!(audit.reason.as_deref(), Some("post-repair checks passed"));
+    }
+
+    #[test]
+    fn test_jsonl_rebuild_audit_records_import_counts() {
+        let repair = DoctorRepairResult {
+            imported: 3,
+            skipped: 1,
+            fk_violations_cleaned: 2,
+        };
+
+        let audit =
+            jsonl_rebuild_audit_record("doctor.jsonl_rebuild", "verified", Some(&repair), None);
+
+        assert_eq!(audit.action, "jsonl_rebuild");
+        assert_eq!(audit.imported, Some(3));
+        assert_eq!(audit.skipped, Some(1));
+        assert_eq!(audit.fk_violations_cleaned, Some(2));
     }
 
     #[test]
@@ -3566,6 +3836,7 @@ mod tests {
         let report = DoctorReport {
             ok: false,
             workspace_health: None,
+            reliability_audit: None,
             checks: vec![CheckResult {
                 name: "db.sidecars".to_string(),
                 status: CheckStatus::Error,
@@ -3610,6 +3881,7 @@ mod tests {
         let report = DoctorReport {
             ok: true, // Warn-only report is considered ok
             workspace_health: None,
+            reliability_audit: None,
             checks: vec![CheckResult {
                 name: "db.sidecars".to_string(),
                 status: CheckStatus::Warn,
@@ -3642,6 +3914,7 @@ mod tests {
         let report = DoctorReport {
             ok: false,
             workspace_health: None,
+            reliability_audit: None,
             checks: vec![CheckResult {
                 name: "db.recoverable_anomalies".to_string(),
                 status: CheckStatus::Error,
@@ -3663,6 +3936,7 @@ mod tests {
         let report = DoctorReport {
             ok: false,
             workspace_health: None,
+            reliability_audit: None,
             checks: vec![CheckResult {
                 name: "db.recoverable_anomalies".to_string(),
                 status: CheckStatus::Error,
@@ -3955,6 +4229,7 @@ mod tests {
         let report = DoctorReport {
             ok: false,
             workspace_health: None,
+            reliability_audit: None,
             checks: Vec::new(),
         };
 
@@ -3980,6 +4255,7 @@ mod tests {
             let report = DoctorReport {
                 ok: true, // WARNs don't flip ok → false
                 workspace_health: None,
+                reliability_audit: None,
                 checks: vec![CheckResult {
                     name: "sqlite.integrity_check".to_string(),
                     status: CheckStatus::Warn,
@@ -3997,6 +4273,7 @@ mod tests {
         let report = DoctorReport {
             ok: true,
             workspace_health: None,
+            reliability_audit: None,
             checks: vec![CheckResult {
                 name: "sqlite3.integrity_check".to_string(),
                 status: CheckStatus::Warn,
@@ -4013,6 +4290,7 @@ mod tests {
         let report = DoctorReport {
             ok: true,
             workspace_health: None,
+            reliability_audit: None,
             checks: vec![CheckResult {
                 name: "sqlite.integrity_check".to_string(),
                 status: CheckStatus::Warn,
@@ -4027,6 +4305,7 @@ mod tests {
         let report = DoctorReport {
             ok: true,
             workspace_health: None,
+            reliability_audit: None,
             checks: vec![CheckResult {
                 name: "sqlite.integrity_check".to_string(),
                 status: CheckStatus::Warn,
@@ -4045,6 +4324,7 @@ mod tests {
         let report = DoctorReport {
             ok: false,
             workspace_health: None,
+            reliability_audit: None,
             checks: vec![CheckResult {
                 name: "sqlite.integrity_check".to_string(),
                 status: CheckStatus::Error,
@@ -4060,6 +4340,7 @@ mod tests {
         let report = DoctorReport {
             ok: true,
             workspace_health: None,
+            reliability_audit: None,
             checks: vec![CheckResult {
                 name: "db.sidecars".to_string(),
                 status: CheckStatus::Warn,

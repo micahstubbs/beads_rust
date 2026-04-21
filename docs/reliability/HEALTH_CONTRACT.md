@@ -79,6 +79,15 @@ Each row is a workspace component; columns indicate which subsystem owns and val
 | Child counters | storage | - | update on dep add/remove | - | count vs query |
 | Dependencies table | storage | - | add/remove_dependency | - | FK integrity |
 
+## Observability Contract
+
+`br doctor --json` includes machine-readable reliability records:
+
+- `report.reliability_audit`: workspace classification evidence derived from `AnomalyClass`.
+- `recovery_audit`: repair action, outcome, applied local actions, quarantine artifacts, and JSONL rebuild counts.
+
+The same records are emitted through `tracing` with target `br::reliability` so field logs can be correlated with doctor JSON, quarantined artifacts, and replay fixtures.
+
 ## Evidence Bundle (Incident Capture)
 
 When a field failure occurs, the following artifacts should be collected for diagnosis:

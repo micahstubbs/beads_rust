@@ -14,6 +14,16 @@ pub enum WorkspaceHealth {
 
 impl WorkspaceHealth {
     #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Degraded => "degraded",
+            Self::Recoverable => "recoverable",
+            Self::Unsafe => "unsafe",
+        }
+    }
+
+    #[must_use]
     pub fn is_operable(self) -> bool {
         matches!(self, Self::Healthy | Self::Degraded)
     }
@@ -31,12 +41,7 @@ impl WorkspaceHealth {
 
 impl fmt::Display for WorkspaceHealth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Healthy => f.write_str("healthy"),
-            Self::Degraded => f.write_str("degraded"),
-            Self::Recoverable => f.write_str("recoverable"),
-            Self::Unsafe => f.write_str("unsafe"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -104,6 +109,35 @@ pub enum AnomalyClass {
 
 impl AnomalyClass {
     #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::DatabaseMissing => "database_missing",
+            Self::DatabaseNotSqlite => "database_not_sqlite",
+            Self::DatabaseCorrupt { .. } => "database_corrupt",
+            Self::WalCorrupt => "wal_corrupt",
+            Self::SidecarMismatch { .. } => "sidecar_mismatch",
+            Self::TruncatedWal => "truncated_wal",
+            Self::DuplicateSchemaRows { .. } => "duplicate_schema_rows",
+            Self::DuplicateConfigKeys { .. } => "duplicate_config_keys",
+            Self::DuplicateMetadataKeys { .. } => "duplicate_metadata_keys",
+            Self::JsonlParseError { .. } => "jsonl_parse_error",
+            Self::JsonlConflictMarkers => "jsonl_conflict_markers",
+            Self::DbJsonlCountMismatch { .. } => "db_jsonl_count_mismatch",
+            Self::JsonlNewer => "jsonl_newer",
+            Self::DbNewer => "db_newer",
+            Self::StaleRecoveryArtifacts => "stale_recovery_artifacts",
+            Self::BlockedCacheStale => "blocked_cache_stale",
+            Self::NullInNotNullColumn { .. } => "null_in_not_null_column",
+            Self::DirtyFlagMismatch { .. } => "dirty_flag_mismatch",
+            Self::ExportHashMismatch { .. } => "export_hash_mismatch",
+            Self::ChildCountDrift { .. } => "child_count_drift",
+            Self::WriteProbeFailed { .. } => "write_probe_failed",
+            Self::JournalSidecarPresent => "journal_sidecar_present",
+            Self::OrphanedLockFile => "orphaned_lock_file",
+        }
+    }
+
+    #[must_use]
     pub fn severity(&self) -> WorkspaceHealth {
         match self {
             Self::DatabaseNotSqlite
@@ -130,6 +164,15 @@ impl AnomalyClass {
             | Self::ChildCountDrift { .. }
             | Self::JournalSidecarPresent
             | Self::OrphanedLockFile => WorkspaceHealth::Degraded,
+        }
+    }
+
+    #[must_use]
+    pub fn audit_entry(&self) -> AnomalyAuditEntry {
+        AnomalyAuditEntry {
+            code: self.code().to_string(),
+            severity: self.severity().as_str().to_string(),
+            message: self.to_string(),
         }
     }
 }
@@ -216,6 +259,46 @@ pub struct WorkspaceClassification {
     pub anomalies: Vec<AnomalyClass>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AnomalyAuditEntry {
+    pub code: String,
+    pub severity: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReliabilityAuditRecord {
+    pub source: String,
+    pub health: String,
+    pub anomaly_count: usize,
+    pub anomalies: Vec<AnomalyAuditEntry>,
+}
+
+impl ReliabilityAuditRecord {
+    #[must_use]
+    pub fn anomaly_codes_csv(&self) -> String {
+        self.anomalies
+            .iter()
+            .map(|entry| entry.code.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    pub fn emit_tracing(&self, phase: &str, outcome: &str) {
+        let anomaly_codes = self.anomaly_codes_csv();
+        tracing::info!(
+            target: "br::reliability",
+            source = %self.source,
+            phase,
+            outcome,
+            workspace_health = %self.health,
+            anomaly_count = self.anomaly_count,
+            anomaly_codes = %anomaly_codes,
+            "reliability audit record"
+        );
+    }
+}
+
 impl WorkspaceClassification {
     #[must_use]
     pub fn healthy() -> Self {
@@ -248,6 +331,21 @@ impl WorkspaceClassification {
     #[must_use]
     pub fn recovery_possible(&self) -> bool {
         !matches!(self.health, WorkspaceHealth::Unsafe)
+    }
+
+    #[must_use]
+    pub fn audit_record(&self, source: impl Into<String>) -> ReliabilityAuditRecord {
+        let anomalies = self
+            .anomalies
+            .iter()
+            .map(AnomalyClass::audit_entry)
+            .collect::<Vec<_>>();
+        ReliabilityAuditRecord {
+            source: source.into(),
+            health: self.health.as_str().to_string(),
+            anomaly_count: anomalies.len(),
+            anomalies,
+        }
     }
 }
 
@@ -486,6 +584,39 @@ mod tests {
         ];
         let classification = WorkspaceClassification::from_anomalies(anomalies);
         assert_eq!(classification.health, WorkspaceHealth::Unsafe);
+    }
+
+    #[test]
+    fn anomaly_audit_entry_has_stable_code_and_severity() {
+        let anomaly = AnomalyClass::WriteProbeFailed {
+            detail: "database disk image is malformed".to_string(),
+        };
+        let entry = anomaly.audit_entry();
+
+        assert_eq!(entry.code, "write_probe_failed");
+        assert_eq!(entry.severity, "recoverable");
+        assert!(entry.message.contains("database disk image is malformed"));
+    }
+
+    #[test]
+    fn workspace_classification_builds_reliability_audit_record() {
+        let classification = WorkspaceClassification::from_anomalies(vec![
+            AnomalyClass::DbJsonlCountMismatch {
+                db_count: 3,
+                jsonl_count: 2,
+            },
+            AnomalyClass::JsonlNewer,
+        ]);
+
+        let record = classification.audit_record("doctor.inspect");
+
+        assert_eq!(record.source, "doctor.inspect");
+        assert_eq!(record.health, "degraded");
+        assert_eq!(record.anomaly_count, 2);
+        assert_eq!(
+            record.anomaly_codes_csv(),
+            "db_jsonl_count_mismatch,jsonl_newer"
+        );
     }
 
     #[test]
