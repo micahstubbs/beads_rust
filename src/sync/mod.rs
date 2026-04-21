@@ -3571,6 +3571,8 @@ pub fn compute_jsonl_hash(path: &Path) -> Result<String> {
 pub enum ConflictType {
     /// Issue was modified locally but deleted externally (or vice versa).
     DeleteVsModify,
+    /// Issue was modified independently in both local and external stores.
+    BothModified,
     /// Issue was created in both local and external with different content.
     ConvergentCreation,
 }
@@ -3802,22 +3804,7 @@ pub fn merge_issue(
                             )
                         }
                     }
-                    ConflictResolution::Manual => {
-                        // For manual, we still need to pick one, so use newer but mark as note
-                        if l.updated_at >= r.updated_at {
-                            MergeResult::KeepWithNote(
-                                l.clone(),
-                                "Both modified - kept local (newer), review recommended"
-                                    .to_string(),
-                            )
-                        } else {
-                            MergeResult::KeepWithNote(
-                                r.clone(),
-                                "Both modified - kept external (newer), review recommended"
-                                    .to_string(),
-                            )
-                        }
-                    }
+                    ConflictResolution::Manual => MergeResult::Conflict(ConflictType::BothModified),
                 },
             }
         }
@@ -3838,7 +3825,7 @@ pub fn merge_issue(
                         r.clone(),
                         "Convergent creation - kept external".to_string(),
                     ),
-                    ConflictResolution::PreferNewer | ConflictResolution::Manual => {
+                    ConflictResolution::PreferNewer => {
                         if l.updated_at >= r.updated_at {
                             MergeResult::KeepWithNote(
                                 l.clone(),
@@ -3850,6 +3837,9 @@ pub fn merge_issue(
                                 "Convergent creation - kept external (newer)".to_string(),
                             )
                         }
+                    }
+                    ConflictResolution::Manual => {
+                        MergeResult::Conflict(ConflictType::ConvergentCreation)
                     }
                 }
             }
@@ -4253,8 +4243,9 @@ pub(crate) fn restore_tombstones(
 /// - `non_tombstone_updated_at`: IDs whose JSONL record carries a *non*-
 ///   tombstone status, mapped to the record's `updated_at`. When the local
 ///   DB has one of these IDs as a tombstone, there is a disagreement: the
-///   JSONL says the issue is alive, the DB says it's deleted. We resolve
-///   it by timestamp — whichever side's last write is newer wins.
+///   JSONL says the issue is alive, the DB says it's deleted. Import and
+///   rebuild paths must keep the tombstone; reopening is a separate,
+///   explicit user action.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct JsonlTombstoneFilter {
     pub(crate) tombstone_ids: HashSet<String>,
@@ -4268,15 +4259,11 @@ pub(crate) struct JsonlTombstoneFilter {
 /// 1. JSONL has this ID as a tombstone: drop from preservation set — the
 ///    rebuild's own `import_from_jsonl` will reinstate the tombstone.
 ///
-/// 2. JSONL has this ID as a non-tombstone: the user's local delete
-///    competes with the JSONL's live record. Keep the local tombstone
-///    only if `deleted_at > updated_at` (i.e. the local deletion actually
-///    happened after the state the JSONL captured). Otherwise the JSONL
-///    is newer and we let the rebuild's import win, same way a 3-way
-///    merge with `--merge` would resolve it. Missing `deleted_at` (which
-///    shouldn't happen for a well-formed tombstone) is treated
-///    conservatively as "local is newer": preserve the tombstone rather
-///    than silently lose a local deletion.
+/// 2. JSONL has this ID as a non-tombstone: preserve the local tombstone
+///    and restore it after import. This mirrors the normal
+///    `import_from_jsonl` tombstone guard, which rejects resurrection even
+///    when force-upsert is enabled. Timestamp ordering cannot make a
+///    deleted issue live again; the operator must reopen it explicitly.
 ///
 /// 3. JSONL doesn't have this ID at all: the deletion has never been
 ///    flushed anywhere. Always preserve — otherwise this path would
@@ -4288,7 +4275,7 @@ pub(crate) fn tombstones_missing_from_jsonl_tombstones(
 ) -> Vec<PreservedTombstone> {
     let original_count = tombstones.len();
     let mut skipped_already_flushed = 0usize;
-    let mut skipped_jsonl_newer = 0usize;
+    let mut preserved_non_tombstone_conflicts = 0usize;
     let preserved: Vec<PreservedTombstone> = tombstones
         .into_iter()
         .filter(|tombstone| {
@@ -4297,24 +4284,18 @@ pub(crate) fn tombstones_missing_from_jsonl_tombstones(
                 skipped_already_flushed += 1;
                 return false;
             }
-            if let Some(jsonl_updated_at) = jsonl_filter.non_tombstone_updated_at.get(id) {
-                let local_deleted_at = tombstone.issue.deleted_at;
-                let local_is_newer =
-                    local_deleted_at.is_none_or(|deleted_at| deleted_at > *jsonl_updated_at);
-                if !local_is_newer {
-                    skipped_jsonl_newer += 1;
-                    return false;
-                }
+            if jsonl_filter.non_tombstone_updated_at.contains_key(id) {
+                preserved_non_tombstone_conflicts += 1;
             }
             true
         })
         .collect();
 
-    if skipped_already_flushed > 0 || skipped_jsonl_newer > 0 {
+    if skipped_already_flushed > 0 || preserved_non_tombstone_conflicts > 0 {
         tracing::debug!(
             preserved = preserved.len(),
             skipped_already_flushed,
-            skipped_jsonl_newer,
+            preserved_non_tombstone_conflicts,
             original = original_count,
             "Filtered preserved tombstones against JSONL state"
         );
@@ -4891,15 +4872,14 @@ mod tests {
         fs::write(&path, content).unwrap();
 
         let err = analyze_jsonl(&path).unwrap_err();
-        match err {
-            BeadsError::Config(message) => {
-                assert!(
-                    message.contains("Duplicate issue id 'bd-dup'"),
-                    "unexpected duplicate-id error: {message}"
-                );
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(
+                &err,
+                BeadsError::Config(message)
+                    if message.contains("Duplicate issue id 'bd-dup'")
+            ),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
@@ -6197,10 +6177,10 @@ mod tests {
             &output_path,
         )
         .unwrap_err();
-        match err {
-            BeadsError::Database(_) => {}
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(err, BeadsError::Database(_)),
+            "unexpected error: {err:?}"
+        );
 
         assert_eq!(
             storage.get_dirty_issue_ids().unwrap(),
@@ -7514,6 +7494,68 @@ mod tests {
         assert_eq!(report.kept.len(), 1);
         assert_eq!(report.notes.len(), 1);
         assert!(report.notes[0].1.contains("Both modified"));
+    }
+
+    #[test]
+    fn test_manual_merge_reports_both_modified_conflict() {
+        let base_issue = make_issue_with_hash(
+            "bd-001",
+            "Base Title",
+            fixed_time_merge(100),
+            Some("base_hash"),
+        );
+        let local_issue = make_issue_with_hash(
+            "bd-001",
+            "Local Title",
+            fixed_time_merge(200),
+            Some("local_hash"),
+        );
+        let external_issue = make_issue_with_hash(
+            "bd-001",
+            "External Title",
+            fixed_time_merge(300),
+            Some("external_hash"),
+        );
+
+        let result = merge_issue(
+            Some(&base_issue),
+            Some(&local_issue),
+            Some(&external_issue),
+            ConflictResolution::Manual,
+        );
+
+        assert!(matches!(
+            result,
+            MergeResult::Conflict(ConflictType::BothModified)
+        ));
+    }
+
+    #[test]
+    fn test_manual_merge_reports_convergent_creation_conflict() {
+        let local_issue = make_issue_with_hash(
+            "bd-001",
+            "Local Title",
+            fixed_time_merge(200),
+            Some("local_hash"),
+        );
+        let external_issue = make_issue_with_hash(
+            "bd-001",
+            "External Title",
+            fixed_time_merge(300),
+            Some("external_hash"),
+        );
+
+        let result = merge_issue(
+            None,
+            Some(&local_issue),
+            Some(&external_issue),
+            ConflictResolution::Manual,
+        );
+
+        assert!(matches!(
+            result,
+            MergeResult::Conflict(ConflictType::ConvergentCreation)
+        ));
     }
 
     /// Create a progress bar if enabled.

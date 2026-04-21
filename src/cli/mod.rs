@@ -2205,6 +2205,14 @@ pub struct SyncArgs {
     #[arg(long, short = 'f')]
     pub force: bool,
 
+    /// Resolve sync --merge conflicts by keeping the local SQLite database version.
+    #[arg(long, requires = "merge", conflicts_with_all = ["force", "force_jsonl"])]
+    pub force_db: bool,
+
+    /// Resolve sync --merge conflicts by keeping the JSONL file version.
+    #[arg(long, requires = "merge", conflicts_with_all = ["force", "force_db"])]
+    pub force_jsonl: bool,
+
     /// Allow using a JSONL path outside the .beads directory.
     ///
     /// This flag enables paths set via `BEADS_JSONL` environment variable.
@@ -2553,28 +2561,40 @@ mod tests {
     #[test]
     fn test_list_limit_defaults_to_50() {
         let cli = Cli::parse_from(["br", "list"]);
-        match cli.command {
-            Commands::List(args) => assert_eq!(args.limit, Some(50)),
-            _ => panic!("expected list command"),
-        }
+        assert!(
+            matches!(&cli.command, Commands::List(_)),
+            "expected list command"
+        );
+        let Commands::List(args) = cli.command else {
+            return;
+        };
+        assert_eq!(args.limit, Some(50));
     }
 
     #[test]
     fn test_list_limit_zero_parses_as_unlimited() {
         let cli = Cli::parse_from(["br", "list", "--limit", "0"]);
-        match cli.command {
-            Commands::List(args) => assert_eq!(args.limit, Some(0)),
-            _ => panic!("expected list command"),
-        }
+        assert!(
+            matches!(&cli.command, Commands::List(_)),
+            "expected list command"
+        );
+        let Commands::List(args) = cli.command else {
+            return;
+        };
+        assert_eq!(args.limit, Some(0));
     }
 
     #[test]
     fn test_ready_assignee_flag_accepts_missing_value() {
         let cli = Cli::parse_from(["br", "ready", "--assignee"]);
-        match cli.command {
-            Commands::Ready(args) => assert_eq!(args.assignee.as_deref(), Some("")),
-            _ => panic!("expected ready command"),
-        }
+        assert!(
+            matches!(&cli.command, Commands::Ready(_)),
+            "expected ready command"
+        );
+        let Commands::Ready(args) = cli.command else {
+            return;
+        };
+        assert_eq!(args.assignee.as_deref(), Some(""));
     }
 
     #[test]

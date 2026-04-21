@@ -151,7 +151,49 @@ fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
                 .to_string(),
         });
     }
+
+    if (args.force_db || args.force_jsonl) && !args.merge {
+        return Err(BeadsError::Validation {
+            field: "merge-resolution".to_string(),
+            reason: "--force-db and --force-jsonl can only be used with --merge".to_string(),
+        });
+    }
+
+    if args.force_db && args.force_jsonl {
+        return Err(BeadsError::Validation {
+            field: "merge-resolution".to_string(),
+            reason: "--force-db conflicts with --force-jsonl; choose one merge winner".to_string(),
+        });
+    }
+
+    if args.force && (args.force_db || args.force_jsonl) {
+        return Err(BeadsError::Validation {
+            field: "force".to_string(),
+            reason: "--force conflicts with --force-db and --force-jsonl for --merge; choose one conflict resolution policy".to_string(),
+        });
+    }
     Ok(())
+}
+
+fn merge_conflict_resolution(args: &SyncArgs) -> ConflictResolution {
+    if args.force_db {
+        ConflictResolution::PreferLocal
+    } else if args.force_jsonl {
+        ConflictResolution::PreferExternal
+    } else if args.force {
+        ConflictResolution::PreferNewer
+    } else {
+        ConflictResolution::Manual
+    }
+}
+
+fn merge_conflict_resolution_label(strategy: ConflictResolution) -> &'static str {
+    match strategy {
+        ConflictResolution::PreferLocal => "force-db",
+        ConflictResolution::PreferExternal => "force-jsonl",
+        ConflictResolution::PreferNewer => "force-newer",
+        ConflictResolution::Manual => "manual",
+    }
 }
 
 /// When `--rebuild` is requested against an existing (non-auto-rebuilt)
@@ -1442,6 +1484,16 @@ fn execute_import(
     } else {
         Vec::new()
     };
+    let preserved_resurrection_attempts = jsonl_filter.as_ref().map_or(0, |filter| {
+        preserved_tombstones
+            .iter()
+            .filter(|tombstone| {
+                filter
+                    .non_tombstone_updated_at
+                    .contains_key(&tombstone.issue.id)
+            })
+            .count()
+    });
 
     // For force imports and rebuilds, drop and recreate data tables to avoid
     // fsqlite btree cursor bugs on DELETE operations in large tables.
@@ -1544,6 +1596,7 @@ fn execute_import(
 
     if args.force || args.rebuild {
         restore_tombstones_after_rebuild(storage, &preserved_tombstones)?;
+        import_result.tombstone_skipped += preserved_resurrection_attempts;
     }
 
     // Post-rebuild VACUUM + REINDEX to eliminate B-tree/index corruption
@@ -1754,7 +1807,7 @@ fn detect_prefix_from_jsonl(jsonl_path: &Path) -> Option<String> {
 fn execute_merge(
     storage: &mut crate::storage::SqliteStorage,
     path_policy: &SyncPathPolicy,
-    _args: &SyncArgs,
+    args: &SyncArgs,
     use_json: bool,
     show_progress: bool,
     retention_days: Option<u64>,
@@ -1811,9 +1864,8 @@ fn execute_merge(
 
     // 4. Perform Merge
     let context = MergeContext::new(base, left, right);
-    // Keep the current merge behavior explicit until the CLI surface for
-    // configurable conflict resolution is wired through end-to-end.
-    let strategy = ConflictResolution::PreferNewer;
+    let strategy = merge_conflict_resolution(args);
+    let resolution = merge_conflict_resolution_label(strategy);
     let tombstones = None;
 
     let report = three_way_merge(&context, strategy, tombstones);
@@ -1823,6 +1875,7 @@ fn execute_merge(
         kept = report.kept.len(),
         deleted = report.deleted.len(),
         conflicts = report.conflicts.len(),
+        resolution,
         "Merge calculated"
     );
 
@@ -1836,6 +1889,7 @@ fn execute_merge(
             use std::fmt::Write;
             let _ = writeln!(msg, "  - {id}: {kind:?}");
         }
+        msg.push_str("\nUse --force-db to keep local DB changes, --force-jsonl to keep JSONL changes, or --force to keep the newer timestamp.");
         return Err(BeadsError::Config(msg));
     }
 
@@ -1912,6 +1966,7 @@ fn execute_merge(
             "merged_issues": report.kept.len(),
             "deleted_issues": report.deleted.len(),
             "conflicts": report.conflicts.len(),
+            "resolution": resolution,
             "notes": report.notes,
         });
         ctx.json_pretty(&output);
@@ -1967,7 +2022,7 @@ fn render_merge_conflicts_rich(
 
     text.append("\n");
     text.append_styled("Hint: ", theme.dimmed.clone());
-    text.append("Use --force to override or resolve manually.");
+    text.append("Use --force-db to keep local DB changes, --force-jsonl to keep JSONL changes, or --force to keep the newer timestamp.");
 
     let panel = Panel::from_rich_text(&text, ctx.width())
         .title(Text::new("Merge Conflicts"))
@@ -2040,7 +2095,8 @@ mod tests {
     use super::{
         auto_rebuild_semantic_conflict_field, auto_rebuild_semantic_flag_conflict_reason,
         detect_prefix_from_jsonl, jsonl_contains_duplicate_external_refs,
-        jsonl_contains_prefix_mismatch, validate_operator_requested_sync_path, validate_sync_paths,
+        jsonl_contains_prefix_mismatch, merge_conflict_resolution,
+        validate_operator_requested_sync_path, validate_sync_mode_args, validate_sync_paths,
     };
     use crate::cli::SyncArgs;
     use crate::config::{self, CliOverrides};
@@ -2048,8 +2104,9 @@ mod tests {
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use crate::sync::{
-        PreservedTombstone, restore_tombstones, scan_jsonl_for_tombstone_filter,
-        snapshot_tombstones, tombstones_missing_from_jsonl_tombstones,
+        ConflictResolution, PreservedTombstone, restore_tombstones,
+        scan_jsonl_for_tombstone_filter, snapshot_tombstones,
+        tombstones_missing_from_jsonl_tombstones,
     };
     use chrono::Utc;
     use std::collections::HashSet;
@@ -2099,6 +2156,60 @@ mod tests {
             dependencies: vec![],
             comments: vec![],
         }
+    }
+
+    #[test]
+    fn test_merge_conflict_resolution_defaults_to_manual() {
+        let args = SyncArgs {
+            merge: true,
+            ..SyncArgs::default()
+        };
+
+        assert_eq!(merge_conflict_resolution(&args), ConflictResolution::Manual);
+    }
+
+    #[test]
+    fn test_merge_conflict_resolution_supports_explicit_winners() {
+        let force_db = SyncArgs {
+            merge: true,
+            force_db: true,
+            ..SyncArgs::default()
+        };
+        let force_jsonl = SyncArgs {
+            merge: true,
+            force_jsonl: true,
+            ..SyncArgs::default()
+        };
+        let force_newer = SyncArgs {
+            merge: true,
+            force: true,
+            ..SyncArgs::default()
+        };
+
+        assert_eq!(
+            merge_conflict_resolution(&force_db),
+            ConflictResolution::PreferLocal
+        );
+        assert_eq!(
+            merge_conflict_resolution(&force_jsonl),
+            ConflictResolution::PreferExternal
+        );
+        assert_eq!(
+            merge_conflict_resolution(&force_newer),
+            ConflictResolution::PreferNewer
+        );
+    }
+
+    #[test]
+    fn test_merge_resolution_flags_require_merge_mode() {
+        let args = SyncArgs {
+            force_db: true,
+            ..SyncArgs::default()
+        };
+
+        let err = validate_sync_mode_args(&args).expect_err("force-db should require merge");
+        assert!(matches!(err, BeadsError::Validation { .. }));
+        assert!(err.to_string().contains("--merge"));
     }
 
     #[test]
@@ -2280,12 +2391,11 @@ mod tests {
     }
 
     #[test]
-    fn test_tombstones_missing_from_jsonl_tombstones_respects_timestamps() {
+    fn test_tombstones_missing_from_jsonl_tombstones_blocks_resurrection() {
         // Regression: when the JSONL has an ID as a *non*-tombstone, the
-        // preserved tombstone should only overwrite the imported open row
-        // if the local deletion is actually newer than the JSONL state.
-        // Otherwise a stale local delete would silently clobber a pulled
-        // update from another contributor.
+        // preserved tombstone must still overwrite the imported open row.
+        // Timestamp ordering cannot resurrect a tombstone; that requires
+        // an explicit reopen operation.
         use crate::model::Status;
         use chrono::{Duration, Utc};
 
@@ -2324,10 +2434,13 @@ mod tests {
             &filter,
         );
 
-        // Only the newer local tombstone survives: the older one lost to
-        // the JSONL's non-tombstone state (import wins).
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].issue.id, "bd-contested-newer");
+        assert_eq!(filtered.len(), 2);
+        let filtered_ids: HashSet<_> = filtered
+            .iter()
+            .map(|tombstone| tombstone.issue.id.as_str())
+            .collect();
+        assert!(filtered_ids.contains("bd-contested-older"));
+        assert!(filtered_ids.contains("bd-contested-newer"));
     }
 
     #[test]
@@ -2345,15 +2458,14 @@ mod tests {
         std::fs::write(&jsonl_path, content).unwrap();
 
         let err = scan_jsonl_for_tombstone_filter(&jsonl_path).unwrap_err();
-        match err {
-            BeadsError::Config(message) => {
-                assert!(
-                    message.contains("Duplicate issue id 'bd-dup'"),
-                    "unexpected duplicate-id error: {message}"
-                );
-            }
-            other => panic!("expected duplicate-id config error, got {other:?}"),
-        }
+        assert!(
+            matches!(
+                &err,
+                BeadsError::Config(message)
+                    if message.contains("Duplicate issue id 'bd-dup'")
+            ),
+            "expected duplicate-id config error, got {err:?}"
+        );
     }
 
     #[test]

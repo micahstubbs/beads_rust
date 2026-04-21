@@ -32,14 +32,17 @@
 |------|-----------|---------|----------|--------------|
 | `--flush-only` | Yes* | N/A | Export DB → JSONL | Explicit |
 | `--import-only` | Yes* | N/A | Import JSONL → DB | Explicit |
+| `--merge` | Yes* | N/A | Three-way merge base + DB + JSONL | Explicit |
 | `--status` | No | N/A | Show sync status (read-only) | Implicit |
 | `--force` / `-f` | No | `false` | Override safety guards | Forced |
+| `--force-db` | No | `false` | Resolve `--merge` conflicts by keeping local SQLite rows | Forced |
+| `--force-jsonl` | No | `false` | Resolve `--merge` conflicts by keeping JSONL rows | Forced |
 | `--manifest` | No | `false` | Write export manifest | Explicit |
 | `--error-policy` | No | `strict` | Error handling mode | Explicit |
 | `--orphans` | No | `strict` | Orphan handling mode | Explicit |
 | `--robot` / `--json` | No | `false` | Machine-readable output | Implicit |
 
-*One of `--flush-only` or `--import-only` is required.
+*One of `--flush-only`, `--import-only`, `--merge`, or `--status` is required.
 
 ### 2.2 Flag Dependencies
 
@@ -50,6 +53,10 @@ br sync --flush-only          → OK: Export with safety guards
 br sync --flush-only --force  → OK: Export bypassing guards
 br sync --import-only         → OK: Import with validation
 br sync --import-only --force → OK: Import bypassing staleness check
+br sync --merge               → OK: Three-way merge; reports unresolved conflicts
+br sync --merge --force       → OK: Resolve merge conflicts by newer timestamp
+br sync --merge --force-db    → OK: Resolve merge conflicts by keeping SQLite
+br sync --merge --force-jsonl → OK: Resolve merge conflicts by keeping JSONL
 ```
 
 ---
@@ -73,7 +80,15 @@ br sync --import-only --force → OK: Import bypassing staleness check
 | Hash Unchanged | JSONL hash matches last import | "JSONL is current..." | `--force` |
 | Schema Invalid | Malformed JSON in JSONL | "Invalid JSON at line N..." | **NONE** |
 
-### 3.3 Non-Bypassable Guards
+### 3.3 Merge Safety Guards
+
+| Guard | Trigger Condition | User Message | Bypass |
+|-------|-------------------|--------------|--------|
+| Both Modified | Base, SQLite, and JSONL all contain divergent versions | "Merge conflicts detected..." | `--force`, `--force-db`, `--force-jsonl` |
+| Delete vs Modify | One side deletes an issue the other side modified | "Merge conflicts detected..." | `--force`, `--force-db`, `--force-jsonl` |
+| Convergent Creation | SQLite and JSONL independently create the same ID with different content | "Merge conflicts detected..." | `--force`, `--force-db`, `--force-jsonl` |
+
+### 3.4 Non-Bypassable Guards
 
 These guards can NEVER be bypassed, even with `--force`:
 
@@ -174,6 +189,10 @@ br sync --flush-only --force
 # Force import (could import stale data)
 br sync --import-only --force
 
+# Force merge resolution (could discard one side of a conflict)
+br sync --merge --force-db
+br sync --merge --force-jsonl
+
 # Best-effort export (could silently skip issues)
 br sync --flush-only --error-policy=best-effort
 ```
@@ -206,6 +225,7 @@ br sync - Synchronize SQLite database with JSONL file
 USAGE:
     br sync --flush-only    Export database to JSONL
     br sync --import-only   Import JSONL to database
+    br sync --merge         Three-way merge base + database + JSONL
     br sync --status        Show sync status
 
 SAFETY:
@@ -217,6 +237,8 @@ FLAGS:
     --import-only       Import JSONL to database (required unless --flush-only or --status)
     --status            Show sync status without modifying anything
     --force, -f         Override safety guards (use with caution)
+    --force-db          Resolve --merge conflicts by keeping SQLite
+    --force-jsonl       Resolve --merge conflicts by keeping JSONL
     --manifest          Write manifest file with export summary
     --error-policy      Error handling: strict|best-effort|partial|required-core
     --orphans           Orphan handling: strict|skip|allow|resurrect

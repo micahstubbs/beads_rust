@@ -70,6 +70,67 @@ fn make_issue(id: &str, title: &str, now: chrono::DateTime<Utc>) -> Issue {
     }
 }
 
+fn prepare_merge_conflict_workspace() -> (BrWorkspace, String) {
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_merge_conflict");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Merge conflict"],
+        "create_merge_seed",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let issue_id = parse_created_id(&create.stdout);
+
+    let flush = run_br(&workspace, ["sync", "--flush-only"], "flush_merge_conflict");
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
+
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let base_snapshot_path = workspace.root.join(".beads").join("beads.base.jsonl");
+    fs::copy(&jsonl_path, &base_snapshot_path).expect("seed base snapshot");
+
+    let local_update = run_br(
+        &workspace,
+        [
+            "update",
+            &issue_id,
+            "--description",
+            "Local description",
+            "--no-auto-flush",
+        ],
+        "local_merge_update",
+    );
+    assert!(
+        local_update.status.success(),
+        "local update failed: {}",
+        local_update.stderr
+    );
+
+    let contents = fs::read_to_string(&jsonl_path).expect("read jsonl");
+    let mut rewritten = Vec::new();
+    for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+        let mut issue: Value = serde_json::from_str(line).expect("parse issue jsonl");
+        if issue["id"].as_str() == Some(issue_id.as_str()) {
+            issue["description"] = Value::String("External description".to_string());
+            issue["updated_at"] = Value::String("2999-01-01T00:00:00Z".to_string());
+        }
+        rewritten.push(serde_json::to_string(&issue).expect("serialize issue jsonl"));
+    }
+    fs::write(&jsonl_path, rewritten.join("\n") + "\n").expect("write jsonl");
+
+    (workspace, issue_id)
+}
+
+fn assert_issue_description(workspace: &BrWorkspace, issue_id: &str, expected: &str) {
+    let show = run_br(workspace, ["show", issue_id, "--json"], "show_merge_result");
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    let payload = extract_json_payload(&show.stdout);
+    let issues: Vec<Value> = serde_json::from_str(&payload).expect("parse show json");
+    assert_eq!(issues[0]["description"].as_str(), Some(expected));
+}
+
 #[test]
 fn e2e_basic_lifecycle() {
     let _log = common::test_log("e2e_basic_lifecycle");
@@ -611,6 +672,50 @@ fn e2e_sync_import_staleness_and_force() {
         import_force.stdout.contains("Processed: 1 issues"),
         "sync import force missing processed count"
     );
+}
+
+#[test]
+fn e2e_sync_merge_resolution_flags_choose_db_or_jsonl() {
+    let (jsonl_workspace, jsonl_issue_id) = prepare_merge_conflict_workspace();
+    let manual = run_br(&jsonl_workspace, ["sync", "--merge"], "merge_manual");
+    assert!(
+        !manual.status.success(),
+        "manual merge should report conflict: stdout={} stderr={}",
+        manual.stdout,
+        manual.stderr
+    );
+    assert!(
+        manual.stderr.contains("BothModified")
+            && manual.stderr.contains("--force-db")
+            && manual.stderr.contains("--force-jsonl"),
+        "manual conflict should explain explicit resolution flags: {}",
+        manual.stderr
+    );
+
+    let force_jsonl = run_br(
+        &jsonl_workspace,
+        ["sync", "--merge", "--force-jsonl", "--json"],
+        "merge_force_jsonl",
+    );
+    assert!(
+        force_jsonl.status.success(),
+        "force-jsonl merge failed: {}",
+        force_jsonl.stderr
+    );
+    assert_issue_description(&jsonl_workspace, &jsonl_issue_id, "External description");
+
+    let (db_workspace, db_issue_id) = prepare_merge_conflict_workspace();
+    let force_db = run_br(
+        &db_workspace,
+        ["sync", "--merge", "--force-db", "--json"],
+        "merge_force_db",
+    );
+    assert!(
+        force_db.status.success(),
+        "force-db merge failed: {}",
+        force_db.stderr
+    );
+    assert_issue_description(&db_workspace, &db_issue_id, "Local description");
 }
 
 #[test]

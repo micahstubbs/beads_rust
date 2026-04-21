@@ -18,6 +18,7 @@
 |-----------|-------------|
 | **Export** (`--flush-only`) | Writes issues from SQLite to `.beads/issues.jsonl` |
 | **Import** (`--import-only`) | Reads issues from JSONL into SQLite |
+| **Merge** (`--merge`) | Three-way merge of base snapshot, SQLite, and JSONL |
 | **Status** (`--status`) | Shows sync state without modifying anything |
 
 All file I/O is confined to the `.beads/` directory by default.
@@ -54,6 +55,14 @@ These are explicit design non-goals. `br` will never:
 | **Schema validation** | Importing malformed JSON | **None** - must fix JSONL |
 | **Tombstone protection** | Resurrecting deleted issues | **None** - by design |
 
+### Merge Guards
+
+| Guard | What it prevents | Override |
+|-------|-----------------|----------|
+| **Both modified conflict** | Silently choosing between divergent SQLite and JSONL edits | `--force`, `--force-db`, `--force-jsonl` |
+| **Delete vs modify conflict** | Silently deleting one side's edit | `--force`, `--force-db`, `--force-jsonl` |
+| **Convergent creation conflict** | Silently choosing between independently created same-ID issues | `--force`, `--force-db`, `--force-jsonl` |
+
 ---
 
 ## Using --force Safely
@@ -66,17 +75,32 @@ br sync --flush-only --force
 
 # Safe: Import after confirming JSONL is authoritative
 br sync --import-only --force
+
+# Safe: Merge after confirming the newer timestamp should win
+br sync --merge --force
 ```
 
 **When to use --force:**
 - After a deliberate database reset
 - When JSONL is known to be authoritative
 - During recovery from corruption
+- During `--merge`, when timestamp-based conflict resolution is intentional
 
 **When NOT to use --force:**
 - Routinely (defeats the purpose of guards)
 - Without understanding why a guard triggered
 - When the error message is unclear
+
+Use `--force-db` or `--force-jsonl` instead of `--force` when you want a specific
+side of a merge conflict to win regardless of timestamps:
+
+```bash
+# Keep local SQLite changes for merge conflicts
+br sync --merge --force-db
+
+# Keep JSONL changes for merge conflicts
+br sync --merge --force-jsonl
+```
 
 ---
 
