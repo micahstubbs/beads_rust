@@ -1209,7 +1209,43 @@ fn rebuild_database_family(
     // crash-safe on POSIX (within a filesystem) and keeps the database
     // family consistent with its sidecars, which we drop first.
     compact_database_via_vacuum_into_in_place(&mut storage, db_path, lock_timeout);
+    verify_rebuilt_database_postconditions(&storage, &import_result)?;
     Ok((storage, import_result))
+}
+
+fn verify_rebuilt_database_postconditions(
+    storage: &SqliteStorage,
+    import_result: &ImportResult,
+) -> Result<()> {
+    let issue_count = storage
+        .count_issues()
+        .map_err(|source| BeadsError::WithContext {
+            context: "Post-recovery validation failed while counting rebuilt issues".to_string(),
+            source: Box::new(source),
+        })?;
+    if issue_count != import_result.created_count {
+        return Err(BeadsError::Config(format!(
+            "post-recovery validation failed: JSONL import created {} issue rows, but rebuilt database contains {issue_count}",
+            import_result.created_count
+        )));
+    }
+
+    let missing_references =
+        storage
+            .missing_issue_references()
+            .map_err(|source| BeadsError::WithContext {
+                context: "Post-recovery validation failed while checking issue references"
+                    .to_string(),
+                source: Box::new(source),
+            })?;
+    if !missing_references.is_empty() {
+        return Err(BeadsError::Config(format!(
+            "post-recovery validation failed: rebuilt database contains orphaned issue references in {}",
+            missing_references.join(", ")
+        )));
+    }
+
+    Ok(())
 }
 
 /// Compact a database at `db_path` by writing a fresh copy via `VACUUM
@@ -5070,6 +5106,85 @@ routing:
 
         assert_eq!(issue.title, "Recovered from JSONL only");
         assert!(db_path.is_file(), "database should be rebuilt from JSONL");
+    }
+
+    #[test]
+    fn rebuilt_database_postconditions_reject_issue_count_mismatch() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let storage = SqliteStorage::open(&db_path).expect("storage");
+        let import_result = ImportResult {
+            created_count: 1,
+            ..ImportResult::default()
+        };
+
+        let err = verify_rebuilt_database_postconditions(&storage, &import_result)
+            .expect_err("issue-count mismatch should fail validation");
+        assert!(
+            err.to_string()
+                .contains("JSONL import created 1 issue rows"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rebuilt_database_postconditions_reject_orphaned_issue_references() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        let issue = Issue {
+            id: "bd-kept".to_string(),
+            title: "Kept issue".to_string(),
+            ..Issue::default()
+        };
+        storage
+            .create_issue(&issue, "tester")
+            .expect("create issue");
+        storage
+            .execute_raw("PRAGMA foreign_keys = OFF")
+            .expect("disable foreign keys");
+        storage
+            .execute_raw("INSERT INTO labels (issue_id, label) VALUES ('bd-missing', 'orphan')")
+            .expect("insert orphan label");
+        let import_result = ImportResult {
+            created_count: 1,
+            ..ImportResult::default()
+        };
+
+        let err = verify_rebuilt_database_postconditions(&storage, &import_result)
+            .expect_err("orphaned label should fail validation");
+        assert!(
+            err.to_string().contains("labels.issue_id"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rebuilt_database_postconditions_allow_external_dependency_targets() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        let issue = Issue {
+            id: "bd-kept".to_string(),
+            title: "Kept issue".to_string(),
+            ..Issue::default()
+        };
+        storage
+            .create_issue(&issue, "tester")
+            .expect("create issue");
+        storage
+            .execute_raw(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_by) \
+                 VALUES ('bd-kept', 'external:other:capability', 'blocks', 'tester')",
+            )
+            .expect("insert external dependency");
+        let import_result = ImportResult {
+            created_count: 1,
+            ..ImportResult::default()
+        };
+
+        verify_rebuilt_database_postconditions(&storage, &import_result)
+            .expect("external dependency targets should be allowed");
     }
 
     #[test]

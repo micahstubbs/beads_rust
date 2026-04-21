@@ -674,6 +674,7 @@ impl SqliteStorage {
     pub(crate) fn has_missing_issue_reference(&self, table: &str, column: &str) -> Result<bool> {
         const ALLOWED_PAIRS: &[(&str, &str)] = &[
             ("dependencies", "issue_id"),
+            ("dependencies", "depends_on_id"),
             ("labels", "issue_id"),
             ("comments", "issue_id"),
             ("events", "issue_id"),
@@ -687,10 +688,46 @@ impl SqliteStorage {
                 "has_missing_issue_reference: disallowed table/column pair ({table}, {column})"
             )));
         }
+        let external_dependency_filter = if table == "dependencies" && column == "depends_on_id" {
+            " AND depends_on_id NOT LIKE 'external:%'"
+        } else {
+            ""
+        };
         let row = self.conn.query_row(&format!(
-            "SELECT COUNT(*) FROM {table} WHERE {column} NOT IN (SELECT id FROM issues)"
+            "SELECT COUNT(*) FROM {table} WHERE {column} NOT IN (SELECT id FROM issues){external_dependency_filter}"
         ))?;
         Ok(row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0) > 0)
+    }
+
+    /// Return FK-like issue references that point at missing local issues.
+    ///
+    /// External dependency targets are intentionally allowed because the
+    /// schema supports cross-project blockers through `external:*` IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any invariant query fails.
+    pub(crate) fn missing_issue_references(&self) -> Result<Vec<String>> {
+        const ISSUE_REFERENCE_PAIRS: &[(&str, &str)] = &[
+            ("dependencies", "issue_id"),
+            ("dependencies", "depends_on_id"),
+            ("labels", "issue_id"),
+            ("comments", "issue_id"),
+            ("events", "issue_id"),
+            ("dirty_issues", "issue_id"),
+            ("export_hashes", "issue_id"),
+            ("blocked_issues_cache", "issue_id"),
+            ("child_counters", "parent_id"),
+        ];
+
+        let mut violations = Vec::new();
+        for (table, column) in ISSUE_REFERENCE_PAIRS {
+            if self.has_missing_issue_reference(table, column)? {
+                violations.push(format!("{table}.{column}"));
+            }
+        }
+
+        Ok(violations)
     }
 
     /// Execute a raw SQL statement and return the number of affected rows.
@@ -7616,9 +7653,7 @@ mod tests {
     #[test]
     fn test_open_memory() {
         let storage = SqliteStorage::open_memory();
-        if let Err(error) = storage {
-            panic!("open_memory failed: {error:?}");
-        }
+        assert!(storage.is_ok(), "open_memory failed: {:?}", storage.err());
     }
 
     #[test]
@@ -7757,15 +7792,10 @@ mod tests {
             .unwrap();
 
         let err = storage.get_all_issues_metadata().unwrap_err();
-        match err {
-            BeadsError::Config(message) => {
-                assert!(
-                    message.contains("unparseable datetime"),
-                    "unexpected error: {message}"
-                );
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(&err, BeadsError::Config(message) if message.contains("unparseable datetime")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
@@ -8662,13 +8692,15 @@ mod tests {
             .unwrap();
 
         let err = storage.get_comments("bd-c-invalid").unwrap_err();
-        match err {
-            BeadsError::Config(msg) => {
-                assert!(msg.contains("invalid comment timestamp"));
-                assert!(msg.contains("unparseable datetime"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(
+                &err,
+                BeadsError::Config(msg)
+                    if msg.contains("invalid comment timestamp")
+                        && msg.contains("unparseable datetime")
+            ),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
