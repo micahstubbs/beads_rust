@@ -1,7 +1,43 @@
 use super::common::cli::run_br;
 use super::{create_issue, init_workspace, normalize_json};
-use insta::assert_json_snapshot;
+use insta::{assert_json_snapshot, assert_snapshot};
 use serde_json::Value;
+use std::fs;
+
+// Representative fixture for exact list/show JSON goldens.
+//
+// Golden update workflow:
+// INSTA_UPDATE=always rch exec -- cargo test --test snapshots representative_json_golden
+//
+// Review the resulting tests/snapshots/snapshots/*.snap diffs before committing.
+// The fixture uses fixed IDs, actors, and timestamps, so these snapshots should
+// not require masking; they intentionally lock down JSON field order and
+// optional/null omission behavior from the CLI serializer.
+const LIST_SHOW_JSONL_FIXTURE: &str = r#"{"id":"bd-golden-parent","title":"01 Parent Epic","description":"Parent description","status":"open","priority":1,"issue_type":"epic","assignee":"alice","owner":"owner@example.com","created_at":"2026-01-01T00:00:00Z","created_by":"fixture","updated_at":"2026-01-01T00:00:00Z","due_at":"2026-07-01T00:00:00Z","source_repo":".","compaction_level":0,"original_size":0,"labels":["ops","ux"]}
+{"id":"bd-golden-child","title":"02 Child Task","description":"Child description","design":"Design notes","acceptance_criteria":"Acceptance text","notes":"Operator notes","status":"in_progress","priority":2,"issue_type":"task","assignee":"bob","owner":"child@example.com","created_at":"2026-01-02T00:00:00Z","created_by":"fixture","updated_at":"2026-01-02T01:00:00Z","defer_until":"2026-07-03T00:00:00Z","source_repo":".","compaction_level":0,"original_size":0,"labels":["backend"],"dependencies":[{"issue_id":"bd-golden-child","depends_on_id":"bd-golden-parent","type":"parent-child","created_at":"2026-01-02T00:00:00Z","created_by":"fixture","metadata":"{}","thread_id":""}],"comments":[{"id":1,"issue_id":"bd-golden-child","author":"fixture","text":"first comment","created_at":"2026-01-02T02:00:00Z"}]}
+{"id":"bd-golden-closed","title":"03 Closed Bug","description":"Closed bug description","status":"closed","priority":0,"issue_type":"bug","assignee":"carol","owner":"owner@example.com","created_at":"2026-01-03T00:00:00Z","created_by":"fixture","updated_at":"2026-01-03T03:00:00Z","closed_at":"2026-01-03T03:00:00Z","close_reason":"fixed","closed_by_session":"session-1","source_repo":".","compaction_level":0,"original_size":0,"labels":["bugfix"]}
+{"id":"bd-golden-deleted","title":"04 Deleted Cleanup","status":"tombstone","priority":3,"issue_type":"task","created_at":"2026-01-04T00:00:00Z","created_by":"fixture","updated_at":"2026-01-04T04:00:00Z","deleted_at":"2026-01-04T04:00:00Z","deleted_by":"fixture","delete_reason":"fixture tombstone","original_type":"task","source_repo":".","compaction_level":0,"original_size":0}
+"#;
+
+fn init_list_show_golden_workspace() -> super::common::cli::BrWorkspace {
+    let workspace = init_workspace();
+    let jsonl_path = workspace.root.join(".beads/issues.jsonl");
+    fs::write(jsonl_path, LIST_SHOW_JSONL_FIXTURE).expect("write list/show JSONL fixture");
+
+    let import = run_br(
+        &workspace,
+        ["sync", "--import-only", "--json"],
+        "representative_json_golden_import",
+    );
+    assert!(
+        import.status.success(),
+        "fixture import failed:\nstdout:\n{}\nstderr:\n{}",
+        import.stdout,
+        import.stderr
+    );
+
+    workspace
+}
 
 #[test]
 fn snapshot_list_json() {
@@ -34,6 +70,61 @@ fn snapshot_show_json() {
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
     assert_json_snapshot!("show_json_output", normalize_json(&json));
+}
+
+#[test]
+fn representative_json_golden_list_output() {
+    let workspace = init_list_show_golden_workspace();
+
+    let output = run_br(
+        &workspace,
+        ["list", "--all", "--sort", "title", "--json"],
+        "representative_json_golden_list",
+    );
+    assert!(
+        output.status.success(),
+        "representative list JSON failed: {}",
+        output.stderr
+    );
+
+    let json: Value = serde_json::from_str(&output.stdout).expect("parse list JSON");
+    assert_eq!(
+        json.get("total").and_then(Value::as_u64),
+        Some(3),
+        "list --all should include open/in_progress/closed and exclude tombstones"
+    );
+    assert_snapshot!("representative_list_json_output", output.stdout.trim_end());
+}
+
+#[test]
+fn representative_json_golden_show_output() {
+    let workspace = init_list_show_golden_workspace();
+
+    let output = run_br(
+        &workspace,
+        [
+            "show",
+            "bd-golden-parent",
+            "bd-golden-child",
+            "bd-golden-closed",
+            "bd-golden-deleted",
+            "--json",
+        ],
+        "representative_json_golden_show",
+    );
+    assert!(
+        output.status.success(),
+        "representative show JSON failed: {}",
+        output.stderr
+    );
+
+    let json: Value = serde_json::from_str(&output.stdout).expect("parse show JSON");
+    assert_eq!(
+        json.as_array().map(Vec::len),
+        Some(4),
+        "show should preserve all requested fixture issues, including tombstones"
+    );
+    assert_snapshot!("representative_show_json_output", output.stdout.trim_end());
 }
 
 #[test]
