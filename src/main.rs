@@ -39,27 +39,6 @@ fn main() {
         }
     };
 
-    // Phase 1.5: Acquire exclusive write lock for mutating commands.
-    //
-    // Issue #243: frankensqlite deadlocks when multiple processes attempt
-    // concurrent writes to the same database file. Serialize all mutating
-    // operations through a blocking flock on `.beads/.write.lock`. Read-only
-    // commands skip this lock entirely. The lock is held until main() exits.
-    let write_lock = if needs_write_lock(&cli.command) && ctx.is_initialized() {
-        match ctx
-            .beads_dir
-            .as_deref()
-            .map(beads_rust::sync::blocking_write_lock)
-        {
-            Some(Ok(lock)) => Some(lock),
-            Some(Err(e)) => handle_error(&e, json_error_mode),
-            None => None,
-        }
-    } else {
-        None
-    };
-
-    // Phase 2: Open Storage (One-time)
     let storage_enabled = ctx.is_initialized() && !ctx.no_db();
     let should_auto_flush_now = is_mutating && !ctx.no_auto_flush();
     let should_preopen_storage = should_preopen_storage(
@@ -67,6 +46,36 @@ fn main() {
         needs_bootstrap_context,
         should_auto_flush_now,
     );
+    let command_needs_write_lock = needs_write_lock(&cli.command);
+
+    // Phase 1.5: Acquire exclusive write lock before any DB-family open that
+    // may apply schema, recover, quarantine sidecars, or write metadata.
+    //
+    // Issue #243: frankensqlite deadlocks when multiple processes attempt
+    // concurrent writes to the same database file. Serialize all mutating
+    // operations through a blocking flock on `.beads/.write.lock`. Storage open
+    // itself is not guaranteed read-only in recovery/schema paths, so commands
+    // that preopen storage for freshness checks also acquire it before Phase 2.
+    // The lock is held until main() exits so command bodies that open storage
+    // internally remain covered as well.
+    let write_lock =
+        if should_acquire_startup_write_lock(command_needs_write_lock, should_preopen_storage)
+            && ctx.is_initialized()
+        {
+            match ctx
+                .beads_dir
+                .as_deref()
+                .map(beads_rust::sync::blocking_write_lock)
+            {
+                Some(Ok(lock)) => Some(lock),
+                Some(Err(e)) => handle_error(&e, json_error_mode),
+                None => None,
+            }
+        } else {
+            None
+        };
+
+    // Phase 2: Open Storage (One-time)
     let mut storage_result = if should_preopen_storage {
         match open_storage_from_ctx(&mut ctx) {
             Ok(res) => Some(res),
@@ -457,6 +466,13 @@ const fn should_preopen_storage(
     storage_enabled && (needs_bootstrap_context || should_auto_flush_now)
 }
 
+const fn should_acquire_startup_write_lock(
+    command_needs_write_lock: bool,
+    should_preopen_storage: bool,
+) -> bool {
+    command_needs_write_lock || should_preopen_storage
+}
+
 /// Determine if a command potentially mutates data and triggers auto-flush.
 const fn is_mutating_command(cmd: &Commands) -> bool {
     match cmd {
@@ -490,13 +506,13 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
     }
 }
 
-/// Determine if a command modifies the SQLite database and requires the `.write.lock`.
+/// Determine if a command must hold `.write.lock` for its whole execution.
 const fn needs_write_lock(cmd: &Commands) -> bool {
     if is_mutating_command(cmd) {
         return true;
     }
     match cmd {
-        // Every sync mode except `--status` writes to the SQLite database.
+        // Every sync mode must open storage inside `sync::execute`.
         // `--flush-only` looks like a "just rewrite JSONL" path but also calls
         // `finalize_export` inside a `with_write_transaction`, updating dirty
         // flags, export hashes, and metadata (jsonl_content_hash,
@@ -504,8 +520,10 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
         // concurrent `br sync --flush-only` racing with another process's
         // auto-flush (or a second `--flush-only`) can trip fsqlite's
         // concurrent-write deadlock that this lock was specifically added
-        // to prevent (issue #243). Only `--status` is truly read-only.
-        Commands::Sync(args) => !args.status,
+        // to prevent (issue #243). `--status` only renders status after open,
+        // but opening storage can still apply schema/runtime defaults or
+        // recover the DB family, so it must also serialize before open.
+        Commands::Sync(_) | Commands::Init { .. } => true,
         Commands::Config { command } => matches!(
             command,
             beads_rust::cli::ConfigCommands::Set { .. }
@@ -519,7 +537,6 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
             )
         ),
         Commands::Doctor(args) => args.repair,
-        Commands::Init { .. } => true,
         _ => false,
     }
 }
@@ -794,7 +811,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_flush_only_requires_write_lock() {
+    fn sync_modes_require_write_lock_before_storage_open() {
         // Regression: `br sync --flush-only` calls `finalize_export` inside a
         // `with_write_transaction` (clears dirty flags, updates
         // jsonl_content_hash + last_export_time + needs_flush metadata, writes
@@ -804,6 +821,10 @@ mod tests {
         // --flush-only` invocations — or one racing a mutating command's
         // auto-flush — to hit the fsqlite concurrent-write deadlock that the
         // `.write.lock` was specifically introduced (issue #243) to prevent.
+        //
+        // `br sync --status` is read-only after storage is open, but the open
+        // path can apply runtime metadata defaults, recover from JSONL, or move
+        // sidecars. It must therefore serialize before entering `sync::execute`.
         let flush_only = Cli::parse_from(["br", "sync", "--flush-only"]).command;
         let status = Cli::parse_from(["br", "sync", "--status"]).command;
         let merge = Cli::parse_from(["br", "sync", "--merge"]).command;
@@ -815,8 +836,8 @@ mod tests {
             "`br sync --flush-only` writes DB metadata and must serialize via .write.lock"
         );
         assert!(
-            !needs_write_lock(&status),
-            "`br sync --status` is read-only and must not block on .write.lock"
+            needs_write_lock(&status),
+            "`br sync --status` opens storage and must serialize before recovery/schema work"
         );
         assert!(needs_write_lock(&merge));
         assert!(needs_write_lock(&import_only));
@@ -1018,5 +1039,13 @@ mod tests {
     #[test]
     fn preopen_storage_keeps_bootstrap_path_for_staleness_checks() {
         assert!(should_preopen_storage(true, true, false));
+    }
+
+    #[test]
+    fn preopen_storage_requires_write_lock_before_open() {
+        assert!(should_acquire_startup_write_lock(false, true));
+        assert!(should_acquire_startup_write_lock(true, false));
+        assert!(should_acquire_startup_write_lock(true, true));
+        assert!(!should_acquire_startup_write_lock(false, false));
     }
 }
