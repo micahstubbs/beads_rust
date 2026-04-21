@@ -54,11 +54,13 @@ struct DoctorReport {
     checks: Vec<CheckResult>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct DoctorRepairResult {
     imported: usize,
     skipped: usize,
     fk_violations_cleaned: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    verified_backups: Vec<config::RecoveryBackupVerification>,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +90,8 @@ struct RecoveryAuditRecord {
     applied_actions: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     quarantined_artifacts: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    verified_backups: Vec<config::RecoveryBackupVerification>,
     #[serde(skip_serializing_if = "Option::is_none")]
     imported: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -186,6 +190,7 @@ fn local_repair_audit_record(
         reason,
         applied_actions: local_repair_applied_actions(repair),
         quarantined_artifacts: repair.quarantined_artifacts.clone(),
+        verified_backups: Vec::new(),
         imported: None,
         skipped: None,
         fk_violations_cleaned: None,
@@ -205,6 +210,7 @@ fn jsonl_rebuild_audit_record(
         reason,
         applied_actions: Vec::new(),
         quarantined_artifacts: Vec::new(),
+        verified_backups: repair.map_or_else(Vec::new, |result| result.verified_backups.clone()),
         imported: repair.map(|result| result.imported),
         skipped: repair.map(|result| result.skipped),
         fk_violations_cleaned: repair.map(|result| result.fk_violations_cleaned),
@@ -228,6 +234,7 @@ fn no_op_repair_audit_record(repaired_gitignore: bool) -> RecoveryAuditRecord {
         reason: None,
         applied_actions,
         quarantined_artifacts: Vec::new(),
+        verified_backups: Vec::new(),
         imported: None,
         skipped: None,
         fk_violations_cleaned: None,
@@ -244,6 +251,8 @@ fn emit_recovery_audit_record(record: &RecoveryAuditRecord) {
         reason = record.reason.as_deref().unwrap_or(""),
         applied_actions = %applied_actions,
         quarantined_artifacts = record.quarantined_artifacts.len(),
+        verified_backups = record.verified_backups.len(),
+        verified_backup_details = ?record.verified_backups,
         imported = record.imported.unwrap_or(0),
         skipped = record.skipped.unwrap_or(0),
         fk_violations_cleaned = record.fk_violations_cleaned.unwrap_or(0),
@@ -1122,7 +1131,7 @@ fn repair_database_from_jsonl(
     // rebuild only replays what's in the JSONL.
     let preserved_tombstones = preserved_tombstones_for_doctor_rebuild(db_path, jsonl_path);
 
-    let (mut storage, import_result) = config::repair_database_from_jsonl(
+    let (mut storage, import_result, verified_backups) = config::repair_database_from_jsonl(
         beads_dir,
         db_path,
         jsonl_path,
@@ -1171,6 +1180,7 @@ fn repair_database_from_jsonl(
         imported: import_result.imported_count,
         skipped: import_result.skipped_count,
         fk_violations_cleaned: fk_violations,
+        verified_backups,
     })
 }
 
@@ -1254,6 +1264,7 @@ fn write_jsonl_rebuild_verification_failed_marker(
         "imported": repair_result.imported,
         "skipped": repair_result.skipped,
         "fk_violations_cleaned": repair_result.fk_violations_cleaned,
+        "verified_backups": &repair_result.verified_backups,
         "workspace_health": post_repair.report.workspace_health.as_deref(),
         "failed_checks": failed_checks,
     });
@@ -3301,6 +3312,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             "imported": repair_result.imported,
             "skipped": repair_result.skipped,
             "fk_violations_cleaned": repair_result.fk_violations_cleaned,
+            "verified_backups": &repair_result.verified_backups,
             "post_repair": post_repair.report,
             "verified": post_repair.report.ok,
             "recovery_failure_marker": verification_failure_marker
@@ -3507,6 +3519,7 @@ mod tests {
             imported: 3,
             skipped: 1,
             fk_violations_cleaned: 2,
+            verified_backups: Vec::new(),
         };
 
         let audit =
@@ -3577,6 +3590,7 @@ mod tests {
             imported: 1,
             skipped: 0,
             fk_violations_cleaned: 0,
+            verified_backups: Vec::new(),
         };
 
         let marker = write_jsonl_rebuild_verification_failed_marker(

@@ -24,10 +24,11 @@ use crate::util::id::{IdConfig, abbreviate_prefix, normalize_prefix, split_prefi
 use chrono::Utc;
 use fsqlite_error::FrankenError;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{BufRead, IsTerminal};
+use std::io::{BufRead, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use tempfile::tempdir;
@@ -486,7 +487,32 @@ struct RecoveryBackupSet {
     db_path: PathBuf,
     recovery_dir: PathBuf,
     stamp: String,
-    files: Vec<(PathBuf, PathBuf)>,
+    files: Vec<RecoveryBackupPath>,
+    verified_files: Vec<RecoveryBackupVerification>,
+}
+
+type RecoveryBackupPath = (PathBuf, PathBuf);
+type VerifiedRecoveryBackupBatch = (Vec<RecoveryBackupPath>, Vec<RecoveryBackupVerification>);
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct RecoveryBackupVerification {
+    pub original: String,
+    pub backup: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symlink_target: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveryArtifactFingerprint {
+    kind: String,
+    size_bytes: Option<u64>,
+    sha256: Option<String>,
+    symlink_target: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -951,7 +977,7 @@ fn rebuild_database_from_jsonl(
         bootstrap_layer,
         false,
     )
-    .map(|(storage, _)| storage)
+    .map(|(storage, _, _)| storage)
 }
 
 /// Snapshot local tombstones that have not yet been flushed to JSONL.
@@ -1001,7 +1027,7 @@ pub(crate) fn repair_database_from_jsonl(
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
     show_progress: bool,
-) -> Result<(SqliteStorage, ImportResult)> {
+) -> Result<(SqliteStorage, ImportResult, Vec<RecoveryBackupVerification>)> {
     let prefix = resolve_bootstrap_issue_prefix(bootstrap_layer, beads_dir, jsonl_path)?;
     let mut import_config = import_config_for_resolved_jsonl(beads_dir, db_path, jsonl_path);
     import_config.show_progress = show_progress;
@@ -1015,17 +1041,21 @@ pub(crate) fn repair_database_from_jsonl(
         "Rebuilding SQLite database from JSONL"
     );
 
-    let ((storage, import_result), recovery_dir) =
+    let ((storage, import_result), backup_set) =
         rebuild_database_family_with_backup(db_path, beads_dir, || {
             rebuild_database_family(db_path, lock_timeout, jsonl_path, &import_config, &prefix)
         })?;
+    let recovery_dir = backup_set.recovery_dir.clone();
+    let verified_backups = backup_set.verified_files.clone();
 
     warn!(
         db_path = %db_path.display(),
         recovery_dir = %recovery_dir.display(),
+        verified_backup_count = verified_backups.len(),
+        verified_backups = ?verified_backups,
         "SQLite rebuild from JSONL succeeded"
     );
-    Ok((storage, import_result))
+    Ok((storage, import_result, verified_backups))
 }
 
 fn should_surface_recovery_error(recovery_err: &BeadsError) -> bool {
@@ -1046,7 +1076,7 @@ fn recovery_restore_failure(
     }
 }
 
-fn rollback_renamed_paths(renamed_paths: &[(PathBuf, PathBuf)], operation: &str) -> Result<()> {
+fn rollback_renamed_paths(renamed_paths: &[RecoveryBackupPath], operation: &str) -> Result<()> {
     for (original, renamed) in renamed_paths.iter().rev() {
         fs::rename(renamed, original).with_context(|| {
             format!(
@@ -1060,6 +1090,114 @@ fn rollback_renamed_paths(renamed_paths: &[(PathBuf, PathBuf)], operation: &str)
     Ok(())
 }
 
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path).with_context(|| {
+        format!(
+            "Failed to open recovery artifact '{}' for hashing",
+            path.display()
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+
+    loop {
+        let read = file.read(&mut buffer).with_context(|| {
+            format!(
+                "Failed to read recovery artifact '{}' for hashing",
+                path.display()
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn recovery_artifact_fingerprint(path: &Path) -> Result<RecoveryArtifactFingerprint> {
+    let metadata = fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "Failed to inspect recovery artifact '{}' for verification",
+            path.display()
+        )
+    })?;
+    let file_type = metadata.file_type();
+
+    if file_type.is_symlink() {
+        let target = fs::read_link(path).with_context(|| {
+            format!(
+                "Failed to read recovery symlink artifact '{}'",
+                path.display()
+            )
+        })?;
+        return Ok(RecoveryArtifactFingerprint {
+            kind: "symlink".to_string(),
+            size_bytes: None,
+            sha256: None,
+            symlink_target: Some(target.display().to_string()),
+        });
+    }
+
+    if metadata.is_file() {
+        return Ok(RecoveryArtifactFingerprint {
+            kind: "file".to_string(),
+            size_bytes: Some(metadata.len()),
+            sha256: Some(sha256_file(path)?),
+            symlink_target: None,
+        });
+    }
+
+    if metadata.is_dir() {
+        return Ok(RecoveryArtifactFingerprint {
+            kind: "directory".to_string(),
+            size_bytes: None,
+            sha256: None,
+            symlink_target: None,
+        });
+    }
+
+    Ok(RecoveryArtifactFingerprint {
+        kind: "other".to_string(),
+        size_bytes: None,
+        sha256: None,
+        symlink_target: None,
+    })
+}
+
+fn verify_recovery_backup_artifact(
+    backup: &Path,
+    expected: &RecoveryArtifactFingerprint,
+) -> Result<()> {
+    let actual = recovery_artifact_fingerprint(backup)?;
+    if &actual == expected {
+        return Ok(());
+    }
+
+    Err(BeadsError::Config(format!(
+        "Recovery backup verification failed for '{}': expected {:?}, found {:?}",
+        backup.display(),
+        expected,
+        actual
+    )))
+}
+
+fn recovery_backup_verification(
+    original: &Path,
+    backup: &Path,
+    fingerprint: &RecoveryArtifactFingerprint,
+) -> RecoveryBackupVerification {
+    RecoveryBackupVerification {
+        original: original.display().to_string(),
+        backup: backup.display().to_string(),
+        kind: fingerprint.kind.clone(),
+        size_bytes: fingerprint.size_bytes,
+        sha256: fingerprint.sha256.clone(),
+        symlink_target: fingerprint.symlink_target.clone(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MissingRenameSourcePolicy {
     Skip,
@@ -1070,7 +1208,7 @@ fn rename_existing_paths<I>(
     paths: I,
     operation: &str,
     missing_source_policy: MissingRenameSourcePolicy,
-) -> Result<Vec<(PathBuf, PathBuf)>>
+) -> Result<Vec<RecoveryBackupPath>>
 where
     I: IntoIterator<Item = (PathBuf, PathBuf)>,
 {
@@ -1143,6 +1281,111 @@ where
     }
 
     Ok(renamed_paths)
+}
+
+#[allow(clippy::too_many_lines)]
+fn rename_existing_paths_with_backup_verification<I>(
+    paths: I,
+    operation: &str,
+    missing_source_policy: MissingRenameSourcePolicy,
+) -> Result<VerifiedRecoveryBackupBatch>
+where
+    I: IntoIterator<Item = (PathBuf, PathBuf)>,
+{
+    let mut renamed_paths = Vec::new();
+    let mut verified_files = Vec::new();
+
+    for (original, renamed) in paths {
+        let fingerprint = match fs::symlink_metadata(&original) {
+            Ok(_) => recovery_artifact_fingerprint(&original)?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if matches!(missing_source_policy, MissingRenameSourcePolicy::Skip) {
+                    continue;
+                }
+
+                let rename_err = BeadsError::WithContext {
+                    context: format!("Failed to {operation}"),
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("expected '{}' to exist", original.display()),
+                    )),
+                };
+                if let Err(rollback_err) = rollback_renamed_paths(&renamed_paths, operation) {
+                    return Err(BeadsError::WithContext {
+                        context: format!(
+                            "Failed to {operation} ({rename_err}); rollback also failed"
+                        ),
+                        source: Box::new(rollback_err),
+                    });
+                }
+
+                return Err(rename_err);
+            }
+            Err(err) => {
+                let rename_err = BeadsError::WithContext {
+                    context: format!(
+                        "Failed to inspect '{}' before attempting to {operation}",
+                        original.display()
+                    ),
+                    source: Box::new(err),
+                };
+                if let Err(rollback_err) = rollback_renamed_paths(&renamed_paths, operation) {
+                    return Err(BeadsError::WithContext {
+                        context: format!(
+                            "Failed to {operation} ({rename_err}); rollback also failed"
+                        ),
+                        source: Box::new(rollback_err),
+                    });
+                }
+
+                return Err(rename_err);
+            }
+        };
+
+        if let Err(rename_err) = fs::rename(&original, &renamed) {
+            if let Err(rollback_err) = rollback_renamed_paths(&renamed_paths, operation) {
+                warn!(
+                    operation,
+                    rollback_error = %rollback_err,
+                    "Failed to roll back partially completed file rename batch"
+                );
+                return Err(BeadsError::WithContext {
+                    context: format!("Failed to {operation} ({rename_err}); rollback also failed"),
+                    source: Box::new(rollback_err),
+                });
+            }
+
+            return Err(rename_err.into());
+        }
+
+        renamed_paths.push((original.clone(), renamed.clone()));
+        if let Err(verify_err) = verify_recovery_backup_artifact(&renamed, &fingerprint) {
+            if let Err(rollback_err) = rollback_renamed_paths(&renamed_paths, operation) {
+                return Err(BeadsError::WithContext {
+                    context: format!(
+                        "Failed to verify recovery backup '{}' after {operation} ({verify_err}); rollback also failed",
+                        renamed.display()
+                    ),
+                    source: Box::new(rollback_err),
+                });
+            }
+
+            return Err(BeadsError::WithContext {
+                context: format!(
+                    "Failed to verify recovery backup '{}' after {operation}",
+                    renamed.display()
+                ),
+                source: Box::new(verify_err),
+            });
+        }
+        verified_files.push(recovery_backup_verification(
+            &original,
+            &renamed,
+            &fingerprint,
+        ));
+    }
+
+    Ok((renamed_paths, verified_files))
 }
 
 fn rebuild_database_family(
@@ -1401,19 +1644,18 @@ pub(crate) fn compact_database_via_vacuum_into_in_place(
     }
 }
 
-pub(crate) fn rebuild_database_family_with_backup<T, F>(
+fn rebuild_database_family_with_backup<T, F>(
     db_path: &Path,
     beads_dir: &Path,
     rebuild: F,
-) -> Result<(T, PathBuf)>
+) -> Result<(T, RecoveryBackupSet)>
 where
     F: FnOnce() -> Result<T>,
 {
     let backup_set = backup_database_family_for_recovery(db_path, beads_dir)?;
-    let recovery_dir = backup_set.recovery_dir.clone();
 
     match rebuild() {
-        Ok(value) => Ok((value, recovery_dir)),
+        Ok(value) => Ok((value, backup_set)),
         Err(rebuild_err) => {
             if let Err(restore_err) = restore_database_family_after_failed_rebuild(&backup_set) {
                 warn!(
@@ -1453,6 +1695,7 @@ fn prepare_missing_database_cleanup_for_recovery(
         recovery_dir,
         stamp,
         files: Vec::new(),
+        verified_files: Vec::new(),
     })
 }
 
@@ -1463,7 +1706,7 @@ fn move_database_family_to_recovery(
 ) -> Result<RecoveryBackupSet> {
     let recovery_dir = recovery_dir_for_db_path(db_path, beads_dir);
     fs::create_dir_all(&recovery_dir)?;
-    let files = rename_existing_paths(
+    let (files, verified_files) = rename_existing_paths_with_backup_verification(
         database_family_paths(db_path).into_iter().map(|original| {
             let backup = recovery_dir.join(recovery_backup_filename(&original, stamp, "bak"));
             (original, backup)
@@ -1477,6 +1720,7 @@ fn move_database_family_to_recovery(
         recovery_dir,
         stamp: stamp.to_string(),
         files,
+        verified_files,
     })
 }
 
@@ -1629,7 +1873,7 @@ where
     let recovery_dir = recovery_dir_for_db_path(db_path, beads_dir);
     fs::create_dir_all(&recovery_dir)?;
 
-    let renamed_paths = rename_existing_paths(
+    let (renamed_paths, verified_files) = rename_existing_paths_with_backup_verification(
         artifact_paths.into_iter().map(|original| {
             let backup = recovery_dir.join(recovery_backup_filename(&original, &stamp, suffix));
             (original, backup)
@@ -1637,6 +1881,14 @@ where
         "quarantine database artifacts",
         MissingRenameSourcePolicy::Skip,
     )?;
+
+    tracing::warn!(
+        db_path = %db_path.display(),
+        recovery_dir = %recovery_dir.display(),
+        verified_backup_count = verified_files.len(),
+        verified_backups = ?verified_files,
+        "Verified quarantined database artifact backups"
+    );
 
     Ok(renamed_paths
         .into_iter()
@@ -1759,7 +2011,7 @@ impl OpenStorageResult {
         // BusySnapshot conflicts.
         self.storage = SqliteStorage::open_memory()?;
 
-        let (storage, _) = repair_database_from_jsonl(
+        let (storage, _, _) = repair_database_from_jsonl(
             &self.paths.beads_dir,
             &self.paths.db_path,
             &self.paths.jsonl_path,
@@ -5799,6 +6051,64 @@ routing:
     }
 
     #[test]
+    fn move_database_family_to_recovery_records_verified_file_backups() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        fs::write(&db_path, b"db bytes").expect("write db");
+        fs::write(&wal_path, b"wal bytes").expect("write wal");
+
+        let backup_set = move_database_family_to_recovery(&db_path, &beads_dir, "fixed-stamp")
+            .expect("backup set");
+
+        assert_eq!(backup_set.files.len(), 2);
+        assert_eq!(backup_set.verified_files.len(), 2);
+        let db_verification = backup_set
+            .verified_files
+            .iter()
+            .find(|verification| verification.original == db_path.display().to_string())
+            .expect("db backup verification");
+        assert_eq!(db_verification.kind, "file");
+        assert_eq!(db_verification.size_bytes, Some(8));
+        assert_eq!(
+            db_verification.sha256.as_ref().map(String::len),
+            Some(64),
+            "file backup verification should record a sha256 digest"
+        );
+        assert_eq!(
+            fs::read(Path::new(&db_verification.backup)).expect("read db backup"),
+            b"db bytes"
+        );
+        assert!(
+            !db_path.exists(),
+            "verified backup move should remove the live DB path"
+        );
+    }
+
+    #[test]
+    fn verify_recovery_backup_artifact_rejects_digest_mismatch() {
+        let temp = TempDir::new().expect("tempdir");
+        let original = temp.path().join("beads.db");
+        let backup = temp.path().join("beads.db.fixed-stamp.bak");
+        fs::write(&original, b"original bytes").expect("write original");
+        fs::write(&backup, b"corrupt bytes").expect("write backup");
+
+        let expected = recovery_artifact_fingerprint(&original).expect("fingerprint");
+        let err = verify_recovery_backup_artifact(&backup, &expected)
+            .expect_err("mismatched backup should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("Recovery backup verification failed")
+                && err.to_string().contains(&backup.display().to_string()),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn move_database_family_to_recovery_rolls_back_partial_failure() {
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
@@ -5858,6 +6168,7 @@ routing:
             recovery_dir: recovery_dir.clone(),
             stamp: "fixed-stamp".to_string(),
             files: vec![(wal_path.clone(), wal_backup_file.clone())],
+            verified_files: Vec::new(),
         })
         .expect_err("missing backup should fail restore");
         assert!(
