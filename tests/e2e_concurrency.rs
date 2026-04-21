@@ -12,9 +12,10 @@ mod common;
 use assert_cmd::Command;
 use common::dataset_registry::{DatasetRegistry, IsolatedDataset, KnownDataset};
 use std::ffi::OsStr;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::{Command as StdCommand, Stdio};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -45,6 +46,31 @@ fn clear_inherited_br_env(cmd: &mut Command) {
             cmd.env_remove(&key);
         }
     }
+}
+
+fn clear_inherited_br_env_std(cmd: &mut StdCommand) {
+    for (key, _) in std::env::vars_os() {
+        if should_clear_inherited_br_env(&key) {
+            cmd.env_remove(&key);
+        }
+    }
+}
+
+fn spawn_br_child_in_dir<I, S>(root: &Path, args: I) -> std::process::Child
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut cmd = StdCommand::new(assert_cmd::cargo::cargo_bin!("br"));
+    cmd.current_dir(root);
+    cmd.args(args);
+    clear_inherited_br_env_std(&mut cmd);
+    cmd.env("NO_COLOR", "1");
+    cmd.env("RUST_BACKTRACE", "1");
+    cmd.env("HOME", root);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.spawn().expect("spawn br child")
 }
 
 /// Run br command in a specific directory.
@@ -251,6 +277,94 @@ fn configure_external_route(main_root: &Path, external_root: &Path) {
     )
     .expect("write external config");
     create_routes_file(main_root, &[("ext-", external_root)]);
+}
+
+/// A writer process killed while waiting for `.write.lock` must not leave a
+/// ghost mutation or poison the advisory lock for subsequent writers.
+#[test]
+#[allow(clippy::incompatible_msrv)]
+fn e2e_killed_writer_waiting_on_write_lock_does_not_poison_workspace() {
+    let _log =
+        common::test_log("e2e_killed_writer_waiting_on_write_lock_does_not_poison_workspace");
+
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let root = temp_dir.path().to_path_buf();
+
+    let init = run_br_in_dir(&root, ["init"]);
+    assert!(init.success, "init failed: {}", init.stderr);
+
+    let seed = run_br_in_dir(&root, ["create", "Seed before killed writer"]);
+    assert!(seed.success, "seed create failed: {}", seed.stderr);
+
+    let lock_path = root.join(".beads").join(".write.lock");
+    let write_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .expect("open .write.lock");
+    write_lock.lock().expect("hold .write.lock");
+
+    let mut blocked_writer = spawn_br_child_in_dir(
+        &root,
+        ["create", "Killed while waiting for write lock", "--json"],
+    );
+    thread::sleep(Duration::from_millis(250));
+
+    let early_exit = blocked_writer.try_wait().expect("poll blocked writer");
+    assert!(
+        early_exit.is_none(),
+        "writer should still be waiting on .write.lock; status={early_exit:?}"
+    );
+
+    blocked_writer.kill().expect("kill blocked writer");
+    let killed = blocked_writer
+        .wait_with_output()
+        .expect("collect killed writer");
+    assert!(
+        !killed.status.success(),
+        "killed writer must not report success"
+    );
+    drop(write_lock);
+
+    let after = run_br_in_dir(&root, ["create", "After killed writer", "--json"]);
+    assert!(
+        after.success,
+        "post-kill writer failed: stdout={} stderr={}",
+        after.stdout, after.stderr
+    );
+
+    let list = run_br_in_dir(&root, ["list", "--json"]);
+    assert!(
+        list.success,
+        "list after killed writer failed: {}",
+        list.stderr
+    );
+    let issues = extract_issues_array(&list.stdout);
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue["title"].as_str() == Some("Seed before killed writer")),
+        "seed issue should remain visible: {}",
+        list.stdout
+    );
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue["title"].as_str() == Some("After killed writer")),
+        "post-kill issue should be visible: {}",
+        list.stdout
+    );
+    assert!(
+        issues.iter().all(|issue| {
+            issue["title"].as_str() != Some("Killed while waiting for write lock")
+        }),
+        "killed waiter must not create a ghost issue: {}",
+        list.stdout
+    );
+
+    assert_doctor_healthy(&root);
 }
 
 /// Test that concurrent write operations respect `SQLite` locking.
