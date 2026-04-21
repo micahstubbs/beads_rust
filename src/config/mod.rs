@@ -669,6 +669,26 @@ fn open_when_db_file_is_missing(
 /// database family lets SQLite recreate them on the next write while
 /// preserving the original bytes for operator inspection.
 fn quarantine_truncated_wal_sidecar(db_path: &Path, beads_dir: &Path) {
+    match fs::symlink_metadata(db_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                "Skipping truncated WAL quarantine for symlinked database path"
+            );
+            return;
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                error = %err,
+                "Skipping truncated WAL quarantine because the database path could not be inspected"
+            );
+            return;
+        }
+    }
+
     let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
     let Ok(meta) = fs::metadata(&wal_path) else {
         return;
@@ -6416,6 +6436,8 @@ routing:
 
         fs::write(&target_db_path, b"not a sqlite database").expect("write corrupt target");
         symlink(&target_db_path, &db_path).expect("symlink db path");
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+        fs::write(&wal_path, b"short wal").expect("write truncated wal sidecar");
         write_single_issue_jsonl(&jsonl_path, "bd-symln1", "Symlinked DB recovery payload");
 
         let err =
@@ -6440,6 +6462,11 @@ routing:
             fs::read(&target_db_path).expect("read target bytes"),
             b"not a sqlite database",
             "recovery refusal must not rewrite the symlink target"
+        );
+        assert_eq!(
+            fs::read(&wal_path).expect("read wal sidecar"),
+            b"short wal",
+            "recovery refusal must not quarantine sidecars for a symlinked DB path"
         );
         assert!(
             !recovery_dir_for_db_path(&db_path, &beads_dir).exists(),

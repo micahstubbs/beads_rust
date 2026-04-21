@@ -1,5 +1,5 @@
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 const ORPHANED_LOCK_FILE_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
@@ -360,6 +360,11 @@ impl fmt::Display for WorkspaceClassification {
 }
 
 #[must_use]
+fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    PathBuf::from(format!("{}{}", db_path.to_string_lossy(), suffix))
+}
+
+#[must_use]
 pub fn classify_file_state(db_path: &Path, jsonl_path: &Path) -> Vec<AnomalyClass> {
     let mut anomalies = Vec::new();
 
@@ -377,12 +382,12 @@ pub fn classify_file_state(db_path: &Path, jsonl_path: &Path) -> Vec<AnomalyClas
         }
     }
 
-    let wal_path = db_path.with_extension("db-wal");
-    let shm_path = db_path.with_extension("db-shm");
+    let wal_path = sqlite_sidecar_path(db_path, "-wal");
+    let shm_path = sqlite_sidecar_path(db_path, "-shm");
     let has_wal = wal_path.is_file();
     let has_shm = shm_path.is_file();
 
-    if has_wal && !has_shm {
+    if has_shm && !has_wal {
         anomalies.push(AnomalyClass::SidecarMismatch { has_wal, has_shm });
     }
 
@@ -407,7 +412,7 @@ pub fn classify_file_state(db_path: &Path, jsonl_path: &Path) -> Vec<AnomalyClas
         }
     }
 
-    let journal_path = db_path.with_extension("db-journal");
+    let journal_path = sqlite_sidecar_path(db_path, "-journal");
     if journal_path.is_file() {
         anomalies.push(AnomalyClass::JournalSidecarPresent);
     }
@@ -553,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_mismatch_is_degraded() {
+    fn wal_without_shm_is_expected_for_frankensqlite() {
         let (_dir, db_path, jsonl_path) = setup_workspace();
         let mut f = std::fs::File::create(&db_path).unwrap();
         f.write_all(b"SQLite format 3\0").unwrap();
@@ -564,13 +569,90 @@ mod tests {
 
         let anomalies = classify_file_state(&db_path, &jsonl_path);
         assert!(
-            anomalies
+            !anomalies
                 .iter()
-                .any(|a| matches!(a, AnomalyClass::SidecarMismatch { .. }))
+                .any(|a| matches!(a, AnomalyClass::SidecarMismatch { .. })),
+            "WAL-without-SHM is expected for frankensqlite and should not be a sidecar mismatch: {anomalies:?}"
+        );
+        let classification = WorkspaceClassification::from_anomalies(anomalies);
+        assert_eq!(classification.health, WorkspaceHealth::Healthy);
+        assert!(classification.is_operable());
+    }
+
+    #[test]
+    fn shm_without_wal_is_degraded_sidecar_mismatch() {
+        let (_dir, db_path, jsonl_path) = setup_workspace();
+        let mut f = std::fs::File::create(&db_path).unwrap();
+        f.write_all(b"SQLite format 3\0").unwrap();
+        f.write_all(&[0u8; 100]).unwrap();
+        std::fs::write(&jsonl_path, "{\"id\":\"test-1\"}\n").unwrap();
+        let shm_path = db_path.with_extension("db-shm");
+        std::fs::write(&shm_path, [0u8; 64]).unwrap();
+
+        let anomalies = classify_file_state(&db_path, &jsonl_path);
+        assert!(
+            anomalies.iter().any(|a| {
+                matches!(
+                    a,
+                    AnomalyClass::SidecarMismatch {
+                        has_wal: false,
+                        has_shm: true
+                    }
+                )
+            }),
+            "SHM-without-WAL should be a sidecar mismatch: {anomalies:?}"
         );
         let classification = WorkspaceClassification::from_anomalies(anomalies);
         assert_eq!(classification.health, WorkspaceHealth::Degraded);
         assert!(classification.is_operable());
+    }
+
+    #[test]
+    fn custom_db_filename_uses_sqlite_append_style_shm_path() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("issues.sqlite");
+        let jsonl_path = dir.path().join("issues.jsonl");
+        let mut f = std::fs::File::create(&db_path).unwrap();
+        f.write_all(b"SQLite format 3\0").unwrap();
+        f.write_all(&[0u8; 100]).unwrap();
+        std::fs::write(&jsonl_path, "{\"id\":\"test-1\"}\n").unwrap();
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(&shm_path, [0u8; 64]).unwrap();
+
+        let anomalies = classify_file_state(&db_path, &jsonl_path);
+        assert!(
+            anomalies.iter().any(|a| {
+                matches!(
+                    a,
+                    AnomalyClass::SidecarMismatch {
+                        has_wal: false,
+                        has_shm: true
+                    }
+                )
+            }),
+            "custom DB filename SHM sidecar should be detected at {shm_path:?}: {anomalies:?}"
+        );
+    }
+
+    #[test]
+    fn custom_db_filename_uses_sqlite_append_style_wal_path() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("issues.sqlite");
+        let jsonl_path = dir.path().join("issues.jsonl");
+        let mut f = std::fs::File::create(&db_path).unwrap();
+        f.write_all(b"SQLite format 3\0").unwrap();
+        f.write_all(&[0u8; 100]).unwrap();
+        std::fs::write(&jsonl_path, "{\"id\":\"test-1\"}\n").unwrap();
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        std::fs::write(&wal_path, b"short wal").unwrap();
+
+        let anomalies = classify_file_state(&db_path, &jsonl_path);
+        assert!(
+            anomalies
+                .iter()
+                .any(|a| matches!(a, AnomalyClass::TruncatedWal)),
+            "custom DB filename WAL sidecar should be detected at {wal_path:?}: {anomalies:?}"
+        );
     }
 
     #[test]
