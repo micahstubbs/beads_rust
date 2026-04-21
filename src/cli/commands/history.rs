@@ -7,18 +7,13 @@ use crate::sync::history;
 use crate::sync::{require_safe_sync_overwrite_path, validate_temp_file_path};
 use rich_rust::prelude::*;
 use serde_json::json;
+use similar::TextDiff;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
 /// Result type for diff status: (status_string, diff_available, optional_size_tuple).
 type DiffStatusResult = (&'static str, bool, Option<(u64, u64)>);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiffCommandStatus {
-    Identical,
-    Different,
-}
 
 struct TempRestoreGuard {
     path: PathBuf,
@@ -440,49 +435,15 @@ fn diff_backup(
         println!("Diffing current {current_name} vs {filename}...");
     }
 
-    // Let's shell out to `diff -u` for now as it's standard on linux/mac.
-    // Avoid GNU-only flags (like --color) to keep this portable.
-    let status = std::process::Command::new("diff")
-        .arg("-u")
-        .arg(&current_path)
-        .arg(&backup_path)
-        .status();
-
-    match status {
-        Ok(s) => match classify_diff_exit(s.success(), s.code())? {
-            DiffCommandStatus::Identical => {
-                if ctx.is_rich() {
-                    ctx.success("Files are identical.");
-                } else {
-                    println!("Files are identical.");
-                }
-            }
-            DiffCommandStatus::Different => {}
-        },
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let current_size = std::fs::metadata(&current_path)?.len();
-            let backup_size = std::fs::metadata(&backup_path)?.len();
-            let current_human = format_size(current_size);
-            let backup_human = format_size(backup_size);
-            if ctx.is_rich() {
-                let theme = ctx.theme();
-                let body = format!(
-                    "Diff tool not available; comparing sizes.\nCurrent: {current_human} ({current_size} bytes)\nBackup:  {backup_human} ({backup_size} bytes)"
-                );
-                let panel = Panel::from_text(&body)
-                    .title(Text::styled("History Diff", theme.panel_title.clone()))
-                    .box_style(theme.box_style)
-                    .border_style(theme.panel_border.clone());
-                ctx.render(&panel);
-            } else {
-                println!("'diff' command not found. Comparing sizes:");
-                println!("Current: {current_size} bytes");
-                println!("Backup:  {backup_size} bytes");
-            }
+    let diff = unified_diff_for_files(&current_path, &backup_path)?;
+    if diff.is_empty() {
+        if ctx.is_rich() {
+            ctx.success("Files are identical.");
+        } else {
+            println!("Files are identical.");
         }
-        Err(err) => {
-            return Err(BeadsError::Config(format!("Failed to run diff: {err}")));
-        }
+    } else {
+        print!("{diff}");
     }
 
     Ok(())
@@ -623,39 +584,26 @@ fn prune_backups(
 }
 
 fn diff_status_for_json(current_path: &Path, backup_path: &Path) -> Result<DiffStatusResult> {
-    let output = std::process::Command::new("diff")
-        .arg("-u")
-        .arg(current_path)
-        .arg(backup_path)
-        .output();
-
-    match output {
-        Ok(out) => match classify_diff_exit(out.status.success(), out.status.code())? {
-            DiffCommandStatus::Identical => Ok(("identical", true, None)),
-            DiffCommandStatus::Different => Ok(("different", true, None)),
-        },
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let current_size = std::fs::metadata(current_path)?.len();
-            let backup_size = std::fs::metadata(backup_path)?.len();
-            Ok(("diff_unavailable", false, Some((current_size, backup_size))))
-        }
-        Err(err) => Err(BeadsError::Config(format!("Failed to run diff: {err}"))),
-    }
+    let diff = unified_diff_for_files(current_path, backup_path)?;
+    let status = if diff.is_empty() {
+        "identical"
+    } else {
+        "different"
+    };
+    Ok((status, true, None))
 }
 
-fn classify_diff_exit(success: bool, code: Option<i32>) -> Result<DiffCommandStatus> {
-    if success {
-        return Ok(DiffCommandStatus::Identical);
-    }
-    if code == Some(1) {
-        return Ok(DiffCommandStatus::Different);
-    }
-
-    let detail = code.map_or_else(
-        || "diff terminated without an exit code".to_string(),
-        |value| format!("diff exited with status {value}"),
-    );
-    Err(BeadsError::Config(format!("Failed to run diff: {detail}")))
+fn unified_diff_for_files(current_path: &Path, backup_path: &Path) -> Result<String> {
+    let current = fs::read_to_string(current_path)?;
+    let backup = fs::read_to_string(backup_path)?;
+    let diff = TextDiff::from_lines(&current, &backup);
+    Ok(diff
+        .unified_diff()
+        .header(
+            &current_path.display().to_string(),
+            &backup_path.display().to_string(),
+        )
+        .to_string())
 }
 
 fn current_jsonl_path_for_backup(
@@ -810,7 +758,10 @@ mod tests {
                     "unexpected message: {msg}"
                 );
             }
-            other => panic!("unexpected error: {other:?}"),
+            other => assert!(
+                matches!(other, BeadsError::Config(_)),
+                "unexpected error: {other:?}"
+            ),
         }
     }
 
@@ -822,7 +773,10 @@ mod tests {
 
         match err {
             BeadsError::Config(msg) => assert!(msg.contains("Invalid backup filename format")),
-            other => panic!("unexpected error: {other:?}"),
+            other => assert!(
+                matches!(other, BeadsError::Config(_)),
+                "unexpected error: {other:?}"
+            ),
         }
     }
 
@@ -835,18 +789,48 @@ mod tests {
 
         match err {
             BeadsError::Config(msg) => assert!(msg.contains("Invalid backup filename format")),
-            other => panic!("unexpected error: {other:?}"),
+            other => assert!(
+                matches!(other, BeadsError::Config(_)),
+                "unexpected error: {other:?}"
+            ),
         }
     }
 
     #[test]
-    fn test_classify_diff_exit_rejects_real_diff_failures() {
-        let err = classify_diff_exit(false, Some(2)).unwrap_err();
+    fn test_unified_diff_for_files_reports_differences() {
+        let temp = TempDir::new().unwrap();
+        let current = temp.path().join("current.jsonl");
+        let backup = temp.path().join("backup.jsonl");
+        fs::write(&current, "{\"id\":\"one\",\"title\":\"current\"}\n").unwrap();
+        fs::write(&backup, "{\"id\":\"one\",\"title\":\"backup\"}\n").unwrap();
 
-        match err {
-            BeadsError::Config(msg) => assert!(msg.contains("diff exited with status 2")),
-            other => panic!("unexpected error: {other:?}"),
-        }
+        let diff = unified_diff_for_files(&current, &backup).unwrap();
+
+        assert!(
+            diff.contains("--- ") && diff.contains("+++ ") && diff.contains("@@"),
+            "diff should include unified diff headers: {diff}"
+        );
+        assert!(
+            diff.contains("-{\"id\":\"one\",\"title\":\"current\"}")
+                && diff.contains("+{\"id\":\"one\",\"title\":\"backup\"}"),
+            "diff should include current and backup lines: {diff}"
+        );
+    }
+
+    #[test]
+    fn test_unified_diff_for_files_returns_empty_for_identical_files() {
+        let temp = TempDir::new().unwrap();
+        let current = temp.path().join("current.jsonl");
+        let backup = temp.path().join("backup.jsonl");
+        fs::write(&current, "{\"id\":\"one\",\"title\":\"same\"}\n").unwrap();
+        fs::write(&backup, "{\"id\":\"one\",\"title\":\"same\"}\n").unwrap();
+
+        let diff = unified_diff_for_files(&current, &backup).unwrap();
+
+        assert!(
+            diff.is_empty(),
+            "identical files should not emit diff: {diff}"
+        );
     }
 
     #[test]
@@ -1139,7 +1123,10 @@ mod tests {
                     "unexpected message: {message}"
                 );
             }
-            other => panic!("unexpected error: {other:?}"),
+            other => assert!(
+                matches!(other, BeadsError::Config(_)),
+                "unexpected error: {other:?}"
+            ),
         }
         assert_eq!(
             fs::read_to_string(&target_path).unwrap(),
@@ -1184,7 +1171,10 @@ mod tests {
                     "unexpected message: {msg}"
                 );
             }
-            other => panic!("unexpected error: {other:?}"),
+            other => assert!(
+                matches!(other, BeadsError::Config(_)),
+                "unexpected error: {other:?}"
+            ),
         }
     }
 
@@ -1221,7 +1211,10 @@ mod tests {
 
         match err {
             BeadsError::Config(msg) => assert!(msg.contains("Current custom.jsonl not found")),
-            other => panic!("unexpected error: {other:?}"),
+            other => assert!(
+                matches!(other, BeadsError::Config(_)),
+                "unexpected error: {other:?}"
+            ),
         }
     }
 
@@ -1247,7 +1240,10 @@ mod tests {
             restore_backup(&beads_dir, &history_dir, backup_name, true, None, &ctx).unwrap_err();
         match err {
             BeadsError::Config(msg) => assert!(msg.contains("must not be a symlink")),
-            other => panic!("unexpected error: {other:?}"),
+            other => assert!(
+                matches!(other, BeadsError::Config(_)),
+                "unexpected error: {other:?}"
+            ),
         }
     }
 }

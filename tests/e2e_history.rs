@@ -244,20 +244,13 @@ fn e2e_history_diff_shows_differences() {
     // Flush to update issues.jsonl
     sync_flush(&workspace);
 
-    // Diff should show something
+    // Diff should show a unified diff generated in-process.
     let diff = run_br(&workspace, ["history", "diff", backup_file], "history_diff");
-    // diff may succeed or show differences (exit code depends on diff tool)
-    // Just verify it doesn't crash
+    assert!(diff.status.success(), "diff failed: {}", diff.stderr);
     assert!(
-        diff.stdout.contains("Diff")
-            || diff.stdout.contains("diff")
-            || diff.stdout.contains("identical")
-            || diff.stdout.contains("bytes")
-            || diff.stderr.is_empty()
-            || diff.status.success(),
-        "diff should run without critical error: stdout={}, stderr={}",
-        diff.stdout,
-        diff.stderr
+        diff.stdout.contains("--- ") && diff.stdout.contains("+++ ") && diff.stdout.contains("@@"),
+        "diff should render unified diff output: {}",
+        diff.stdout
     );
 }
 
@@ -789,6 +782,50 @@ fn e2e_history_restore_json_output() {
     );
     assert_eq!(json["restored"], true, "restored should be true");
     assert!(json.get("next_step").is_some(), "should have next_step");
+}
+
+#[test]
+fn e2e_history_diff_json_reports_internal_diff_status() {
+    let _log = common::test_log("e2e_history_diff_json_reports_internal_diff_status");
+    let workspace = setup_workspace_with_jsonl();
+
+    create_issue(&workspace, "Issue for JSON diff", "create_json_diff");
+    sync_flush(&workspace);
+
+    let backups = list_backup_files(&workspace);
+    assert!(!backups.is_empty(), "should have backup");
+    let backup_file = &backups[0];
+
+    create_issue(&workspace, "New JSON diff issue", "create_json_diff_new");
+    sync_flush(&workspace);
+
+    let diff = run_br(
+        &workspace,
+        ["--json", "history", "diff", backup_file],
+        "history_diff_json",
+    );
+    assert!(diff.status.success(), "diff failed: {}", diff.stderr);
+
+    let json: serde_json::Value =
+        serde_json::from_str(&diff.stdout).expect("history diff should emit JSON");
+    assert_eq!(json["action"], "diff", "action should be diff");
+    assert_eq!(
+        json["backup"].as_str(),
+        Some(backup_file.as_str()),
+        "backup field should match"
+    );
+    assert_eq!(
+        json["status"], "different",
+        "status should report differences"
+    );
+    assert_eq!(
+        json["diff_available"], true,
+        "pure-Rust diff should always be available for readable JSONL files"
+    );
+    assert!(
+        json["current_size_bytes"].is_null() && json["backup_size_bytes"].is_null(),
+        "size fallback fields should be null when the internal diff engine runs: {json}"
+    );
 }
 
 #[test]
