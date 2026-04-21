@@ -170,6 +170,58 @@ fn compute_file_hash(path: &Path) -> Option<String> {
     }
 }
 
+fn jsonl_export_temp_files(beads_dir: &Path) -> Vec<PathBuf> {
+    let mut temps = Vec::new();
+    if let Ok(entries) = fs::read_dir(beads_dir) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            if file_name == "issues.jsonl.tmp"
+                || (file_name.starts_with("issues.jsonl.") && file_name.ends_with(".tmp"))
+            {
+                temps.push(entry.path());
+            }
+        }
+    }
+    temps.sort_unstable();
+    temps
+}
+
+fn read_jsonl_values(path: &Path, context: &str) -> Vec<Value> {
+    let content = fs::read_to_string(path);
+    let read_error = match content.as_ref() {
+        Ok(_) => String::new(),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        content.is_ok(),
+        "{context} should be readable at {}: {read_error}",
+        path.display()
+    );
+    let content = content.unwrap_or_default();
+    content
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let parsed = serde_json::from_str(trimmed);
+            let parse_error = match parsed.as_ref() {
+                Ok(_) => String::new(),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                parsed.is_ok(),
+                "{context} line {} should be valid JSON: {parse_error}\nline={trimmed}",
+                index + 1
+            );
+            Some(parsed.unwrap_or(Value::Null))
+        })
+        .collect()
+}
+
 fn parse_stdout_json(run: &BrRun, context: &str) -> Value {
     let payload = extract_json_payload(&run.stdout);
     let parsed = serde_json::from_str(&payload);
@@ -1169,6 +1221,147 @@ fn cli_sync_flush_sigkill_while_waiting_for_write_lock_preserves_dirty_state() {
     artifacts.log(
         "verification",
         "PASSED: killed blocked sync flush preserved dirty state and later explicit flush recovered",
+    );
+    artifacts.save();
+}
+
+/// Test: two real `sync --flush-only` children racing the same dirty workspace
+/// must serialize through `.write.lock` and leave one valid JSONL export.
+#[test]
+#[cfg(unix)]
+#[allow(clippy::incompatible_msrv)]
+fn cli_sync_flush_concurrent_export_race_serializes_jsonl_sidecars() {
+    let _log = common::test_log("cli_sync_flush_concurrent_export_race_serializes_jsonl_sidecars");
+    let mut artifacts = FailureTestArtifacts::new("cli_sync_flush_concurrent_export_race");
+
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "concurrent_flush_init");
+    assert_run_success(&init, "concurrent_flush_init");
+
+    let create = run_br(
+        &workspace,
+        ["create", "Concurrent sync flush anchor", "--json"],
+        "concurrent_flush_create",
+    );
+    assert_run_success(&create, "concurrent_flush_create");
+    let create_json = parse_stdout_json(&create, "concurrent_flush_create");
+    let issue_id = create_json["id"].as_str().unwrap_or("").to_string();
+    assert!(
+        !issue_id.is_empty(),
+        "create should report an issue id in stdout: {}",
+        create.stdout
+    );
+
+    flush_and_assert_clean(&workspace, "concurrent_flush_baseline");
+
+    let beads_dir = workspace.root.join(".beads");
+    let jsonl_path = beads_dir.join("issues.jsonl");
+    let baseline_hash = compute_file_hash(&jsonl_path).expect("baseline jsonl hash");
+    assert!(
+        jsonl_export_temp_files(&beads_dir).is_empty(),
+        "baseline export should not leave temp JSONL files"
+    );
+
+    let update = run_br(
+        &workspace,
+        [
+            "update",
+            &issue_id,
+            "--status",
+            "in_progress",
+            "--json",
+            "--no-auto-flush",
+        ],
+        "concurrent_flush_dirty_update",
+    );
+    assert_run_success(&update, "concurrent_flush_dirty_update");
+    let dirty_before_race = sync_status_json(&workspace, "concurrent_flush_dirty_before_race");
+    assert_dirty_status(
+        &dirty_before_race,
+        "dirty update before concurrent flush race",
+    );
+
+    let lock_path = beads_dir.join(".write.lock");
+    let write_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .expect("open .write.lock");
+    write_lock.lock().expect("hold .write.lock");
+
+    let mut flush_a = spawn_br_child(
+        &workspace,
+        ["sync", "--flush-only", "--json", "--no-auto-import"],
+    );
+    let mut flush_b = spawn_br_child(
+        &workspace,
+        ["sync", "--flush-only", "--json", "--no-auto-import"],
+    );
+    thread::sleep(Duration::from_millis(250));
+
+    let early_a = flush_a.try_wait().expect("poll first blocked flush");
+    let early_b = flush_b.try_wait().expect("poll second blocked flush");
+    assert!(
+        early_a.is_none() && early_b.is_none(),
+        "both sync --flush-only children should be queued on .write.lock; first={early_a:?} second={early_b:?}"
+    );
+
+    drop(write_lock);
+
+    let output_a = flush_a.wait_with_output().expect("collect first flush");
+    let output_b = flush_b.wait_with_output().expect("collect second flush");
+    artifacts.log("flush_a_stdout", &String::from_utf8_lossy(&output_a.stdout));
+    artifacts.log("flush_a_stderr", &String::from_utf8_lossy(&output_a.stderr));
+    artifacts.log("flush_b_stdout", &String::from_utf8_lossy(&output_b.stdout));
+    artifacts.log("flush_b_stderr", &String::from_utf8_lossy(&output_b.stderr));
+    assert!(
+        output_a.status.success(),
+        "first concurrent flush should succeed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output_a.stdout),
+        String::from_utf8_lossy(&output_a.stderr)
+    );
+    assert!(
+        output_b.status.success(),
+        "second concurrent flush should succeed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output_b.stdout),
+        String::from_utf8_lossy(&output_b.stderr)
+    );
+
+    let final_hash = compute_file_hash(&jsonl_path).expect("final jsonl hash");
+    assert_ne!(
+        baseline_hash, final_hash,
+        "concurrent recovery flush should export the dirty update into JSONL"
+    );
+    let exported = read_jsonl_values(&jsonl_path, "concurrent flush JSONL");
+    let exported_issue = exported
+        .iter()
+        .find(|issue| issue["id"].as_str() == Some(&issue_id));
+    assert!(
+        exported_issue.is_some(),
+        "final JSONL should contain {issue_id}; entries={exported:?}"
+    );
+    let exported_issue = exported_issue.unwrap_or(&Value::Null);
+    assert_eq!(
+        exported_issue["status"].as_str(),
+        Some("in_progress"),
+        "final JSONL should contain the dirty status update: {exported_issue}"
+    );
+
+    let status_after_race = sync_status_json(&workspace, "concurrent_flush_status_after_race");
+    assert_clean_status(&status_after_race, "concurrent flush race");
+    let temp_files = jsonl_export_temp_files(&beads_dir);
+    assert!(
+        temp_files.is_empty(),
+        "concurrent flush race should not leave export temp files: {temp_files:?}"
+    );
+    assert_doctor_healthy(&workspace, "concurrent_flush_final_doctor");
+
+    artifacts.snapshot_dir("after_concurrent_race", &workspace.root);
+    artifacts.log(
+        "verification",
+        "PASSED: concurrent sync flush children serialized cleanly and left one valid JSONL export",
     );
     artifacts.save();
 }
