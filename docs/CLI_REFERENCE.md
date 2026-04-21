@@ -707,17 +707,35 @@ br sync [OPTIONS]
 |--------|-------------|
 | `--flush-only` | Export database to JSONL |
 | `--import-only` | Import JSONL into database |
+| `--merge` | Three-way merge `.beads/beads.base.jsonl`, SQLite, and JSONL |
 | `--status` | Show sync status (read-only) |
 
 **Options:**
 | Option | Description |
 |--------|-------------|
 | `-f, --force` | Override safety guards (use with caution) |
+| `--force-db` | With `--merge`, resolve conflicts by keeping the local SQLite version |
+| `--force-jsonl` | With `--merge`, resolve conflicts by keeping the JSONL version |
 | `--allow-external-jsonl` | Allow JSONL path outside `.beads/` |
 | `--manifest` | Write manifest file with export summary |
 | `--error-policy <POLICY>` | Export error handling: strict, best-effort, partial, required-core |
 | `--orphans <MODE>` | Orphan handling: strict, resurrect, skip, allow |
+| `--rename-prefix` | During import, rewrite mismatched issue IDs into the configured default prefix |
+| `--rebuild` | During import, rebuild SQLite from JSONL and remove DB entries absent from JSONL |
 | `--robot` | Machine-readable output |
+
+**Merge semantics:**
+- `--merge` uses `.beads/beads.base.jsonl` as the common ancestor and compares it with the local SQLite database and current JSONL file.
+- Without an explicit conflict policy, semantic conflicts stop the command. This covers both-modified, delete-vs-modify, and convergent same-ID creation conflicts.
+- `--force-db` keeps local SQLite changes for conflicts, `--force-jsonl` keeps JSONL changes for conflicts, and `--force` chooses the side with the newer timestamp.
+- `--force-db`, `--force-jsonl`, and `--force` are mutually exclusive for `--merge`.
+
+**Rebuild semantics:**
+- `--rebuild` is valid only with import mode: `br sync --rebuild` or `br sync --import-only --rebuild`.
+- JSONL is authoritative. After import, entries present only in SQLite are removed; deletion tombstones are preserved when applicable.
+- `--rebuild` is rejected with `--flush-only` and `--merge`.
+- Recovery artifacts are preserved under `.beads/.br_recovery/` when br has to move aside a damaged SQLite family before rebuilding.
+- If open-time recovery rebuilt the database before a semantic import flag such as `--rename-prefix` could apply, br prints a rerun command that includes the needed flags.
 
 **Examples:**
 ```bash
@@ -726,6 +744,20 @@ br sync --flush-only
 
 # Import from JSONL
 br sync --import-only
+
+# Merge DB and JSONL after both changed
+br sync --merge
+
+# Resolve semantic merge conflicts explicitly
+br sync --merge --force-db
+br sync --merge --force-jsonl
+br sync --merge --force
+
+# Rebuild SQLite from authoritative JSONL
+br sync --import-only --rebuild
+
+# Rebuild while rewriting imported IDs to the configured prefix
+br sync --import-only --rebuild --rename-prefix
 
 # Check sync status
 br sync --status

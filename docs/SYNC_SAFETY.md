@@ -19,6 +19,7 @@
 | **Export** (`--flush-only`) | Writes issues from SQLite to `.beads/issues.jsonl` |
 | **Import** (`--import-only`) | Reads issues from JSONL into SQLite |
 | **Merge** (`--merge`) | Three-way merge of base snapshot, SQLite, and JSONL |
+| **Rebuild** (`--import-only --rebuild`) | Treats JSONL as authoritative and rebuilds SQLite from it |
 | **Status** (`--status`) | Shows sync state without modifying anything |
 
 All file I/O is confined to the `.beads/` directory by default.
@@ -101,6 +102,41 @@ br sync --merge --force-db
 # Keep JSONL changes for merge conflicts
 br sync --merge --force-jsonl
 ```
+
+The merge base is `.beads/beads.base.jsonl`. A successful export or merge updates
+that snapshot so future `--merge` runs can distinguish local SQLite edits from
+JSONL edits.
+
+`--force-db`, `--force-jsonl`, and `--force` are mutually exclusive during
+`--merge`. They only resolve semantic merge conflicts; they do not bypass JSONL
+syntax validation or unresolved git conflict markers.
+
+---
+
+## Rebuilding From JSONL
+
+Use `--rebuild` only when JSONL is the source of truth and the SQLite database
+should be made to match it:
+
+```bash
+# Equivalent forms
+br sync --rebuild
+br sync --import-only --rebuild
+```
+
+`--rebuild` is import-only. It is rejected with `--flush-only` and `--merge`.
+After importing JSONL, br removes database entries absent from JSONL and
+preserves deletion tombstones when they are still needed for sync safety.
+
+When rebuild is part of corruption recovery, br preserves the original database
+family under `.beads/.br_recovery/` before creating the repaired database. These
+artifacts are evidence for diagnosis; inspect them before pruning anything.
+
+If `--rename-prefix` is combined with rebuild, imported IDs may be rewritten to
+the configured prefix. In that mode, br skips set-difference orphan cleanup
+because the original JSONL IDs no longer match the rewritten database IDs. If
+open-time recovery already rebuilt the database before `--rename-prefix` could
+apply, br reports a rerun command with the needed flags.
 
 ---
 

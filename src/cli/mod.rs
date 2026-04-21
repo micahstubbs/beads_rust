@@ -881,6 +881,7 @@ SAFETY GUARANTEES:
 MODES (one required unless --status):
   --flush-only    Export database to JSONL (safe by default)
   --import-only   Import JSONL into database (validates first)
+  --merge         Three-way merge .beads/beads.base.jsonl + DB + JSONL
   --status        Show sync status (read-only)
 
 SAFETY GUARDS:
@@ -892,6 +893,16 @@ SAFETY GUARDS:
     • Conflict markers: Rejects files with git merge conflict markers
     • Invalid JSON: Rejects malformed JSONL entries
 
+  Merge guards:
+    • Semantic conflicts require --force-db, --force-jsonl, or --force
+    • --force-db keeps the local SQLite version
+    • --force-jsonl keeps the JSONL version
+    • --force keeps the newer timestamp
+
+  Rebuild:
+    • --rebuild is import-only and treats JSONL as authoritative
+    • Removes DB entries absent from JSONL while preserving tombstones
+
 VERBOSE LOGGING:
   -v     Show INFO-level safety guard decisions
   -vv    Show DEBUG-level file operations
@@ -900,6 +911,9 @@ EXAMPLES:
   br sync --flush-only           Export database to .beads/issues.jsonl
   br sync --flush-only -v        Export with safety logging
   br sync --import-only          Import from JSONL (validates first)
+  br sync --merge                Merge DB and JSONL changes
+  br sync --merge --force-db     Keep local DB conflicts
+  br sync --merge --force-jsonl  Keep JSONL conflicts
   br sync --rebuild              Import + remove DB entries not in JSONL
   br sync --status               Show current sync status")]
     Sync(SyncArgs),

@@ -154,6 +154,12 @@ br sync --flush-only
 # Import is explicit (not automatic)
 br sync --import-only
 
+# Merge divergent DB and JSONL edits using the saved base snapshot
+br sync --merge
+
+# Rebuild SQLite from authoritative JSONL after recovery/corruption
+br sync --import-only --rebuild
+
 # Git operations are YOUR responsibility
 git add .beads/ && git commit -m "..."
 ```
@@ -627,7 +633,14 @@ br sync --status
 
 # Force import (may lose local changes)
 br sync --import-only --force
+
+# If JSONL is authoritative, rebuild SQLite to match it exactly
+br sync --import-only --rebuild
 ```
+
+`--rebuild` is an import-mode operation. It is not valid with `--flush-only` or
+`--merge`; after import it removes database entries that are absent from JSONL,
+while preserving deletion tombstones used by sync.
 
 ### Sync Issues After Git Merge
 
@@ -638,9 +651,17 @@ git status .beads/
 # 2. If conflicts, resolve manually then:
 br sync --import-only
 
-# 3. If database seems stale:
+# 3. If both SQLite and JSONL changed cleanly, run a three-way merge:
+br sync --merge
+
+# 4. If database seems stale:
 br doctor
 ```
+
+`br sync --merge` uses `.beads/beads.base.jsonl` as the common ancestor. If the
+same issue changed on both sides, br stops and asks for an explicit policy:
+`--force-db` keeps the local SQLite version, `--force-jsonl` keeps the JSONL
+version, and `--force` keeps the newer timestamp.
 
 ### Command Output is Garbled
 
@@ -750,6 +771,18 @@ vim .beads/issues.jsonl
 # Mark resolved and import
 git add .beads/issues.jsonl
 br sync --import-only
+```
+
+If git merged `.beads/issues.jsonl` without textual conflict markers but both
+SQLite and JSONL have independent br changes, use the sync merge path instead:
+
+```bash
+br sync --merge
+
+# If br reports semantic conflicts, choose one resolution policy:
+br sync --merge --force-db     # keep local SQLite changes
+br sync --merge --force-jsonl  # keep JSONL changes
+br sync --merge --force        # keep the newer timestamp
 ```
 
 ### Q: Can I customize the issue ID prefix?
