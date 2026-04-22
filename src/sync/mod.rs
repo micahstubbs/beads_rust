@@ -3041,6 +3041,22 @@ fn normalize_issue(issue: &mut Issue) {
         }
     }
 
+    // Normalize legacy Go-beads (bd) terminal status aliases that survived
+    // JSONL import as `Status::Custom(_)`. Leaving them unmapped is
+    // corruptive: our own `is_terminal()` returns false for Custom, so the
+    // closed_at repair below skips them and the CHECK constraint later
+    // rejects the row. Downstream consumers (bv, bd-style readers) also
+    // reject unknown statuses outright.
+    if let crate::model::Status::Custom(raw) = &issue.status {
+        let key = raw.trim().to_ascii_lowercase();
+        if matches!(
+            key.as_str(),
+            "done" | "complete" | "completed" | "finished" | "resolved"
+        ) {
+            issue.status = crate::model::Status::Closed;
+        }
+    }
+
     // Recompute content hash
     issue.content_hash = Some(content_hash(issue));
 
@@ -5603,6 +5619,43 @@ mod tests {
 
         assert!(issue.content_hash.is_some());
         assert!(!issue.content_hash.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_normalize_issue_remaps_legacy_done_to_closed() {
+        // Go-beads "done" survives round-tripping as Status::Custom; ensure
+        // import normalization promotes it to the canonical Closed variant
+        // and that closed_at gets populated to satisfy the DB CHECK.
+        let mut issue = make_test_issue("bd-001", "Legacy done");
+        issue.status = Status::Custom("done".to_string());
+        issue.closed_at = None;
+
+        normalize_issue(&mut issue);
+
+        assert_eq!(issue.status, Status::Closed);
+        assert!(issue.closed_at.is_some());
+    }
+
+    #[test]
+    fn test_normalize_issue_remaps_mixed_case_terminal_aliases() {
+        for raw in ["Done", "COMPLETE", "completed", "Finished", "Resolved"] {
+            let mut issue = make_test_issue("bd-001", "Legacy alias");
+            issue.status = Status::Custom(raw.to_string());
+            normalize_issue(&mut issue);
+            assert_eq!(
+                issue.status,
+                Status::Closed,
+                "alias {raw:?} should map to Closed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_issue_preserves_unknown_custom_status() {
+        let mut issue = make_test_issue("bd-001", "Custom status");
+        issue.status = Status::Custom("qa-review".to_string());
+        normalize_issue(&mut issue);
+        assert_eq!(issue.status, Status::Custom("qa-review".to_string()));
     }
 
     #[test]
