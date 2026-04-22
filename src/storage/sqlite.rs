@@ -3317,19 +3317,19 @@ impl SqliteStorage {
                 .append(&mut blockers);
         }
 
-        // 3. Delete only affected rows from the cache.
-        for chunk in affected
-            .iter()
-            .collect::<Vec<_>>()
-            .chunks(BLOCKED_CACHE_DELETE_CHUNK_SIZE)
-        {
-            // Delete existing entries row-by-row to avoid fsqlite IN-clause bugs
-            for id in chunk {
-                conn.execute_with_params(
-                    "DELETE FROM blocked_issues_cache WHERE issue_id = ?",
-                    &[SqliteValue::from(id.as_str())],
-                )?;
-            }
+        // 3. Delete only affected rows from the cache (batched).
+        let affected_vec: Vec<_> = affected.iter().collect();
+        for chunk in affected_vec.chunks(BLOCKED_CACHE_DELETE_CHUNK_SIZE) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "DELETE FROM blocked_issues_cache WHERE issue_id IN ({})",
+                placeholders.join(", ")
+            );
+            let params: Vec<SqliteValue> = chunk
+                .iter()
+                .map(|id| SqliteValue::from(id.as_str()))
+                .collect();
+            conn.execute_with_params(&sql, &params)?;
         }
 
         // 4. Re-insert only affected rows that have blockers.
