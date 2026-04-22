@@ -201,7 +201,7 @@ fn collect_files_recursive(base: &Path, current: &Path, files: &mut BTreeMap<Str
                     .to_string_lossy()
                     .to_string();
                 let content = fs::read(&path).unwrap_or_default();
-                let hash = format!("{:x}", Sha256::digest(&content));
+                let hash = beads_rust::util::hex_encode(&Sha256::digest(&content));
                 files.insert(relative, hash);
             } else if path.is_dir() {
                 collect_files_recursive(base, &path, files);
@@ -219,7 +219,7 @@ fn create_test_issue(id: &str, title: &str) -> Issue {
 fn compute_file_hash(path: &Path) -> Option<String> {
     if path.exists() {
         let content = fs::read(path).ok()?;
-        Some(format!("{:x}", Sha256::digest(&content)))
+        Some(beads_rust::util::hex_encode(&Sha256::digest(&content)))
     } else {
         None
     }

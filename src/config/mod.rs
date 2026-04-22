@@ -28,6 +28,8 @@ use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::util::hex_encode;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -1165,7 +1167,7 @@ fn sha256_file(path: &Path) -> Result<String> {
         hasher.update(&buffer[..read]);
     }
 
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex_encode(&hasher.finalize()))
 }
 
 fn recovery_artifact_fingerprint(path: &Path) -> Result<RecoveryArtifactFingerprint> {

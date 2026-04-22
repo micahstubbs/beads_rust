@@ -391,7 +391,7 @@ fn env_flag(name: &str) -> bool {
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
-    format!("{:x}", hasher.finalize())
+    beads_rust::util::hex_encode(&hasher.finalize())
 }
 
 fn collect_dir_listing(path: &PathBuf) -> Vec<String> {

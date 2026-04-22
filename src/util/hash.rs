@@ -7,6 +7,17 @@ use sha2::{Digest, Sha256};
 
 use crate::model::{Issue, IssueType, Priority, Status};
 
+/// Lowercase hex encoding for digest outputs (sha2 0.11 no longer impls `LowerHex`
+/// on `Array<u8, _>`, so we format bytes directly).
+pub fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        write!(&mut s, "{b:02x}").expect("writing to String never fails");
+    }
+    s
+}
+
 /// Trait for types that can produce a deterministic content hash.
 pub trait ContentHashable {
     /// Compute the content hash for this value.
@@ -136,7 +147,7 @@ impl HashFieldWriter {
     }
 
     fn finalize(self) -> String {
-        format!("{:x}", self.hasher.finalize())
+        hex_encode(&self.hasher.finalize())
     }
 }
 

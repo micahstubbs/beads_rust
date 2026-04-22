@@ -39,7 +39,7 @@ fn visit_dir(dir: &Path, base: &Path, hash_map: &mut BTreeMap<String, String>) {
                 if let Ok(contents) = fs::read(&path) {
                     let mut digest = Sha256::new();
                     digest.update(&contents);
-                    let hash = format!("{:x}", digest.finalize());
+                    let hash = beads_rust::util::hex_encode(&digest.finalize());
                     hash_map.insert(rel_path, hash);
                 }
             } else if path.is_dir() {
@@ -566,7 +566,7 @@ fn regression_sync_never_touches_source_files() {
             let content = fs::read(p).unwrap();
             let mut hasher = Sha256::new();
             hasher.update(&content);
-            (p.clone(), format!("{:x}", hasher.finalize()))
+            (p.clone(), beads_rust::util::hex_encode(&hasher.finalize()))
         })
         .collect();
 
@@ -595,7 +595,7 @@ fn regression_sync_never_touches_source_files() {
             let content = fs::read(p).unwrap();
             let mut hasher = Sha256::new();
             hasher.update(&content);
-            (p.clone(), format!("{:x}", hasher.finalize()))
+            (p.clone(), beads_rust::util::hex_encode(&hasher.finalize()))
         })
         .collect();
 
@@ -729,7 +729,7 @@ impl FileTreeSnapshot {
                     if let Ok(contents) = fs::read(&path) {
                         let mut hasher = Sha256::new();
                         hasher.update(&contents);
-                        let hash = format!("{:x}", hasher.finalize());
+                        let hash = beads_rust::util::hex_encode(&hasher.finalize());
                         let size = contents.len() as u64;
                         files.insert(rel_path, (hash, size));
                     }

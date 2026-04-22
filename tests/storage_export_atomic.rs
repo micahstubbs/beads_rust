@@ -62,7 +62,7 @@ fn setup_beads_dir(temp: &TempDir) -> std::path::PathBuf {
 
 fn compute_file_hash(path: &Path) -> String {
     let content = fs::read(path).unwrap();
-    format!("{:x}", Sha256::digest(&content))
+    beads_rust::util::hex_encode(&Sha256::digest(&content))
 }
 
 fn default_config(beads_dir: &Path) -> ExportConfig {

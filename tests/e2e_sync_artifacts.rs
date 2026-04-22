@@ -162,7 +162,7 @@ impl DirectorySnapshot {
                     if let Ok(contents) = fs::read(&path) {
                         let mut digest = Sha256::new();
                         digest.update(&contents);
-                        let hash = format!("{:x}", digest.finalize());
+                        let hash = beads_rust::util::hex_encode(&digest.finalize());
                         files.insert(rel_path, hash);
                     }
                 } else if path.is_dir() {

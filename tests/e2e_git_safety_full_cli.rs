@@ -28,7 +28,7 @@ fn hash_file(path: &Path) -> Option<String> {
     fs::read(path).ok().map(|contents| {
         let mut hasher = Sha256::new();
         hasher.update(&contents);
-        format!("{:x}", hasher.finalize())
+        beads_rust::util::hex_encode(&hasher.finalize())
     })
 }
 

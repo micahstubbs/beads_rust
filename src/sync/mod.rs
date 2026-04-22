@@ -27,6 +27,8 @@ use chrono::Utc;
 use fsqlite_types::SqliteValue;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::util::hex_encode;
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::RandomState};
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -1777,7 +1779,7 @@ pub fn export_to_jsonl_with_policy(
         .sync_all()?;
 
     // Compute final hash
-    let content_hash = format!("{:x}", hasher.finalize());
+    let content_hash = hex_encode(&hasher.finalize());
 
     // Verify staged export integrity before replacing the live JSONL.
     let actual_count = count_issues_in_jsonl(&temp_path)?;
@@ -1970,7 +1972,7 @@ pub fn export_to_writer_with_policy<W: Write>(
         report.comments_exported += issue.comments.len();
     }
 
-    let content_hash = format!("{:x}", hasher.finalize());
+    let content_hash = hex_encode(&hasher.finalize());
 
     let result = ExportResult {
         exported_count: exported_ids.len(),
@@ -2617,7 +2619,7 @@ fn write_jsonl_lines_atomically(
     crate::util::durable_rename(&temp_path, output_path)?;
     temp_guard.persist();
 
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex_encode(&hasher.finalize()))
 }
 
 fn try_incremental_auto_flush(
@@ -3635,7 +3637,7 @@ pub fn compute_jsonl_hash(path: &Path) -> Result<String> {
         }
     }
 
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex_encode(&hasher.finalize()))
 }
 
 // ============================================================================

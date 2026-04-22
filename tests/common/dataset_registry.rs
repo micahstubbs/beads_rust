@@ -645,7 +645,7 @@ fn hash_beads_directory(beads_dir: &Path) -> std::io::Result<String> {
         }
     }
 
-    Ok(format!("{:x}", hasher.finalize())[..16].to_string())
+    Ok(beads_rust::util::hex_encode(&hasher.finalize())[..16].to_string())
 }
 
 fn normalize_source_commit(value: &str) -> Option<String> {
