@@ -644,6 +644,10 @@ impl StructuredError {
                 ErrorCode::IoError,
                 Some(json!({"command": command, "reason": reason})),
             ),
+            BeadsError::Upgrade { reason } => (
+                ErrorCode::IoError,
+                Some(json!({"operation": "upgrade", "reason": reason})),
+            ),
             BeadsError::Internal { message } => {
                 (ErrorCode::InternalError, Some(json!({"message": message})))
             }
@@ -679,7 +683,6 @@ impl StructuredError {
                     )
                 }
             }
-            BeadsError::Other(_) => (ErrorCode::InternalError, None),
         }
     }
 

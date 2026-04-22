@@ -63,7 +63,7 @@ pub trait OptionExt<T> {
 
 impl<T> OptionExt<T> for Option<T> {
     fn ok_or_context(self, ctx: impl Into<String>) -> Result<T, BeadsError> {
-        self.ok_or_else(|| BeadsError::Other(anyhow::anyhow!(ctx.into())))
+        self.ok_or_else(|| BeadsError::internal(ctx.into()))
     }
 }
 

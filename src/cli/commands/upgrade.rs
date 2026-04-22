@@ -216,7 +216,7 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, ctx: &OutputContex
     let status = updater.update().map_err(|e| {
         let msg = e.to_string();
         if msg.contains("archive-tar") || msg.contains("ArchiveNotEnabled") || msg.contains("tar") {
-            BeadsError::Other(anyhow::anyhow!(
+            BeadsError::upgrade(format!(
                 "{msg}\n\n\
                  This binary was built without archive support for the required format (e.g., .tar.gz).\n\
                  This is a known issue in some older versions (e.g., 0.1.21 - 0.1.26). Version 0.1.27 and later include the correct 'archive-tar' linkage.\n\n\
@@ -336,7 +336,7 @@ fn build_updater_with_target(
 
 /// Map `self_update` errors to `BeadsError`.
 fn map_update_error<E: std::error::Error + Send + Sync + 'static>(err: E) -> BeadsError {
-    BeadsError::Other(anyhow::Error::from(err))
+    BeadsError::upgrade(err.to_string())
 }
 
 /// Compare versions to check if new is greater than current.

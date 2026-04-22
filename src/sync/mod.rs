@@ -2394,9 +2394,9 @@ fn restore_foreign_keys_after_import(
         .unwrap_or(0);
 
     if foreign_keys_enabled != 1 {
-        return Err(BeadsError::Other(anyhow::anyhow!(
+        return Err(BeadsError::internal(
             "Import completed with foreign key enforcement still disabled"
-        )));
+        ));
     }
 
     if !validate_integrity {
@@ -2404,9 +2404,10 @@ fn restore_foreign_keys_after_import(
     }
 
     if let Some((table, column)) = find_post_import_fk_violation(storage)? {
-        return Err(BeadsError::Other(anyhow::anyhow!(
-            "Import finished with orphaned rows in {table}.{column}"
-        )));
+        return Err(BeadsError::validation(
+            "jsonl import",
+            format!("orphaned rows in {table}.{column}"),
+        ));
     }
 
     Ok(())

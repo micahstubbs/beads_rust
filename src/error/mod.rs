@@ -6,7 +6,6 @@
 //! # Design
 //!
 //! - Uses `thiserror` for derive-based error types
-//! - Supports `anyhow` integration for gradual migration
 //! - Provides recovery hints for user-facing errors
 //! - Matches bd's exit code conventions
 //! - Provides structured JSON output for AI coding agents
@@ -22,8 +21,7 @@ use thiserror::Error;
 
 /// Primary error type for `beads_rust` operations.
 ///
-/// Design: Structured variants for common cases, with `Other` for
-/// wrapped anyhow errors during migration.
+/// Design: Structured variants for common cases.
 #[derive(Error, Debug)]
 pub enum BeadsError {
     // === Storage Errors ===
@@ -131,6 +129,10 @@ pub enum BeadsError {
     #[error("External command failed: {command}: {reason}")]
     ExternalCommand { command: String, reason: String },
 
+    /// Self-update or upgrade operation failed.
+    #[error("Upgrade failed: {reason}")]
+    Upgrade { reason: String },
+
     /// Internal consistency check failed.
     #[error("Internal error: {message}")]
     Internal { message: String },
@@ -170,9 +172,6 @@ pub enum BeadsError {
     #[error("Nothing to do: {reason}")]
     NothingToDo { reason: String },
 
-    /// Wrapped anyhow error for gradual migration.
-    #[error(transparent)]
-    Other(#[from] anyhow::Error),
 }
 
 impl BeadsError {
@@ -303,6 +302,14 @@ impl BeadsError {
         }
     }
 
+    /// Create a self-update failure.
+    #[must_use]
+    pub fn upgrade(reason: impl Into<String>) -> Self {
+        Self::Upgrade {
+            reason: reason.into(),
+        }
+    }
+
     /// Create an internal consistency error.
     #[must_use]
     pub fn internal(message: impl Into<String>) -> Self {
@@ -365,6 +372,19 @@ mod tests {
 
         assert_eq!(structured.code, ErrorCode::InternalError);
         assert_eq!(err.exit_code(), 1);
+    }
+
+    #[test]
+    fn test_upgrade_uses_io_error_code_with_context() {
+        let err = BeadsError::upgrade("network timeout");
+        let structured = StructuredError::from_error(&err);
+
+        assert_eq!(structured.code, ErrorCode::IoError);
+        assert_eq!(err.exit_code(), 8);
+        assert_eq!(
+            structured.context["operation"],
+            serde_json::Value::String("upgrade".to_string())
+        );
     }
 
     #[test]

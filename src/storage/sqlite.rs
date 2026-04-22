@@ -2104,7 +2104,7 @@ impl SqliteStorage {
         };
         let issue = Self::issue_from_row(&row)?;
         if issue.id != id {
-            return Err(BeadsError::Other(anyhow::anyhow!(
+            return Err(BeadsError::internal(format!(
                 "storage consistency: get_issue_from_conn requested {id:?} but row returned id {:?}",
                 issue.id
             )));
