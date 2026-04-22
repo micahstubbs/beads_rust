@@ -113,32 +113,44 @@ fn main() {
                 .map_or(true, |staleness| staleness.jsonl_newer);
 
         if should_attempt_auto_import {
-            let _sync_lock = ctx
+            let _sync_lock = match ctx
                 .beads_dir
                 .as_deref()
-                .and_then(beads_rust::sync::try_sync_lock);
-            let allow_external_jsonl = config::implicit_external_jsonl_allowed(
-                &paths.beads_dir,
-                &paths.db_path,
-                &paths.jsonl_path,
-            );
-            let expected_prefix = match resolve_auto_import_expected_prefix(res, &ctx.overrides) {
-                Ok(prefix) => Some(prefix),
-                Err(e) => {
+                .map(beads_rust::sync::try_sync_lock)
+            {
+                Some(Ok(Some(lock))) => Some(lock),
+                Some(Ok(None)) => {
+                    tracing::debug!("Auto-import skipped because .sync.lock is held");
+                    None
+                }
+                Some(Err(e)) => handle_error(&e, json_error_mode),
+                None => None,
+            };
+            if _sync_lock.is_some() {
+                let allow_external_jsonl = config::implicit_external_jsonl_allowed(
+                    &paths.beads_dir,
+                    &paths.db_path,
+                    &paths.jsonl_path,
+                );
+                let expected_prefix = match resolve_auto_import_expected_prefix(res, &ctx.overrides)
+                {
+                    Ok(prefix) => Some(prefix),
+                    Err(e) => {
+                        handle_error(&e, json_error_mode);
+                    }
+                };
+                let outcome = auto_import_if_stale(
+                    &mut res.storage,
+                    &paths.beads_dir,
+                    &paths.jsonl_path,
+                    expected_prefix.as_deref(),
+                    allow_external_jsonl,
+                    false,
+                    false,
+                );
+                if let Err(e) = outcome {
                     handle_error(&e, json_error_mode);
                 }
-            };
-            let outcome = auto_import_if_stale(
-                &mut res.storage,
-                &paths.beads_dir,
-                &paths.jsonl_path,
-                expected_prefix.as_deref(),
-                allow_external_jsonl,
-                false,
-                false,
-            );
-            if let Err(e) = outcome {
-                handle_error(&e, json_error_mode);
             }
             // _sync_lock drops here, releasing the advisory lock before command execution
         }
@@ -349,28 +361,52 @@ fn main() {
 
     // Phase 5: Auto-Flush (with advisory flock to serialize concurrent access)
     if is_mutating && !ctx.no_auto_flush() {
-        let _sync_lock = ctx
-            .beads_dir
-            .as_deref()
-            .and_then(beads_rust::sync::try_sync_lock);
-        if let (Some(res), Some(paths)) = (storage_result.as_mut(), ctx.paths.as_ref())
-            && let Err(e) = auto_flush(
-                &mut res.storage,
-                &paths.beads_dir,
-                &paths.jsonl_path,
-                config::implicit_external_jsonl_allowed(
+        if let (Some(res), Some(paths)) = (storage_result.as_mut(), ctx.paths.as_ref()) {
+            let sync_lock = match beads_rust::sync::try_sync_lock(&paths.beads_dir) {
+                Ok(Some(lock)) => Some(lock),
+                Ok(None) => {
+                    let err = BeadsError::Config(format!(
+                        "Automatic JSONL export skipped because sync lock at {} is held by another process",
+                        paths.beads_dir.join(".sync.lock").display()
+                    ));
+                    commands::report_auto_flush_failure(
+                        &output_ctx,
+                        &paths.beads_dir,
+                        &paths.jsonl_path,
+                        &err,
+                    );
+                    None
+                }
+                Err(e) => {
+                    commands::report_auto_flush_failure(
+                        &output_ctx,
+                        &paths.beads_dir,
+                        &paths.jsonl_path,
+                        &e,
+                    );
+                    None
+                }
+            };
+
+            if let Some(_sync_lock) = sync_lock
+                && let Err(e) = auto_flush(
+                    &mut res.storage,
                     &paths.beads_dir,
-                    &paths.db_path,
                     &paths.jsonl_path,
-                ),
-            )
-        {
-            commands::report_auto_flush_failure(
-                &output_ctx,
-                &paths.beads_dir,
-                &paths.jsonl_path,
-                &e,
-            );
+                    config::implicit_external_jsonl_allowed(
+                        &paths.beads_dir,
+                        &paths.db_path,
+                        &paths.jsonl_path,
+                    ),
+                )
+            {
+                commands::report_auto_flush_failure(
+                    &output_ctx,
+                    &paths.beads_dir,
+                    &paths.jsonl_path,
+                    &e,
+                );
+            }
         }
     }
 }

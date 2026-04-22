@@ -137,10 +137,10 @@ pub const fn default_write_lock_timeout_ms() -> u64 {
 ///
 /// Returns the lock file on success. The lock is held until the returned
 /// `File` is dropped. If another process already holds the lock, returns
-/// `None` (non-blocking).
+/// `Ok(None)` (non-blocking). Lock-file open or OS lock errors are returned
+/// separately so callers do not confuse a broken lock path with contention.
 #[allow(clippy::incompatible_msrv)]
-#[must_use]
-pub fn try_sync_lock(beads_dir: &Path) -> Option<File> {
+pub fn try_sync_lock(beads_dir: &Path) -> Result<Option<File>> {
     let lock_path = beads_dir.join(".sync.lock");
     let file = OpenOptions::new()
         .read(true)
@@ -148,10 +148,19 @@ pub fn try_sync_lock(beads_dir: &Path) -> Option<File> {
         .create(true)
         .truncate(false)
         .open(&lock_path)
-        .ok()?;
+        .map_err(|err| {
+            BeadsError::Config(format!(
+                "Failed to open sync lock at {}: {err}",
+                lock_path.display()
+            ))
+        })?;
     match file.try_lock() {
-        Ok(()) => Some(file),
-        Err(_) => None,
+        Ok(()) => Ok(Some(file)),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(err)) => Err(BeadsError::Config(format!(
+            "Failed to acquire sync lock at {}: {err}",
+            lock_path.display()
+        ))),
     }
 }
 
@@ -4639,6 +4648,49 @@ mod tests {
         drop(held_lock);
         let acquired =
             blocking_write_lock_with_timeout(&beads_dir, Some(25)).expect("lock after release");
+        drop(acquired);
+    }
+
+    #[test]
+    fn try_sync_lock_errors_when_lock_path_cannot_open() {
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        fs::create_dir_all(beads_dir.join(".sync.lock")).unwrap();
+
+        let err = try_sync_lock(&beads_dir).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                BeadsError::Config(message)
+                    if message.contains("Failed to open sync lock")
+                        && message.contains(".sync.lock")
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::incompatible_msrv)]
+    fn try_sync_lock_returns_none_when_lock_is_held() {
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let lock_path = beads_dir.join(".sync.lock");
+        let held_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("open held sync lock");
+        held_lock.lock().expect("hold sync lock");
+
+        assert!(try_sync_lock(&beads_dir).unwrap().is_none());
+
+        drop(held_lock);
+        let acquired = try_sync_lock(&beads_dir)
+            .expect("sync lock after release")
+            .expect("uncontended lock should be acquired");
         drop(acquired);
     }
 

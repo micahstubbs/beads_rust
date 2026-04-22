@@ -21,10 +21,10 @@ use crate::sync::{
 };
 use crate::util::id::split_prefix_remainder;
 use rich_rust::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, IsTerminal};
+use std::io::IsTerminal;
 use std::path::{Component, Path, PathBuf};
 use tracing::{debug, info, warn};
 
@@ -1407,7 +1407,7 @@ fn execute_import(
             let db_prefix = storage.get_config("issue_prefix")?;
             if let Some(p) = db_prefix {
                 p
-            } else if let Some(detected) = detect_prefix_from_jsonl(jsonl_path) {
+            } else if let Some(detected) = detect_prefix_from_jsonl(jsonl_path)? {
                 info!(detected_prefix = %detected, "Auto-detected prefix from JSONL (no prefix configured)");
                 // Persist the detected prefix to config for future operations
                 storage.set_config("issue_prefix", &detected)?;
@@ -1867,44 +1867,20 @@ fn render_import_result_rich(result: &ImportResultOutput, ctx: &OutputContext) {
 ///
 /// Returns `None` if the file is empty or contains no issues with a recognizable prefix.
 /// Supports hyphenated prefixes such as `document-intelligence-0sa`.
-fn detect_prefix_from_jsonl(jsonl_path: &Path) -> Option<String> {
-    #[derive(Deserialize)]
-    struct PrefixProbe {
-        id: String,
-        status: Option<String>,
-    }
+fn detect_prefix_from_jsonl(jsonl_path: &Path) -> Result<Option<String>> {
+    let issues = read_issues_from_jsonl(jsonl_path)?;
 
-    let file = File::open(jsonl_path).ok()?;
-    let reader = BufReader::new(file);
-
-    for line in reader.lines() {
-        // Skip lines that fail to read (IO errors)
-        let Ok(line) = line else {
-            continue;
-        };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+    for issue in issues {
+        if issue.status == crate::model::Status::Tombstone {
             continue;
         }
 
-        // Parse as JSON to get the issue ID (skip malformed lines)
-        let Ok(probe) = serde_json::from_str::<PrefixProbe>(trimmed) else {
-            continue;
-        };
-
-        // Skip tombstones (deleted issues)
-        if let Some(status) = probe.status
-            && status == "tombstone"
-        {
-            continue;
-        }
-
-        if let Some((prefix, _)) = split_prefix_remainder(&probe.id) {
-            return Some(prefix.to_string());
+        if let Some((prefix, _)) = split_prefix_remainder(&issue.id) {
+            return Ok(Some(prefix.to_string()));
         }
     }
 
-    None
+    Ok(None)
 }
 
 /// Execute the --merge operation.
@@ -2974,8 +2950,44 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            detect_prefix_from_jsonl(&jsonl_path),
+            detect_prefix_from_jsonl(&jsonl_path).unwrap(),
             Some("document-intelligence".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_prefix_from_jsonl_rejects_malformed_before_prefix() {
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let issue = make_test_issue("foreign-0sa", "Foreign Prefix");
+        fs::write(
+            &jsonl_path,
+            format!("{{not-json\n{}\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+
+        let err = detect_prefix_from_jsonl(&jsonl_path).unwrap_err();
+        assert!(
+            matches!(err, BeadsError::Config(ref message) if message.contains("Invalid JSON at line 1")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_detect_prefix_from_jsonl_validates_entire_file_before_returning_prefix() {
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let issue = make_test_issue("foreign-0sa", "Foreign Prefix");
+        fs::write(
+            &jsonl_path,
+            format!("{}\n{{not-json\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+
+        let err = detect_prefix_from_jsonl(&jsonl_path).unwrap_err();
+        assert!(
+            matches!(err, BeadsError::Config(ref message) if message.contains("Invalid JSON at line 2")),
+            "unexpected error: {err:?}"
         );
     }
 

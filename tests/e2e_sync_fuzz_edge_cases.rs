@@ -17,7 +17,9 @@
 
 mod common;
 
+use beads_rust::storage::SqliteStorage;
 use common::cli::{BrWorkspace, run_br};
+use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::symlink;
 
@@ -120,6 +122,62 @@ fn edge_case_import_rejects_partial_lines() {
         "[PASS] Import correctly rejected partial line JSONL\n\
          Error: {}",
         import.stderr.lines().next().unwrap_or("(no error)")
+    );
+}
+
+/// Test: `--rename-prefix` rejects malformed JSONL before auto-persisting a detected prefix.
+#[test]
+fn edge_case_rename_prefix_rejects_malformed_jsonl_before_config_write() {
+    let _log =
+        common::test_log("edge_case_rename_prefix_rejects_malformed_jsonl_before_config_write");
+    let workspace = setup_workspace_with_issues();
+    let beads_dir = workspace.root.join(".beads");
+    let db_path = beads_dir.join("beads.db");
+    let jsonl_path = beads_dir.join("issues.jsonl");
+
+    {
+        let mut storage = SqliteStorage::open(&db_path).expect("open storage");
+        storage
+            .delete_config("issue_prefix")
+            .expect("delete issue_prefix");
+        assert_eq!(
+            storage.get_config("issue_prefix").expect("read prefix"),
+            None
+        );
+    }
+
+    let original = fs::read_to_string(&jsonl_path).expect("read jsonl");
+    let first_issue = original
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .expect("exported issue line");
+    let mut foreign_issue: Value = serde_json::from_str(first_issue).expect("parse issue json");
+    foreign_issue["id"] = Value::String("foreign-abc12".to_string());
+    let foreign_line = serde_json::to_string(&foreign_issue).expect("serialize foreign issue");
+    fs::write(&jsonl_path, format!("{{not-json\n{foreign_line}\n")).expect("write malformed jsonl");
+
+    let import = run_br(
+        &workspace,
+        ["sync", "--import-only", "--force", "--rename-prefix"],
+        "import_malformed_rename_prefix",
+    );
+
+    assert!(
+        !import.status.success(),
+        "rename-prefix import should reject malformed JSONL before config write"
+    );
+    assert!(
+        import.stderr.contains("Invalid JSON at line 1")
+            || import.stderr.to_lowercase().contains("json"),
+        "error should mention JSON parse failure; stderr: {}",
+        import.stderr
+    );
+
+    let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+    assert_eq!(
+        storage.get_config("issue_prefix").expect("read prefix"),
+        None,
+        "failed rename-prefix auto-detection must not persist the later valid issue prefix"
     );
 }
 
