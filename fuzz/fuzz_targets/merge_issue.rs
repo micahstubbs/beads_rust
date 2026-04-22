@@ -8,6 +8,7 @@ use beads_rust::sync::{
     three_way_merge,
 };
 use beads_rust::util::content_hash;
+use beads_rust::validation::IssueValidator;
 use chrono::{DateTime, Duration, Utc};
 use common::{ByteCursor, TrimmedCustomIssueCursorExt};
 use libfuzzer_sys::fuzz_target;
@@ -86,6 +87,7 @@ fn run_merge_case(data: &[u8]) -> Result<(), String> {
         }
 
         assert_merge_result_invariants(&first, &case)?;
+        assert_validator_on_output(&first)?;
         assert_no_silent_conflict_resolution(&case, strategy, &first)?;
         assert_uncontested_changes_preserved(&case, &first)?;
         assert_three_way_merge_invariants(&case, strategy)?;
@@ -331,6 +333,20 @@ fn assert_merge_result_invariants(
     Ok(())
 }
 
+fn assert_validator_on_output(result: &MergeResult) -> Result<(), String> {
+    match result {
+        MergeResult::Keep(issue) | MergeResult::KeepWithNote(issue, _) => {
+            IssueValidator::validate(issue).map_err(|errors| {
+                format!(
+                    "merge output {} failed IssueValidator::validate: {errors:?}",
+                    issue.id
+                )
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
 fn assert_issue_invariants(issue: &Issue) -> Result<(), String> {
     if issue.id.trim().is_empty() {
         return Err("kept issue has an empty id".to_string());
@@ -540,6 +556,12 @@ fn assert_merge_report_invariants(report: &MergeReport) -> Result<(), String> {
     let mut kept_ids = HashSet::new();
     for issue in &report.kept {
         assert_issue_invariants(issue)?;
+        IssueValidator::validate(issue).map_err(|errors| {
+            format!(
+                "three_way_merge kept issue {} failed IssueValidator::validate: {errors:?}",
+                issue.id
+            )
+        })?;
         if !kept_ids.insert(issue.id.as_str()) {
             return Err(format!("three_way_merge kept duplicate issue {}", issue.id));
         }
@@ -674,13 +696,37 @@ fn merge_strategies() -> [ConflictResolution; 4] {
 }
 
 fn normalize_issue(mut issue: Issue) -> Issue {
-    issue.id = clean_id(&issue.id);
+    issue.id = valid_issue_id(&clean_id(&issue.id));
     issue.title = non_empty(truncate(&issue.title, MAX_FIELD_BYTES), "fuzz-title");
     issue.priority = Priority(issue.priority.0.clamp(0, 4));
     normalize_status_fields(&mut issue);
     normalize_relations(&mut issue);
+    sanitize_external_ref(&mut issue);
     issue.content_hash = Some(content_hash(&issue));
     issue
+}
+
+fn valid_issue_id(raw: &str) -> String {
+    let lower: String = raw
+        .chars()
+        .map(|c| c.to_ascii_lowercase())
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
+        .collect();
+    let trimmed = lower.trim_matches('-');
+    if trimmed.is_empty() || !trimmed.contains('-') {
+        "bd-fuzz".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn sanitize_external_ref(issue: &mut Issue) {
+    if let Some(ext_ref) = &mut issue.external_ref {
+        ext_ref.retain(|c| !c.is_whitespace());
+        if ext_ref.is_empty() || ext_ref.len() > 200 {
+            issue.external_ref = None;
+        }
+    }
 }
 
 fn normalize_status_fields(issue: &mut Issue) {
@@ -703,7 +749,10 @@ fn normalize_status_fields(issue: &mut Issue) {
                 .original_type
                 .get_or_insert_with(|| issue.issue_type.as_str().to_string());
         }
-        _ => {}
+        _ => {
+            issue.closed_at = None;
+            issue.close_reason = None;
+        }
     }
 }
 
