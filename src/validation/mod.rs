@@ -17,6 +17,12 @@ use crate::model::{Comment, Dependency, Issue, Priority, Status};
 use crate::util::id::MAX_ID_LENGTH;
 use std::path::Path;
 
+const TITLE_MAX_CHARS: usize = 500;
+const LONG_TEXT_MAX_BYTES: usize = 102_400;
+const ACTOR_MAX_CHARS: usize = 200;
+const CUSTOM_VARIANT_MAX_CHARS: usize = 50;
+const ISSUE_LABEL_MAX_COUNT: usize = 64;
+
 /// Validates issue fields and invariants.
 pub struct IssueValidator;
 
@@ -115,33 +121,66 @@ fn validate_issue_text_fields(issue: &Issue, errors: &mut Vec<ValidationError>) 
     if issue.title.trim().is_empty() {
         errors.push(ValidationError::new("title", "cannot be empty"));
     }
-    if issue.title.chars().count() > 500 {
+    if issue.title.chars().count() > TITLE_MAX_CHARS {
         errors.push(ValidationError::new("title", "exceeds 500 characters"));
     }
     reject_nul("title", &issue.title, errors);
 
     // Description: Optional, max 100KB.
-    if let Some(description) = issue.description.as_ref() {
-        if description.len() > 102_400 {
-            errors.push(ValidationError::new("description", "exceeds 100KB"));
-        }
-        reject_nul("description", description, errors);
-    }
-
-    reject_nul_opt("design", issue.design.as_deref(), errors);
-    reject_nul_opt(
-        "acceptance_criteria",
-        issue.acceptance_criteria.as_deref(),
+    reject_bounded_bytes_opt(
+        "description",
+        issue.description.as_deref(),
+        LONG_TEXT_MAX_BYTES,
+        "exceeds 100KB",
         errors,
     );
-    reject_nul_opt("notes", issue.notes.as_deref(), errors);
+
+    reject_bounded_bytes_opt(
+        "design",
+        issue.design.as_deref(),
+        LONG_TEXT_MAX_BYTES,
+        "exceeds 100KB",
+        errors,
+    );
+    reject_bounded_bytes_opt(
+        "acceptance_criteria",
+        issue.acceptance_criteria.as_deref(),
+        LONG_TEXT_MAX_BYTES,
+        "exceeds 100KB",
+        errors,
+    );
+    reject_bounded_bytes_opt(
+        "notes",
+        issue.notes.as_deref(),
+        LONG_TEXT_MAX_BYTES,
+        "exceeds 100KB",
+        errors,
+    );
     reject_nul("status", issue.status.as_str(), errors);
+    validate_custom_status(&issue.status, errors);
     reject_nul("issue_type", issue.issue_type.as_str(), errors);
-    reject_nul_opt("assignee", issue.assignee.as_deref(), errors);
-    reject_nul_opt("owner", issue.owner.as_deref(), errors);
-    reject_nul_opt("created_by", issue.created_by.as_deref(), errors);
+    validate_custom_issue_type(&issue.issue_type, errors);
+    reject_bounded_chars_opt(
+        "assignee",
+        issue.assignee.as_deref(),
+        ACTOR_MAX_CHARS,
+        errors,
+    );
+    reject_bounded_chars_opt("owner", issue.owner.as_deref(), ACTOR_MAX_CHARS, errors);
+    reject_bounded_chars_opt(
+        "created_by",
+        issue.created_by.as_deref(),
+        ACTOR_MAX_CHARS,
+        errors,
+    );
     validate_external_ref(issue.external_ref.as_deref(), errors);
-    reject_nul_opt("source_system", issue.source_system.as_deref(), errors);
+    reject_bounded_chars_opt(
+        "source_system",
+        issue.source_system.as_deref(),
+        ACTOR_MAX_CHARS,
+        errors,
+    );
+    validate_issue_labels(issue, errors);
 }
 
 fn validate_external_ref(external_ref: Option<&str>, errors: &mut Vec<ValidationError>) {
@@ -168,9 +207,78 @@ fn reject_nul(field: &str, value: &str, errors: &mut Vec<ValidationError>) {
     }
 }
 
-fn reject_nul_opt(field: &str, value: Option<&str>, errors: &mut Vec<ValidationError>) {
+fn reject_bounded_bytes_opt(
+    field: &str,
+    value: Option<&str>,
+    max_bytes: usize,
+    message: &str,
+    errors: &mut Vec<ValidationError>,
+) {
     if let Some(value) = value {
         reject_nul(field, value, errors);
+        if value.len() > max_bytes {
+            errors.push(ValidationError::new(field, message));
+        }
+    }
+}
+
+fn reject_bounded_chars_opt(
+    field: &str,
+    value: Option<&str>,
+    max_chars: usize,
+    errors: &mut Vec<ValidationError>,
+) {
+    if let Some(value) = value {
+        reject_nul(field, value, errors);
+        if value.chars().count() > max_chars {
+            errors.push(ValidationError::new(
+                field,
+                format!("exceeds {max_chars} characters"),
+            ));
+        }
+    }
+}
+
+fn validate_custom_status(status: &Status, errors: &mut Vec<ValidationError>) {
+    if let Status::Custom(value) = status
+        && value.chars().count() > CUSTOM_VARIANT_MAX_CHARS
+    {
+        errors.push(ValidationError::new(
+            "status",
+            "custom status exceeds 50 characters",
+        ));
+    }
+}
+
+fn validate_custom_issue_type(
+    issue_type: &crate::model::IssueType,
+    errors: &mut Vec<ValidationError>,
+) {
+    if let crate::model::IssueType::Custom(value) = issue_type
+        && value.chars().count() > CUSTOM_VARIANT_MAX_CHARS
+    {
+        errors.push(ValidationError::new(
+            "issue_type",
+            "custom issue type exceeds 50 characters",
+        ));
+    }
+}
+
+fn validate_issue_labels(issue: &Issue, errors: &mut Vec<ValidationError>) {
+    if issue.labels.len() > ISSUE_LABEL_MAX_COUNT {
+        errors.push(ValidationError::new(
+            "labels",
+            format!("exceeds {ISSUE_LABEL_MAX_COUNT} labels"),
+        ));
+    }
+
+    for (idx, label) in issue.labels.iter().enumerate() {
+        if let Err(err) = LabelValidator::validate(label) {
+            errors.push(ValidationError::new(
+                "labels",
+                format!("label at index {idx}: {}", err.message),
+            ));
+        }
     }
 }
 

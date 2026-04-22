@@ -10,6 +10,7 @@ use chrono::{TimeZone, Utc};
 use proptest::prelude::*;
 use tracing::info;
 
+use beads_rust::error::{BeadsError, ErrorCode, StructuredError};
 use beads_rust::model::{Issue, IssueType, Priority, Status};
 use beads_rust::validation::{IssueValidator, LabelValidator};
 
@@ -65,6 +66,19 @@ fn make_valid_issue(title: &str) -> Issue {
         dependencies: vec![],
         comments: vec![],
     }
+}
+
+fn assert_validation_error_for_field(
+    result: Result<(), Vec<beads_rust::error::ValidationError>>,
+    expected_field: &str,
+) {
+    let errors = result.expect_err("issue should fail validation");
+    assert!(
+        errors.iter().any(|e| e.field == expected_field),
+        "expected {expected_field} error, got {errors:?}"
+    );
+    let structured = StructuredError::from_error(&BeadsError::from_validation_errors(errors));
+    assert_eq!(structured.code, ErrorCode::ValidationFailed);
 }
 
 proptest! {
@@ -211,6 +225,105 @@ proptest! {
             errors.iter().any(|e| e.field == "description"),
             "Should have description error"
         );
+    }
+
+    /// Property: rich-text issue fields over 100KB fail validation.
+    #[test]
+    fn large_rich_text_fields_fail(
+        field_index in 0usize..3usize,
+        extra_bytes in 1usize..1000usize,
+    ) {
+        init_test_logging();
+        let len = 102_400 + extra_bytes;
+        let payload = "x".repeat(len);
+
+        let mut issue = make_valid_issue("Test Issue");
+        let expected_field = match field_index {
+            0 => {
+                issue.design = Some(payload);
+                "design"
+            }
+            1 => {
+                issue.acceptance_criteria = Some(payload);
+                "acceptance_criteria"
+            }
+            _ => {
+                issue.notes = Some(payload);
+                "notes"
+            }
+        };
+
+        assert_validation_error_for_field(IssueValidator::validate(&issue), expected_field);
+    }
+
+    /// Property: actor/source metadata over 200 chars fails validation.
+    #[test]
+    fn long_actor_fields_fail(
+        field_index in 0usize..4usize,
+        extra_chars in 1usize..50usize,
+    ) {
+        init_test_logging();
+        let payload = "x".repeat(200 + extra_chars);
+
+        let mut issue = make_valid_issue("Test Issue");
+        let expected_field = match field_index {
+            0 => {
+                issue.assignee = Some(payload);
+                "assignee"
+            }
+            1 => {
+                issue.owner = Some(payload);
+                "owner"
+            }
+            2 => {
+                issue.created_by = Some(payload);
+                "created_by"
+            }
+            _ => {
+                issue.source_system = Some(payload);
+                "source_system"
+            }
+        };
+
+        assert_validation_error_for_field(IssueValidator::validate(&issue), expected_field);
+    }
+
+    /// Property: custom status/type variants over 50 chars fail validation.
+    #[test]
+    fn long_custom_status_and_type_fail(
+        field_index in 0usize..2usize,
+        extra_chars in 1usize..50usize,
+    ) {
+        init_test_logging();
+        let payload = "x".repeat(50 + extra_chars);
+
+        let mut issue = make_valid_issue("Test Issue");
+        let expected_field = if field_index == 0 {
+            issue.status = Status::Custom(payload);
+            "status"
+        } else {
+            issue.issue_type = IssueType::Custom(payload);
+            "issue_type"
+        };
+
+        assert_validation_error_for_field(IssueValidator::validate(&issue), expected_field);
+    }
+
+    /// Property: pathological label arrays and label payloads fail validation.
+    #[test]
+    fn unbounded_labels_fail(
+        label_count in 65usize..80usize,
+        long_label_extra in 1usize..50usize,
+    ) {
+        init_test_logging();
+
+        let mut too_many = make_valid_issue("Test Issue");
+        too_many.labels = (0..label_count).map(|i| format!("label{i}")).collect();
+        assert_validation_error_for_field(IssueValidator::validate(&too_many), "labels");
+
+        let mut too_long = make_valid_issue("Test Issue");
+        too_long.labels = vec!["x".repeat(50 + long_label_extra)];
+        assert_validation_error_for_field(IssueValidator::validate(&too_long), "labels");
     }
 
     /// Property: updated_at before created_at fails validation
