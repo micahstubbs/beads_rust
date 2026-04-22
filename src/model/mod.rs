@@ -107,7 +107,8 @@ impl FromStr for Status {
     type Err = crate::error::BeadsError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
+        let normalized = s.to_lowercase();
+        match normalized.as_str() {
             "open" => Ok(Self::Open),
             "in_progress" | "inprogress" => Ok(Self::InProgress),
             "blocked" => Ok(Self::Blocked),
@@ -116,7 +117,7 @@ impl FromStr for Status {
             "closed" => Ok(Self::Closed),
             "tombstone" => Ok(Self::Tombstone),
             "pinned" => Ok(Self::Pinned),
-            other => Ok(Self::Custom(other.to_string())),
+            _ => Ok(Self::Custom(s.to_string())),
         }
     }
 }
@@ -232,7 +233,8 @@ impl FromStr for IssueType {
     type Err = crate::error::BeadsError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
+        let normalized = s.to_lowercase();
+        match normalized.as_str() {
             "task" => Ok(Self::Task),
             "bug" => Ok(Self::Bug),
             "feature" => Ok(Self::Feature),
@@ -240,7 +242,7 @@ impl FromStr for IssueType {
             "chore" => Ok(Self::Chore),
             "docs" => Ok(Self::Docs),
             "question" => Ok(Self::Question),
-            other => Ok(Self::Custom(other.to_string())),
+            _ => Ok(Self::Custom(s.to_string())),
         }
     }
 }
@@ -1021,6 +1023,9 @@ mod tests {
     fn test_status_from_str_unknown_becomes_custom() {
         let result = Status::from_str("invalid_status").unwrap();
         assert_eq!(result, Status::Custom("invalid_status".to_string()));
+
+        let mixed_case = Status::from_str("QaReview").unwrap();
+        assert_eq!(mixed_case, Status::Custom("QaReview".to_string()));
     }
 
     #[test]
@@ -1186,6 +1191,9 @@ mod tests {
             result.unwrap(),
             IssueType::Custom("custom_type".to_string())
         );
+
+        let mixed_case = IssueType::from_str("Odd_Type").unwrap();
+        assert_eq!(mixed_case, IssueType::Custom("Odd_Type".to_string()));
     }
 
     #[test]
