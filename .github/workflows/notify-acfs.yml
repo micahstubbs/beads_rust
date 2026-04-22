@@ -74,10 +74,26 @@ jobs:
           echo "Tool: ${{ env.TOOL_NAME }}"
           echo "SHA256: ${{ steps.checksum.outputs.sha256 }}"
 
-      - name: Notify ACFS
+      - name: Check for ACFS_NOTIFY_TOKEN
+        id: check_token
         if: |
           (steps.compare.outputs.changed == 'true' || github.event.inputs.force == 'true') &&
           github.event.inputs.dry_run != 'true'
+        env:
+          ACFS_NOTIFY_TOKEN: ${{ secrets.ACFS_NOTIFY_TOKEN }}
+        run: |
+          if [ -n "$ACFS_NOTIFY_TOKEN" ]; then
+            echo "has_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::ACFS_NOTIFY_TOKEN is not configured; skipping notification."
+          fi
+
+      - name: Notify ACFS
+        if: |
+          (steps.compare.outputs.changed == 'true' || github.event.inputs.force == 'true') &&
+          github.event.inputs.dry_run != 'true' &&
+          steps.check_token.outputs.has_token == 'true'
         uses: peter-evans/repository-dispatch@v4
         with:
           token: ${{ secrets.ACFS_NOTIFY_TOKEN }}
