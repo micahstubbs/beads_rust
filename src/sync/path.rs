@@ -1347,9 +1347,15 @@ mod tests {
 
         let file = File::open(&dir_path).expect("open directory");
         let result = validate_jsonl_fd_metadata(&file, &dir_path);
-        assert!(result.is_err(), "directory fd should fail metadata validation");
         assert!(
-            result.unwrap_err().to_string().contains("not a regular file"),
+            result.is_err(),
+            "directory fd should fail metadata validation"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not a regular file"),
             "error should mention regular file"
         );
     }
