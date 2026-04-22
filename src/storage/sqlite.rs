@@ -381,6 +381,42 @@ impl SqliteStorage {
         }
     }
 
+    fn foreign_keys_enabled(conn: &Connection) -> Result<bool> {
+        let row = conn.query_row("PRAGMA foreign_keys")?;
+        Ok(row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0) == 1)
+    }
+
+    fn restore_foreign_keys(conn: &Connection, operation: &str) -> Result<()> {
+        conn.execute("PRAGMA foreign_keys = ON")
+            .map_err(BeadsError::Database)?;
+
+        if Self::foreign_keys_enabled(conn)? {
+            return Ok(());
+        }
+
+        Err(BeadsError::Config(format!(
+            "failed to re-enable SQLite foreign key enforcement after {operation}: PRAGMA foreign_keys remained OFF"
+        )))
+    }
+
+    fn finish_foreign_key_suppressed_result<T>(
+        conn: &Connection,
+        operation: &str,
+        result: Result<T>,
+    ) -> Result<T> {
+        match (result, Self::restore_foreign_keys(conn, operation)) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(restore_error)) => Err(restore_error),
+            (Err(original_error), Ok(())) => Err(original_error),
+            (Err(original_error), Err(restore_error)) => Err(BeadsError::WithContext {
+                context: format!(
+                    "{operation} failed, and SQLite foreign key enforcement could not be re-enabled: {restore_error}"
+                ),
+                source: Box::new(original_error),
+            }),
+        }
+    }
+
     fn refresh_blocked_cache_after_commit(
         &self,
         op: &str,
@@ -396,8 +432,7 @@ impl SqliteStorage {
             tracing::debug!(operation = op, refreshed, "Refreshed blocked issues cache");
             Ok(())
         });
-        let _ = self.conn.execute("PRAGMA foreign_keys = ON");
-        result
+        Self::finish_foreign_key_suppressed_result(&self.conn, "blocked-cache refresh", result)
     }
 
     pub(crate) fn blocked_cache_marked_stale(&self) -> Result<bool> {
@@ -436,8 +471,7 @@ impl SqliteStorage {
             tracing::debug!(refreshed, "Rebuilt stale blocked issues cache on demand");
             Ok(true)
         });
-        let _ = self.conn.execute("PRAGMA foreign_keys = ON");
-        result
+        Self::finish_foreign_key_suppressed_result(&self.conn, "blocked-cache lazy rebuild", result)
     }
 
     /// Open a new connection to the database at the given path.
@@ -1130,9 +1164,8 @@ impl SqliteStorage {
 
         // Re-enable FK enforcement after the transaction completes
         // (regardless of success or failure).
-        let _ = self.conn.execute("PRAGMA foreign_keys = ON");
-
-        let (result, blocked_cache_plan) = tx_result?;
+        let (result, blocked_cache_plan) =
+            Self::finish_foreign_key_suppressed_result(&self.conn, op, tx_result)?;
 
         match blocked_cache_plan {
             Some(BlockedCacheRefreshPlan::Deferred) => {
@@ -2675,13 +2708,12 @@ impl SqliteStorage {
 
     #[allow(clippy::too_many_lines)]
     fn build_ready_issue_candidates_query(
-        &self,
         filters: &ReadyFilters,
         sort: ReadySortPolicy,
         exclude_blocked_in_sql: bool,
         apply_limit: bool,
         projection: ReadyIssueProjection,
-    ) -> Result<(String, Vec<SqliteValue>)> {
+    ) -> (String, Vec<SqliteValue>) {
         let mut sql = String::from(projection.select_clause());
         sql.push_str(" FROM issues WHERE 1=1");
         let mut params: Vec<SqliteValue> = Vec::new();
@@ -2825,7 +2857,7 @@ impl SqliteStorage {
             sql = format!("{cte_prefix}{sql}");
         }
 
-        Ok((sql, params))
+        (sql, params)
     }
 
     fn query_ready_issue_candidates_with_projection(
@@ -2836,13 +2868,13 @@ impl SqliteStorage {
         apply_limit: bool,
         projection: ReadyIssueProjection,
     ) -> Result<Vec<Issue>> {
-        let (sql, params) = self.build_ready_issue_candidates_query(
+        let (sql, params) = Self::build_ready_issue_candidates_query(
             filters,
             sort,
             exclude_blocked_in_sql,
             apply_limit,
             projection,
-        )?;
+        );
         let rows = self.conn.query_with_params(&sql, &params)?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -3075,8 +3107,7 @@ impl SqliteStorage {
             )?;
             Ok(rebuilt)
         });
-        let _ = self.conn.execute("PRAGMA foreign_keys = ON");
-        result
+        Self::finish_foreign_key_suppressed_result(&self.conn, "blocked-cache rebuild", result)
     }
 
     /// Rebuild the blocked cache using the caller's active transaction.
@@ -5227,9 +5258,7 @@ impl SqliteStorage {
                 },
             };
 
-            map.entry(depends_on_id.to_string())
-                .or_default()
-                .push(meta);
+            map.entry(depends_on_id.to_string()).or_default().push(meta);
         }
         Ok(map)
     }
@@ -10146,15 +10175,10 @@ mod tests {
         let storage = SqliteStorage::open_memory().unwrap();
 
         // Check foreign keys are enabled
-        #[allow(clippy::cast_possible_truncation)]
-        let fk = storage
-            .conn
-            .query_row("PRAGMA foreign_keys")
-            .unwrap()
-            .get(0)
-            .and_then(SqliteValue::as_integer)
-            .unwrap_or(0) as i32;
-        assert_eq!(fk, 1, "Foreign keys should be enabled");
+        assert!(
+            SqliteStorage::foreign_keys_enabled(&storage.conn).unwrap(),
+            "Foreign keys should be enabled"
+        );
 
         // Check journal mode (memory DBs use 'memory' mode)
         let mode = storage
@@ -10169,6 +10193,65 @@ mod tests {
             mode.to_lowercase() == "wal" || mode.to_lowercase() == "memory",
             "Journal mode should be WAL or memory"
         );
+    }
+
+    #[test]
+    fn test_foreign_key_restore_reports_noop_inside_transaction() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        storage.conn.execute("PRAGMA foreign_keys = OFF").unwrap();
+        storage.conn.execute("BEGIN").unwrap();
+
+        let err = SqliteStorage::finish_foreign_key_suppressed_result(
+            &storage.conn,
+            "test operation",
+            Ok::<(), BeadsError>(()),
+        )
+        .unwrap_err();
+
+        storage.conn.execute("ROLLBACK").unwrap();
+        storage.conn.execute("PRAGMA foreign_keys = ON").unwrap();
+
+        assert!(
+            matches!(
+                err,
+                BeadsError::Config(ref message)
+                    if message.contains("test operation") && message.contains("remained OFF")
+            ),
+            "restore failure should be returned instead of reporting success: {err}"
+        );
+        assert!(SqliteStorage::foreign_keys_enabled(&storage.conn).unwrap());
+    }
+
+    #[test]
+    fn test_foreign_key_restore_combines_original_error_with_restore_error() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        storage.conn.execute("PRAGMA foreign_keys = OFF").unwrap();
+        storage.conn.execute("BEGIN").unwrap();
+
+        let err = SqliteStorage::finish_foreign_key_suppressed_result(
+            &storage.conn,
+            "failing test operation",
+            Err::<(), _>(BeadsError::Config("original write failed".to_string())),
+        )
+        .unwrap_err();
+
+        storage.conn.execute("ROLLBACK").unwrap();
+        storage.conn.execute("PRAGMA foreign_keys = ON").unwrap();
+
+        match err {
+            BeadsError::WithContext { context, source } => {
+                assert!(context.contains("failing test operation"));
+                assert!(context.contains("could not be re-enabled"));
+                assert!(source.to_string().contains("original write failed"));
+            }
+            other => {
+                assert!(
+                    matches!(other, BeadsError::WithContext { .. }),
+                    "expected combined WithContext error"
+                );
+            }
+        }
+        assert!(SqliteStorage::foreign_keys_enabled(&storage.conn).unwrap());
     }
 
     #[test]
@@ -12263,24 +12346,23 @@ mod tests {
         let b0 = SqliteStorage::jittered_backoff(50, 0);
         let b1 = SqliteStorage::jittered_backoff(50, 1);
         let b2 = SqliteStorage::jittered_backoff(50, 2);
-        assert!(b0 >= 25 && b0 <= 75, "attempt 0: {b0}");
-        assert!(b1 >= 50 && b1 <= 150, "attempt 1: {b1}");
-        assert!(b2 >= 100 && b2 <= 300, "attempt 2: {b2}");
+        assert!((25..=75).contains(&b0), "attempt 0: {b0}");
+        assert!((50..=150).contains(&b1), "attempt 1: {b1}");
+        assert!((100..=300).contains(&b2), "attempt 2: {b2}");
     }
 
     #[test]
-    fn jittered_backoff_zero_base_returns_positive() {
+    fn jittered_backoff_zero_base_returns_zero() {
         let b = SqliteStorage::jittered_backoff(0, 0);
-        assert!(b >= 0, "zero base should not underflow");
+        assert_eq!(b, 0, "zero base should not underflow");
     }
 
     #[test]
     fn write_transaction_propagates_body_error() {
         let dir = TempDir::new().unwrap();
-        let mut storage = SqliteStorage::open(dir.path().join("test.db")).unwrap();
-        let result: Result<()> = storage.with_write_transaction(|_| {
-            Err(crate::error::BeadsError::Config("test error".into()))
-        });
+        let mut storage = SqliteStorage::open(&dir.path().join("test.db")).unwrap();
+        let result: Result<()> = storage
+            .with_write_transaction(|_| Err(crate::error::BeadsError::Config("test error".into())));
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -12292,12 +12374,10 @@ mod tests {
     #[test]
     fn connection_write_transaction_propagates_body_error() {
         let dir = TempDir::new().unwrap();
-        let storage = SqliteStorage::open(dir.path().join("test.db")).unwrap();
+        let storage = SqliteStorage::open(&dir.path().join("test.db")).unwrap();
         let result: Result<()> =
             SqliteStorage::with_connection_write_transaction(&storage.conn, |_| {
-                Err(crate::error::BeadsError::Config(
-                    "conn test error".into(),
-                ))
+                Err(crate::error::BeadsError::Config("conn test error".into()))
             });
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
