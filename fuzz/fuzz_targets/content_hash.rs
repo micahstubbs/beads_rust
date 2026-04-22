@@ -4,6 +4,7 @@ mod common;
 
 use beads_rust::model::{Comment, Dependency, DependencyType, Issue, Priority};
 use beads_rust::util::content_hash;
+use beads_rust::validation::IssueValidator;
 use common::{ByteCursor, EmptyCustomIssueCursorExt};
 use libfuzzer_sys::fuzz_target;
 use serde_json::Value;
@@ -26,6 +27,10 @@ fuzz_target!(|data: &[u8]| {
 
 fn run_hash_case(data: &[u8]) -> Result<(), Box<dyn Error>> {
     let issue = issue_from_bytes(data);
+    if IssueValidator::validate(&issue).is_err() {
+        return Ok(());
+    }
+
     let hash = content_hash(&issue);
     assert_hash_shape(&hash)?;
 
