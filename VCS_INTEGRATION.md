@@ -1,13 +1,17 @@
 # VCS Integration (Git Baseline)
 
-br is VCS-agnostic and never runs version-control commands. It only reads/writes
-inside `.beads/`. This document covers the **git baseline** workflow plus
-best-effort command equivalents for other VCS (hg, jj, Perforce, Sapling).
-Verify details with your VCS docs if your environment differs.
+br never automatically runs version-control commands — all storage lives inside
+`.beads/`. User-invoked reporting commands (`br changelog`, `br orphans`, and
+commit-activity `br stats`) read git history when explicitly called but never
+write to or modify the repository. This document covers the **git baseline**
+workflow plus best-effort command equivalents for other VCS (hg, jj, Perforce,
+Sapling). Verify details with your VCS docs if your environment differs.
 
 ## Core Principles
 
-- **br does not run git** — all VCS operations are explicit and manual.
+- **br never runs git automatically** — VCS operations are explicit and manual.
+  Reporting commands (`changelog`, `orphans`, `stats`) read git history only
+  when you invoke them.
 - **Track `.beads/` in version control** — it is the collaboration surface.
 - **Local-only artifacts stay local** — `.beads/.gitignore` excludes dbs, locks,
   and machine-specific files.
