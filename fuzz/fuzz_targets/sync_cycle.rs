@@ -2,7 +2,7 @@
 
 mod common;
 
-use beads_rust::model::{DependencyType, Issue, IssueType, Priority, Status};
+use beads_rust::model::{DependencyType, Issue, Priority, Status};
 use beads_rust::storage::SqliteStorage;
 use beads_rust::sync::{
     ExportConfig, ImportConfig, OrphanMode, compute_jsonl_hash, compute_staleness,
