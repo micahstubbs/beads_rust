@@ -233,7 +233,6 @@ fn filter_by_all_priority_levels() {
     storage.create_issue(&p0, "tester").unwrap();
     storage.create_issue(&p4, "tester").unwrap();
 
-    // All priority levels should work
     for prio in [
         Priority::CRITICAL,
         Priority::HIGH,
@@ -245,8 +244,20 @@ fn filter_by_all_priority_levels() {
             priorities: Some(vec![prio]),
             ..Default::default()
         };
-        // Just verify no error - not all priorities have issues
-        let _ = storage.list_issues(&filters).unwrap();
+        let results = storage.list_issues(&filters).unwrap();
+        assert!(
+            results.iter().all(|issue| issue.priority == prio),
+            "priority filter {prio:?} returned non-matching issues: {results:?}"
+        );
+
+        let ids: Vec<_> = results.iter().map(|issue| issue.id.as_str()).collect();
+        match prio {
+            Priority::CRITICAL => assert_eq!(ids, vec![p0.id.as_str()]),
+            Priority::BACKLOG => assert_eq!(ids, vec![p4.id.as_str()]),
+            Priority::HIGH | Priority::MEDIUM | Priority::LOW => {
+                assert!(ids.is_empty(), "unexpected issues for {prio:?}: {ids:?}");
+            }
+        }
     }
 }
 
@@ -327,7 +338,6 @@ fn filter_by_all_issue_types() {
         .build();
     storage.create_issue(&task, "tester").unwrap();
 
-    // All issue types should work without error
     for issue_type in [
         IssueType::Task,
         IssueType::Bug,
@@ -341,7 +351,21 @@ fn filter_by_all_issue_types() {
             types: Some(vec![issue_type]),
             ..Default::default()
         };
-        let _ = storage.list_issues(&filters).unwrap();
+        let results = storage.list_issues(&filters).unwrap();
+        assert!(
+            results.iter().all(|issue| issue.issue_type == issue_type),
+            "type filter {issue_type:?} returned non-matching issues: {results:?}"
+        );
+
+        let ids: Vec<_> = results.iter().map(|issue| issue.id.as_str()).collect();
+        if issue_type == IssueType::Task {
+            assert_eq!(ids, vec![task.id.as_str()]);
+        } else {
+            assert!(
+                ids.is_empty(),
+                "unexpected issues for {issue_type:?}: {ids:?}"
+            );
+        }
     }
 }
 
