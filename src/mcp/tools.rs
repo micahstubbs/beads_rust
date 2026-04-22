@@ -18,6 +18,7 @@ use serde_json::json;
 use crate::error::{ErrorCode, StructuredError};
 use crate::model::{Issue, IssueType, Priority, Status};
 use crate::storage::{IssueUpdate, ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
+use crate::validation::LabelValidator;
 
 use super::BeadsState;
 
@@ -646,6 +647,16 @@ fn optional_string_array_arg(args: &serde_json::Value, key: &str) -> McpResult<V
         .collect()
 }
 
+fn optional_label_array_arg(args: &serde_json::Value, key: &str) -> McpResult<Vec<String>> {
+    let labels = optional_string_array_arg(args, key)?;
+    for (idx, label) in labels.iter().enumerate() {
+        LabelValidator::validate(label).map_err(|err| {
+            McpError::invalid_params(format!("'{key}[{idx}]' invalid label: {}", err.message))
+        })?;
+    }
+    Ok(labels)
+}
+
 /// Parse update fields from JSON args into an `IssueUpdate` + coercion warnings.
 /// Extracted to keep `UpdateIssueTool::call` under the line limit.
 #[allow(clippy::too_many_lines)]
@@ -1051,9 +1062,8 @@ impl ToolHandler for ShowIssueTool {
         let maybe_details = storage
             .get_issue_details(&id, true, true, 20)
             .map_err(beads_to_mcp)?;
-        let details = match maybe_details {
-            Some(details) => details,
-            None => return Err(issue_not_found_err(&storage, &id)?),
+        let Some(details) = maybe_details else {
+            return Err(issue_not_found_err(&storage, &id)?);
         };
 
         let mut result = serde_json::to_value(&details.issue).unwrap_or_default();
@@ -1252,7 +1262,7 @@ impl ToolHandler for CreateIssueTool {
         let description = optional_str_arg(&args, "description")?;
         let assignee = optional_str_arg(&args, "assignee")?;
 
-        let labels_to_add = optional_string_array_arg(&args, "labels")?;
+        let labels_to_add = optional_label_array_arg(&args, "labels")?;
 
         let id = self.0.with_mutation(|storage| {
             let now = chrono::Utc::now();
@@ -1459,8 +1469,8 @@ impl ToolHandler for UpdateIssueTool {
         let id = required_str_arg(&args, "id")?;
 
         let (updates, coercions) = parse_update_fields(&id, &args)?;
-        let labels_to_add = optional_string_array_arg(&args, "labels_add")?;
-        let labels_to_remove = optional_string_array_arg(&args, "labels_remove")?;
+        let labels_to_add = optional_label_array_arg(&args, "labels_add")?;
+        let labels_to_remove = optional_label_array_arg(&args, "labels_remove")?;
         let comment = optional_str_arg(&args, "comment")?;
 
         let issue = self.0.with_mutation(|storage| {
@@ -2070,8 +2080,8 @@ impl ToolHandler for ProjectOverviewTool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_list_filters, issue_not_found_err, optional_string_array_arg, parse_update_fields,
-        storage_read_warning,
+        build_list_filters, issue_not_found_err, optional_label_array_arg,
+        optional_string_array_arg, parse_update_fields, storage_read_warning,
     };
     use crate::error::BeadsError;
     use crate::storage::SqliteStorage;
@@ -2110,6 +2120,24 @@ mod tests {
             .expect_err("non-string label entries must be rejected");
 
         assert!(err.to_string().contains("'labels[1]' must be a string"));
+    }
+
+    #[test]
+    fn optional_label_array_arg_rejects_invalid_label_values() {
+        let err = optional_label_array_arg(&json!({"labels": ["bug", "bad label"]}), "labels")
+            .expect_err("MCP labels must use the same validation rules as CLI labels");
+
+        assert!(err.to_string().contains("'labels[1]' invalid label"));
+        assert!(err.to_string().contains("invalid characters"));
+    }
+
+    #[test]
+    fn optional_label_array_arg_accepts_namespaced_labels() {
+        let labels =
+            optional_label_array_arg(&json!({"labels": ["bug", "team:backend"]}), "labels")
+                .expect("valid labels");
+
+        assert_eq!(labels, vec!["bug", "team:backend"]);
     }
 
     #[test]

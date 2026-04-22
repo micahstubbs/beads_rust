@@ -165,9 +165,8 @@ impl ResourceHandler for IssueResource {
         let maybe_details = storage
             .get_issue_details(id, true, true, 20)
             .map_err(to_mcp)?;
-        let details = match maybe_details {
-            Some(details) => details,
-            None => return Err(issue_not_found_resource(&storage, id)?),
+        let Some(details) = maybe_details else {
+            return Err(issue_not_found_resource(&storage, id)?);
         };
 
         let mut result = serde_json::to_value(&details.issue).unwrap_or_default();
