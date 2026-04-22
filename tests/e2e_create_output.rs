@@ -100,6 +100,58 @@ fn test_create_positional_vs_title_flag() {
 }
 
 #[test]
+fn test_create_rejects_positional_and_title_flag_together() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path();
+
+    let bin = assert_cmd::cargo::cargo_bin!("br");
+
+    Command::new(bin.as_os_str())
+        .current_dir(path)
+        .arg("init")
+        .assert()
+        .success();
+
+    let output = Command::new(bin.as_os_str())
+        .current_dir(path)
+        .arg("create")
+        .arg("Positional Title")
+        .arg("--title")
+        .arg("Flag Title")
+        .arg("--json")
+        .output()
+        .expect("create with conflicting title inputs");
+
+    assert!(
+        !output.status.success(),
+        "create should reject conflicting title inputs: {output:?}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot be used with") && stderr.contains("--title"),
+        "expected clap conflict for --title, got: {stderr}"
+    );
+
+    let list_output = Command::new(bin.as_os_str())
+        .current_dir(path)
+        .arg("list")
+        .arg("--json")
+        .output()
+        .expect("list after rejected create");
+
+    assert!(
+        list_output.status.success(),
+        "list after rejected create failed: {list_output:?}"
+    );
+    let issues = extract_issues_array(&list_output.stdout);
+    assert!(
+        issues.is_empty(),
+        "rejected create must not create any issues: {issues:?}"
+    );
+}
+
+#[test]
 fn test_create_json_output_includes_labels_and_deps() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path();

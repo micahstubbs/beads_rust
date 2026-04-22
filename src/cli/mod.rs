@@ -977,7 +977,7 @@ pub struct CreateArgs {
     pub title: Option<String>,
 
     /// Issue title (alternative to positional argument)
-    #[arg(long = "title")]
+    #[arg(long = "title", conflicts_with = "title")]
     pub title_flag: Option<String>, // Handled in logic
 
     /// Issue type (task, bug, feature, etc.)
@@ -2621,6 +2621,14 @@ mod tests {
     fn test_ready_assignee_conflicts_with_unassigned() {
         let err = Cli::try_parse_from(["br", "ready", "--assignee", "alice", "--unassigned"])
             .expect_err("ready filters should conflict");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn test_create_positional_title_conflicts_with_title_flag() {
+        let err =
+            Cli::try_parse_from(["br", "create", "positional title", "--title", "flag title"])
+                .expect_err("create should reject ambiguous title sources");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
