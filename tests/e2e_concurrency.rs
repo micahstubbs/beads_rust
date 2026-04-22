@@ -271,7 +271,7 @@ fn issue_title_count(root: &Path, title: &str) -> i64 {
         .expect("count issue title");
 
     rows.first()
-        .and_then(|row| row.first())
+        .and_then(|row| row.get(0))
         .and_then(SqliteValue::as_integer)
         .unwrap_or(0)
 }

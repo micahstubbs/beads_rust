@@ -99,6 +99,16 @@ const ALL_KNOWN_STATUSES: &[Status] = &[
     Status::Pinned,
 ];
 
+prop_compose! {
+    fn issue_spec()(
+        status in status_strategy(),
+        priority in priority_strategy(),
+        issue_type in issue_type_strategy(),
+    ) -> (Status, Priority, IssueType) {
+        (status, priority, issue_type)
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 64,
@@ -112,28 +122,22 @@ proptest! {
     /// disjoint (no issue appears in two partitions).
     #[test]
     fn status_partition_is_exhaustive_and_disjoint(
-        statuses in prop::collection::vec(status_strategy(), 2..=12),
-        priorities in prop::collection::vec(priority_strategy(), 2..=12),
-        types in prop::collection::vec(issue_type_strategy(), 2..=12),
+        specs in prop::collection::vec(issue_spec(), 2..=12),
     ) {
-        let count = statuses.len();
         let mut storage = SqliteStorage::open_memory().unwrap();
 
-        for (i, ((status, priority), issue_type)) in statuses
-            .into_iter()
-            .zip(priorities.into_iter())
-            .zip(types.into_iter())
-            .enumerate()
-        {
+        for (i, (status, priority, issue_type)) in specs.iter().enumerate() {
             let issue = make_issue(
                 &format!("part{i:03}"),
                 &format!("Partition test {i}"),
-                status,
-                priority,
-                issue_type,
+                status.clone(),
+                priority.clone(),
+                issue_type.clone(),
             );
             storage.create_issue(&issue, "proptest").unwrap();
         }
+
+        let count = specs.len();
 
         // Explicit enumeration of all statuses to get the true universe,
         // including tombstones (which list_issues hides by default even with
