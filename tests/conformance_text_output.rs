@@ -14,10 +14,22 @@ use std::sync::LazyLock;
 
 /// Check if the `bd` (Go beads) binary is available on the system.
 fn bd_available() -> bool {
-    std::process::Command::new("bd")
+    let bd_bin = std::env::var("BD_BINARY").unwrap_or_else(|_| "bd".to_string());
+    std::process::Command::new(bd_bin)
         .arg("version")
         .output()
-        .is_ok_and(|o| o.status.success())
+        .is_ok_and(|o| {
+            if !o.status.success() {
+                return false;
+            }
+
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let Some(first_token) = stdout.split_whitespace().next() else {
+                return false;
+            };
+
+            matches!(first_token.to_ascii_lowercase().as_str(), "bd" | "beads")
+        })
 }
 
 /// Skip test if bd binary is not available (used in CI where only br is built)
@@ -715,7 +727,7 @@ fn conformance_text_show_not_found() {
     workspace.init_both();
 
     let br_show = workspace.run_br(["show", "nonexistent-id"], "show");
-    let _bd_show = workspace.run_bd(["show", "nonexistent-id"], "show");
+    let bd_show = workspace.run_bd(["show", "nonexistent-id"], "show");
 
     // INTENTIONAL DIFFERENCE: br returns error (exit 3), bd returns success (exit 0)
     // br's behavior is more correct - errors should have non-zero exit codes
@@ -726,11 +738,21 @@ fn conformance_text_show_not_found() {
         br_show.exit_code
     );
 
-    // Both should print error messages (br to stderr, bd to stdout)
+    // Both should print a not-found diagnostic even though legacy bd differs
+    // on exit status and output stream.
     assert!(
         br_show.stderr.contains("not found") || br_show.stderr.contains("IssueNotFound"),
         "br should print not-found error, got: {}",
         br_show.stderr
+    );
+    let bd_diagnostic = format!("{}\n{}", bd_show.stdout, bd_show.stderr).to_lowercase();
+    assert!(
+        bd_diagnostic.contains("not found")
+            || bd_diagnostic.contains("no such")
+            || bd_diagnostic.contains("not exist"),
+        "bd should print not-found error, got stdout: {}, stderr: {}",
+        bd_show.stdout,
+        bd_show.stderr
     );
 
     workspace.finish(true);
