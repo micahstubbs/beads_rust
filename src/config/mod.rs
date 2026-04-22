@@ -3711,8 +3711,7 @@ mod tests {
             .expect("seed issue prefix");
         drop(storage);
 
-        let conn =
-            Connection::open(db_path.to_string_lossy().into_owned()).expect("open setup db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open setup db");
         crate::storage::schema::execute_batch(
             &conn,
             "DROP TABLE blocked_issues_cache;
@@ -3727,8 +3726,7 @@ mod tests {
     }
 
     fn insert_duplicate_issue_prefix_config_row(db_path: &Path, value: &str) {
-        let conn =
-            Connection::open(db_path.to_string_lossy().into_owned()).expect("open setup db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open setup db");
         conn.execute(&format!(
             "INSERT INTO config (key, value) VALUES ('issue_prefix', '{}')",
             value.replace('\'', "''")
