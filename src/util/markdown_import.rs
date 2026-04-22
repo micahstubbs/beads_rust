@@ -110,6 +110,7 @@ impl Section {
 /// - The file doesn't exist
 /// - The file extension is not .md or .markdown
 /// - The path contains ".." (path traversal)
+/// - The path is a symlink or not a regular file
 /// - The file cannot be read
 pub fn parse_markdown_file(path: &Path) -> Result<Vec<ParsedIssue>> {
     // Validate file extension
@@ -142,6 +143,18 @@ pub fn parse_markdown_file(path: &Path) -> Result<Vec<ParsedIssue>> {
             "file",
             format!("file not found: {}", path.display()),
         ));
+    }
+
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|e| BeadsError::validation("file", format!("cannot inspect file: {e}")))?;
+    if metadata.file_type().is_symlink() {
+        return Err(BeadsError::validation(
+            "file",
+            "symlinked markdown imports are not allowed",
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(BeadsError::validation("file", "must be a regular file"));
     }
 
     // Read file content
@@ -656,6 +669,47 @@ This is the actual description.
     fn test_parse_markdown_file_rejects_parent_dir() {
         let err = parse_markdown_file(Path::new("../issues.md")).unwrap_err();
         assert!(matches!(err, BeadsError::Validation { field, .. } if field == "file"));
+    }
+
+    #[test]
+    fn test_parse_markdown_file_rejects_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let err = parse_markdown_file(temp.path()).unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Validation { field, reason } if field == "file" && reason.contains(".md"))
+        );
+    }
+
+    #[test]
+    fn test_parse_markdown_file_rejects_non_regular_md_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir_path = temp.path().join("issues.md");
+        fs::create_dir(&dir_path).unwrap();
+
+        let err = parse_markdown_file(&dir_path).unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Validation { field, reason } if field == "file" && reason.contains("regular file"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_markdown_file_rejects_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.md");
+        let link = temp.path().join("issues.md");
+        fs::write(&target, "## Imported\n").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let err = parse_markdown_file(&link).unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Validation { field, reason } if field == "file" && reason.contains("symlink"))
+        );
     }
 
     #[test]
