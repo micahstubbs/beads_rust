@@ -6,8 +6,13 @@
 
 use proptest::prelude::*;
 
-use beads_rust::model::{DependencyType, IssueType, Status};
-use beads_rust::util::content_hash_from_parts;
+use beads_rust::model::{DependencyType, Issue, IssueType, Priority, Status};
+use beads_rust::storage::SqliteStorage;
+use beads_rust::sync::{ExportConfig, ImportConfig, export_to_jsonl, import_from_jsonl};
+use beads_rust::util::{content_hash, content_hash_from_parts};
+use chrono::{TimeZone, Utc};
+use std::fs;
+use tempfile::TempDir;
 
 fn arb_status_name() -> impl Strategy<Value = (&'static str, Status)> {
     prop_oneof![
@@ -56,6 +61,135 @@ fn case_variants(s: &str) -> Vec<String> {
             })
             .collect(),
     ]
+}
+
+#[derive(Debug)]
+struct JsonlCaseVariant {
+    status: Status,
+    issue_type: IssueType,
+    json_status: &'static str,
+    json_issue_type: &'static str,
+}
+
+fn issue_for_jsonl_case(id: String, status: Status, issue_type: IssueType) -> Issue {
+    let created_at = Utc.with_ymd_and_hms(2026, 4, 22, 10, 49, 8).unwrap();
+    let closed_at = status.is_terminal().then_some(created_at);
+
+    Issue {
+        id,
+        title: "Mixed case JSONL sync surface".to_string(),
+        description: Some("Status and issue_type should normalize after import".to_string()),
+        status,
+        priority: Priority::MEDIUM,
+        issue_type,
+        created_at,
+        updated_at: created_at,
+        closed_at,
+        close_reason: closed_at.map(|_| "closed for case test".to_string()),
+        created_by: Some("proptest".to_string()),
+        source_repo: Some(".".to_string()),
+        ..Issue::default()
+    }
+}
+
+#[test]
+fn jsonl_import_mixed_case_status_issue_type_preserves_hash() {
+    let variants = [
+        JsonlCaseVariant {
+            status: Status::Open,
+            issue_type: IssueType::Bug,
+            json_status: "Open",
+            json_issue_type: "Bug",
+        },
+        JsonlCaseVariant {
+            status: Status::Open,
+            issue_type: IssueType::Bug,
+            json_status: "OPEN",
+            json_issue_type: "BUG",
+        },
+        JsonlCaseVariant {
+            status: Status::Open,
+            issue_type: IssueType::Bug,
+            json_status: "OpEn",
+            json_issue_type: "bUg",
+        },
+        JsonlCaseVariant {
+            status: Status::InProgress,
+            issue_type: IssueType::Feature,
+            json_status: "INPROGRESS",
+            json_issue_type: "FeAtUrE",
+        },
+        JsonlCaseVariant {
+            status: Status::Draft,
+            issue_type: IssueType::Docs,
+            json_status: "DrAfT",
+            json_issue_type: "DoCs",
+        },
+        JsonlCaseVariant {
+            status: Status::Closed,
+            issue_type: IssueType::Question,
+            json_status: "CLOSED",
+            json_issue_type: "QuEsTiOn",
+        },
+    ];
+
+    for (index, variant) in variants.into_iter().enumerate() {
+        let temp = TempDir::new().unwrap();
+        let canonical_path = temp.path().join("canonical.jsonl");
+        let mixed_path = temp.path().join("mixed.jsonl");
+        let reexport_path = temp.path().join("reexport.jsonl");
+
+        let issue = issue_for_jsonl_case(
+            format!("bd-mixedcase{index}"),
+            variant.status.clone(),
+            variant.issue_type.clone(),
+        );
+        let expected_hash = content_hash(&issue);
+
+        let mut original = SqliteStorage::open_memory().unwrap();
+        original.create_issue(&issue, "proptest").unwrap();
+        let canonical_export =
+            export_to_jsonl(&original, &canonical_path, &ExportConfig::default()).unwrap();
+
+        let canonical_text = fs::read_to_string(&canonical_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&canonical_text).unwrap();
+        value["status"] = serde_json::Value::String(variant.json_status.to_string());
+        value["issue_type"] = serde_json::Value::String(variant.json_issue_type.to_string());
+        let mixed_text = format!("{}\n", serde_json::to_string(&value).unwrap());
+        assert!(mixed_text.contains(variant.json_status));
+        assert!(mixed_text.contains(variant.json_issue_type));
+        fs::write(&mixed_path, mixed_text).unwrap();
+
+        let mut imported = SqliteStorage::open_memory().unwrap();
+        let import_result = import_from_jsonl(
+            &mut imported,
+            &mixed_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .unwrap();
+        assert_eq!(import_result.imported_count, 1);
+
+        let imported_issue = imported.get_issue(&issue.id).unwrap().unwrap();
+        assert_eq!(imported_issue.status, variant.status);
+        assert_eq!(imported_issue.issue_type, variant.issue_type);
+        assert_eq!(
+            imported_issue.content_hash.as_deref(),
+            Some(expected_hash.as_str())
+        );
+
+        let reexport =
+            export_to_jsonl(&imported, &reexport_path, &ExportConfig::default()).unwrap();
+        assert_eq!(reexport.content_hash, canonical_export.content_hash);
+        assert_eq!(
+            reexport
+                .issue_hashes
+                .iter()
+                .find(|(id, _)| id == &issue.id)
+                .map(|(_, hash)| hash.as_str()),
+            Some(expected_hash.as_str())
+        );
+    }
 }
 
 proptest! {
