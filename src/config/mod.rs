@@ -695,6 +695,9 @@ fn quarantine_truncated_wal_sidecar(db_path: &Path, beads_dir: &Path) {
     let Ok(meta) = fs::metadata(&wal_path) else {
         return;
     };
+    if !meta.is_file() {
+        return;
+    }
     if meta.len() >= 32 {
         return;
     }
@@ -3591,7 +3594,7 @@ mod tests {
     use crate::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use chrono::Utc;
-    use std::process::Command;
+    use fsqlite::Connection;
     use tempfile::TempDir;
 
     struct RelationRichFixture {
@@ -3702,53 +3705,33 @@ mod tests {
     }
 
     fn create_malformed_blocked_cache_db(db_path: &Path) {
-        let create = Command::new("sqlite3")
-            .args([
-                db_path.to_str().expect("db path utf8"),
-                "CREATE TABLE blocked_issues_cache (issue_id TEXT PRIMARY KEY, blocked_by TEXT NOT NULL, blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);",
-            ])
-            .output()
-            .expect("run sqlite3 create");
-        assert!(
-            create.status.success(),
-            "sqlite3 create failed: {}",
-            String::from_utf8_lossy(&create.stderr)
-        );
-
-        let mutate_master = Command::new("sqlite3")
-            .arg(db_path)
-            .args([
-                "-cmd",
-                ".dbconfig defensive off",
-                "-cmd",
-                "PRAGMA writable_schema=ON;",
-                "INSERT INTO sqlite_master(type,name,tbl_name,rootpage,sql) SELECT type,name,tbl_name,rootpage,sql FROM sqlite_master WHERE name='blocked_issues_cache';",
-            ])
-            .output()
-            .expect("run sqlite3 writable_schema");
-        assert!(
-            mutate_master.status.success(),
-            "sqlite3 writable_schema failed: {}",
-            String::from_utf8_lossy(&mutate_master.stderr)
-        );
+        let conn =
+            Connection::open(db_path.to_string_lossy().into_owned()).expect("open setup db");
+        crate::storage::schema::execute_batch(
+            &conn,
+            "CREATE TABLE blocked_issues_cache (
+                issue_id TEXT PRIMARY KEY,
+                blocked_by TEXT NOT NULL,
+                blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            PRAGMA writable_schema=ON;
+            INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+            SELECT type, name, tbl_name, rootpage, sql
+            FROM sqlite_master
+            WHERE name='blocked_issues_cache';
+            PRAGMA writable_schema=OFF;",
+        )
+        .expect("create duplicate blocked_issues_cache schema rows");
     }
 
     fn insert_duplicate_issue_prefix_config_row(db_path: &Path, value: &str) {
-        let insert = Command::new("sqlite3")
-            .args([
-                db_path.to_str().expect("db path utf8"),
-                &format!(
-                    "INSERT INTO config (key, value) VALUES ('issue_prefix', '{}');",
-                    value.replace('\'', "''")
-                ),
-            ])
-            .output()
-            .expect("run sqlite3 duplicate config insert");
-        assert!(
-            insert.status.success(),
-            "sqlite3 duplicate config insert failed: {}",
-            String::from_utf8_lossy(&insert.stderr)
-        );
+        let conn =
+            Connection::open(db_path.to_string_lossy().into_owned()).expect("open setup db");
+        conn.execute(&format!(
+            "INSERT INTO config (key, value) VALUES ('issue_prefix', '{}')",
+            value.replace('\'', "''")
+        ))
+        .expect("insert duplicate issue_prefix config row");
     }
 
     #[test]
