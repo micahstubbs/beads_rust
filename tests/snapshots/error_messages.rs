@@ -66,7 +66,10 @@ fn snapshot_error_invalid_label() {
         ["label", "add", &id, "bad label"],
         "label_add_bad",
     );
-    assert!(!output.status.success(), "expected label validation failure");
+    assert!(
+        !output.status.success(),
+        "expected label validation failure"
+    );
     assert_snapshot!("error_invalid_label", normalize_output(&output.stderr));
 }
 

@@ -15,7 +15,7 @@ use fastmcp_rust::{
 };
 use serde_json::json;
 
-use crate::error::{ErrorCode, StructuredError};
+use crate::error::{BeadsError, ErrorCode, StructuredError};
 use crate::model::{Issue, IssueType, Priority, Status};
 use crate::storage::{IssueUpdate, ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
 use crate::validation::LabelValidator;
@@ -148,6 +148,90 @@ fn require_valid_issue(storage: &SqliteStorage, id: &str) -> McpResult<()> {
         return Err(err);
     }
     Err(issue_not_found_err(storage, id)?)
+}
+
+fn id_lookup_failed(operation: &str, err: &BeadsError) -> McpError {
+    let structured = StructuredError::from_error(err);
+    McpError::with_data(
+        McpErrorCode::ToolExecutionError,
+        format!("Failed to check issue ID existence during {operation}: {err}"),
+        json!({
+            "error_type": "ID_LOOKUP_FAILED",
+            "operation": operation,
+            "source_error_type": structured.code.as_str(),
+            "message": structured.message,
+            "recoverable": structured.retryable,
+        }),
+    )
+}
+
+fn no_available_child_id(parent_id: &str, start: u32, limit: u32) -> McpError {
+    McpError::with_data(
+        McpErrorCode::ToolExecutionError,
+        format!("Could not find an available child ID for {parent_id}"),
+        json!({
+            "error_type": "NO_AVAILABLE_CHILD_ID",
+            "parent_id": parent_id,
+            "first_candidate_number": start,
+            "last_candidate_number": limit,
+            "recoverable": false,
+        }),
+    )
+}
+
+fn next_available_child_id<F>(parent_id: &str, start: u32, id_exists: F) -> McpResult<String>
+where
+    F: Fn(&str) -> Result<bool, BeadsError>,
+{
+    let limit = start.saturating_add(100);
+    let mut num = start;
+    loop {
+        let candidate = crate::util::id::child_id(parent_id, num);
+        if !id_exists(&candidate).map_err(|err| id_lookup_failed("child ID generation", &err))? {
+            return Ok(candidate);
+        }
+
+        if num >= limit {
+            return Err(no_available_child_id(parent_id, start, limit));
+        }
+        num = num
+            .checked_add(1)
+            .ok_or_else(|| no_available_child_id(parent_id, start, limit))?;
+    }
+}
+
+fn generate_issue_id_with_checked_lookup<F>(
+    title: &str,
+    actor: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    prefix: &str,
+    id_exists: F,
+) -> McpResult<String>
+where
+    F: Fn(&str) -> Result<bool, BeadsError>,
+{
+    let id_gen = crate::util::id::IdGenerator::new(crate::util::id::IdConfig::with_prefix(prefix));
+    let lookup_error = std::cell::RefCell::new(None);
+    let id = id_gen.generate(
+        title,
+        None,
+        Some(actor),
+        now,
+        0,
+        |candidate| match id_exists(candidate) {
+            Ok(exists) => exists,
+            Err(err) => {
+                *lookup_error.borrow_mut() = Some(err);
+                true
+            }
+        },
+    );
+
+    if let Some(err) = lookup_error.into_inner() {
+        return Err(id_lookup_failed("hash ID generation", &err));
+    }
+
+    Ok(id)
 }
 
 // ---------------------------------------------------------------------------
@@ -1275,21 +1359,15 @@ impl ToolHandler for CreateIssueTool {
 
             let id = if let Some(ref pid) = parent_id {
                 let next_num = storage.next_child_number(pid).map_err(beads_to_mcp)?;
-                let mut candidate = crate::util::id::child_id(pid, next_num);
-                // Handle rare hash/id collision safely under the transaction lock
-                let mut num = next_num + 1;
-                while storage.id_exists(&candidate).unwrap_or(false) {
-                    candidate = crate::util::id::child_id(pid, num);
-                    num += 1;
-                }
-                candidate
+                next_available_child_id(pid, next_num, |candidate| storage.id_exists(candidate))?
             } else {
-                let id_gen = crate::util::id::IdGenerator::new(
-                    crate::util::id::IdConfig::with_prefix(prefix),
-                );
-                id_gen.generate(&title, None, Some(&self.0.actor), now, 0, |candidate| {
-                    storage.id_exists(candidate).unwrap_or(false)
-                })
+                generate_issue_id_with_checked_lookup(
+                    &title,
+                    &self.0.actor,
+                    now,
+                    prefix,
+                    |candidate| storage.id_exists(candidate),
+                )?
             };
 
             let issue = Issue {
@@ -2080,12 +2158,15 @@ impl ToolHandler for ProjectOverviewTool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_list_filters, issue_not_found_err, optional_label_array_arg,
-        optional_string_array_arg, parse_update_fields, storage_read_warning,
+        build_list_filters, generate_issue_id_with_checked_lookup, issue_not_found_err,
+        next_available_child_id, optional_label_array_arg, optional_string_array_arg,
+        parse_update_fields, storage_read_warning,
     };
     use crate::error::BeadsError;
     use crate::storage::SqliteStorage;
+    use chrono::TimeZone;
     use serde_json::json;
+    use std::cell::Cell;
 
     #[test]
     fn parse_update_fields_rejects_non_string_priority() {
@@ -2165,6 +2246,101 @@ mod tests {
         assert!(
             err.to_string().contains("issues") || err.to_string().contains("no such table"),
             "unexpected MCP error: {err}"
+        );
+    }
+
+    #[test]
+    fn hash_id_generation_reports_lookup_failure_even_if_later_candidate_is_free() {
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 4, 22, 20, 55, 0)
+            .single()
+            .expect("valid timestamp");
+        let calls = Cell::new(0);
+
+        let err = generate_issue_id_with_checked_lookup(
+            "MCP lookup failure",
+            "mcp-test",
+            now,
+            "br",
+            |_| {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call == 0 {
+                    Err(BeadsError::Config("id lookup unavailable".to_string()))
+                } else {
+                    Ok(false)
+                }
+            },
+        )
+        .expect_err("any ID lookup error must be returned");
+
+        assert_eq!(err.code, fastmcp_rust::McpErrorCode::ToolExecutionError);
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|data| data.get("error_type"))
+                .and_then(serde_json::Value::as_str),
+            Some("ID_LOOKUP_FAILED")
+        );
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|data| data.get("operation"))
+                .and_then(serde_json::Value::as_str),
+            Some("hash ID generation")
+        );
+    }
+
+    #[test]
+    fn child_id_generation_reports_lookup_failure() {
+        let err = next_available_child_id("br-parent", 1, |_| {
+            Err(BeadsError::Config("child lookup unavailable".to_string()))
+        })
+        .expect_err("child ID lookup error must be returned");
+
+        assert_eq!(err.code, fastmcp_rust::McpErrorCode::ToolExecutionError);
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|data| data.get("error_type"))
+                .and_then(serde_json::Value::as_str),
+            Some("ID_LOOKUP_FAILED")
+        );
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|data| data.get("operation"))
+                .and_then(serde_json::Value::as_str),
+            Some("child ID generation")
+        );
+    }
+
+    #[test]
+    fn child_id_generation_bounds_collision_retries() {
+        let err = next_available_child_id("br-parent", 7, |_| Ok(true))
+            .expect_err("fully occupied child ID window must fail explicitly");
+
+        assert_eq!(err.code, fastmcp_rust::McpErrorCode::ToolExecutionError);
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|data| data.get("error_type"))
+                .and_then(serde_json::Value::as_str),
+            Some("NO_AVAILABLE_CHILD_ID")
+        );
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|data| data.get("first_candidate_number"))
+                .and_then(serde_json::Value::as_u64),
+            Some(7)
+        );
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|data| data.get("last_candidate_number"))
+                .and_then(serde_json::Value::as_u64),
+            Some(107)
         );
     }
 
