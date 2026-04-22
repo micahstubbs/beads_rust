@@ -345,7 +345,7 @@ self_update = ["dep:self_update"]   # Self-update from GitHub releases (rustls T
 | `BeadsError` | Unified error enum (thiserror-derived) with structured variants |
 | `ErrorCode` | Deterministic exit code mapping (e.g., `IssueNotFound` = exit 3) |
 | `StructuredError` | JSON-serializable error with code, message, context |
-| `OutputMode` | Enum: `Rich`, `Plain`, `Json`, `Quiet` — auto-detected from terminal state |
+| `OutputMode` | Enum: `Rich`, `Plain`, `Json`, `Toon`, `Quiet` — auto-detected from flags, env, and terminal state |
 
 ### Key Design Decisions
 
@@ -392,6 +392,7 @@ br supports multiple output modes for different use cases:
 | **Rich** | TTY with colors | Colored panels, tables, styled text |
 | **Plain** | `NO_COLOR` env or `--no-color` | Text output without ANSI codes |
 | **JSON** | `--json` or `--robot` | Machine-readable structured output |
+| **Toon** | `--format toon`, `BR_OUTPUT_FORMAT=toon`, or `TOON_DEFAULT_FORMAT=toon` | Token-efficient structured output |
 | **Quiet** | `--quiet` or `-q` | Minimal output |
 
 ### Mode Detection
@@ -400,9 +401,13 @@ The output mode is automatically detected:
 
 1. `--json` or `--robot` flags → **JSON mode**
 2. `--quiet` flag → **Quiet mode**
-3. `NO_COLOR` env var or `--no-color` → **Plain mode**
-4. Non-TTY stdout (piped output) → **Plain mode**
-5. Otherwise → **Rich mode** (default for interactive terminals)
+3. `BR_OUTPUT_FORMAT` env var or `TOON_DEFAULT_FORMAT` fallback env var can force **JSON** or **Toon** mode
+4. `NO_COLOR` env var or `--no-color` → **Plain mode**
+5. Non-TTY stdout (piped output) → **Plain mode**
+6. Otherwise → **Rich mode** (default for interactive terminals)
+
+See [docs/AGENT_INTEGRATION.md](docs/AGENT_INTEGRATION.md) for agent-oriented
+format defaults and `TOON_DEFAULT_FORMAT` examples.
 
 ### For Coding Agents
 
