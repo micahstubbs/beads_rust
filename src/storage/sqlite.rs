@@ -2616,10 +2616,19 @@ impl SqliteStorage {
             sql.push_str(" ORDER BY priority ASC, created_at DESC");
         }
 
-        if let Some(limit) = filters.limit
-            && limit > 0
-        {
-            let _ = write!(sql, " LIMIT {limit}");
+        match (filters.limit, filters.offset) {
+            (Some(limit), offset) if limit > 0 => {
+                let _ = write!(sql, " LIMIT {limit}");
+                if let Some(offset) = offset
+                    && offset > 0
+                {
+                    let _ = write!(sql, " OFFSET {offset}");
+                }
+            }
+            (_, Some(offset)) if offset > 0 => {
+                let _ = write!(sql, " LIMIT -1 OFFSET {offset}");
+            }
+            _ => {}
         }
 
         let rows = self.conn.query_with_params(&sql, &params)?;
@@ -11172,6 +11181,59 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id, "bd-s-sort-b");
+    }
+
+    #[test]
+    fn test_search_issues_applies_offset() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 9, 1, 0, 0, 0).unwrap();
+
+        for (idx, id) in ["bd-s-page-a", "bd-s-page-b", "bd-s-page-c"]
+            .into_iter()
+            .enumerate()
+        {
+            let issue = make_issue(
+                id,
+                &format!("authentication page {idx}"),
+                Status::Open,
+                i32::try_from(idx + 1).unwrap(),
+                None,
+                t1 + chrono::Duration::minutes(i64::try_from(idx).unwrap()),
+                None,
+            );
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        let results = storage
+            .search_issues(
+                "authentication",
+                &ListFilters {
+                    limit: Some(1),
+                    offset: Some(1),
+                    ..ListFilters::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "bd-s-page-b");
+
+        let all_after_offset = storage
+            .search_issues(
+                "authentication",
+                &ListFilters {
+                    limit: Some(0),
+                    offset: Some(2),
+                    ..ListFilters::default()
+                },
+            )
+            .unwrap();
+
+        let ids: Vec<_> = all_after_offset
+            .iter()
+            .map(|issue| issue.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["bd-s-page-c"]);
     }
 
     #[test]
