@@ -137,7 +137,11 @@ fn execute_routed(
             crate::cli::OutputFormat::Toon => {
                 structured_ctx.toon_with_stats(&details_list, args.stats);
             }
-            crate::cli::OutputFormat::Text | crate::cli::OutputFormat::Csv => unreachable!(),
+            other => {
+                return Err(crate::error::BeadsError::Config(format!(
+                    "routed show: format '{other:?}' should be handled by the text rendering path"
+                )));
+            }
         }
         return Ok(());
     }
@@ -1268,5 +1272,26 @@ mod tests {
         info!(
             "test_reorder_details_by_requested_inputs_restores_mixed_route_order: assertions passed"
         );
+    }
+
+    #[test]
+    fn routed_structured_output_guard_excludes_text_and_csv() {
+        use crate::cli::OutputFormat;
+
+        let structured_formats = [OutputFormat::Json, OutputFormat::Toon];
+        let text_formats = [OutputFormat::Text, OutputFormat::Csv];
+
+        for fmt in &structured_formats {
+            assert!(
+                matches!(fmt, OutputFormat::Json | OutputFormat::Toon),
+                "{fmt:?} should pass the structured-output guard"
+            );
+        }
+        for fmt in &text_formats {
+            assert!(
+                !matches!(fmt, OutputFormat::Json | OutputFormat::Toon),
+                "{fmt:?} should NOT pass the structured-output guard"
+            );
+        }
     }
 }
