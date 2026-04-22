@@ -41,6 +41,7 @@
 //! - `SYNC_SAFETY_INVARIANTS.md`: PC-1, PC-2, PC-3, PC-4, NG-5, NG-6, NGI-1, NGI-3
 
 use crate::error::{BeadsError, Result};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
@@ -745,6 +746,34 @@ pub fn validate_temp_file_path(
     validate_sync_path_with_external(temp_path, beads_dir, allow_external)
 }
 
+/// Validate metadata on an already-opened file descriptor.
+///
+/// Pre-open path checks (`validate_sync_path`) race against the filesystem:
+/// between validation and `File::open` a same-user attacker could swap the
+/// path to a symlink, device, or FIFO. This function closes that TOCTOU gap
+/// by inspecting the fd-level metadata (`fstat`) of the already-opened file.
+///
+/// # Errors
+///
+/// Returns `BeadsError::Config` if the opened file is not a regular file.
+pub fn validate_jsonl_fd_metadata(file: &File, path: &Path) -> Result<()> {
+    let metadata = file.metadata().map_err(|err| {
+        BeadsError::Config(format!(
+            "Failed to read metadata on opened JSONL fd for {}: {err}",
+            path.display()
+        ))
+    })?;
+
+    if !metadata.is_file() {
+        return Err(BeadsError::Config(format!(
+            "Opened fd for {} is not a regular file (possible TOCTOU swap after path validation)",
+            path.display()
+        )));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1294,6 +1323,34 @@ mod tests {
         assert!(
             result.is_err(),
             "Existing symlink temp paths should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_validate_jsonl_fd_metadata_accepts_regular_file() {
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let path = beads_dir.join("issues.jsonl");
+        std::fs::write(&path, "{}\n").expect("write");
+
+        let file = File::open(&path).expect("open");
+        assert!(
+            validate_jsonl_fd_metadata(&file, &path).is_ok(),
+            "regular file fd should pass metadata validation"
+        );
+    }
+
+    #[test]
+    fn test_validate_jsonl_fd_metadata_rejects_directory_fd() {
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let dir_path = beads_dir.join("subdir");
+        std::fs::create_dir(&dir_path).expect("create dir");
+
+        let file = File::open(&dir_path).expect("open directory");
+        let result = validate_jsonl_fd_metadata(&file, &dir_path);
+        assert!(result.is_err(), "directory fd should fail metadata validation");
+        assert!(
+            result.unwrap_err().to_string().contains("not a regular file"),
+            "error should mention regular file"
         );
     }
 }

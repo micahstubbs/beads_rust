@@ -1302,6 +1302,7 @@ const CONFLICT_END: &str = ">>>>>>>";
 /// Returns an error if the file cannot be read.
 pub fn scan_conflict_markers(path: &Path) -> Result<Vec<ConflictMarker>> {
     let file = File::open(path)?;
+    path::validate_jsonl_fd_metadata(&file, path)?;
     let reader = BufReader::with_capacity(2 * 1024 * 1024, file);
     let mut markers = Vec::new();
 
@@ -1382,6 +1383,7 @@ pub fn analyze_jsonl(path: &Path) -> Result<(usize, HashSet<String>)> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, HashSet::new())),
         Err(e) => return Err(BeadsError::Io(e)),
     };
+    path::validate_jsonl_fd_metadata(&file, path)?;
 
     let mut reader = BufReader::new(file);
     let mut count = 0;
@@ -2811,6 +2813,7 @@ pub fn auto_flush(
 /// Returns an error if the file cannot be read or contains invalid JSON.
 pub fn read_issues_from_jsonl(path: &Path) -> Result<Vec<Issue>> {
     let file = File::open(path)?;
+    path::validate_jsonl_fd_metadata(&file, path)?;
     let file_size = file.metadata().map_or(0, |m| m.len());
     let estimated_count = (file_size / 500) as usize;
     let mut reader = BufReader::new(file);
@@ -3121,6 +3124,7 @@ fn for_each_jsonl_import_issue(
     mut handle_issue: impl FnMut(usize, Issue) -> Result<()>,
 ) -> Result<()> {
     let file = File::open(input_path)?;
+    path::validate_jsonl_fd_metadata(&file, input_path)?;
     let mut reader = BufReader::with_capacity(2 * 1024 * 1024, file);
     let mut line = String::new();
     let mut line_num = 0usize;
@@ -3709,6 +3713,7 @@ fn sync_issue_relations(storage: &SqliteStorage, issue: &Issue) -> Result<()> {
 pub fn compute_jsonl_hash(path: &Path) -> Result<String> {
     use std::io::BufRead;
     let file = std::fs::File::open(path)?;
+    self::path::validate_jsonl_fd_metadata(&file, path)?;
     let mut reader = std::io::BufReader::new(file);
     let mut hasher = Sha256::new();
     let mut line_buf = Vec::with_capacity(4096);
