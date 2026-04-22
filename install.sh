@@ -159,6 +159,8 @@ try_install_gum() {
     [[ -z "${CI:-}" ]] || return 1
     [[ -t 1 ]] || return 1
 
+    printf >&2 '%s\n' "Note: installing 'gum' (charmbracelet/gum) for styled output. Pass --no-gum to skip."
+
     # Inline OS detection
     local os="unknown"
     case "$(uname -s)" in
