@@ -231,7 +231,11 @@ mod tests {
         let tracker = ProgressTracker::new_spinner("Loading...");
         assert_eq!(tracker.bar().length(), None);
         assert_eq!(tracker.is_showing(), should_show_progress());
-        let expected_initial_message = if tracker.is_showing() { "Loading..." } else { "" };
+        let expected_initial_message = if tracker.is_showing() {
+            "Loading..."
+        } else {
+            ""
+        };
         assert_eq!(tracker.bar().message(), expected_initial_message);
 
         tracker.set_message("Still loading...");
