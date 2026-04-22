@@ -720,6 +720,42 @@ fn issues_filter_columns_require_v3_rebuild(conn: &Connection) -> bool {
     false
 }
 
+fn foreign_keys_enabled(conn: &Connection) -> Result<bool> {
+    let row = conn.query_row("PRAGMA foreign_keys")?;
+    Ok(row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0) == 1)
+}
+
+fn restore_foreign_keys(conn: &Connection, operation: &str) -> Result<()> {
+    conn.execute("PRAGMA foreign_keys = ON")
+        .map_err(BeadsError::Database)?;
+
+    if foreign_keys_enabled(conn)? {
+        return Ok(());
+    }
+
+    Err(BeadsError::Config(format!(
+        "failed to re-enable SQLite foreign key enforcement after {operation}: PRAGMA foreign_keys remained OFF"
+    )))
+}
+
+fn finish_foreign_key_suppressed_result<T>(
+    conn: &Connection,
+    operation: &str,
+    result: Result<T>,
+) -> Result<T> {
+    match (result, restore_foreign_keys(conn, operation)) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(restore_error)) => Err(restore_error),
+        (Err(original_error), Ok(())) => Err(original_error),
+        (Err(original_error), Err(restore_error)) => Err(BeadsError::WithContext {
+            context: format!(
+                "{operation} failed, and SQLite foreign key enforcement could not be re-enabled: {restore_error}"
+            ),
+            source: Box::new(original_error),
+        }),
+    }
+}
+
 /// Rebuild the issues table so columns match the canonical SCHEMA_SQL order.
 ///
 /// This fixes databases where ALTER TABLE ADD COLUMN appended columns in a
@@ -747,22 +783,25 @@ fn rebuild_issues_table(conn: &Connection) -> Result<()> {
     // This property is connection-scoped.
     conn.execute("PRAGMA foreign_keys = OFF")?;
 
-    // Wrap the entire rebuild in a transaction so a crash between DROP TABLE
-    // and RENAME cannot lose data.
-    conn.execute("BEGIN EXCLUSIVE")?;
+    let result = (|| -> Result<()> {
+        // Wrap the entire rebuild in a transaction so a crash between DROP TABLE
+        // and RENAME cannot lose data.
+        conn.execute("BEGIN EXCLUSIVE")?;
 
-    if let Err(e) = rebuild_issues_table_inner(conn, &existing_columns) {
-        let _ = conn.execute("ROLLBACK");
-        let _ = conn.execute("PRAGMA foreign_keys = ON");
-        return Err(e);
-    }
+        if let Err(e) = rebuild_issues_table_inner(conn, &existing_columns) {
+            let _ = conn.execute("ROLLBACK");
+            return Err(e);
+        }
 
-    conn.execute("COMMIT")?;
+        if let Err(e) = conn.execute("COMMIT") {
+            let _ = conn.execute("ROLLBACK");
+            return Err(e.into());
+        }
 
-    // Restore foreign key enforcement
-    conn.execute("PRAGMA foreign_keys = ON")?;
+        Ok(())
+    })();
 
-    Ok(())
+    finish_foreign_key_suppressed_result(conn, "issues table rebuild", result)
 }
 
 /// Inner helper for [`rebuild_issues_table`] that performs the actual work
@@ -1898,6 +1937,32 @@ mod tests {
             !table_exists(&conn, "issues_rebuild_tmp"),
             "failed rebuild should roll back the temporary table"
         );
+    }
+
+    #[test]
+    fn test_rebuild_issues_table_restores_foreign_keys_when_begin_fails() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("locked-rebuild.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute("PRAGMA busy_timeout=0").unwrap();
+        apply_schema(&conn).unwrap();
+
+        let lock_conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        lock_conn.execute("PRAGMA busy_timeout=0").unwrap();
+        lock_conn.execute("BEGIN IMMEDIATE").unwrap();
+
+        assert!(foreign_keys_enabled(&conn).unwrap());
+        let err = rebuild_issues_table(&conn).expect_err("exclusive rebuild should hit busy lock");
+        assert!(
+            err.to_string().contains("busy") || err.to_string().contains("lock"),
+            "expected lock contention error, got {err}"
+        );
+        assert!(
+            foreign_keys_enabled(&conn).unwrap(),
+            "failed rebuild must restore foreign key enforcement"
+        );
+
+        lock_conn.execute("ROLLBACK").unwrap();
     }
 
     /// Migration: add missing dependency type column for older schemas.
