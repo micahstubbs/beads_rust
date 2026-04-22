@@ -306,7 +306,22 @@ mod tests {
         assert_eq!(hex_encode(&[0x0a]), "0a");
         assert_eq!(hex_encode(&[0xff]), "ff");
         assert_eq!(hex_encode(&[0x80]), "80");
+        assert_eq!(hex_encode(&[0x7f]), "7f");
         assert_eq!(hex_encode(&[0x01]), "01");
+    }
+
+    #[test]
+    fn test_hex_encode_length_invariant() {
+        for len in [0, 1, 2, 16, 32, 64, 128, 255] {
+            let bytes: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let hex = hex_encode(&bytes);
+            assert_eq!(
+                hex.len(),
+                bytes.len() * 2,
+                "hex_encode output length should be 2*input for {} bytes",
+                len
+            );
+        }
     }
 
     #[test]

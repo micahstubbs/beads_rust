@@ -292,3 +292,32 @@ fn hash_changes_with_issue_type() {
 
     info!("proptest_hash_type: PASS - different types produce different hashes");
 }
+
+mod hex_encode_fuzz {
+    use beads_rust::util::hex_encode;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn hex_encode_roundtrip(bytes in proptest::collection::vec(any::<u8>(), 0..=256)) {
+            let hex = hex_encode(&bytes);
+
+            prop_assert_eq!(
+                hex.len(), bytes.len() * 2,
+                "output length must be exactly 2 * input length for {} bytes",
+                bytes.len()
+            );
+            prop_assert!(
+                hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "output must be lowercase hex: {hex}"
+            );
+
+            let decoded: Vec<u8> = (0..bytes.len())
+                .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap())
+                .collect();
+            prop_assert_eq!(&decoded, &bytes, "roundtrip decode must match original bytes");
+        }
+    }
+}
