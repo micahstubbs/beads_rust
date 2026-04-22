@@ -545,7 +545,9 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
                     | beads_rust::cli::HistoryCommands::Prune { .. }
             )
         ),
-        Commands::Doctor(args) => args.repair,
+        // Plain `br doctor` inspects a live SQLite DB family via snapshot copy
+        // and a rollback write probe, so it must serialize with writers too.
+        Commands::Doctor(_) => true,
         _ => false,
     }
 }
@@ -851,6 +853,18 @@ mod tests {
         assert!(needs_write_lock(&merge));
         assert!(needs_write_lock(&import_only));
         assert!(needs_write_lock(&default_sync));
+    }
+
+    #[test]
+    fn doctor_requires_write_lock_before_live_inspection() {
+        let inspect = Cli::parse_from(["br", "doctor"]).command;
+        let repair = Cli::parse_from(["br", "doctor", "--repair"]).command;
+
+        assert!(
+            needs_write_lock(&inspect),
+            "`br doctor` copies/probes the live DB family and must serialize via .write.lock"
+        );
+        assert!(needs_write_lock(&repair));
     }
 
     #[test]
