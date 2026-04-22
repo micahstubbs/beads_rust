@@ -247,11 +247,13 @@ impl SqliteStorage {
         // the write lock under parallel agent operations.
         const MAX_RETRIES: u32 = 8;
         let base_backoff_ms: u64 = 50;
+        let mut last_error: Option<crate::error::BeadsError> = None;
 
         for attempt in 0..MAX_RETRIES {
             match conn.execute("BEGIN IMMEDIATE") {
                 Ok(_) => {}
                 Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
+                    last_error = Some(e.into());
                     let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
                     std::thread::sleep(Duration::from_millis(backoff));
                     continue;
@@ -269,6 +271,7 @@ impl SqliteStorage {
                                 "ROLLBACK failed after transient COMMIT error"
                             );
                         }
+                        last_error = Some(e.into());
                         let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
                         std::thread::sleep(Duration::from_millis(backoff));
                     }
@@ -284,6 +287,7 @@ impl SqliteStorage {
                         tracing::warn!(error = %rb_err, "ROLLBACK failed after transaction error");
                     }
                     if e.is_transient() && attempt < MAX_RETRIES - 1 {
+                        last_error = Some(e);
                         let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
                         std::thread::sleep(Duration::from_millis(backoff));
                     } else {
@@ -293,7 +297,12 @@ impl SqliteStorage {
             }
         }
 
-        unreachable!("Retry loop exited without returning")
+        Err(last_error.unwrap_or_else(|| {
+            crate::error::BeadsError::Config(
+                "connection write transaction retry loop exhausted without producing an error"
+                    .into(),
+            )
+        }))
     }
 
     fn metadata_key_exists(conn: &Connection, key: &str) -> Result<bool> {
@@ -12276,6 +12285,24 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("test error"),
+            "should propagate body error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn connection_write_transaction_propagates_body_error() {
+        let dir = TempDir::new().unwrap();
+        let storage = SqliteStorage::open(dir.path().join("test.db")).unwrap();
+        let result: Result<()> =
+            SqliteStorage::with_connection_write_transaction(&storage.conn, |_| {
+                Err(crate::error::BeadsError::Config(
+                    "conn test error".into(),
+                ))
+            });
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("conn test error"),
             "should propagate body error, got: {err_msg}"
         );
     }
