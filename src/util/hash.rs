@@ -349,6 +349,31 @@ mod tests {
     }
 
     #[test]
+    fn test_hex_encode_all_zeros_32_bytes() {
+        let bytes = [0u8; 32];
+        let hex = hex_encode(&bytes);
+        assert_eq!(hex.len(), 64);
+        assert_eq!(hex, "0".repeat(64));
+    }
+
+    #[test]
+    fn test_hex_encode_all_ff_32_bytes() {
+        let bytes = [0xffu8; 32];
+        let hex = hex_encode(&bytes);
+        assert_eq!(hex.len(), 64);
+        assert_eq!(hex, "f".repeat(64));
+    }
+
+    #[test]
+    fn test_hex_encode_all_256_byte_values() {
+        let bytes: Vec<u8> = (0..=255).collect();
+        let hex = hex_encode(&bytes);
+        assert_eq!(hex.len(), 512);
+        let reference: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, reference);
+    }
+
+    #[test]
     fn test_hex_encode_matches_sha256_digest() {
         let mut hasher = Sha256::new();
         hasher.update(b"hello world");
