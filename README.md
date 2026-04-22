@@ -24,6 +24,8 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_rust/main/
 ```
 
 <p><em>Works on Linux, macOS, and Windows (WSL). Auto-detects your platform and downloads the right binary.</em></p>
+
+<p><em>Useful install flags: <code>--skip-skills</code> to skip all Claude Code / Codex skills, or <code>--no-migration-skill</code> to skip just the bd-to-br-migration skill (handy for clean agent sandboxes where you're only using <code>br</code>).</em></p>
 </div>
 
 ---

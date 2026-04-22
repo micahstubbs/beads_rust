@@ -17,7 +17,8 @@
 #   --from-source      Build from source instead of downloading binary
 #   --quiet            Suppress non-error output
 #   --no-gum           Disable gum formatting even if available
-#   --skip-skills      Don't install Claude Code / Codex skills
+#   --skip-skills      Don't install any Claude Code / Codex skills
+#   --no-migration-skill  Skip the bd-to-br-migration skill only (keeps other skills)
 #   --uninstall        Remove br and clean up
 #   --help             Show this help
 #
@@ -123,6 +124,12 @@ LOCK_FILE="/tmp/br-install.lock"
 SYSTEM=0
 NO_GUM=0
 SKIP_SKILLS=0
+# Per-skill opt-outs. Each entry is a skill name matching the first half of
+# entries in the `skills` array in install_skills(). When set to 1, that
+# specific skill is skipped. --no-migration-skill toggles this for
+# bd-to-br-migration (see #261 — letting users keep `br` in clean agent
+# sandboxes without pulling in the migration skill).
+NO_MIGRATION_SKILL=0
 MAX_RETRIES=3
 DOWNLOAD_TIMEOUT=120
 INSTALLER_VERSION="2.0.0"
@@ -396,7 +403,8 @@ usage() {
         gum style --faint "    --verify           Run self-test after install"
         gum style --faint "    --quiet            Suppress progress messages"
         gum style --faint "    --no-gum           Disable gum formatting"
-        gum style --faint "    --skip-skills      Don't install Claude/Codex skills"
+        gum style --faint "    --skip-skills      Don't install any Claude/Codex skills"
+        gum style --faint "    --no-migration-skill  Skip the bd-to-br-migration skill only"
         echo ""
         gum style --foreground 39 "  Maintenance"
         gum style --faint "    --uninstall        Remove br and clean up"
@@ -454,7 +462,8 @@ Options:
   --from-source      Build from source instead of downloading binary
   --quiet            Suppress non-error output
   --no-gum           Disable gum formatting even if available
-  --skip-skills      Don't install Claude Code / Codex skills
+  --skip-skills      Don't install any Claude Code / Codex skills
+  --no-migration-skill  Skip the bd-to-br-migration skill only
   --uninstall        Remove br and clean up
 
 Environment Variables:
@@ -506,6 +515,7 @@ while [ $# -gt 0 ]; do
         --quiet|-q) QUIET=1; shift;;
         --no-gum) NO_GUM=1; shift;;
         --skip-skills) SKIP_SKILLS=1; shift;;
+        --no-migration-skill) NO_MIGRATION_SKILL=1; shift;;
         --uninstall) UNINSTALL=1; shift;;
         -h|--help) usage;;
         *) shift;;
@@ -771,6 +781,16 @@ install_skills() {
     for skill in "${skills[@]}"; do
         local skill_name="${skill%%:*}"
         local files_str="${skill#*:}"
+
+        # Per-skill opt-outs: map skill_name to its flag var.
+        case "$skill_name" in
+            bd-to-br-migration)
+                if [ "$NO_MIGRATION_SKILL" -eq 1 ]; then
+                    log_step "Skipping skill: $skill_name (--no-migration-skill)"
+                    continue
+                fi
+                ;;
+        esac
 
         log_step "Installing skill: $skill_name"
 
