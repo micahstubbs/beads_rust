@@ -890,28 +890,28 @@ fn detect_priority_intent(input: &str) -> Option<&'static str> {
 
     // Already valid
     if ["0", "1", "2", "3", "4"].contains(&lower.as_str()) {
-        return Some(match lower.as_str() {
-            "0" => "0",
-            "1" => "1",
-            "2" => "2",
-            "3" => "3",
-            "4" => "4",
-            _ => unreachable!(),
-        });
+        return match lower.as_str() {
+            "0" => Some("0"),
+            "1" => Some("1"),
+            "2" => Some("2"),
+            "3" => Some("3"),
+            "4" => Some("4"),
+            _ => None,
+        };
     }
 
     // P0-P4 format
     if lower.starts_with('p') && lower.len() == 2 {
         let digit = lower.chars().nth(1)?;
         if digit.is_ascii_digit() && digit <= '4' {
-            return Some(match digit {
-                '0' => "0",
-                '1' => "1",
-                '2' => "2",
-                '3' => "3",
-                '4' => "4",
-                _ => unreachable!(),
-            });
+            return match digit {
+                '0' => Some("0"),
+                '1' => Some("1"),
+                '2' => Some("2"),
+                '3' => Some("3"),
+                '4' => Some("4"),
+                _ => None,
+            };
         }
     }
 
@@ -1084,6 +1084,44 @@ mod tests {
         assert_eq!(detect_priority_intent("p3"), Some("3"));
         assert_eq!(detect_priority_intent("2"), Some("2"));
         assert_eq!(detect_priority_intent("xyz"), None);
+    }
+
+    #[test]
+    fn test_detect_priority_intent_all_digits() {
+        for (digit, expected) in [("0", "0"), ("1", "1"), ("2", "2"), ("3", "3"), ("4", "4")] {
+            assert_eq!(detect_priority_intent(digit), Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_detect_priority_intent_all_p_prefixed() {
+        for (input, expected) in [
+            ("p0", "0"),
+            ("P0", "0"),
+            ("p1", "1"),
+            ("P1", "1"),
+            ("p2", "2"),
+            ("P2", "2"),
+            ("p3", "3"),
+            ("P3", "3"),
+            ("p4", "4"),
+            ("P4", "4"),
+        ] {
+            assert_eq!(detect_priority_intent(input), Some(expected), "input: {input}");
+        }
+    }
+
+    #[test]
+    fn test_detect_priority_intent_rejects_malformed() {
+        assert_eq!(detect_priority_intent("p5"), None);
+        assert_eq!(detect_priority_intent("P5"), None);
+        assert_eq!(detect_priority_intent("px"), None);
+        assert_eq!(detect_priority_intent("p10"), None);
+        assert_eq!(detect_priority_intent("5"), None);
+        assert_eq!(detect_priority_intent("9"), None);
+        assert_eq!(detect_priority_intent(""), None);
+        assert_eq!(detect_priority_intent("p"), None);
+        assert_eq!(detect_priority_intent("P"), None);
     }
 
     #[test]
