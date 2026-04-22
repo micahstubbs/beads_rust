@@ -20,10 +20,10 @@ use crate::error::{BeadsError, Result};
 use crate::model::{Comment, Dependency, Issue};
 use crate::storage::SqliteStorage;
 use crate::sync::history::HistoryConfig;
-use crate::util::id::parse_id;
+use crate::util::id::{IdConfig, IdGenerator, parse_id};
 use crate::util::progress::{create_progress_bar, create_spinner};
 use crate::validation::IssueValidator;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use fsqlite_types::SqliteValue;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_WRITE_LOCK_TIMEOUT_MS: u64 = 30_000;
 const WRITE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const IMPORT_EXPORT_HASH_BATCH_SIZE: usize = 512;
 
 /// Acquire a blocking exclusive lock on `.beads/.write.lock`.
 ///
@@ -3110,6 +3111,427 @@ fn normalize_issue(issue: &mut Issue) {
     }
 }
 
+#[derive(Debug)]
+struct PrefixRenameSeed {
+    old_id: String,
+    title: String,
+    description: Option<String>,
+    created_by: Option<String>,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Default)]
+struct ImportValidationPlan {
+    record_count: usize,
+    prefix_mismatches: Vec<PrefixRenameSeed>,
+    occupied_ids: HashSet<String>,
+}
+
+struct ImportMetadataMaps {
+    meta_by_id: HashMap<String, crate::storage::sqlite::IssueMetadata>,
+    id_by_ext_ref: HashMap<String, String>,
+    id_by_hash: HashMap<String, String>,
+}
+
+fn parse_normalized_import_issue(trimmed: &str, line_num: usize) -> Result<Issue> {
+    let mut issue: Issue = serde_json::from_str(trimmed)
+        .map_err(|e| BeadsError::Config(format!("Invalid JSON at line {line_num}: {e}")))?;
+
+    normalize_issue(&mut issue);
+
+    if let Err(errors) = IssueValidator::validate(&issue) {
+        let details = errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(BeadsError::Config(format!(
+            "Validation failed for issue {} at line {}: {}",
+            issue.id, line_num, details
+        )));
+    }
+
+    Ok(issue)
+}
+
+fn for_each_jsonl_import_issue(
+    input_path: &Path,
+    mut handle_issue: impl FnMut(usize, Issue) -> Result<()>,
+) -> Result<()> {
+    let file = File::open(input_path)?;
+    let mut reader = BufReader::with_capacity(2 * 1024 * 1024, file);
+    let mut line = String::new();
+    let mut line_num = 0usize;
+
+    while reader.read_line(&mut line)? > 0 {
+        line_num += 1;
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            let issue = parse_normalized_import_issue(trimmed, line_num)?;
+            handle_issue(line_num, issue)?;
+        }
+        line.clear();
+    }
+
+    Ok(())
+}
+
+fn collect_import_validation_plan(
+    input_path: &Path,
+    config: &ImportConfig,
+    expected_prefix: Option<&str>,
+) -> Result<ImportValidationPlan> {
+    let mut plan = ImportValidationPlan::default();
+    let mut seen_ids = HashSet::new();
+
+    for_each_jsonl_import_issue(input_path, |line_num, issue| {
+        let prefix_mismatch = !config.skip_prefix_validation
+            && expected_prefix.is_some_and(|prefix| {
+                !id_matches_expected_prefix(&issue.id, prefix)
+                    && issue.status != crate::model::Status::Tombstone
+            });
+
+        if prefix_mismatch && !config.rename_on_import {
+            return Err(BeadsError::Config(format!(
+                "Prefix mismatch at line {}: expected '{}', found issue '{}'",
+                line_num,
+                expected_prefix.unwrap_or_default(),
+                issue.id
+            )));
+        }
+
+        if !seen_ids.insert(issue.id.clone()) {
+            return Err(BeadsError::Config(format!(
+                "Duplicate issue id '{}' in {} at line {}",
+                issue.id,
+                input_path.display(),
+                line_num
+            )));
+        }
+
+        if prefix_mismatch {
+            plan.prefix_mismatches.push(PrefixRenameSeed {
+                old_id: issue.id,
+                title: issue.title,
+                description: issue.description,
+                created_by: issue.created_by,
+                created_at: issue.created_at,
+            });
+        } else {
+            plan.occupied_ids.insert(issue.id);
+        }
+        plan.record_count += 1;
+
+        Ok(())
+    })?;
+
+    Ok(plan)
+}
+
+fn build_prefix_renames(
+    storage: &SqliteStorage,
+    plan: &ImportValidationPlan,
+    expected_prefix: Option<&str>,
+) -> Result<HashMap<String, String>> {
+    if plan.prefix_mismatches.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let Some(prefix) = expected_prefix else {
+        return Ok(HashMap::new());
+    };
+
+    let generator = IdGenerator::new(IdConfig::with_prefix(prefix));
+    let mut occupied_ids = plan.occupied_ids.clone();
+    occupied_ids.extend(storage.get_all_ids()?);
+
+    let mut generated_ids = HashSet::new();
+    let mut renames = HashMap::with_capacity(plan.prefix_mismatches.len());
+
+    for seed in &plan.prefix_mismatches {
+        let new_id = generator.generate(
+            &seed.title,
+            seed.description.as_deref(),
+            seed.created_by.as_deref(),
+            seed.created_at,
+            plan.record_count,
+            |candidate| occupied_ids.contains(candidate) || generated_ids.contains(candidate),
+        );
+        generated_ids.insert(new_id.clone());
+        renames.insert(seed.old_id.clone(), new_id);
+    }
+
+    Ok(renames)
+}
+
+fn apply_prefix_renames(issue: &mut Issue, renames: &HashMap<String, String>) {
+    use crate::util::content_hash;
+
+    if let Some(new_id) = renames.get(&issue.id) {
+        if issue.external_ref.is_none() {
+            issue.external_ref = Some(issue.id.clone());
+        }
+        issue.id.clone_from(new_id);
+        issue.content_hash = Some(content_hash(issue));
+    }
+
+    for dep in &mut issue.dependencies {
+        if let Some(new_target) = renames.get(&dep.depends_on_id) {
+            dep.depends_on_id.clone_from(new_target);
+        }
+        if let Some(new_source) = renames.get(&dep.issue_id) {
+            dep.issue_id.clone_from(new_source);
+        }
+    }
+
+    for comment in &mut issue.comments {
+        if let Some(new_source) = renames.get(&comment.issue_id) {
+            comment.issue_id.clone_from(new_source);
+        }
+    }
+}
+
+fn load_import_metadata_maps(storage: &SqliteStorage) -> Result<ImportMetadataMaps> {
+    let all_meta = storage.get_all_issues_metadata()?;
+    let meta_len = all_meta.len();
+    let mut meta_by_id = HashMap::with_capacity(meta_len);
+    let mut id_by_ext_ref = HashMap::with_capacity(meta_len);
+    let mut id_by_hash = HashMap::with_capacity(meta_len);
+
+    for metadata in all_meta {
+        let issue_id = metadata.id.clone();
+        if let Some(ext) = metadata.external_ref.as_ref() {
+            id_by_ext_ref
+                .entry(ext.clone())
+                .or_insert_with(|| issue_id.clone());
+        }
+        if let Some(hash) = metadata.content_hash.as_ref() {
+            // Preserve the first matching issue to mirror the old query_row
+            // collision path when multiple issues share the same content hash.
+            id_by_hash
+                .entry(hash.clone())
+                .or_insert_with(|| issue_id.clone());
+        }
+        meta_by_id.insert(issue_id, metadata);
+    }
+
+    Ok(ImportMetadataMaps {
+        meta_by_id,
+        id_by_ext_ref,
+        id_by_hash,
+    })
+}
+
+fn handle_duplicate_external_ref(
+    issue: &mut Issue,
+    seen_external_refs: &mut HashSet<String>,
+    config: &ImportConfig,
+) -> Result<()> {
+    let Some(ext_ref) = issue.external_ref.clone() else {
+        return Ok(());
+    };
+
+    if seen_external_refs.contains(&ext_ref) {
+        if config.clear_duplicate_external_refs {
+            issue.external_ref = None;
+            issue.content_hash = Some(crate::util::content_hash(issue));
+            Ok(())
+        } else {
+            Err(BeadsError::Config(format!(
+                "Duplicate external_ref: {ext_ref}"
+            )))
+        }
+    } else {
+        seen_external_refs.insert(ext_ref);
+        Ok(())
+    }
+}
+
+fn scan_import_collision_renames(
+    input_path: &Path,
+    config: &ImportConfig,
+    prefix_renames: &HashMap<String, String>,
+    metadata: &ImportMetadataMaps,
+    result: &mut ImportResult,
+    record_count: usize,
+) -> Result<HashMap<String, String>> {
+    let mut seen_external_refs = HashSet::new();
+    let mut renames = HashMap::new();
+    let progress =
+        create_progress_bar(record_count as u64, "Scanning issues", config.show_progress);
+
+    for_each_jsonl_import_issue(input_path, |_line_num, mut issue| {
+        apply_prefix_renames(&mut issue, prefix_renames);
+
+        if issue.ephemeral {
+            result.skipped_count += 1;
+            progress.inc(1);
+            return Ok(());
+        }
+
+        handle_duplicate_external_ref(&mut issue, &mut seen_external_refs, config)?;
+
+        let computed_hash = crate::util::content_hash(&issue);
+        let collision = detect_collision(
+            &issue,
+            &metadata.id_by_ext_ref,
+            &metadata.id_by_hash,
+            &metadata.meta_by_id,
+            &computed_hash,
+        );
+        let _action = determine_action(
+            &collision,
+            &issue,
+            &metadata.meta_by_id,
+            config.force_upsert,
+        )?;
+        let target_id = match &collision {
+            CollisionResult::Match { existing_id, .. } => existing_id.clone(),
+            CollisionResult::NewIssue => issue.id.clone(),
+        };
+
+        if target_id != issue.id {
+            renames.insert(issue.id.clone(), target_id);
+        }
+
+        progress.inc(1);
+        Ok(())
+    })?;
+
+    progress.finish_with_message("Scan complete");
+    Ok(renames)
+}
+
+fn apply_collision_renames(issue: &mut Issue, renames: &HashMap<String, String>) {
+    if let Some(new_id) = renames.get(&issue.id) {
+        issue.id.clone_from(new_id);
+    }
+
+    for dep in &mut issue.dependencies {
+        if let Some(new_target) = renames.get(&dep.depends_on_id) {
+            dep.depends_on_id.clone_from(new_target);
+        }
+        if let Some(new_source) = renames.get(&dep.issue_id) {
+            dep.issue_id.clone_from(new_source);
+        }
+    }
+
+    for comment in &mut issue.comments {
+        if let Some(new_source) = renames.get(&comment.issue_id) {
+            comment.issue_id.clone_from(new_source);
+        }
+    }
+}
+
+fn cleanup_import_orphans_in_tx(storage: &SqliteStorage) -> Result<usize> {
+    let orphan_tables = &[
+        ("dependencies", "issue_id"),
+        ("dependencies", "depends_on_id"),
+        ("labels", "issue_id"),
+        ("comments", "issue_id"),
+        ("events", "issue_id"),
+        ("dirty_issues", "issue_id"),
+        ("blocked_issues_cache", "issue_id"),
+        ("child_counters", "parent_id"),
+    ];
+    let mut orphans_cleaned = 0usize;
+
+    for (table, col) in orphan_tables {
+        let sql = if *table == "dependencies" && *col == "depends_on_id" {
+            format!(
+                "DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues) AND {col} NOT LIKE 'external:%'"
+            )
+        } else {
+            format!("DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues)")
+        };
+        orphans_cleaned += storage.execute_raw_count(&sql)?;
+    }
+
+    Ok(orphans_cleaned)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_import_actions_in_tx(
+    storage: &SqliteStorage,
+    input_path: &Path,
+    config: &ImportConfig,
+    prefix_renames: &HashMap<String, String>,
+    collision_renames: &HashMap<String, String>,
+    metadata: &ImportMetadataMaps,
+    base_result: &ImportResult,
+    progress: &indicatif::ProgressBar,
+) -> Result<ImportResult> {
+    let mut tx_result = base_result.clone();
+    let mut seen_external_refs = HashSet::new();
+    let mut export_hash_batch = Vec::with_capacity(IMPORT_EXPORT_HASH_BATCH_SIZE);
+    let mut export_hash_ids = HashSet::new();
+
+    progress.set_position(0);
+    storage.clear_all_export_hashes_in_tx()?;
+
+    for_each_jsonl_import_issue(input_path, |_line_num, mut issue| {
+        apply_prefix_renames(&mut issue, prefix_renames);
+
+        if issue.ephemeral {
+            progress.inc(1);
+            return Ok(());
+        }
+
+        handle_duplicate_external_ref(&mut issue, &mut seen_external_refs, config)?;
+
+        let computed_hash = crate::util::content_hash(&issue);
+        let collision = detect_collision(
+            &issue,
+            &metadata.id_by_ext_ref,
+            &metadata.id_by_hash,
+            &metadata.meta_by_id,
+            &computed_hash,
+        );
+        let action = determine_action(
+            &collision,
+            &issue,
+            &metadata.meta_by_id,
+            config.force_upsert,
+        )?;
+        let target_id = match &collision {
+            CollisionResult::Match { existing_id, .. } => existing_id.clone(),
+            CollisionResult::NewIssue => issue.id.clone(),
+        };
+
+        apply_collision_renames(&mut issue, collision_renames);
+        process_import_action(storage, &action, &issue, &mut tx_result)?;
+
+        export_hash_ids.insert(target_id.clone());
+        export_hash_batch.push((target_id, computed_hash));
+        if export_hash_batch.len() >= IMPORT_EXPORT_HASH_BATCH_SIZE {
+            storage.set_export_hashes_in_tx(&export_hash_batch)?;
+            export_hash_batch.clear();
+        }
+
+        progress.inc(1);
+        Ok(())
+    })?;
+
+    if !export_hash_batch.is_empty() {
+        storage.set_export_hashes_in_tx(&export_hash_batch)?;
+    }
+    tx_result.export_hashes_recorded = export_hash_ids.len();
+
+    let orphans_cleaned = cleanup_import_orphans_in_tx(storage)?;
+    if orphans_cleaned > 0 {
+        tracing::info!(
+            count = orphans_cleaned,
+            "Cleaned orphaned FK rows after import"
+        );
+        tx_result.orphan_cleaned_count = orphans_cleaned;
+    }
+
+    tx_result.blocked_cache_entries = storage.rebuild_blocked_cache_in_tx()?;
+    tx_result.child_counter_entries = storage.rebuild_child_counters_in_tx()?;
+
+    Ok(tx_result)
+}
+
 /// Import issues from a JSONL file.
 ///
 /// Implements classic bd import semantics:
@@ -3141,8 +3563,6 @@ pub fn import_from_jsonl(
     config: &ImportConfig,
     expected_prefix: Option<&str>,
 ) -> Result<ImportResult> {
-    use crate::util::content_hash;
-
     // Step 0: Path validation (PC-1, PC-2, PC-3, NGI-3) - BEFORE any file operations
     if let Some(ref beads_dir) = config.beads_dir {
         validate_sync_path_with_external(input_path, beads_dir, config.allow_external_jsonl)?;
@@ -3157,289 +3577,37 @@ pub fn import_from_jsonl(
     // Step 1: Conflict marker scan
     ensure_no_conflict_markers(input_path)?;
 
-    // Step 2: Parse, Normalize, and Validate JSONL
+    // Step 2: Parse, Normalize, Validate, and collect minimal rename state.
     let spinner = create_spinner("Parsing and validating issues", config.show_progress);
-    let file = File::open(input_path)?;
-    let file_size = file.metadata().map_or(0, |m| m.len());
-    // Estimate ~500 bytes per issue to pre-allocate vector capacity
-    let estimated_count = (file_size / 500) as usize;
-    let mut reader = BufReader::with_capacity(2 * 1024 * 1024, file);
-    let mut issues = Vec::with_capacity(estimated_count);
-    let mut seen_ids = HashSet::with_capacity(estimated_count);
-    let mut mismatches = Vec::new();
-
-    let mut line = String::new();
-    let mut line_num = 0;
-    while reader.read_line(&mut line)? > 0 {
-        line_num += 1;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            line.clear();
-            continue;
-        }
-        let mut issue: Issue = serde_json::from_str(trimmed)
-            .map_err(|e| BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num, e)))?;
-
-        // 1. Normalize (Step 3)
-        normalize_issue(&mut issue);
-
-        // 2. Validate (Step 3.5)
-        if let Err(errors) = IssueValidator::validate(&issue) {
-            let details = errors
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(BeadsError::Config(format!(
-                "Validation failed for issue {} at line {}: {}",
-                issue.id, line_num, details
-            )));
-        }
-
-        // 3. Prefix Check (Step 4)
-        if !config.skip_prefix_validation
-            && let Some(prefix) = expected_prefix
-            && !id_matches_expected_prefix(&issue.id, prefix)
-            && issue.status != crate::model::Status::Tombstone
-        {
-            if !config.rename_on_import {
-                return Err(BeadsError::Config(format!(
-                    "Prefix mismatch at line {}: expected '{}', found issue '{}'",
-                    line_num, prefix, issue.id
-                )));
-            }
-            mismatches.push(issue.id.clone());
-        }
-
-        // 4. Reject duplicate IDs instead of silently collapsing records.
-        if !seen_ids.insert(issue.id.clone()) {
-            return Err(BeadsError::Config(format!(
-                "Duplicate issue id '{}' in {} at line {}",
-                issue.id,
-                input_path.display(),
-                line_num
-            )));
-        }
-        issues.push(issue);
-
-        line.clear();
-    }
+    let validation_plan = collect_import_validation_plan(input_path, config, expected_prefix)?;
     spinner.finish_with_message("Parsed and validated issues");
 
     let mut result = ImportResult::default();
 
     // Step 5: Handle renames if requested
-    if config.rename_on_import
-        && !mismatches.is_empty()
-        && let Some(prefix) = expected_prefix
-    {
-        use crate::util::id::{IdConfig, IdGenerator};
+    let prefix_renames = if config.rename_on_import {
+        build_prefix_renames(storage, &validation_plan, expected_prefix)?
+    } else {
+        HashMap::new()
+    };
 
-        let mismatch_set: std::collections::HashSet<String> = mismatches.iter().cloned().collect();
-
-        // Collect details to avoid borrowing issues during generation
-        let to_rename: Vec<_> = issues
-            .iter()
-            .filter(|i| mismatch_set.contains(&i.id))
-            .map(|i| {
-                (
-                    i.id.clone(),
-                    i.title.clone(),
-                    i.description.clone(),
-                    i.created_by.clone(),
-                    i.created_at,
-                )
-            })
-            .collect();
-
-        let generator = IdGenerator::new(IdConfig::with_prefix(prefix));
-        let mut renames = std::collections::HashMap::new();
-        let existing_ids: std::collections::HashSet<String> =
-            storage.get_all_ids()?.into_iter().collect();
-
-        // Collect all IDs that will NOT be renamed to avoid collisions
-        let mut occupied_ids: std::collections::HashSet<String> = issues
-            .iter()
-            .filter(|i| !mismatch_set.contains(&i.id))
-            .map(|i| i.id.clone())
-            .collect();
-
-        // Add existing IDs from storage to occupied set
-        occupied_ids.extend(existing_ids);
-
-        let mut generated_ids = std::collections::HashSet::new();
-
-        for (old_id, title, desc, creator, created_at) in to_rename {
-            let new_id = generator.generate(
-                &title,
-                desc.as_deref(),
-                creator.as_deref(),
-                created_at,
-                issues.len(),
-                |candidate| occupied_ids.contains(candidate) || generated_ids.contains(candidate),
-            );
-            generated_ids.insert(new_id.clone());
-            renames.insert(old_id, new_id);
-        }
-
-        // Apply renames
-        for issue in &mut issues {
-            if let Some(new_id) = renames.get(&issue.id) {
-                // Preserve old ID in external_ref if empty
-                if issue.external_ref.is_none() {
-                    issue.external_ref = Some(issue.id.clone());
-                }
-                issue.id = new_id.clone();
-                // Recompute content hash since ID/external_ref changed
-                issue.content_hash = Some(content_hash(issue));
-            }
-            // Update dependencies
-            for dep in &mut issue.dependencies {
-                if let Some(new_target) = renames.get(&dep.depends_on_id) {
-                    dep.depends_on_id = new_target.clone();
-                }
-                if let Some(new_source) = renames.get(&dep.issue_id) {
-                    dep.issue_id = new_source.clone();
-                }
-            }
-            // Update comments
-            for comment in &mut issue.comments {
-                if let Some(new_source) = renames.get(&comment.issue_id) {
-                    comment.issue_id = new_source.clone();
-                }
-            }
-        }
-    }
-
-    // Preload all metadata for O(1) collision detection (avoiding N+1 queries)
-    let all_meta = storage.get_all_issues_metadata()?;
-    let meta_len = all_meta.len();
-    let mut meta_by_id = std::collections::HashMap::with_capacity(meta_len);
-    let mut id_by_ext_ref = std::collections::HashMap::with_capacity(meta_len);
-    let mut id_by_hash = std::collections::HashMap::with_capacity(meta_len);
-
-    for m in all_meta {
-        let issue_id = m.id.clone();
-        if let Some(ext) = m.external_ref.as_ref() {
-            id_by_ext_ref
-                .entry(ext.clone())
-                .or_insert_with(|| issue_id.clone());
-        }
-        if let Some(hash) = m.content_hash.as_ref() {
-            // Preserve the first matching issue to mirror the old query_row
-            // collision path when multiple issues share the same content hash.
-            id_by_hash
-                .entry(hash.clone())
-                .or_insert_with(|| issue_id.clone());
-        }
-        meta_by_id.insert(issue_id, m);
-    }
+    // Preload metadata for O(1) collision detection while streaming the input.
+    let metadata = load_import_metadata_maps(storage)?;
 
     // Phase 1: Scan and Resolve IDs
-    let mut seen_external_refs: HashSet<String> = HashSet::new();
-    let mut renames: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let issues_len = issues.len();
-    let mut import_ops = Vec::with_capacity(issues_len);
-    let mut new_export_hashes = Vec::with_capacity(issues_len);
-
-    let progress =
-        create_progress_bar(issues.len() as u64, "Scanning issues", config.show_progress);
-
-    for mut issue in issues {
-        // Skip ephemerals during import (they shouldn't be in JSONL anyway)
-        if issue.ephemeral {
-            result.skipped_count += 1;
-            progress.inc(1);
-            continue;
-        }
-
-        // Handle external ref duplicates before collision detection
-        if let Some(ref ext_ref) = issue.external_ref {
-            if seen_external_refs.contains(ext_ref) {
-                if config.clear_duplicate_external_refs {
-                    issue.external_ref = None;
-                    issue.content_hash = Some(content_hash(&issue));
-                } else {
-                    progress.inc(1);
-                    return Err(BeadsError::Config(format!(
-                        "Duplicate external_ref: {ext_ref}"
-                    )));
-                }
-            } else {
-                seen_external_refs.insert(ext_ref.clone());
-            }
-        }
-
-        // Compute content hash for collision detection
-        let computed_hash = content_hash(&issue);
-
-        // Detect collision
-        let collision = detect_collision(
-            &issue,
-            &id_by_ext_ref,
-            &id_by_hash,
-            &meta_by_id,
-            &computed_hash,
-        );
-
-        // Determine action
-        let action = determine_action(&collision, &issue, &meta_by_id, config.force_upsert)?;
-
-        // Determine target ID and record mapping
-        let target_id = match &collision {
-            CollisionResult::Match { existing_id, .. } => existing_id.clone(),
-            CollisionResult::NewIssue => {
-                // Keep distinct rows from the same JSONL snapshot distinct during the scan
-                // phase. Only metadata-backed collisions (already in storage) should remap
-                // IDs; otherwise `--no-db` imports can collapse valid duplicate records or
-                // try to update rows that do not exist yet.
-                issue.id.clone()
-            }
-        };
-
-        if target_id != issue.id {
-            renames.insert(issue.id.clone(), target_id.clone());
-        }
-
-        // Collect hash for export_hashes table
-        new_export_hashes.push((target_id, computed_hash));
-
-        import_ops.push((issue, action));
-        progress.inc(1);
-    }
-    progress.finish_with_message("Scan complete");
+    let collision_renames = scan_import_collision_renames(
+        input_path,
+        config,
+        &prefix_renames,
+        &metadata,
+        &mut result,
+        validation_plan.record_count,
+    )?;
 
     let jsonl_hash = compute_jsonl_hash(input_path)?;
-
-    // Phase 2: Remap Dependencies
-    if !renames.is_empty() {
-        for (issue, _) in &mut import_ops {
-            // Update issue ID if it was remapped (e.g. collision with existing issue)
-            if let Some(new_id) = renames.get(&issue.id) {
-                issue.id = new_id.clone();
-            }
-
-            // Remap dependencies to point to the resolved IDs
-            for dep in &mut issue.dependencies {
-                if let Some(new_target) = renames.get(&dep.depends_on_id) {
-                    dep.depends_on_id = new_target.clone();
-                }
-                if let Some(new_source) = renames.get(&dep.issue_id) {
-                    dep.issue_id = new_source.clone();
-                }
-            }
-
-            // Remap comments to point to the resolved ID
-            for comment in &mut issue.comments {
-                if let Some(new_source) = renames.get(&comment.issue_id) {
-                    comment.issue_id = new_source.clone();
-                }
-            }
-        }
-    }
     let observed_jsonl = observed_jsonl_witness(input_path)?;
 
-    // Phase 3: Execute Actions
+    // Phase 2: Execute Actions
     //
     // Disable FK constraints during bulk import so that issues can reference
     // other issues (in dependencies/comments) that haven't been inserted yet.
@@ -3452,62 +3620,24 @@ pub fn import_from_jsonl(
         })?;
 
     let progress = create_progress_bar(
-        import_ops.len() as u64,
+        validation_plan.record_count as u64,
         "Importing issues",
         config.show_progress,
     );
 
     let apply_result = storage.with_write_transaction(|storage| -> Result<ImportResult> {
-        let mut tx_result = result.clone();
-        progress.set_position(0);
-        // Keep export-hash state transactional so failed imports do not
-        // erase incremental export bookkeeping.
-        storage.clear_all_export_hashes_in_tx()?;
+        let tx_result = stream_import_actions_in_tx(
+            storage,
+            input_path,
+            config,
+            &prefix_renames,
+            &collision_renames,
+            &metadata,
+            &result,
+            &progress,
+        )?;
 
-        for (issue, action) in &import_ops {
-            process_import_action(storage, action, issue, &mut tx_result)?;
-            progress.inc(1);
-        }
-
-        // Clean up any orphaned rows left by FK-deferred import
-        // (e.g., dependencies referencing issues not in the JSONL)
-        let orphan_tables = &[
-            ("dependencies", "issue_id"),
-            ("dependencies", "depends_on_id"),
-            ("labels", "issue_id"),
-            ("comments", "issue_id"),
-            ("events", "issue_id"),
-            ("dirty_issues", "issue_id"),
-            ("blocked_issues_cache", "issue_id"),
-            ("child_counters", "parent_id"),
-        ];
-        let mut orphans_cleaned = 0usize;
-        for (table, col) in orphan_tables {
-            let sql = if *table == "dependencies" && *col == "depends_on_id" {
-                format!(
-                    "DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues) AND {col} NOT LIKE 'external:%'"
-                )
-            } else {
-                format!("DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues)")
-            };
-            orphans_cleaned += storage.execute_raw_count(&sql)?;
-        }
-        if orphans_cleaned > 0 {
-            tracing::info!(
-                count = orphans_cleaned,
-                "Cleaned orphaned FK rows after import"
-            );
-            tx_result.orphan_cleaned_count = orphans_cleaned;
-        }
-
-        if !new_export_hashes.is_empty() {
-            tx_result.export_hashes_recorded = storage.set_export_hashes_in_tx(&new_export_hashes)?;
-        }
-
-        tx_result.blocked_cache_entries = storage.rebuild_blocked_cache_in_tx()?;
-        tx_result.child_counter_entries = storage.rebuild_child_counters_in_tx()?;
-        storage
-            .set_metadata_in_tx(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
+        storage.set_metadata_in_tx(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
         storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, &jsonl_hash)?;
         record_observed_jsonl_witness_in_tx(storage, &observed_jsonl)?;
 
