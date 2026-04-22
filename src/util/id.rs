@@ -186,14 +186,22 @@ pub fn generate_id_seed(
     created_at: DateTime<Utc>,
     nonce: u32,
 ) -> String {
-    format!(
-        "{}|{}|{}|{}|{}",
-        title,
-        description.unwrap_or(""),
-        creator.unwrap_or(""),
-        created_at.timestamp_nanos_opt().unwrap_or(0),
-        nonce
-    )
+    let timestamp = created_at.timestamp_nanos_opt().unwrap_or(0).to_string();
+    let nonce = nonce.to_string();
+
+    let mut seed = String::new();
+    append_seed_part(&mut seed, title);
+    append_seed_part(&mut seed, description.unwrap_or(""));
+    append_seed_part(&mut seed, creator.unwrap_or(""));
+    append_seed_part(&mut seed, &timestamp);
+    append_seed_part(&mut seed, &nonce);
+    seed
+}
+
+fn append_seed_part(seed: &mut String, value: &str) {
+    use std::fmt::Write;
+    write!(seed, "{}:", value.len()).expect("writing to String never fails");
+    seed.push_str(value);
 }
 
 /// Compute a base36 hash of the input string with a specific length.

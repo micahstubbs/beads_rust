@@ -253,6 +253,19 @@ fn id_no_collisions_batch() {
     info!("proptest_batch_collision: PASS - 100 unique IDs generated");
 }
 
+#[test]
+fn id_seed_distinguishes_delimiter_positions() {
+    let now = Utc::now();
+
+    let split_fields = generate_id_seed("a", Some("b"), None, now, 0);
+    let delimiter_in_title = generate_id_seed("a|b", None, None, now, 0);
+
+    assert_ne!(
+        split_fields, delimiter_in_title,
+        "seed encoding must not collapse separators inside user-controlled fields"
+    );
+}
+
 /// Property: Optimal length calculation is monotonic with issue count
 #[test]
 fn optimal_length_monotonic() {
