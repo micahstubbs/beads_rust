@@ -490,4 +490,82 @@ proptest! {
         prop_assert_eq!(&first_source.dependencies, &second_source.dependencies);
         prop_assert_eq!(&first_source.comments, &second_source.comments);
     }
+
+    /// Property: importing the same JSONL issue set in a different line order
+    /// produces the same canonical database state after export.
+    #[test]
+    fn jsonl_import_is_invariant_to_issue_line_order(case in round_trip_case()) {
+        init_test_logging();
+        info!(
+            issue_id = %case.source.id,
+            dependency_target = %case.blocker.id,
+            "proptest_jsonl_import_order_invariance"
+        );
+
+        let temp = TempDir::new().unwrap();
+        let original_path = temp.path().join("original.jsonl");
+        let permuted_path = temp.path().join("permuted.jsonl");
+        let original_export_path = temp.path().join("original-export.jsonl");
+        let permuted_export_path = temp.path().join("permuted-export.jsonl");
+
+        let original = populate_storage(&case);
+        export_to_jsonl(&original, &original_path, &ExportConfig::default()).unwrap();
+
+        let original_jsonl = fs::read_to_string(&original_path).unwrap();
+        let mut permuted_lines = original_jsonl.lines().collect::<Vec<_>>();
+        permuted_lines.reverse();
+        fs::write(&permuted_path, format!("{}\n", permuted_lines.join("\n"))).unwrap();
+
+        let mut original_import = SqliteStorage::open_memory().unwrap();
+        let original_result = import_from_jsonl(
+            &mut original_import,
+            &original_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .unwrap();
+
+        let mut permuted_import = SqliteStorage::open_memory().unwrap();
+        let permuted_result = import_from_jsonl(
+            &mut permuted_import,
+            &permuted_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .unwrap();
+
+        prop_assert_eq!(original_result.imported_count, 2);
+        prop_assert_eq!(permuted_result.imported_count, original_result.imported_count);
+
+        let original_export =
+            export_to_jsonl(&original_import, &original_export_path, &ExportConfig::default())
+                .unwrap();
+        let permuted_export =
+            export_to_jsonl(&permuted_import, &permuted_export_path, &ExportConfig::default())
+                .unwrap();
+        let original_issues = read_issues_from_jsonl(&original_export_path).unwrap();
+        let permuted_issues = read_issues_from_jsonl(&permuted_export_path).unwrap();
+
+        prop_assert_eq!(
+            original_export.content_hash,
+            permuted_export.content_hash,
+            "canonical JSONL hash must not depend on input line order"
+        );
+        prop_assert_eq!(
+            hash_map(&original_export.issue_hashes),
+            hash_map(&permuted_export.issue_hashes),
+            "per-issue export hashes must not depend on input line order"
+        );
+        prop_assert_eq!(
+            &original_issues,
+            &permuted_issues,
+            "canonical re-export must be byte-equivalent after permuted import"
+        );
+
+        let original_source = find_issue(&original_issues, &case.source.id);
+        let permuted_source = find_issue(&permuted_issues, &case.source.id);
+        prop_assert_eq!(&original_source.labels, &permuted_source.labels);
+        prop_assert_eq!(&original_source.dependencies, &permuted_source.dependencies);
+        prop_assert_eq!(&original_source.comments, &permuted_source.comments);
+    }
 }
