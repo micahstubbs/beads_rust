@@ -29,7 +29,7 @@ where
 }
 
 /// Issue lifecycle status.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     #[default]
@@ -45,6 +45,23 @@ pub enum Status {
     Pinned,
     #[serde(untagged)]
     Custom(String),
+}
+
+impl<'de> Deserialize<'de> for Status {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.to_lowercase().as_str() {
+            "open" => Self::Open,
+            "in_progress" | "inprogress" => Self::InProgress,
+            "blocked" => Self::Blocked,
+            "deferred" => Self::Deferred,
+            "draft" => Self::Draft,
+            "closed" => Self::Closed,
+            "tombstone" => Self::Tombstone,
+            "pinned" => Self::Pinned,
+            _ => Self::Custom(value),
+        })
+    }
 }
 
 impl Status {
