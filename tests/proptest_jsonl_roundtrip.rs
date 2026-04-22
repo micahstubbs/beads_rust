@@ -6,7 +6,7 @@
 use beads_rust::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use beads_rust::storage::SqliteStorage;
 use beads_rust::sync::{
-    ExportConfig, ImportConfig, export_to_jsonl, import_from_jsonl, read_issues_from_jsonl,
+    export_to_jsonl, import_from_jsonl, read_issues_from_jsonl, ExportConfig, ImportConfig,
 };
 use chrono::{Duration, TimeZone, Utc};
 use proptest::prelude::*;
@@ -486,6 +486,84 @@ proptest! {
         prop_assert!(!first_source.labels.is_empty());
         prop_assert!(!first_source.dependencies.is_empty());
         prop_assert!(!first_source.comments.is_empty());
+        prop_assert_eq!(&first_source.labels, &second_source.labels);
+        prop_assert_eq!(&first_source.dependencies, &second_source.dependencies);
+        prop_assert_eq!(&first_source.comments, &second_source.comments);
+    }
+
+    /// Property: importing the same JSONL file twice into the same database is
+    /// idempotent. The second import must not duplicate labels, dependencies,
+    /// comments, or drift content hashes.
+    #[test]
+    fn jsonl_reimport_is_idempotent(case in round_trip_case()) {
+        init_test_logging();
+        info!(
+            issue_id = %case.source.id,
+            "proptest_jsonl_reimport_idempotent"
+        );
+
+        let temp = TempDir::new().unwrap();
+        let input_path = temp.path().join("input.jsonl");
+        let after_first_path = temp.path().join("after-first.jsonl");
+        let after_second_path = temp.path().join("after-second.jsonl");
+
+        let original = populate_storage(&case);
+        export_to_jsonl(&original, &input_path, &ExportConfig::default()).unwrap();
+
+        let mut imported = SqliteStorage::open_memory().unwrap();
+        let first_import = import_from_jsonl(
+            &mut imported,
+            &input_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .unwrap();
+        prop_assert_eq!(first_import.imported_count, 2);
+
+        let first_export =
+            export_to_jsonl(&imported, &after_first_path, &ExportConfig::default()).unwrap();
+        let first_issues = read_issues_from_jsonl(&after_first_path).unwrap();
+        let first_hashes = hash_map(&first_export.issue_hashes);
+
+        let second_import = import_from_jsonl(
+            &mut imported,
+            &input_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .unwrap();
+        prop_assert!(
+            second_import.imported_count <= first_import.imported_count,
+            "re-import should not create more issue rows than first import"
+        );
+
+        let second_export =
+            export_to_jsonl(&imported, &after_second_path, &ExportConfig::default()).unwrap();
+        let second_issues = read_issues_from_jsonl(&after_second_path).unwrap();
+
+        prop_assert_eq!(
+            first_export.content_hash,
+            second_export.content_hash,
+            "second import changed canonical JSONL content hash"
+        );
+        prop_assert_eq!(
+            first_hashes,
+            hash_map(&second_export.issue_hashes),
+            "second import changed per-issue content hashes"
+        );
+        prop_assert_eq!(
+            fs::read_to_string(&after_first_path).unwrap(),
+            fs::read_to_string(&after_second_path).unwrap(),
+            "second import changed exported JSONL bytes"
+        );
+        prop_assert_eq!(
+            &first_issues,
+            &second_issues,
+            "second import changed canonical issue payloads"
+        );
+
+        let first_source = find_issue(&first_issues, &case.source.id);
+        let second_source = find_issue(&second_issues, &case.source.id);
         prop_assert_eq!(&first_source.labels, &second_source.labels);
         prop_assert_eq!(&first_source.dependencies, &second_source.dependencies);
         prop_assert_eq!(&first_source.comments, &second_source.comments);
