@@ -966,7 +966,7 @@ fn execute_flush(
     )?;
     info!("Export complete, cleared dirty flags");
 
-    // Write manifest if requested
+    // Write manifest if requested (atomic: temp + fsync + durable_rename)
     let manifest_path = if args.manifest {
         let manifest = serde_json::json!({
             "export_time": chrono::Utc::now().to_rfc3339(),
@@ -983,7 +983,7 @@ fn execute_flush(
             path_policy.allow_external_jsonl,
             "write manifest",
         )?;
-        fs::write(&manifest_file, serde_json::to_string_pretty(&manifest)?)?;
+        write_manifest_atomically(&manifest_file, &manifest)?;
         Some(manifest_file.to_string_lossy().to_string())
     } else {
         None
@@ -1065,6 +1065,33 @@ fn execute_flush(
             }
         }
     }
+
+    Ok(())
+}
+
+fn write_manifest_atomically(
+    manifest_path: &Path,
+    manifest: &serde_json::Value,
+) -> Result<()> {
+    use std::io::Write;
+
+    let temp_path = manifest_path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let content = serde_json::to_string_pretty(manifest)?;
+
+    let mut file = File::create(&temp_path).map_err(|e| {
+        BeadsError::Config(format!(
+            "failed to create temp manifest file {}: {e}",
+            temp_path.display()
+        ))
+    })?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+
+    crate::util::durable_rename(&temp_path, manifest_path).map_err(|e| {
+        let _ = fs::remove_file(&temp_path);
+        e
+    })?;
 
     Ok(())
 }
