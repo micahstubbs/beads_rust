@@ -4143,6 +4143,49 @@ impl SqliteStorage {
         Ok(counts)
     }
 
+    /// Returns IDs of direct dot-notation children of `parent_id` that are
+    /// still open or in-progress, ignoring any formally declared parent-child
+    /// dep rows.
+    ///
+    /// Rationale: `get_epic_counts()` covers the happy path (issues created
+    /// with `br create --parent ...`, which writes a `parent-child` row in
+    /// `dependencies`). But issues migrated from legacy beads DBs, bulk
+    /// JSONL imports, or hand-authored JSONL can introduce IDs like
+    /// `epic.1`, `epic.2` that are semantically children but have no dep
+    /// row. Without this check, `br close epic` silently closes the parent
+    /// while leaving those children orphaned.
+    ///
+    /// Excludes grandchildren (e.g. `epic.1.1` is not a direct child of
+    /// `epic`). LIKE pattern specials in the parent id are escaped via
+    /// `escape_like_pattern` + `ESCAPE '\\'` so any id is safe to pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_open_dot_notation_children(&self, parent_id: &str) -> Result<Vec<String>> {
+        let escaped = escape_like_pattern(parent_id);
+        let direct_prefix = format!("{escaped}.%");
+        let grandchild_prefix = format!("{escaped}.%.%");
+        let rows = self.conn.query_with_params(
+            "SELECT i.id FROM issues i \
+             WHERE i.status IN ('open', 'in_progress') \
+               AND (i.is_template = 0 OR i.is_template IS NULL) \
+               AND i.id LIKE ? ESCAPE '\\' \
+               AND i.id NOT LIKE ? ESCAPE '\\'",
+            &[
+                SqliteValue::from(direct_prefix.as_str()),
+                SqliteValue::from(grandchild_prefix.as_str()),
+            ],
+        )?;
+        let mut result = Vec::with_capacity(rows.len());
+        for row in &rows {
+            if let Some(id) = row.get(0).and_then(SqliteValue::as_text) {
+                result.push(id.to_string());
+            }
+        }
+        Ok(result)
+    }
+
     /// Add a dependency between issues.
     ///
     /// # Errors
@@ -12043,6 +12086,100 @@ mod tests {
         assert!(
             !blocked_after.iter().any(|(i, _)| i.id == "m06q-dual"),
             "task should be unblocked after both blockers closed"
+        );
+    }
+
+    // ========================================================================
+    // get_open_dot_notation_children — supplementary guard for legacy/imported
+    // dot-notation parent-child relationships that lack formal dep rows.
+    // ========================================================================
+
+    #[test]
+    fn dot_notation_children_detects_open_direct_children() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let parent = make_issue("epic", "Epic", Status::Open, 1, None, now, None);
+        let child1 = make_issue("epic.1", "Child 1", Status::Open, 1, None, now, None);
+        let child2 = make_issue("epic.2", "Child 2", Status::InProgress, 1, None, now, None);
+        let mut child3 = make_issue("epic.3", "Child 3", Status::Closed, 1, None, now, None);
+        // closed rows require closed_at set (DB CHECK constraint).
+        child3.closed_at = Some(now);
+        storage.create_issue(&parent, "t").unwrap();
+        storage.create_issue(&child1, "t").unwrap();
+        storage.create_issue(&child2, "t").unwrap();
+        storage.create_issue(&child3, "t").unwrap();
+
+        let mut open_children = storage.get_open_dot_notation_children("epic").unwrap();
+        open_children.sort();
+        assert_eq!(
+            open_children,
+            vec!["epic.1".to_string(), "epic.2".to_string()],
+            "closed child should be excluded; open and in_progress should be returned"
+        );
+    }
+
+    #[test]
+    fn dot_notation_children_excludes_grandchildren() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let parent = make_issue("root", "Root", Status::Open, 1, None, now, None);
+        let child = make_issue("root.1", "Child", Status::Open, 1, None, now, None);
+        let grandchild = make_issue("root.1.1", "Grandchild", Status::Open, 1, None, now, None);
+        storage.create_issue(&parent, "t").unwrap();
+        storage.create_issue(&child, "t").unwrap();
+        storage.create_issue(&grandchild, "t").unwrap();
+
+        let open_children = storage.get_open_dot_notation_children("root").unwrap();
+        assert_eq!(
+            open_children,
+            vec!["root.1".to_string()],
+            "grandchildren (root.1.1) must not be returned as direct children of root"
+        );
+    }
+
+    #[test]
+    fn dot_notation_children_returns_empty_when_none() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let parent = make_issue("solo", "Solo", Status::Open, 1, None, now, None);
+        let unrelated = make_issue("other", "Other", Status::Open, 1, None, now, None);
+        storage.create_issue(&parent, "t").unwrap();
+        storage.create_issue(&unrelated, "t").unwrap();
+
+        let open_children = storage.get_open_dot_notation_children("solo").unwrap();
+        assert!(
+            open_children.is_empty(),
+            "parent with no dot-notation children should return empty vec, got {open_children:?}"
+        );
+    }
+
+    #[test]
+    fn dot_notation_children_escapes_like_specials_in_parent_id() {
+        // If escape_like_pattern were bypassed, a parent id containing `_`
+        // would match any single character via LIKE. Pin the escaping behavior
+        // so `a_b.1` matches but `aXb.1` does not.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let parent = make_issue(
+            "a_b",
+            "Parent with underscore",
+            Status::Open,
+            1,
+            None,
+            now,
+            None,
+        );
+        let child = make_issue("a_b.1", "Real child", Status::Open, 1, None, now, None);
+        let decoy = make_issue("aXb.1", "Decoy", Status::Open, 1, None, now, None);
+        storage.create_issue(&parent, "t").unwrap();
+        storage.create_issue(&child, "t").unwrap();
+        storage.create_issue(&decoy, "t").unwrap();
+
+        let open_children = storage.get_open_dot_notation_children("a_b").unwrap();
+        assert_eq!(
+            open_children,
+            vec!["a_b.1".to_string()],
+            "underscore in parent id must be escaped so `a_b.1` matches but `aXb.1` does not"
         );
     }
 }

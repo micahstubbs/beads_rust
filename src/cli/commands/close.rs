@@ -540,6 +540,42 @@ fn execute_route(
             continue;
         }
 
+        // Supplementary guard: catch dot-notation children (e.g. `epic.1`,
+        // `epic.2`) that exist in the issues table without a formal
+        // parent-child dep row. These slip past `epic_counts` because
+        // get_epic_counts only scans the dependencies table. Missing-dep
+        // children occur with legacy-bd migrations, bulk JSONL imports,
+        // and hand-edited JSONL. Without this check, closing the parent
+        // silently orphans the open children.
+        if !args.force {
+            let open_dot_children = storage_ctx.storage.get_open_dot_notation_children(id)?;
+            if !open_dot_children.is_empty() {
+                let label = if issue.issue_type == IssueType::Epic {
+                    "epic"
+                } else {
+                    "parent issue"
+                };
+                let preview: Vec<String> = open_dot_children.iter().take(5).cloned().collect();
+                let suffix = if open_dot_children.len() > preview.len() {
+                    format!(", +{} more", open_dot_children.len() - preview.len())
+                } else {
+                    String::new()
+                };
+                let skipped = SkippedIssue {
+                    id: id.clone(),
+                    reason: format!(
+                        "{label} has {} open dot-notation child issue(s): {}{} (use --force to close anyway)",
+                        open_dot_children.len(),
+                        preview.join(", "),
+                        suffix
+                    ),
+                };
+                ordered_outcomes.push(CloseOutcome::Skipped(skipped.clone()));
+                skipped_issues.push(skipped);
+                continue;
+            }
+        }
+
         if args.force {
             open_issues.insert(id.clone(), issue);
             continue;
