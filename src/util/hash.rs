@@ -371,7 +371,11 @@ mod tests {
         let bytes: Vec<u8> = (0..=255).collect();
         let hex = hex_encode(&bytes);
         assert_eq!(hex.len(), 512);
-        let reference: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let reference: String = bytes.iter().fold(String::new(), |mut acc, b| {
+            use std::fmt::Write;
+            write!(acc, "{b:02x}").unwrap();
+            acc
+        });
         assert_eq!(hex, reference);
     }
 
