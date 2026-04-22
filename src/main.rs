@@ -364,53 +364,53 @@ fn main() {
         && !ctx.no_auto_flush()
         && let (Some(res), Some(paths)) = (storage_result.as_mut(), ctx.paths.as_ref())
     {
-            let sync_lock = match beads_rust::sync::try_sync_lock(&paths.beads_dir) {
-                Ok(Some(lock)) => Some(lock),
-                Ok(None) => {
-                    let err = BeadsError::Config(format!(
-                        "Automatic JSONL export skipped because sync lock at {} is held by another process",
-                        paths.beads_dir.join(".sync.lock").display()
-                    ));
-                    commands::report_auto_flush_failure(
-                        &output_ctx,
-                        &paths.beads_dir,
-                        &paths.jsonl_path,
-                        &err,
-                    );
-                    None
-                }
-                Err(e) => {
-                    commands::report_auto_flush_failure(
-                        &output_ctx,
-                        &paths.beads_dir,
-                        &paths.jsonl_path,
-                        &e,
-                    );
-                    None
-                }
-            };
-
-            if let Some(_sync_lock) = sync_lock
-                && let Err(e) = auto_flush(
-                    &mut res.storage,
+        let sync_lock = match beads_rust::sync::try_sync_lock(&paths.beads_dir) {
+            Ok(Some(lock)) => Some(lock),
+            Ok(None) => {
+                let err = BeadsError::Config(format!(
+                    "Automatic JSONL export skipped because sync lock at {} is held by another process",
+                    paths.beads_dir.join(".sync.lock").display()
+                ));
+                commands::report_auto_flush_failure(
+                    &output_ctx,
                     &paths.beads_dir,
                     &paths.jsonl_path,
-                    config::implicit_external_jsonl_allowed(
-                        &paths.beads_dir,
-                        &paths.db_path,
-                        &paths.jsonl_path,
-                    ),
-                )
-            {
+                    &err,
+                );
+                None
+            }
+            Err(e) => {
                 commands::report_auto_flush_failure(
                     &output_ctx,
                     &paths.beads_dir,
                     &paths.jsonl_path,
                     &e,
                 );
+                None
             }
+        };
+
+        if let Some(_sync_lock) = sync_lock
+            && let Err(e) = auto_flush(
+                &mut res.storage,
+                &paths.beads_dir,
+                &paths.jsonl_path,
+                config::implicit_external_jsonl_allowed(
+                    &paths.beads_dir,
+                    &paths.db_path,
+                    &paths.jsonl_path,
+                ),
+            )
+        {
+            commands::report_auto_flush_failure(
+                &output_ctx,
+                &paths.beads_dir,
+                &paths.jsonl_path,
+                &e,
+            );
         }
     }
+}
 
 struct StartupContext {
     overrides: config::CliOverrides,
