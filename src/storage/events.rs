@@ -357,26 +357,18 @@ pub fn insert_restored_event(
 /// Returns an error if the database query fails.
 pub fn get_events(conn: &Connection, issue_id: &str, limit: usize) -> Result<Vec<Event>> {
     let events = conn.query_with_params(
-        &format!(
-            r"
+        r"
             SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
             FROM events
             WHERE issue_id = ?1
-            ORDER BY created_at DESC, id DESC
-            {}
             ",
-            if limit > 0 {
-                format!("LIMIT {limit}")
-            } else {
-                String::new()
-            }
-        ),
         &[SqliteValue::from(issue_id)],
     )?;
 
     let mut result: Vec<Event> = events.iter().map(event_from_row).collect::<Result<_>>()?;
-    // fsqlite may not honour ORDER BY DESC or LIMIT in all query plans;
-    // enforce both in Rust for correctness.
+    // fsqlite may not honour ORDER BY DESC or LIMIT in all query plans. Fetch
+    // the full issue event stream, then enforce both in Rust so LIMIT cannot
+    // discard the wrong rows before sorting.
     result.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
     if limit > 0 && result.len() > limit {
         result.truncate(limit);
@@ -449,23 +441,17 @@ fn parse_event_timestamp(value: &str) -> Result<DateTime<Utc>> {
 ///
 /// Returns an error if the database query fails.
 pub fn get_all_events(conn: &Connection, limit: usize) -> Result<Vec<Event>> {
-    let rows = conn.query(&format!(
+    let rows = conn.query(
         r"
             SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
             FROM events
-            ORDER BY created_at DESC, id DESC
-            {}
             ",
-        if limit > 0 {
-            format!("LIMIT {limit}")
-        } else {
-            String::new()
-        }
-    ))?;
+    )?;
 
     let mut result: Vec<Event> = rows.iter().map(event_from_row).collect::<Result<_>>()?;
-    // fsqlite may not honour ORDER BY DESC or LIMIT in all query plans;
-    // enforce both in Rust for correctness.
+    // fsqlite may not honour ORDER BY DESC or LIMIT in all query plans. Fetch
+    // the full audit stream, then enforce both in Rust so LIMIT cannot discard
+    // the wrong rows before sorting.
     result.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
     if limit > 0 && result.len() > limit {
         result.truncate(limit);
@@ -697,6 +683,38 @@ mod tests {
     }
 
     #[test]
+    fn test_get_events_limit_is_applied_after_timestamp_sort() {
+        let conn = setup_test_db();
+
+        let rows = [
+            ("oldest", "2026-04-22T10:00:00Z"),
+            ("newest", "2026-04-22T13:00:00Z"),
+            ("middle", "2026-04-22T12:00:00Z"),
+            ("newer", "2026-04-22T12:30:00Z"),
+        ];
+        for (comment, created_at) in rows {
+            conn.execute_with_params(
+                "INSERT INTO events (issue_id, event_type, actor, comment, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    SqliteValue::from("test-001"),
+                    SqliteValue::from("commented"),
+                    SqliteValue::from("user"),
+                    SqliteValue::from(comment),
+                    SqliteValue::from(created_at),
+                ],
+            )
+            .expect("insert event");
+        }
+
+        let events = get_events(&conn, "test-001", 2).expect("events");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].comment.as_deref(), Some("newest"));
+        assert_eq!(events[1].comment.as_deref(), Some("newer"));
+    }
+
+    #[test]
     fn test_count_events() {
         let conn = setup_test_db();
 
@@ -817,9 +835,9 @@ mod tests {
         conn.execute("COMMIT").expect("commit malformed event");
 
         let err = get_events(&conn, "test-001", 0).unwrap_err();
-        match err {
-            BeadsError::Config(msg) => assert!(msg.contains("Invalid event timestamp")),
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(err, BeadsError::Config(ref msg) if msg.contains("Invalid event timestamp")),
+            "unexpected error: {err:?}"
+        );
     }
 }
