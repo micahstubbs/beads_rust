@@ -11786,10 +11786,42 @@ mod tests {
         let t = Utc::now();
 
         let epic = make_issue("proj-epic", "Epic", Status::Open, 0, Some("epic"), t, None);
-        let task1 = make_issue("proj-task1", "Task 1", Status::Open, 1, Some("task"), t, None);
-        let task2 = make_issue("proj-task2", "Task 2", Status::Open, 1, Some("task"), t, None);
-        let task3 = make_issue("proj-task3", "Task 3", Status::Open, 2, Some("task"), t, None);
-        let blocker = make_issue("proj-blocker", "Blocker", Status::Open, 1, Some("bug"), t, None);
+        let task1 = make_issue(
+            "proj-task1",
+            "Task 1",
+            Status::Open,
+            1,
+            Some("task"),
+            t,
+            None,
+        );
+        let task2 = make_issue(
+            "proj-task2",
+            "Task 2",
+            Status::Open,
+            1,
+            Some("task"),
+            t,
+            None,
+        );
+        let task3 = make_issue(
+            "proj-task3",
+            "Task 3",
+            Status::Open,
+            2,
+            Some("task"),
+            t,
+            None,
+        );
+        let blocker = make_issue(
+            "proj-blocker",
+            "Blocker",
+            Status::Open,
+            1,
+            Some("bug"),
+            t,
+            None,
+        );
 
         storage.create_issue(&epic, "tester").unwrap();
         storage.create_issue(&task1, "tester").unwrap();
@@ -11874,8 +11906,15 @@ mod tests {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t = Utc::now();
 
-        let blocker =
-            make_issue("m06q-blocker", "Blocker", Status::Open, 1, Some("bug"), t, None);
+        let blocker = make_issue(
+            "m06q-blocker",
+            "Blocker",
+            Status::Open,
+            1,
+            Some("bug"),
+            t,
+            None,
+        );
         let task = make_issue("m06q-task", "Task", Status::Open, 1, Some("task"), t, None);
 
         storage.create_issue(&blocker, "tester").unwrap();
@@ -11928,9 +11967,33 @@ mod tests {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t = Utc::now();
 
-        let b1 = make_issue("m06q-b1", "Blocker 1", Status::Open, 1, Some("bug"), t, None);
-        let b2 = make_issue("m06q-b2", "Blocker 2", Status::Open, 1, Some("bug"), t, None);
-        let task = make_issue("m06q-dual", "Dual blocked", Status::Open, 1, Some("task"), t, None);
+        let b1 = make_issue(
+            "m06q-b1",
+            "Blocker 1",
+            Status::Open,
+            1,
+            Some("bug"),
+            t,
+            None,
+        );
+        let b2 = make_issue(
+            "m06q-b2",
+            "Blocker 2",
+            Status::Open,
+            1,
+            Some("bug"),
+            t,
+            None,
+        );
+        let task = make_issue(
+            "m06q-dual",
+            "Dual blocked",
+            Status::Open,
+            1,
+            Some("task"),
+            t,
+            None,
+        );
 
         storage.create_issue(&b1, "tester").unwrap();
         storage.create_issue(&b2, "tester").unwrap();
@@ -11969,9 +12032,7 @@ mod tests {
             status: Some(Status::InProgress),
             ..Default::default()
         };
-        let claimed = storage
-            .update_issue("m06q-dual", &claim, "tester")
-            .unwrap();
+        let claimed = storage.update_issue("m06q-dual", &claim, "tester").unwrap();
         assert_eq!(claimed.status, Status::InProgress);
 
         let blocked_after = storage.get_blocked_issues().unwrap();

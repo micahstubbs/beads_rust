@@ -1,8 +1,8 @@
 //! Reproduction of 3-way merge data loss bug.
 //!
 //! This test demonstrates that changes to labels, dependencies, or comments
-//! are lost during a 3-way merge if the "significant" content hash (title, description, etc.)
-//! remains unchanged on both sides.
+//! must participate in merge-change detection even when scalar issue content
+//! is unchanged.
 
 mod common;
 
@@ -35,11 +35,17 @@ fn repro_3way_merge_data_loss() {
     // 3. Sync to JSONL (creates base snapshot)
     let sync1 = run_br(&workspace, ["sync", "--flush-only"], "sync1");
     assert!(sync1.status.success(), "sync1 failed");
+    let beads_dir = workspace.root.join(".beads");
+    let jsonl_path = beads_dir.join("issues.jsonl");
+    let base_snapshot_path = beads_dir.join("beads.base.jsonl");
+    let base_jsonl = fs::read_to_string(&jsonl_path).expect("read base jsonl");
+    fs::write(&base_snapshot_path, &base_jsonl).expect("seed base snapshot");
 
-    // 4. Modify labels LOCALLY (Left side of merge)
+    // 4. Modify labels LOCALLY (Left side of merge), keeping JSONL at the base
+    // snapshot so this is a true local-only relation change.
     let label_local = run_br(
         &workspace,
-        ["label", "add", &issue_id, "local-tag"],
+        ["--no-auto-flush", "label", "add", &issue_id, "local-tag"],
         "label_local",
     );
     assert!(
@@ -50,13 +56,13 @@ fn repro_3way_merge_data_loss() {
 
     // 5. Modify description EXTERNALLY (Right side of merge)
     // We simulate this by directly editing the JSONL.
-    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
     let jsonl_content = fs::read_to_string(&jsonl_path).expect("read jsonl");
     let mut issue: serde_json::Value =
         serde_json::from_str(jsonl_content.trim()).expect("parse jsonl");
 
     // Change description - this WILL change the content_hash
     issue["description"] = serde_json::Value::String("External description".to_string());
+    issue["updated_at"] = serde_json::Value::String("2999-01-01T00:00:00Z".to_string());
 
     let modified_jsonl = serde_json::to_string(&issue).expect("serialize modified issue");
     fs::write(&jsonl_path, format!("{}\n", modified_jsonl)).expect("write modified jsonl");
@@ -64,21 +70,31 @@ fn repro_3way_merge_data_loss() {
     // 6. Run 3-way merge
     // At this point:
     // Base: labels=[], desc=""
-    // Left (DB): labels=["local-tag"], desc=""  -> Hash matches Base! (labels excluded from hash)
-    // Right (JSONL): labels=[], desc="External description" -> Hash differs from Base.
+    // Left (DB): labels=["local-tag"], desc=""
+    // Right (JSONL): labels=[], desc="External description"
 
-    // In the CURRENT implementation of merge_issue:
-    // left_changed = (l.hash != b.hash) = (H1 != H1) = false
-    // right_changed = (r.hash != b.hash) = (H2 != H1) = true
-    // (false, true) => Keep(r)
-    // Result: Issue has desc="External description" but labels=[] (LOCAL TAG LOST!)
+    let merge = run_br(&workspace, ["sync", "--merge"], "merge");
+    assert!(
+        !merge.status.success(),
+        "manual merge should stop instead of choosing a lossy side: stdout={} stderr={}",
+        merge.stdout,
+        merge.stderr
+    );
+    assert!(
+        merge.stderr.contains("BothModified"),
+        "manual merge should report a both-modified conflict: {}",
+        merge.stderr
+    );
 
-    let merge = run_br(&workspace, ["sync", "--merge", "--force"], "merge");
-    assert!(merge.status.success(), "merge failed: {}", merge.stderr);
-
-    // 7. Verify result
-    let show = run_br(&workspace, ["show", &issue_id, "--json"], "show");
-    assert!(show.status.success(), "show failed");
+    // 7. Verify the failed merge preserved both sides for explicit operator
+    // resolution: DB still has the local tag, JSONL still has the external
+    // description.
+    let show = run_br(
+        &workspace,
+        ["--allow-stale", "show", &issue_id, "--json"],
+        "show_after_conflict",
+    );
+    assert!(show.status.success(), "show failed: {}", show.stderr);
     let final_issue_list: serde_json::Value =
         serde_json::from_str(&show.stdout).expect("parse final issue list");
     let final_issue = &final_issue_list[0];
@@ -90,10 +106,16 @@ fn repro_3way_merge_data_loss() {
 
     assert!(
         has_local_tag,
-        "DATA LOSS: Local tag 'local-tag' was lost during 3-way merge!\n\
-         Final labels: {:?}\n\
-         Final description: {}",
-        labels, final_issue["description"]
+        "DATA LOSS: Local tag 'local-tag' was lost during failed manual merge!\n\
+         Final labels: {:?}",
+        labels
+    );
+
+    let preserved_jsonl = fs::read_to_string(&jsonl_path).expect("read preserved jsonl");
+    assert!(
+        preserved_jsonl.contains("External description"),
+        "DATA LOSS: External description was lost during failed manual merge!\n\
+         Final JSONL: {preserved_jsonl}"
     );
 }
 
