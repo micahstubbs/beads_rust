@@ -5,7 +5,7 @@ use fsqlite_types::SqliteValue;
 
 use crate::error::{BeadsError, Result};
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 5;
+pub const CURRENT_SCHEMA_VERSION: i32 = 6;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -1207,6 +1207,26 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
             );
             conn.execute("DROP INDEX IF EXISTS idx_issues_list_active_order")?;
         }
+
+        // v6: Repair datetime columns and legacy status values.
+        //
+        // External tools (including pre-Rust bd flows and direct SQLite edits)
+        // have occasionally written integer epoch microseconds into DATETIME
+        // columns, and imported JSONL has carried the Go-beads "done" status
+        // unchanged via the Status::Custom fallback. Both corrupt the JSONL
+        // export: the reader's legacy `as_text().unwrap_or("")` path mapped
+        // integer datetimes to UNIX_EPOCH (updated_at rows becoming
+        // 1970-01-01) and dropped optional datetimes (closed_at → null),
+        // while downstream tools (bv, bd-style consumers) reject an unknown
+        // "done" status entirely. This migration rewrites the data in place
+        // so every row is fully-typed and uses canonical status strings.
+        if user_version < 6 && table_exists(conn, "issues") {
+            tracing::info!(
+                "Migrating database to schema version 6 (normalize datetime columns and legacy status aliases)"
+            );
+            repair_integer_datetime_columns(conn)?;
+            repair_legacy_status_values(conn)?;
+        }
     }
 
     // Note: source_repo and is_template column backfills are handled in
@@ -1310,6 +1330,52 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
     Ok(())
 }
 
+/// Rewrite any DATETIME column on `issues` that is stored as INTEGER (epoch
+/// micros from stray writers) into canonical RFC 3339 TEXT. Idempotent; rows
+/// that are already TEXT are left untouched.
+fn repair_integer_datetime_columns(conn: &Connection) -> Result<()> {
+    const DATETIME_COLUMNS: &[&str] = &[
+        "created_at",
+        "updated_at",
+        "closed_at",
+        "due_at",
+        "defer_until",
+        "deleted_at",
+        "compacted_at",
+    ];
+    for column in DATETIME_COLUMNS {
+        if !column_exists(conn, "issues", column) {
+            continue;
+        }
+        // Use strftime over the integer microseconds interpretation. The
+        // integers observed in the wild are 16-digit epoch µs (ingested from
+        // chrono `.timestamp_micros()` or equivalent). We preserve six
+        // fractional digits; divisions use `/1000000.0` so the REAL argument
+        // to `strftime` is in fractional seconds.
+        let sql = format!(
+            "UPDATE issues \
+             SET {column} = strftime('%Y-%m-%dT%H:%M:%f', {column} / 1000000.0, 'unixepoch') || 'Z' \
+             WHERE typeof({column}) = 'integer'"
+        );
+        conn.execute(&sql)?;
+    }
+    Ok(())
+}
+
+/// Normalize legacy Go-beads status values. `"done"` is the bd terminal state
+/// and survives round-tripping through Rust via `Status::Custom("done")`;
+/// remap it to the canonical `"closed"` state and make sure `closed_at` is
+/// populated so the `issues` CHECK constraint stays satisfied.
+fn repair_legacy_status_values(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE issues \
+         SET closed_at = COALESCE(closed_at, updated_at, created_at), \
+             status = 'closed' \
+         WHERE LOWER(status) IN ('done', 'complete', 'completed', 'finished', 'resolved')",
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1356,6 +1422,97 @@ mod tests {
         let row = conn.query_row("PRAGMA foreign_keys").unwrap();
         let foreign_keys = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
         assert_eq!(foreign_keys, 1);
+    }
+
+    #[test]
+    fn test_v6_repair_integer_datetime_columns() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("Failed to apply schema");
+
+        // Seed an issue whose updated_at/closed_at were written as INTEGER
+        // microseconds (the bug signature observed in the wild). We bypass
+        // the normal create_issue path by inserting raw so the column
+        // storage class is actually Integer.
+        conn.execute(
+            "INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at, closed_at, close_reason) \
+             VALUES ('bug-1', 'legacy', 'closed', 2, 'task', '2026-04-19T21:34:04.000000000Z', 1776651488000000, 1776651488000000, 'Completed')",
+        )
+        .expect("seed integer datetime row");
+
+        // Sanity: typeof() must confirm the bad state.
+        let row = conn
+            .query_row("SELECT typeof(updated_at), typeof(closed_at) FROM issues WHERE id='bug-1'")
+            .unwrap();
+        assert_eq!(row.get(0).and_then(SqliteValue::as_text), Some("integer"));
+        assert_eq!(row.get(1).and_then(SqliteValue::as_text), Some("integer"));
+
+        repair_integer_datetime_columns(&conn).expect("repair should succeed");
+
+        let row = conn
+            .query_row("SELECT typeof(updated_at), updated_at, typeof(closed_at), closed_at FROM issues WHERE id='bug-1'")
+            .unwrap();
+        assert_eq!(
+            row.get(0).and_then(SqliteValue::as_text),
+            Some("text"),
+            "updated_at must be TEXT after repair"
+        );
+        let updated_at = row
+            .get(1)
+            .and_then(SqliteValue::as_text)
+            .expect("updated_at text");
+        assert!(
+            updated_at.starts_with("2026-04-20T02:18:08"),
+            "expected 2026-04-20 timestamp, got {updated_at}"
+        );
+        assert_eq!(
+            row.get(2).and_then(SqliteValue::as_text),
+            Some("text"),
+            "closed_at must be TEXT after repair"
+        );
+    }
+
+    #[test]
+    fn test_v6_repair_legacy_status_values() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("Failed to apply schema");
+
+        // The issues CHECK constraint forbids closed without closed_at, so
+        // we seed rows that are legally in the `done` state (status NOT IN
+        // ('closed','tombstone') ⇒ closed_at must be NULL). The migration
+        // will promote them to `closed` and backfill closed_at from
+        // updated_at.
+        conn.execute(
+            "INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at) \
+             VALUES ('legacy-done', 'bd legacy', 'done', 2, 'task', '2026-04-02T20:00:00Z', '2026-04-03T01:00:00Z')",
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at) \
+             VALUES ('legacy-resolved', 'bd legacy', 'Resolved', 2, 'task', '2026-04-02T20:00:00Z', '2026-04-03T01:00:00Z')",
+        ).unwrap();
+
+        repair_legacy_status_values(&conn).expect("repair should succeed");
+
+        for id in ["legacy-done", "legacy-resolved"] {
+            let row = conn
+                .query_row(&format!(
+                    "SELECT status, closed_at FROM issues WHERE id='{id}'"
+                ))
+                .unwrap();
+            assert_eq!(
+                row.get(0).and_then(SqliteValue::as_text),
+                Some("closed"),
+                "{id} should be closed"
+            );
+            let closed_at = row
+                .get(1)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or_default();
+            assert!(!closed_at.is_empty(), "{id} closed_at should be populated");
+        }
     }
 
     #[test]

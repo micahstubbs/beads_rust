@@ -2043,11 +2043,7 @@ impl SqliteStorage {
                 .get(2)
                 .and_then(SqliteValue::as_text)
                 .map(str::to_string);
-            let updated_at = parse_datetime(
-                row.get(3)
-                    .and_then(SqliteValue::as_text)
-                    .unwrap_or_default(),
-            )?;
+            let updated_at = parse_datetime_value(row.get(3))?;
             let status = parse_status(row.get(4).and_then(SqliteValue::as_text));
 
             metas.push(IssueMetadata {
@@ -5833,9 +5829,7 @@ impl SqliteStorage {
                     .and_then(SqliteValue::as_text)
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(DependencyType::Blocks),
-                created_at: parse_datetime(
-                    row.get(3).and_then(SqliteValue::as_text).unwrap_or(""),
-                )?,
+                created_at: parse_datetime_value(row.get(3))?,
                 created_by: row.get(4).and_then(SqliteValue::as_text).map(String::from),
                 metadata: row.get(5).and_then(SqliteValue::as_text).map(String::from),
                 thread_id: row.get(6).and_then(SqliteValue::as_text).map(String::from),
@@ -6248,8 +6242,6 @@ impl SqliteStorage {
                 .unwrap_or("")
                 .to_string()
         };
-        let get_str_ref =
-            |idx: usize| -> &str { row.get(idx).and_then(SqliteValue::as_text).unwrap_or("") };
         let get_opt_str = |idx: usize| -> Option<String> {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
@@ -6271,11 +6263,7 @@ impl SqliteStorage {
             row.get(idx).and_then(SqliteValue::as_integer).unwrap_or(0) != 0
         };
         let get_opt_datetime = |idx: usize| -> Result<Option<chrono::DateTime<chrono::Utc>>> {
-            row.get(idx)
-                .and_then(SqliteValue::as_text)
-                .filter(|s| !s.is_empty())
-                .map(parse_datetime)
-                .transpose()
+            parse_opt_datetime_value(row.get(idx))
         };
 
         Ok(Issue {
@@ -6292,9 +6280,9 @@ impl SqliteStorage {
             assignee: get_non_empty_str(10),
             owner: get_non_empty_str(11),
             estimated_minutes: get_opt_i32(12),
-            created_at: parse_datetime(get_str_ref(13))?,
+            created_at: parse_datetime_value(row.get(13))?,
             created_by: get_non_empty_str(14),
-            updated_at: parse_datetime(get_str_ref(15))?,
+            updated_at: parse_datetime_value(row.get(15))?,
             closed_at: get_opt_datetime(16)?,
             close_reason: get_non_empty_str(17),
             closed_by_session: get_non_empty_str(18),
@@ -6328,8 +6316,6 @@ impl SqliteStorage {
                 .unwrap_or("")
                 .to_string()
         };
-        let get_str_ref =
-            |idx: usize| -> &str { row.get(idx).and_then(SqliteValue::as_text).unwrap_or("") };
         let get_non_empty_str = |idx: usize| -> Option<String> {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
@@ -6357,9 +6343,9 @@ impl SqliteStorage {
             assignee: get_non_empty_str(8),
             owner: get_non_empty_str(9),
             estimated_minutes: get_opt_i32(10),
-            created_at: parse_datetime(get_str_ref(11))?,
+            created_at: parse_datetime_value(row.get(11))?,
             created_by: get_non_empty_str(12),
-            updated_at: parse_datetime(get_str_ref(13))?,
+            updated_at: parse_datetime_value(row.get(13))?,
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
@@ -6409,11 +6395,7 @@ impl SqliteStorage {
             row.get(idx).and_then(SqliteValue::as_integer).unwrap_or(0) != 0
         };
         let get_opt_datetime = |idx: usize| -> Result<Option<DateTime<Utc>>> {
-            row.get(idx)
-                .and_then(SqliteValue::as_text)
-                .filter(|s| !s.is_empty())
-                .map(parse_datetime)
-                .transpose()
+            parse_opt_datetime_value(row.get(idx))
         };
 
         Ok(StatsIssueRow {
@@ -6422,7 +6404,7 @@ impl SqliteStorage {
             priority: Priority(get_opt_i32(2).unwrap_or_else(|| Priority::default().0)),
             issue_type: parse_issue_type(row.get(3).and_then(SqliteValue::as_text)),
             assignee: get_non_empty_str(4),
-            created_at: parse_datetime(row.get(5).and_then(SqliteValue::as_text).unwrap_or(""))?,
+            created_at: parse_datetime_value(row.get(5))?,
             closed_at: get_opt_datetime(6)?,
             defer_until: get_opt_datetime(7)?,
             ephemeral: get_bool(8),
@@ -6877,6 +6859,105 @@ fn parse_datetime(s: &str) -> Result<DateTime<Utc>> {
     }
 
     Err(BeadsError::Config(format!("unparseable datetime: {s}")))
+}
+
+/// Decode a DATETIME column that may be stored as TEXT (canonical RFC 3339),
+/// INTEGER (epoch seconds/ms/µs/ns), REAL (fractional epoch seconds), or NULL.
+///
+/// SQLite's DATETIME is an advisory type — any storage class is accepted. In
+/// practice external tools and older migration paths have written integer
+/// epoch microseconds into datetime columns; the legacy reader called
+/// `as_text().unwrap_or("")` and then `parse_datetime` silently mapped the
+/// empty string to `UNIX_EPOCH`, corrupting the value on export. This helper
+/// preserves the data by coercing numeric storage classes into a real
+/// `DateTime<Utc>`.
+fn parse_datetime_value(value: Option<&SqliteValue>) -> Result<DateTime<Utc>> {
+    match value {
+        None | Some(SqliteValue::Null) => Ok(DateTime::<Utc>::UNIX_EPOCH),
+        Some(SqliteValue::Text(s)) => parse_datetime(s.as_ref()),
+        Some(SqliteValue::Integer(n)) => datetime_from_epoch_auto(*n),
+        Some(SqliteValue::Float(f)) => datetime_from_epoch_seconds_f64(*f),
+        Some(SqliteValue::Blob(_)) => Err(BeadsError::Config(
+            "unexpected BLOB storage class for datetime column".to_string(),
+        )),
+    }
+}
+
+/// Like [`parse_datetime_value`] but returns `None` for `NULL` / missing
+/// columns instead of `UNIX_EPOCH`. Empty TEXT is treated as `None`.
+fn parse_opt_datetime_value(value: Option<&SqliteValue>) -> Result<Option<DateTime<Utc>>> {
+    match value {
+        None | Some(SqliteValue::Null) => Ok(None),
+        Some(SqliteValue::Text(s)) if s.is_empty() => Ok(None),
+        Some(SqliteValue::Text(s)) => parse_datetime(s.as_ref()).map(Some),
+        Some(SqliteValue::Integer(n)) => datetime_from_epoch_auto(*n).map(Some),
+        Some(SqliteValue::Float(f)) => datetime_from_epoch_seconds_f64(*f).map(Some),
+        Some(SqliteValue::Blob(_)) => Err(BeadsError::Config(
+            "unexpected BLOB storage class for datetime column".to_string(),
+        )),
+    }
+}
+
+/// Convert a numeric epoch stored as `i64` into a UTC datetime by auto-
+/// detecting the unit from magnitude. We assume any realistic beads timestamp
+/// is within a century of the Unix epoch, which gives non-overlapping ranges
+/// for seconds (≤10^10), milliseconds (≤10^13), microseconds (≤10^16), and
+/// nanoseconds (≤10^19).
+fn datetime_from_epoch_auto(n: i64) -> Result<DateTime<Utc>> {
+    const MS_THRESHOLD: i64 = 10_000_000_000; // ~Nov 2286 as seconds
+    const US_THRESHOLD: i64 = 10_000_000_000_000;
+    const NS_THRESHOLD: i64 = 10_000_000_000_000_000;
+
+    let abs = n.unsigned_abs();
+    let (secs, sub_nanos): (i64, u32) = if abs < MS_THRESHOLD as u64 {
+        (n, 0)
+    } else if abs < US_THRESHOLD as u64 {
+        let secs = n.div_euclid(1_000);
+        let rem = epoch_remainder_u32(n, 1_000)?;
+        (secs, rem * 1_000_000)
+    } else if abs < NS_THRESHOLD as u64 {
+        let secs = n.div_euclid(1_000_000);
+        let rem = epoch_remainder_u32(n, 1_000_000)?;
+        (secs, rem * 1_000)
+    } else {
+        let secs = n.div_euclid(1_000_000_000);
+        let rem = epoch_remainder_u32(n, 1_000_000_000)?;
+        (secs, rem)
+    };
+
+    DateTime::<Utc>::from_timestamp(secs, sub_nanos)
+        .ok_or_else(|| BeadsError::Config(format!("invalid epoch value in datetime column: {n}")))
+}
+
+fn epoch_remainder_u32(n: i64, divisor: i64) -> Result<u32> {
+    u32::try_from(n.rem_euclid(divisor))
+        .map_err(|_| BeadsError::Config(format!("invalid epoch value in datetime column: {n}")))
+}
+
+fn datetime_from_epoch_seconds_f64(f: f64) -> Result<DateTime<Utc>> {
+    if !f.is_finite() {
+        return Err(BeadsError::Config(format!(
+            "non-finite datetime column value: {f}"
+        )));
+    }
+    let whole_seconds = f.trunc();
+    const MIN_I64_AS_F64: f64 = -9_223_372_036_854_775_808.0;
+    const MAX_I64_AS_F64: f64 = 9_223_372_036_854_775_807.0;
+    if !(MIN_I64_AS_F64..=MAX_I64_AS_F64).contains(&whole_seconds) {
+        return Err(BeadsError::Config(format!(
+            "invalid epoch value in datetime column: {f}"
+        )));
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    let secs = whole_seconds as i64;
+    let nanos_f64 = ((f - whole_seconds).abs() * 1_000_000_000.0)
+        .round()
+        .min(999_999_999.0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let nanos = nanos_f64 as u32;
+    DateTime::<Utc>::from_timestamp(secs, nanos)
+        .ok_or_else(|| BeadsError::Config(format!("invalid epoch value in datetime column: {f}")))
 }
 
 /// Escape special LIKE pattern characters (%, _, \) for literal matching.
@@ -7754,7 +7835,7 @@ mod tests {
     use super::*;
     use crate::format::ReadyIssue;
     use crate::model::{Issue, IssueType, Priority, Status};
-    use chrono::{DateTime, Datelike, TimeZone, Utc};
+    use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
     use std::fs;
     use tempfile::TempDir;
 
@@ -11905,6 +11986,88 @@ mod tests {
     fn test_parse_datetime_garbage_returns_error() {
         let result = parse_datetime("not-a-date");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_datetime_value_text_roundtrips() {
+        let v = SqliteValue::from("2026-04-19T21:34:04.546468109Z");
+        let dt = parse_datetime_value(Some(&v)).unwrap();
+        assert_eq!(dt.year(), 2026);
+        assert_eq!(dt.month(), 4);
+        assert_eq!(dt.day(), 19);
+    }
+
+    #[test]
+    fn test_parse_datetime_value_integer_microseconds() {
+        // 1776651488000000 µs = 2026-04-20T02:18:08Z — the exact wire format
+        // the schema v6 migration repairs. The old reader (as_text().unwrap_or("")
+        // → parse_datetime) silently produced UNIX_EPOCH here.
+        let v = SqliteValue::Integer(1_776_651_488_000_000);
+        let dt = parse_datetime_value(Some(&v)).unwrap();
+        assert_eq!(dt.year(), 2026);
+        assert_eq!(dt.month(), 4);
+        assert_eq!(dt.day(), 20);
+        assert_eq!(dt.hour(), 2);
+        assert_eq!(dt.minute(), 18);
+        assert_eq!(dt.second(), 8);
+    }
+
+    #[test]
+    fn test_parse_datetime_value_integer_seconds() {
+        // 1_776_651_488 s = 2026-04-20T02:18:08Z
+        let v = SqliteValue::Integer(1_776_651_488);
+        let dt = parse_datetime_value(Some(&v)).unwrap();
+        assert_eq!(dt.year(), 2026);
+        assert_eq!(dt.hour(), 2);
+    }
+
+    #[test]
+    fn test_parse_datetime_value_integer_nanoseconds() {
+        let v = SqliteValue::Integer(1_776_651_488_000_000_000);
+        let dt = parse_datetime_value(Some(&v)).unwrap();
+        assert_eq!(dt.year(), 2026);
+    }
+
+    #[test]
+    fn test_parse_datetime_value_null_is_epoch() {
+        assert_eq!(
+            parse_datetime_value(Some(&SqliteValue::Null)).unwrap(),
+            DateTime::<Utc>::UNIX_EPOCH
+        );
+        assert_eq!(
+            parse_datetime_value(None).unwrap(),
+            DateTime::<Utc>::UNIX_EPOCH
+        );
+    }
+
+    #[test]
+    fn test_parse_opt_datetime_value_integer_preserved_not_dropped() {
+        // The legacy get_opt_datetime path turned integer-typed columns
+        // into None; parse_opt_datetime_value must preserve the timestamp.
+        let v = SqliteValue::Integer(1_776_651_488_000_000);
+        let dt = parse_opt_datetime_value(Some(&v)).unwrap().unwrap();
+        assert_eq!(dt.year(), 2026);
+        assert_eq!(dt.day(), 20);
+    }
+
+    #[test]
+    fn test_parse_opt_datetime_value_null_is_none() {
+        assert_eq!(
+            parse_opt_datetime_value(Some(&SqliteValue::Null)).unwrap(),
+            None
+        );
+        assert_eq!(parse_opt_datetime_value(None).unwrap(), None);
+        assert_eq!(
+            parse_opt_datetime_value(Some(&SqliteValue::from(""))).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_datetime_value_rejects_blob() {
+        let v = SqliteValue::Blob(std::sync::Arc::from(b"bad".as_slice()));
+        assert!(parse_datetime_value(Some(&v)).is_err());
+        assert!(parse_opt_datetime_value(Some(&v)).is_err());
     }
 
     #[test]
