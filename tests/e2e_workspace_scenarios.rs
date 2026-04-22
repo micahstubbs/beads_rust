@@ -19,6 +19,30 @@ use common::scenarios::{WorkspaceEvolutionEventKind, catalog};
 use serde_json::Value;
 use tempfile::TempDir;
 
+fn parse_json_stdout(stdout: &str, context: &str) -> Value {
+    let payload = extract_json_payload(stdout);
+    serde_json::from_str(&payload)
+        .unwrap_or_else(|error| panic!("parse {context} json failed: {error}; payload={payload}"))
+}
+
+fn assert_doctor_json_has_healthy_checks(json: &Value) {
+    let checks = json
+        .get("checks")
+        .and_then(Value::as_array)
+        .or_else(|| json.as_array())
+        .expect("doctor JSON should contain checks array");
+    assert!(
+        !checks.is_empty(),
+        "doctor should report at least one check"
+    );
+    assert!(
+        checks
+            .iter()
+            .all(|check| check["status"].as_str() != Some("error")),
+        "healthy workspace doctor output should not contain errors: {checks:?}"
+    );
+}
+
 // =============================================================================
 // Init Scenarios
 // =============================================================================
@@ -185,8 +209,9 @@ fn scenario_config_get_json() {
     let get = ws.run_br(["config", "get", "json", "--json"], "config_get_json");
     get.assert_success();
 
-    let payload = extract_json_payload(&get.stdout);
-    let _json: Value = serde_json::from_str(&payload).expect("parse config get json");
+    let json = parse_json_stdout(&get.stdout, "config get");
+    assert_eq!(json["key"].as_str(), Some("json"));
+    assert_eq!(json["value"].as_str(), Some("true"));
 
     ws.finish(true);
 }
@@ -226,6 +251,12 @@ fn scenario_doctor_healthy_workspace() {
     // Doctor on healthy workspace should pass
     let doctor = ws.run_br(["doctor"], "doctor");
     doctor.assert_success();
+    let stdout = doctor.stdout.to_ascii_lowercase();
+    assert!(
+        stdout.contains("ok") || stdout.contains("healthy"),
+        "doctor should report healthy checks: {}",
+        doctor.stdout
+    );
 
     ws.finish(true);
 }
@@ -240,14 +271,8 @@ fn scenario_doctor_json_output() {
     let doctor = ws.run_br(["doctor", "--json"], "doctor_json");
     doctor.assert_success();
 
-    let payload = extract_json_payload(&doctor.stdout);
-    let json: Value = serde_json::from_str(&payload).expect("parse doctor json");
-
-    // Should have checks array
-    assert!(
-        json.get("checks").is_some() || json.is_array(),
-        "doctor JSON should contain checks: {json:?}"
-    );
+    let json = parse_json_stdout(&doctor.stdout, "doctor");
+    assert_doctor_json_has_healthy_checks(&json);
 
     ws.finish(true);
 }
@@ -392,6 +417,11 @@ fn scenario_version_no_workspace_required() {
 
     let version = ws.run_br(["version"], "version");
     version.assert_success();
+    assert!(
+        version.stdout.contains("br") || version.stdout.contains("version"),
+        "version should work without a workspace and show version info: {}",
+        version.stdout
+    );
 
     ws.finish(true);
 }
@@ -407,6 +437,13 @@ fn scenario_workspace_lifecycle() {
     // 1. Check version (no workspace needed)
     let version = ws.run_br(["version", "--json"], "version");
     version.assert_success();
+    let version_json = parse_json_stdout(&version.stdout, "version");
+    assert!(
+        version_json["version"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "version JSON should contain a non-empty version: {version_json:?}"
+    );
 
     // 2. Initialize workspace
     let init = ws.run_br(["init"], "init");
@@ -415,18 +452,38 @@ fn scenario_workspace_lifecycle() {
     // 3. Check workspace location
     let where_cmd = ws.run_br(["where"], "where");
     where_cmd.assert_success();
+    assert!(
+        where_cmd.stdout.contains(".beads"),
+        "where should identify the beads directory: {}",
+        where_cmd.stdout
+    );
 
     // 4. Get workspace info
     let info = ws.run_br(["info", "--json"], "info");
     info.assert_success();
+    let info_json = parse_json_stdout(&info.stdout, "info");
+    assert!(
+        info_json["beads_dir"]
+            .as_str()
+            .is_some_and(|path| path.contains(".beads")),
+        "info JSON should include beads_dir: {info_json:?}"
+    );
+    assert_eq!(info_json["mode"].as_str(), Some("direct"));
 
     // 5. Check configuration
     let config = ws.run_br(["config", "list", "--json"], "config");
     config.assert_success();
+    let config_json = parse_json_stdout(&config.stdout, "config list");
+    assert!(
+        config_json.is_object(),
+        "config list JSON should be an object: {config_json:?}"
+    );
 
     // 6. Run doctor
     let doctor = ws.run_br(["doctor", "--json"], "doctor");
     doctor.assert_success();
+    let doctor_json = parse_json_stdout(&doctor.stdout, "doctor");
+    assert_doctor_json_has_healthy_checks(&doctor_json);
 
     // 7. Re-init without --force should be rejected
     let reinit = ws.run_br(["init"], "reinit");
@@ -442,6 +499,12 @@ fn scenario_workspace_lifecycle() {
     // 8. Doctor still passes
     let doctor2 = ws.run_br(["doctor"], "doctor_after_reinit");
     doctor2.assert_success();
+    let doctor2_stdout = doctor2.stdout.to_ascii_lowercase();
+    assert!(
+        doctor2_stdout.contains("ok") || doctor2_stdout.contains("healthy"),
+        "doctor should remain healthy after rejected re-init: {}",
+        doctor2.stdout
+    );
 
     ws.finish(true);
 }

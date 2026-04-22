@@ -7566,6 +7566,35 @@ fn extract_id_from_json(output: &str) -> String {
     extract_issue_id(&json)
 }
 
+fn assert_command_success(output: &CmdOutput, label: &str) {
+    assert!(
+        output.status.success(),
+        "{label} failed: stdout='{}' stderr='{}'",
+        output.stdout,
+        output.stderr
+    );
+}
+
+fn issue_value_from_show_output(output: &CmdOutput, label: &str) -> Value {
+    assert_command_success(output, label);
+    let json = extract_json_payload(&output.stdout);
+    let value: Value = serde_json::from_str(&json).expect("parse show json");
+    if value.is_array() {
+        value[0].clone()
+    } else {
+        value
+    }
+}
+
+fn assert_json_output_mentions(output: &CmdOutput, expected: &str, label: &str) {
+    assert_command_success(output, label);
+    let json = extract_json_payload(&output.stdout);
+    assert!(
+        json.contains(expected),
+        "{label} output should mention {expected}: {json}"
+    );
+}
+
 fn extract_checks_len(json_str: &str) -> usize {
     serde_json::from_str::<Value>(json_str)
         .ok()
@@ -10265,22 +10294,8 @@ fn conformance_close_sets_closed_at() {
     let br_show = workspace.run_br(["show", &br_id, "--json"], "show_closed");
     let bd_show = workspace.run_bd(["show", &bd_id, "--json"], "show_closed");
 
-    let br_json = extract_json_payload(&br_show.stdout);
-    let bd_json = extract_json_payload(&bd_show.stdout);
-
-    let br_val: Value = serde_json::from_str(&br_json).unwrap_or(Value::Null);
-    let bd_val: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Null);
-
-    let br_issue = if br_val.is_array() {
-        &br_val[0]
-    } else {
-        &br_val
-    };
-    let bd_issue = if bd_val.is_array() {
-        &bd_val[0]
-    } else {
-        &bd_val
-    };
+    let br_issue = issue_value_from_show_output(&br_show, "br show closed issue");
+    let bd_issue = issue_value_from_show_output(&bd_show, "bd show closed issue");
 
     // Both should have closed_at set
     let br_has_closed_at = br_issue.get("closed_at").is_some() && !br_issue["closed_at"].is_null();
@@ -10289,6 +10304,14 @@ fn conformance_close_sets_closed_at() {
     info!(
         "br has closed_at: {}, bd has closed_at: {}",
         br_has_closed_at, bd_has_closed_at
+    );
+    assert!(
+        br_has_closed_at,
+        "br closed issue missing closed_at: {br_issue:?}"
+    );
+    assert!(
+        bd_has_closed_at,
+        "bd closed issue missing closed_at: {bd_issue:?}"
     );
 
     info!("conformance_close_sets_closed_at passed");
@@ -10491,22 +10514,8 @@ fn conformance_reopen_clears_closed_at() {
     let br_show = workspace.run_br(["show", &br_id, "--json"], "show_reopened");
     let bd_show = workspace.run_bd(["show", &bd_id, "--json"], "show_reopened");
 
-    let br_json = extract_json_payload(&br_show.stdout);
-    let bd_json = extract_json_payload(&bd_show.stdout);
-
-    let br_val: Value = serde_json::from_str(&br_json).unwrap_or(Value::Null);
-    let bd_val: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Null);
-
-    let br_issue = if br_val.is_array() {
-        &br_val[0]
-    } else {
-        &br_val
-    };
-    let bd_issue = if bd_val.is_array() {
-        &bd_val[0]
-    } else {
-        &bd_val
-    };
+    let br_issue = issue_value_from_show_output(&br_show, "br show reopened issue");
+    let bd_issue = issue_value_from_show_output(&bd_show, "bd show reopened issue");
 
     // closed_at should be null/cleared
     let br_closed_at = br_issue.get("closed_at");
@@ -10515,6 +10524,14 @@ fn conformance_reopen_clears_closed_at() {
     info!(
         "br closed_at after reopen: {:?}, bd closed_at after reopen: {:?}",
         br_closed_at, bd_closed_at
+    );
+    assert!(
+        br_closed_at.is_none_or(Value::is_null),
+        "br reopened issue should clear closed_at: {br_issue:?}"
+    );
+    assert!(
+        bd_closed_at.is_none_or(Value::is_null),
+        "bd reopened issue should clear closed_at: {bd_issue:?}"
     );
 
     info!("conformance_reopen_clears_closed_at passed");
@@ -11264,6 +11281,8 @@ fn conformance_graph_no_deps() {
         br_out.status.success(),
         bd_out.status.success()
     );
+    assert_json_output_mentions(&br_out, &br_id, "br graph no deps");
+    assert_json_output_mentions(&bd_out, &bd_id, "bd graph no deps");
 
     info!("conformance_graph_no_deps passed");
 }
@@ -11290,8 +11309,10 @@ fn conformance_graph_simple_dep() {
     let bd_b_id = extract_id_from_json(&bd_b.stdout);
 
     // A depends on B (A -> B)
-    workspace.run_br(["dep", "add", &br_a_id, &br_b_id], "add_dep");
-    workspace.run_bd(["dep", "add", &bd_a_id, &bd_b_id], "add_dep");
+    let br_dep = workspace.run_br(["dep", "add", &br_a_id, &br_b_id], "add_dep");
+    let bd_dep = workspace.run_bd(["dep", "add", &bd_a_id, &bd_b_id], "add_dep");
+    assert_command_success(&br_dep, "br graph simple dep setup");
+    assert_command_success(&bd_dep, "bd graph simple dep setup");
 
     // Get graph from A
     let br_out = workspace.run_br(["graph", &br_a_id, "--json"], "graph_simple");
@@ -11302,6 +11323,10 @@ fn conformance_graph_simple_dep() {
         br_out.status.success(),
         bd_out.status.success()
     );
+    assert_json_output_mentions(&br_out, &br_a_id, "br graph simple root");
+    assert_json_output_mentions(&br_out, &br_b_id, "br graph simple dependency");
+    assert_json_output_mentions(&bd_out, &bd_a_id, "bd graph simple root");
+    assert_json_output_mentions(&bd_out, &bd_b_id, "bd graph simple dependency");
 
     info!("conformance_graph_simple_dep passed");
 }
@@ -11335,14 +11360,22 @@ fn conformance_graph_complex_deps() {
     let bd_d_id = extract_id_from_json(&bd_d.stdout);
 
     // A -> B, A -> C, B -> D, C -> D (diamond pattern)
-    workspace.run_br(["dep", "add", &br_a_id, &br_b_id], "dep_ab");
-    workspace.run_bd(["dep", "add", &bd_a_id, &bd_b_id], "dep_ab");
-    workspace.run_br(["dep", "add", &br_a_id, &br_c_id], "dep_ac");
-    workspace.run_bd(["dep", "add", &bd_a_id, &bd_c_id], "dep_ac");
-    workspace.run_br(["dep", "add", &br_b_id, &br_d_id], "dep_bd");
-    workspace.run_bd(["dep", "add", &bd_b_id, &bd_d_id], "dep_bd");
-    workspace.run_br(["dep", "add", &br_c_id, &br_d_id], "dep_cd");
-    workspace.run_bd(["dep", "add", &bd_c_id, &bd_d_id], "dep_cd");
+    let br_dep_ab = workspace.run_br(["dep", "add", &br_a_id, &br_b_id], "dep_ab");
+    let bd_dep_ab = workspace.run_bd(["dep", "add", &bd_a_id, &bd_b_id], "dep_ab");
+    let br_dep_ac = workspace.run_br(["dep", "add", &br_a_id, &br_c_id], "dep_ac");
+    let bd_dep_ac = workspace.run_bd(["dep", "add", &bd_a_id, &bd_c_id], "dep_ac");
+    let br_dep_bd = workspace.run_br(["dep", "add", &br_b_id, &br_d_id], "dep_bd");
+    let bd_dep_bd = workspace.run_bd(["dep", "add", &bd_b_id, &bd_d_id], "dep_bd");
+    let br_dep_cd = workspace.run_br(["dep", "add", &br_c_id, &br_d_id], "dep_cd");
+    let bd_dep_cd = workspace.run_bd(["dep", "add", &bd_c_id, &bd_d_id], "dep_cd");
+    assert_command_success(&br_dep_ab, "br graph complex dep_ab setup");
+    assert_command_success(&bd_dep_ab, "bd graph complex dep_ab setup");
+    assert_command_success(&br_dep_ac, "br graph complex dep_ac setup");
+    assert_command_success(&bd_dep_ac, "bd graph complex dep_ac setup");
+    assert_command_success(&br_dep_bd, "br graph complex dep_bd setup");
+    assert_command_success(&bd_dep_bd, "bd graph complex dep_bd setup");
+    assert_command_success(&br_dep_cd, "br graph complex dep_cd setup");
+    assert_command_success(&bd_dep_cd, "bd graph complex dep_cd setup");
 
     // Get graph from A
     let br_out = workspace.run_br(["graph", &br_a_id, "--json"], "graph_complex");
@@ -11353,6 +11386,12 @@ fn conformance_graph_complex_deps() {
         br_out.status.success(),
         bd_out.status.success()
     );
+    for expected in [&br_a_id, &br_b_id, &br_c_id, &br_d_id] {
+        assert_json_output_mentions(&br_out, expected, "br graph complex");
+    }
+    for expected in [&bd_a_id, &bd_b_id, &bd_c_id, &bd_d_id] {
+        assert_json_output_mentions(&bd_out, expected, "bd graph complex");
+    }
 
     info!("conformance_graph_complex_deps passed");
 }
@@ -11367,10 +11406,14 @@ fn conformance_graph_all_flag() {
     workspace.init_both();
 
     // Create some issues
-    workspace.run_br(["create", "Issue 1", "--json"], "create1");
-    workspace.run_bd(["create", "Issue 1", "--json"], "create1");
-    workspace.run_br(["create", "Issue 2", "--json"], "create2");
-    workspace.run_bd(["create", "Issue 2", "--json"], "create2");
+    let br_issue1 = workspace.run_br(["create", "Issue 1", "--json"], "create1");
+    let bd_issue1 = workspace.run_bd(["create", "Issue 1", "--json"], "create1");
+    let br_issue2 = workspace.run_br(["create", "Issue 2", "--json"], "create2");
+    let bd_issue2 = workspace.run_bd(["create", "Issue 2", "--json"], "create2");
+    let br_issue1_id = extract_id_from_json(&br_issue1.stdout);
+    let bd_issue1_id = extract_id_from_json(&bd_issue1.stdout);
+    let br_issue2_id = extract_id_from_json(&br_issue2.stdout);
+    let bd_issue2_id = extract_id_from_json(&bd_issue2.stdout);
 
     // Get graph for all issues
     let br_out = workspace.run_br(["graph", "--all", "--json"], "graph_all");
@@ -11381,6 +11424,10 @@ fn conformance_graph_all_flag() {
         br_out.status.success(),
         bd_out.status.success()
     );
+    assert_json_output_mentions(&br_out, &br_issue1_id, "br graph all first issue");
+    assert_json_output_mentions(&br_out, &br_issue2_id, "br graph all second issue");
+    assert_json_output_mentions(&bd_out, &bd_issue1_id, "bd graph all first issue");
+    assert_json_output_mentions(&bd_out, &bd_issue2_id, "bd graph all second issue");
 
     info!("conformance_graph_all_flag passed");
 }
@@ -11670,6 +11717,23 @@ fn conformance_audit_record_with_issue() {
         br_out.status.success(),
         bd_out.status.success()
     );
+    assert_command_success(&br_out, "br audit record with issue");
+    assert_command_success(&bd_out, "bd audit record with issue");
+
+    let br_record: Value =
+        serde_json::from_str(&extract_json_payload(&br_out.stdout)).expect("br audit record json");
+    let bd_record: Value =
+        serde_json::from_str(&extract_json_payload(&bd_out.stdout)).expect("bd audit record json");
+    assert!(
+        br_record["id"].as_str().is_some_and(|id| !id.is_empty()),
+        "br audit record should return an id: {br_record:?}"
+    );
+    assert_eq!(br_record["kind"].as_str(), Some("llm_call"));
+    assert!(
+        bd_record["id"].as_str().is_some_and(|id| !id.is_empty()),
+        "bd audit record should return an id: {bd_record:?}"
+    );
+    assert_eq!(bd_record["kind"].as_str(), Some("llm_call"));
 
     info!("conformance_audit_record_with_issue passed");
 }
@@ -11717,10 +11781,12 @@ fn conformance_audit_label() {
         "audit_record_for_label",
     );
 
+    assert_command_success(&br_record, "br audit record for label");
+    assert_command_success(&bd_record, "bd audit record for label");
+
     // Extract entry IDs from the output
     let br_entry_id = extract_audit_entry_id(&br_record.stdout);
     let bd_entry_id = extract_audit_entry_id(&bd_record.stdout);
-
     info!("br entry_id: {}, bd entry_id: {}", br_entry_id, bd_entry_id);
 
     // Now label the entries
@@ -11755,6 +11821,25 @@ fn conformance_audit_label() {
         "br audit label: success={}, bd audit label: success={}",
         br_out.status.success(),
         bd_out.status.success()
+    );
+    assert_command_success(&br_out, "br audit label");
+    assert_command_success(&bd_out, "bd audit label");
+
+    let br_label: Value =
+        serde_json::from_str(&extract_json_payload(&br_out.stdout)).expect("br audit label json");
+    let bd_label: Value =
+        serde_json::from_str(&extract_json_payload(&bd_out.stdout)).expect("bd audit label json");
+    assert_eq!(br_label["parent_id"].as_str(), Some(br_entry_id.as_str()));
+    assert_eq!(br_label["label"].as_str(), Some("good"));
+    assert!(
+        br_label["id"].as_str().is_some_and(|id| !id.is_empty()),
+        "br audit label should return a label entry id: {br_label:?}"
+    );
+    assert_eq!(bd_label["parent_id"].as_str(), Some(bd_entry_id.as_str()));
+    assert_eq!(bd_label["label"].as_str(), Some("good"));
+    assert!(
+        bd_label["id"].as_str().is_some_and(|id| !id.is_empty()),
+        "bd audit label should return a label entry id: {bd_label:?}"
     );
 
     info!("conformance_audit_label passed");
@@ -11826,16 +11911,14 @@ fn conformance_audit_record_with_error() {
 /// Helper to extract audit entry ID from JSON output
 fn extract_audit_entry_id(output: &str) -> String {
     let json = extract_json_payload(output);
-    if let Ok(v) = serde_json::from_str::<Value>(&json) {
-        if let Some(id) = v.get("id").and_then(|v| v.as_str()) {
-            return id.to_string();
-        }
-        if let Some(id) = v.get("entry_id").and_then(|v| v.as_str()) {
-            return id.to_string();
-        }
+    let v: Value = serde_json::from_str(&json).expect("parse audit entry json");
+    if let Some(id) = v.get("id").and_then(|v| v.as_str()) {
+        return id.to_string();
     }
-    // Fallback: generate a placeholder (test may still pass with ExitCodeOnly)
-    "test-entry-id".to_string()
+    if let Some(id) = v.get("entry_id").and_then(|v| v.as_str()) {
+        return id.to_string();
+    }
+    panic!("audit entry JSON should include id or entry_id: {v:?}");
 }
 
 // ============================================================================
