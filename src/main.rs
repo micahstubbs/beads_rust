@@ -16,6 +16,7 @@ fn main() {
 
     let cli = Cli::parse();
     let json_error_mode = should_render_errors_as_json(&cli);
+    let color_error_mode = should_color_human_errors_for_cli(&cli);
     let output_ctx = OutputContext::from_args(&cli);
     let is_mutating = is_mutating_command(&cli.command);
     let needs_bootstrap_context = should_auto_import(&cli.command);
@@ -32,7 +33,7 @@ fn main() {
         Ok(ctx) => ctx,
         Err(e) => {
             if needs_bootstrap_context {
-                handle_error(&e, json_error_mode);
+                handle_error(&e, json_error_mode, color_error_mode);
             }
             StartupContext::empty(overrides.clone())
         }
@@ -66,7 +67,7 @@ fn main() {
                 beads_rust::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout)
             }) {
                 Some(Ok(lock)) => Some(lock),
-                Some(Err(e)) => handle_error(&e, json_error_mode),
+                Some(Err(e)) => handle_error(&e, json_error_mode, color_error_mode),
                 None => None,
             }
         } else {
@@ -79,7 +80,7 @@ fn main() {
             Ok(res) => Some(res),
             Err(e) => {
                 if needs_bootstrap_context {
-                    handle_error(&e, json_error_mode);
+                    handle_error(&e, json_error_mode, color_error_mode);
                 }
                 None
             }
@@ -104,7 +105,7 @@ fn main() {
                 beads_rust::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout)
             }) {
                 Some(Ok(lock)) => Some(lock),
-                Some(Err(e)) => handle_error(&e, json_error_mode),
+                Some(Err(e)) => handle_error(&e, json_error_mode, color_error_mode),
                 None => None,
             }
         };
@@ -123,7 +124,7 @@ fn main() {
                     tracing::debug!("Auto-import skipped because .sync.lock is held");
                     None
                 }
-                Some(Err(e)) => handle_error(&e, json_error_mode),
+                Some(Err(e)) => handle_error(&e, json_error_mode, color_error_mode),
                 None => None,
             };
             if sync_lock.is_some() {
@@ -136,7 +137,7 @@ fn main() {
                 {
                     Ok(prefix) => Some(prefix),
                     Err(e) => {
-                        handle_error(&e, json_error_mode);
+                        handle_error(&e, json_error_mode, color_error_mode);
                     }
                 };
                 let outcome = auto_import_if_stale(
@@ -149,7 +150,7 @@ fn main() {
                     false,
                 );
                 if let Err(e) = outcome {
-                    handle_error(&e, json_error_mode);
+                    handle_error(&e, json_error_mode, color_error_mode);
                 }
             }
             // sync_lock drops here, releasing the advisory lock before command execution
@@ -356,7 +357,7 @@ fn main() {
 
     // Handle command result
     if let Err(e) = result {
-        handle_error(&e, json_error_mode);
+        handle_error(&e, json_error_mode, color_error_mode);
     }
 
     // Phase 5: Auto-Flush (with advisory flock to serialize concurrent access)
@@ -681,8 +682,24 @@ fn should_render_errors_as_json(cli: &Cli) -> bool {
     should_render_errors_as_json_with_env(cli, OutputFormat::from_env())
 }
 
+const fn should_color_human_errors(
+    no_color_flag: bool,
+    no_color_env_present: bool,
+    stderr_is_terminal: bool,
+) -> bool {
+    !no_color_flag && !no_color_env_present && stderr_is_terminal
+}
+
+fn should_color_human_errors_for_cli(cli: &Cli) -> bool {
+    should_color_human_errors(
+        cli.no_color,
+        std::env::var_os("NO_COLOR").is_some(),
+        io::stderr().is_terminal(),
+    )
+}
+
 /// Handle errors with structured output support.
-fn handle_error(err: &BeadsError, json_mode: bool) -> ! {
+fn handle_error(err: &BeadsError, json_mode: bool, color_mode: bool) -> ! {
     let structured = StructuredError::from_error(err);
     let exit_code = structured.code.exit_code();
 
@@ -693,8 +710,7 @@ fn handle_error(err: &BeadsError, json_mode: bool) -> ! {
             serde_json::to_string_pretty(&json).unwrap_or_else(|_| json.to_string())
         );
     } else {
-        let use_color = io::stderr().is_terminal();
-        eprintln!("{}", structured.to_human(use_color));
+        eprintln!("{}", structured.to_human(color_mode));
     }
 
     std::process::exit(exit_code);
@@ -769,6 +785,26 @@ mod tests {
             }
             other => unreachable!("expected create command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn human_error_color_respects_no_color_precedence() {
+        assert!(
+            should_color_human_errors(false, false, true),
+            "interactive stderr should use color when no color controls are set"
+        );
+        assert!(
+            !should_color_human_errors(true, false, true),
+            "--no-color must suppress ANSI error output even on a TTY"
+        );
+        assert!(
+            !should_color_human_errors(false, true, true),
+            "NO_COLOR must suppress ANSI error output even on a TTY"
+        );
+        assert!(
+            !should_color_human_errors(false, false, false),
+            "non-terminal stderr should not receive ANSI error output"
+        );
     }
 
     #[test]
