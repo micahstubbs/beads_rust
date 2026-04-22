@@ -19,7 +19,7 @@ fn main() {
     let color_error_mode = should_color_human_errors_for_cli(&cli);
     let output_ctx = OutputContext::from_args(&cli);
     let is_mutating = is_mutating_command(&cli.command);
-    let needs_bootstrap_context = should_auto_import(&cli.command);
+    let command_supports_auto_import = should_auto_import(&cli.command);
 
     // Initialize logging
     if let Err(e) = init_logging(cli.verbose, cli.quiet, None) {
@@ -32,7 +32,7 @@ fn main() {
     let mut ctx = match StartupContext::init(&overrides) {
         Ok(ctx) => ctx,
         Err(e) => {
-            if needs_bootstrap_context {
+            if command_supports_auto_import {
                 handle_error(&e, json_error_mode, color_error_mode);
             }
             StartupContext::empty(overrides.clone())
@@ -40,10 +40,12 @@ fn main() {
     };
 
     let storage_enabled = ctx.is_initialized() && !ctx.no_db();
+    let should_auto_import_now =
+        command_supports_auto_import && !cli.allow_stale && !ctx.no_auto_import();
     let should_auto_flush_now = is_mutating && !ctx.no_auto_flush();
     let should_preopen_storage = should_preopen_storage(
         storage_enabled,
-        needs_bootstrap_context,
+        should_auto_import_now,
         should_auto_flush_now,
     );
     let command_needs_write_lock = needs_write_lock(&cli.command);
@@ -79,7 +81,7 @@ fn main() {
         match open_storage_from_ctx(&mut ctx) {
             Ok(res) => Some(res),
             Err(e) => {
-                if needs_bootstrap_context {
+                if should_auto_import_now {
                     handle_error(&e, json_error_mode, color_error_mode);
                 }
                 None
@@ -93,9 +95,7 @@ fn main() {
     // JSONL witness metadata, so read commands that reach this path also need
     // the write lock before probing.
     if let (Some(res), Some(paths)) = (storage_result.as_mut(), ctx.paths.as_ref())
-        && should_auto_import(&cli.command)
-        && !cli.allow_stale
-        && !ctx.no_auto_import()
+        && should_auto_import_now
     {
         let _auto_import_write_lock = if write_lock.is_some() {
             None

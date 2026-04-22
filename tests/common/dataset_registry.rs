@@ -1529,6 +1529,12 @@ mod tests {
 
     #[test]
     fn test_run_with_integrity() {
+        let registry = DatasetRegistry::new();
+        if !registry.is_available(KnownDataset::BeadsRust) {
+            eprintln!("Skipping test_run_with_integrity: beads_rust dataset not available");
+            return;
+        }
+
         let (result, provenance) = run_with_integrity(KnownDataset::BeadsRust, |isolated| {
             // Verify we have a valid isolated dataset
             assert!(isolated.beads_dir.exists());

@@ -323,10 +323,26 @@ fn asset_target_name() -> &'static str {
 }
 
 fn is_archive_asset_name(name: &str) -> bool {
-    let lower_name = name.to_ascii_lowercase();
-    (lower_name.ends_with(".tar.gz") || lower_name.ends_with(".zip"))
-        && !lower_name.ends_with(".sha256")
-        && !lower_name.ends_with(".minisig")
+    let path = Path::new(name);
+    if path.extension().is_some_and(|ext| {
+        ext.eq_ignore_ascii_case("sha256") || ext.eq_ignore_ascii_case("minisig")
+    }) {
+        return false;
+    }
+
+    has_tar_gz_extension(path)
+        || path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+}
+
+fn has_tar_gz_extension(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gz"))
+        && path
+            .file_stem()
+            .and_then(|stem| Path::new(stem).extension())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("tar"))
 }
 
 fn release_binary_asset_for<'a>(
