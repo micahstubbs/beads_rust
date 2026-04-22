@@ -1301,11 +1301,15 @@ impl ToolHandler for CreateIssueTool {
                 .map_err(beads_to_mcp)?;
 
             for label in &labels_to_add {
-                let _ = storage.add_label(&id, label, &self.0.actor);
+                storage
+                    .add_label(&id, label, &self.0.actor)
+                    .map_err(beads_to_mcp)?;
             }
 
             if let Some(ref pid) = parent_id {
-                let _ = storage.add_dependency(&id, pid, "parent-child", &self.0.actor);
+                storage
+                    .add_dependency(&id, pid, "parent-child", &self.0.actor)
+                    .map_err(beads_to_mcp)?;
             }
 
             Ok(id)
@@ -1497,17 +1501,23 @@ impl ToolHandler for UpdateIssueTool {
 
             // Handle label mutations
             for label in &labels_to_add {
-                let _ = storage.add_label(&id, label, &self.0.actor);
+                storage
+                    .add_label(&id, label, &self.0.actor)
+                    .map_err(beads_to_mcp)?;
             }
             for label in &labels_to_remove {
-                let _ = storage.remove_label(&id, label, &self.0.actor);
+                storage
+                    .remove_label(&id, label, &self.0.actor)
+                    .map_err(beads_to_mcp)?;
             }
 
             // Add comment if provided
             if let Some(comment) = comment.as_deref()
                 && !comment.is_empty()
             {
-                let _ = storage.add_comment(&id, &self.0.actor, comment);
+                storage
+                    .add_comment(&id, &self.0.actor, comment)
+                    .map_err(beads_to_mcp)?;
             }
 
             Ok(issue)
