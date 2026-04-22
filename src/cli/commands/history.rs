@@ -1479,7 +1479,7 @@ mod tests {
             &dir.path().join("nonexistent_temp.jsonl"),
             &target,
             Some(&mut rollback_guard),
-            |_from, _to| Err(io::Error::new(io::ErrorKind::Other, "injected")),
+            |_from, _to| Err(io::Error::other("injected")),
         );
         assert!(result.is_err());
         assert_eq!(

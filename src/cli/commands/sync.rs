@@ -1085,9 +1085,8 @@ fn write_manifest_atomically(manifest_path: &Path, manifest: &serde_json::Value)
     file.sync_all()?;
     drop(file);
 
-    crate::util::durable_rename(&temp_path, manifest_path).map_err(|e| {
+    crate::util::durable_rename(&temp_path, manifest_path).inspect_err(|_| {
         let _ = fs::remove_file(&temp_path);
-        e
     })?;
 
     Ok(())
