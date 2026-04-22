@@ -6,7 +6,7 @@
 use beads_rust::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use beads_rust::storage::SqliteStorage;
 use beads_rust::sync::{
-    export_to_jsonl, import_from_jsonl, read_issues_from_jsonl, ExportConfig, ImportConfig,
+    ExportConfig, ImportConfig, export_to_jsonl, import_from_jsonl, read_issues_from_jsonl,
 };
 use chrono::{Duration, TimeZone, Utc};
 use proptest::prelude::*;
