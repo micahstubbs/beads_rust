@@ -9,6 +9,7 @@ use crate::model::{Issue, IssueType, Priority, Status};
 
 /// Lowercase hex encoding for digest outputs (sha2 0.11 no longer impls `LowerHex`
 /// on `Array<u8, _>`, so we format bytes directly).
+#[must_use]
 pub fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -292,5 +293,57 @@ mod tests {
             issue.is_template,
         );
         assert_eq!(direct, from_parts);
+    }
+
+    #[test]
+    fn test_hex_encode_empty() {
+        assert_eq!(hex_encode(&[]), "");
+    }
+
+    #[test]
+    fn test_hex_encode_single_byte() {
+        assert_eq!(hex_encode(&[0x00]), "00");
+        assert_eq!(hex_encode(&[0x0a]), "0a");
+        assert_eq!(hex_encode(&[0xff]), "ff");
+        assert_eq!(hex_encode(&[0x80]), "80");
+        assert_eq!(hex_encode(&[0x01]), "01");
+    }
+
+    #[test]
+    fn test_hex_encode_32_bytes_sha256_width() {
+        let bytes: Vec<u8> = (0..32).collect();
+        let hex = hex_encode(&bytes);
+        assert_eq!(hex.len(), 64);
+        assert_eq!(
+            hex,
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+        );
+    }
+
+    #[test]
+    fn test_hex_encode_high_bit_bytes() {
+        assert_eq!(hex_encode(&[0x80, 0xff, 0xfe, 0x7f]), "80fffe7f");
+    }
+
+    #[test]
+    fn test_hex_encode_is_lowercase() {
+        let bytes: Vec<u8> = (0xa0..=0xaf).collect();
+        let hex = hex_encode(&bytes);
+        assert!(hex.chars().all(|c| !c.is_ascii_uppercase()));
+        assert_eq!(hex, "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf");
+    }
+
+    #[test]
+    fn test_hex_encode_matches_sha256_digest() {
+        let mut hasher = Sha256::new();
+        hasher.update(b"hello world");
+        let digest = hasher.finalize();
+        let hex = hex_encode(&digest);
+        assert_eq!(hex.len(), 64);
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(
+            hex,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
     }
 }

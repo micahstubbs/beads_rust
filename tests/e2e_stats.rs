@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::cli::{run_br, BrWorkspace};
+use common::cli::{BrWorkspace, run_br};
 use serde_json::Value;
 
 fn init_and_populate(workspace: &BrWorkspace) {
@@ -14,7 +14,14 @@ fn init_and_populate(workspace: &BrWorkspace) {
 
     let c1 = run_br(
         workspace,
-        ["create", "Auth module", "--type", "feature", "--priority", "1"],
+        [
+            "create",
+            "Auth module",
+            "--type",
+            "feature",
+            "--priority",
+            "1",
+        ],
         "create_auth",
     );
     assert!(c1.status.success(), "create auth: {}", c1.stderr);
@@ -28,7 +35,14 @@ fn init_and_populate(workspace: &BrWorkspace) {
 
     let c3 = run_br(
         workspace,
-        ["create", "Fix login bug", "--type", "bug", "--priority", "0"],
+        [
+            "create",
+            "Fix login bug",
+            "--type",
+            "bug",
+            "--priority",
+            "0",
+        ],
         "create_bug",
     );
     assert!(c3.status.success(), "create bug: {}", c3.stderr);
@@ -40,7 +54,11 @@ fn stats_json_empty_workspace() {
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success());
 
-    let stats = run_br(&workspace, ["stats", "--json", "--no-activity"], "stats_empty");
+    let stats = run_br(
+        &workspace,
+        ["stats", "--json", "--no-activity"],
+        "stats_empty",
+    );
     assert!(stats.status.success(), "stats failed: {}", stats.stderr);
 
     let json: Value = serde_json::from_str(&stats.stdout).expect("valid JSON");
@@ -78,9 +96,7 @@ fn stats_json_after_close() {
     let list = run_br(&workspace, ["list", "--json"], "list_ids");
     assert!(list.status.success());
     let list_json: Value = serde_json::from_str(&list.stdout).expect("valid JSON");
-    let first_id = list_json["issues"][0]["id"]
-        .as_str()
-        .expect("has issue id");
+    let first_id = list_json["issues"][0]["id"].as_str().expect("has issue id");
 
     let close = run_br(
         &workspace,
@@ -115,11 +131,7 @@ fn stats_json_with_deps_shows_blocked() {
     let id0 = issues[0]["id"].as_str().unwrap();
     let id1 = issues[1]["id"].as_str().unwrap();
 
-    let dep = run_br(
-        &workspace,
-        ["dep", "add", id0, id1],
-        "add_dep",
-    );
+    let dep = run_br(&workspace, ["dep", "add", id0, id1], "add_dep");
     assert!(dep.status.success(), "dep add failed: {}", dep.stderr);
 
     let stats = run_br(
@@ -158,12 +170,12 @@ fn stats_plain_text_succeeds() {
     let workspace = BrWorkspace::new();
     init_and_populate(&workspace);
 
-    let stats = run_br(
-        &workspace,
-        ["stats", "--no-activity"],
-        "stats_plain",
+    let stats = run_br(&workspace, ["stats", "--no-activity"], "stats_plain");
+    assert!(
+        stats.status.success(),
+        "stats plain failed: {}",
+        stats.stderr
     );
-    assert!(stats.status.success(), "stats plain failed: {}", stats.stderr);
     assert!(
         !stats.stdout.is_empty(),
         "stats plain should produce output"
