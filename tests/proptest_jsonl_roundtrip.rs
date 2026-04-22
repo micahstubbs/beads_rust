@@ -169,8 +169,8 @@ fn populate_storage(case: &RoundTripCase) -> SqliteStorage {
 fn assert_mixed_case_known_value_round_trip(
     raw_status: &str,
     raw_issue_type: &str,
-    expected_status: Status,
-    expected_issue_type: IssueType,
+    expected_status: &Status,
+    expected_issue_type: &IssueType,
     suffix: &str,
 ) {
     let temp = TempDir::new().unwrap();
@@ -224,8 +224,8 @@ fn assert_mixed_case_known_value_round_trip(
         .get_issue(&canonical_issue.id)
         .unwrap()
         .expect("mixed-case issue imported");
-    assert_eq!(stored.status, expected_status);
-    assert_eq!(stored.issue_type, expected_issue_type);
+    assert_eq!(&stored.status, expected_status);
+    assert_eq!(&stored.issue_type, expected_issue_type);
     assert_eq!(stored.content_hash.as_deref(), Some(expected_hash.as_str()));
 
     let export_result = export_to_jsonl(&imported, &export_path, &ExportConfig::default()).unwrap();
@@ -262,36 +262,36 @@ fn jsonl_import_normalizes_mixed_case_known_status_and_issue_type() {
     assert_mixed_case_known_value_round_trip(
         "In_Progress",
         "Bug",
-        Status::InProgress,
-        IssueType::Bug,
+        &Status::InProgress,
+        &IssueType::Bug,
         "mixedcase0",
     );
     assert_mixed_case_known_value_round_trip(
         "INPROGRESS",
         "FEATURE",
-        Status::InProgress,
-        IssueType::Feature,
+        &Status::InProgress,
+        &IssueType::Feature,
         "mixedcase1",
     );
     assert_mixed_case_known_value_round_trip(
         "DRAFT",
         "Question",
-        Status::Draft,
-        IssueType::Question,
+        &Status::Draft,
+        &IssueType::Question,
         "mixedcase2",
     );
     assert_mixed_case_known_value_round_trip(
         "TOMBSTONE",
         "Docs",
-        Status::Tombstone,
-        IssueType::Docs,
+        &Status::Tombstone,
+        &IssueType::Docs,
         "mixedcase3",
     );
     assert_mixed_case_known_value_round_trip(
         "PINNED",
         "Task",
-        Status::Pinned,
-        IssueType::Task,
+        &Status::Pinned,
+        &IssueType::Task,
         "mixedcase4",
     );
 }
@@ -301,8 +301,8 @@ fn jsonl_import_preserves_custom_status_and_issue_type_case() {
     assert_mixed_case_known_value_round_trip(
         "QaReview",
         "Odd_Type",
-        Status::Custom("QaReview".to_string()),
-        IssueType::Custom("Odd_Type".to_string()),
+        &Status::Custom("QaReview".to_string()),
+        &IssueType::Custom("Odd_Type".to_string()),
         "customcase",
     );
 }

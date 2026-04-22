@@ -204,7 +204,7 @@ fn golden_init_expected_file_set() {
         "metadata.json",
     ]
     .iter()
-    .map(|s| s.to_string())
+    .map(std::string::ToString::to_string)
     .collect();
 
     assert_eq!(

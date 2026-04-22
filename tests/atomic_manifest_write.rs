@@ -71,7 +71,10 @@ fn manifest_write_leaves_no_temp_files() {
     assert!(
         temp_files.is_empty(),
         "no .tmp files should remain after successful flush, found: {:?}",
-        temp_files.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        temp_files
+            .iter()
+            .map(std::fs::DirEntry::file_name)
+            .collect::<Vec<_>>()
     );
 }
 

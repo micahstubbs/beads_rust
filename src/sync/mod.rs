@@ -2730,13 +2730,16 @@ pub fn auto_flush(
     // `br sync --flush-only` already has a `--force` escape hatch for this
     // case; auto-flush has no such surface, so the only safe default is to
     // stop, log clearly, and let the next explicit sync surface the error.
-    if jsonl_exists && let Err(err) = ensure_no_conflict_markers(jsonl_path) {
-        tracing::warn!(
-            jsonl_path = %jsonl_path.display(),
-            error = %err,
-            "Skipping auto-flush: JSONL contains merge-conflict markers. Resolve them (or run `br sync --flush-only --force` to override) before the next write.",
-        );
-        return Ok(AutoFlushResult::default());
+    if jsonl_exists {
+        let conflict_markers = scan_conflict_markers(jsonl_path)?;
+        if !conflict_markers.is_empty() {
+            tracing::warn!(
+                jsonl_path = %jsonl_path.display(),
+                marker_count = conflict_markers.len(),
+                "Skipping auto-flush: JSONL contains merge-conflict markers. Resolve them (or run `br sync --flush-only --force` to override) before the next write.",
+            );
+            return Ok(AutoFlushResult::default());
+        }
     }
 
     tracing::debug!(
@@ -5407,6 +5410,29 @@ mod tests {
         let staleness = compute_staleness(&storage, &jsonl_path).unwrap();
         assert!(staleness.db_newer);
         assert!(!staleness.jsonl_exists);
+    }
+
+    #[test]
+    fn test_auto_flush_propagates_jsonl_scan_io_errors() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&jsonl_path).unwrap();
+
+        let issue = make_test_issue("bd-scan-error", "Dirty issue");
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let err = auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap_err();
+        assert!(
+            err.to_string().contains("directory") || err.to_string().contains("Is a directory"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            storage.get_dirty_issue_ids().unwrap(),
+            vec!["bd-scan-error".to_string()],
+            "failed auto-flush must leave dirty markers intact"
+        );
     }
 
     #[test]

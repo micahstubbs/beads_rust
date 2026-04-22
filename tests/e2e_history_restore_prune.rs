@@ -865,7 +865,7 @@ fn e2e_history_restore_force_no_missing_target_window() {
         "no temp files should remain after restore: {:?}",
         leftover_temps
             .iter()
-            .map(|e| e.file_name())
+            .map(std::fs::DirEntry::file_name)
             .collect::<Vec<_>>()
     );
 }
