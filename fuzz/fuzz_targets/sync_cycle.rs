@@ -8,6 +8,7 @@ use beads_rust::sync::{
     ExportConfig, ImportConfig, OrphanMode, compute_jsonl_hash, compute_staleness,
     ensure_no_conflict_markers, export_to_jsonl, import_from_jsonl, preflight_import,
 };
+use beads_rust::validation::IssueValidator;
 use chrono::Utc;
 use common::{BuiltInIssueCursorExt, ByteCursor};
 use libfuzzer_sys::fuzz_target;
@@ -109,6 +110,7 @@ fn run_sync_cycle_case(data: &[u8]) -> Result<(), Box<dyn Error>> {
                     )? {
                         return Ok(());
                     }
+                    assert_import_validation(&storage)?;
                 }
                 Err(err) => {
                     assert_nonempty_error(err)?;
@@ -172,6 +174,7 @@ fn run_sync_cycle_case(data: &[u8]) -> Result<(), Box<dyn Error>> {
                 if assert_storage_invariants_or_expected(&rebuilt, corrupt_db_family, &workspace)? {
                     return Ok(());
                 }
+                assert_import_validation(&rebuilt)?;
             }
             Err(err) => assert_nonempty_error(err)?,
         }
@@ -711,6 +714,30 @@ where
 {
     if err.to_string().trim().is_empty() {
         return Err("operation returned an empty error message".into());
+    }
+    Ok(())
+}
+
+fn assert_import_validation(storage: &SqliteStorage) -> Result<(), Box<dyn Error>> {
+    for issue in storage.get_all_issues_for_export()? {
+        if let Err(errors) = IssueValidator::validate(&issue) {
+            let import_violations: Vec<_> = errors
+                .into_iter()
+                .filter(|e| {
+                    matches!(
+                        e.field.as_str(),
+                        "title" | "description" | "estimated_minutes"
+                    )
+                })
+                .collect();
+            if !import_violations.is_empty() {
+                return Err(format!(
+                    "imported issue {} has validation failures: {import_violations:?}",
+                    issue.id
+                )
+                .into());
+            }
+        }
     }
     Ok(())
 }

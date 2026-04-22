@@ -73,10 +73,7 @@ fn build_directory_listing(beads_dir: &std::path::Path) -> String {
     entries.sort_by(|a, b| a.path().cmp(b.path()));
 
     for entry in &entries {
-        let rel = entry
-            .path()
-            .strip_prefix(beads_dir)
-            .expect("strip prefix");
+        let rel = entry.path().strip_prefix(beads_dir).expect("strip prefix");
         let name = rel.to_string_lossy();
         if is_transient_sqlite(&name) {
             continue;
@@ -111,10 +108,7 @@ fn build_text_contents(beads_dir: &std::path::Path) -> String {
     entries.sort_by(|a, b| a.path().cmp(b.path()));
 
     for entry in &entries {
-        let rel = entry
-            .path()
-            .strip_prefix(beads_dir)
-            .expect("strip prefix");
+        let rel = entry.path().strip_prefix(beads_dir).expect("strip prefix");
         let name = rel.to_string_lossy();
         let content = fs::read_to_string(entry.path()).unwrap_or_else(|_| "<read error>".into());
         writeln!(out, "--- {name} ---").unwrap();
@@ -214,7 +208,8 @@ fn golden_init_expected_file_set() {
     .collect();
 
     assert_eq!(
-        files, expected,
+        files,
+        expected,
         "init should produce exactly the expected file set.\nMissing: {:?}\nExtra: {:?}",
         expected.difference(&files).collect::<Vec<_>>(),
         files.difference(&expected).collect::<Vec<_>>(),

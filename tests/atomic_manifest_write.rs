@@ -15,12 +15,7 @@ fn init_and_create_issue(workspace: &BrWorkspace) {
 
     let create = run_br(
         workspace,
-        [
-            "create",
-            "--title",
-            "test issue",
-            "--no-auto-flush",
-        ],
+        ["create", "--title", "test issue", "--no-auto-flush"],
         "create",
     );
     assert!(create.status.success(), "create failed: {}", create.stderr);
@@ -31,16 +26,8 @@ fn manifest_is_valid_json_after_flush() {
     let workspace = BrWorkspace::new();
     init_and_create_issue(&workspace);
 
-    let flush = run_br(
-        &workspace,
-        ["sync", "--flush-only", "--manifest"],
-        "flush",
-    );
-    assert!(
-        flush.status.success(),
-        "flush failed: {}",
-        flush.stderr
-    );
+    let flush = run_br(&workspace, ["sync", "--flush-only", "--manifest"], "flush");
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
 
     let manifest_path = workspace.root.join(".beads").join(".manifest.json");
     assert!(
@@ -71,26 +58,14 @@ fn manifest_write_leaves_no_temp_files() {
     let workspace = BrWorkspace::new();
     init_and_create_issue(&workspace);
 
-    let flush = run_br(
-        &workspace,
-        ["sync", "--flush-only", "--manifest"],
-        "flush",
-    );
-    assert!(
-        flush.status.success(),
-        "flush failed: {}",
-        flush.stderr
-    );
+    let flush = run_br(&workspace, ["sync", "--flush-only", "--manifest"], "flush");
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
 
     let beads_dir = workspace.root.join(".beads");
     let temp_files: Vec<_> = fs::read_dir(&beads_dir)
         .expect("read .beads dir")
         .filter_map(Result::ok)
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .ends_with(".tmp")
-        })
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
         .collect();
 
     assert!(
@@ -110,11 +85,7 @@ fn pre_existing_manifest_survives_if_no_manifest_flag() {
     fs::write(&manifest_path, sentinel).expect("write sentinel manifest");
 
     let flush = run_br(&workspace, ["sync", "--flush-only"], "flush-no-manifest");
-    assert!(
-        flush.status.success(),
-        "flush failed: {}",
-        flush.stderr
-    );
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
 
     let content = fs::read_to_string(&manifest_path).expect("read manifest");
     assert_eq!(
@@ -137,11 +108,7 @@ fn manifest_overwrite_replaces_old_content_atomically() {
         ["sync", "--flush-only", "--manifest"],
         "flush-overwrite",
     );
-    assert!(
-        flush.status.success(),
-        "flush failed: {}",
-        flush.stderr
-    );
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
 
     let new_content = fs::read_to_string(&manifest_path).expect("read manifest");
     assert_ne!(
@@ -155,7 +122,9 @@ fn manifest_overwrite_replaces_old_content_atomically() {
         parsed.get("issues_count").is_some(),
         "new manifest should have issues_count"
     );
-    let count = parsed["issues_count"].as_u64().expect("issues_count should be u64");
+    let count = parsed["issues_count"]
+        .as_u64()
+        .expect("issues_count should be u64");
     assert!(
         count >= 1,
         "should have exported at least 1 issue, got {count}"

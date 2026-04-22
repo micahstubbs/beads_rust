@@ -3,6 +3,7 @@
 use beads_rust::model::{DependencyType, Issue};
 use beads_rust::storage::SqliteStorage;
 use beads_rust::sync::{ImportConfig, import_from_jsonl};
+use beads_rust::validation::IssueValidator;
 use libfuzzer_sys::fuzz_target;
 use std::collections::HashSet;
 use std::error::Error;
@@ -59,7 +60,10 @@ fn run_import_case(data: &[u8]) -> Result<(), Box<dyn Error>> {
 
         let import_result = import_from_jsonl(&mut storage, &input_path, &config, Some("fuzz-"));
         match import_result {
-            Ok(_) => assert_storage_invariants(&storage)?,
+            Ok(_) => {
+                assert_storage_invariants(&storage)?;
+                assert_import_validation(&storage)?;
+            }
             Err(err) => {
                 let message = err.to_string();
                 if message.trim().is_empty() {
@@ -205,5 +209,35 @@ fn assert_storage_invariants(storage: &SqliteStorage) -> Result<(), Box<dyn Erro
         }
     }
 
+    Ok(())
+}
+
+fn assert_import_validation(storage: &SqliteStorage) -> Result<(), Box<dyn Error>> {
+    for issue in storage.get_all_issues_for_export()? {
+        if let Err(errors) = IssueValidator::validate(&issue) {
+            // The import pipeline intentionally accepts data from external
+            // systems (Go bd, manual JSONL, etc.) that may not conform to
+            // all IssueValidator rules. Filter to violations that indicate
+            // corrupted import behavior, not just permissive acceptance.
+            // Skipped: id (external IDs), priority (not clamped on import),
+            //   updated_at/closed_at (external timestamps), external_ref.
+            let import_violations: Vec<_> = errors
+                .into_iter()
+                .filter(|e| {
+                    matches!(
+                        e.field.as_str(),
+                        "title" | "description" | "estimated_minutes"
+                    )
+                })
+                .collect();
+            if !import_violations.is_empty() {
+                return Err(format!(
+                    "imported issue {} has validation failures: {import_violations:?}",
+                    issue.id
+                )
+                .into());
+            }
+        }
+    }
     Ok(())
 }

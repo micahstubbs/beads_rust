@@ -1107,7 +1107,11 @@ mod tests {
             ("p4", "4"),
             ("P4", "4"),
         ] {
-            assert_eq!(detect_priority_intent(input), Some(expected), "input: {input}");
+            assert_eq!(
+                detect_priority_intent(input),
+                Some(expected),
+                "input: {input}"
+            );
         }
     }
 

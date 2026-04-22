@@ -1069,10 +1069,7 @@ fn execute_flush(
     Ok(())
 }
 
-fn write_manifest_atomically(
-    manifest_path: &Path,
-    manifest: &serde_json::Value,
-) -> Result<()> {
+fn write_manifest_atomically(manifest_path: &Path, manifest: &serde_json::Value) -> Result<()> {
     use std::io::Write;
 
     let temp_path = manifest_path.with_extension(format!("json.{}.tmp", std::process::id()));
