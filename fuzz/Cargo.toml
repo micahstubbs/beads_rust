@@ -56,3 +56,10 @@ path = "fuzz_targets/markdown_import.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "search_issues"
+path = "fuzz_targets/search_issues.rs"
+test = false
+doc = false
+bench = false
