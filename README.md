@@ -412,6 +412,8 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | `close` | Close issue | `br close br-abc123 --reason "Done"` |
 | `reopen` | Reopen closed issue | `br reopen br-abc123` |
 | `delete` | Delete issue (tombstone) | `br delete br-abc123` |
+| `defer` | Schedule issue for later | `br defer br-abc123 --until tomorrow` |
+| `undefer` | Make deferred issue ready again | `br undefer br-abc123` |
 
 ### Querying
 
@@ -423,6 +425,7 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | `search` | Full-text search | `br search "authentication"` |
 | `stale` | Stale issues | `br stale --days 30` |
 | `count` | Count with grouping | `br count --by status` |
+| `query` | Manage saved queries | `br query save mine --status open --assignee alice` |
 
 ### Dependencies
 
@@ -449,6 +452,29 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 |---------|-------------|---------|
 | `comments add` | Add comment | `br comments add br-abc123 "Found root cause"` |
 | `comments list` | List comments | `br comments list br-abc123` |
+
+### Planning & Reporting
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `epic` | Manage epic rollups | `br epic status --eligible-only` |
+| `graph` | Visualize dependency graph | `br graph br-abc123` |
+| `lint` | Check issues for missing template sections | `br lint --status all` |
+| `orphans` | List open issues referenced in commits | `br orphans` |
+| `changelog` | Generate changelog from closed issues | `br changelog --since-tag v0.1.44` |
+| `history` | Manage local history backups | `br history list` |
+| `status` | Alias for project statistics | `br status` |
+
+### Agents & Tooling
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `agents` | Manage AGENTS.md workflow instructions | `br agents --add --force` |
+| `audit` | Record and label agent interactions | `br audit record --kind note` |
+| `completions` | Generate shell completions | `br completions zsh` |
+| `info` | Show workspace diagnostics | `br info` |
+| `schema` | Emit JSON Schemas for outputs | `br schema all --format json` |
+| `where` | Show active `.beads` directory | `br where` |
 
 ### Sync & System
 
