@@ -3705,23 +3705,25 @@ mod tests {
     }
 
     fn create_malformed_blocked_cache_db(db_path: &Path) {
+        let mut storage = SqliteStorage::open(db_path).expect("create setup db");
+        storage
+            .set_config("issue_prefix", "bd")
+            .expect("seed issue prefix");
+        drop(storage);
+
         let conn =
             Connection::open(db_path.to_string_lossy().into_owned()).expect("open setup db");
         crate::storage::schema::execute_batch(
             &conn,
-            "CREATE TABLE blocked_issues_cache (
+            "DROP TABLE blocked_issues_cache;
+            CREATE TABLE blocked_issues_cache (
                 issue_id TEXT PRIMARY KEY,
                 blocked_by TEXT NOT NULL,
                 blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
-            PRAGMA writable_schema=ON;
-            INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
-            SELECT type, name, tbl_name, rootpage, sql
-            FROM sqlite_master
-            WHERE name='blocked_issues_cache';
-            PRAGMA writable_schema=OFF;",
+            INSERT INTO config (key, value) VALUES ('issue_prefix', 'bd');",
         )
-        .expect("create duplicate blocked_issues_cache schema rows");
+        .expect("create malformed blocked_issues_cache schema");
     }
 
     fn insert_duplicate_issue_prefix_config_row(db_path: &Path, value: &str) {
