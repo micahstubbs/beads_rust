@@ -12,7 +12,7 @@ use crate::cli::GraphArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
-use crate::model::{DependencyType, Issue, Priority, Status};
+use crate::model::{Issue, Priority, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
@@ -525,10 +525,10 @@ fn collect_single_graph(
     root_id: &str,
     root_issue: &Issue,
 ) -> Result<SingleGraphTraversal> {
-    // For single graph (dependents), we want to show all paths from the root.
-    // However, to prevent infinite loops in case of cycles, we track the current path.
-    // We also want traversal_order to reflect first-visit DFS order so rendered subtrees stay
-    // contiguous in the human-readable graph output.
+    // DFS traversal producing first-visit order so rendered subtrees stay contiguous.
+    // Cycle prevention uses expanded_nodes (fully processed) and queued_nodes (on stack)
+    // — together they prevent any node from being pushed twice, making the per-entry
+    // path Vec unnecessary.
     let mut traversal_order: Vec<String> = Vec::new();
     let mut issues_by_id: HashMap<String, Issue> = HashMap::new();
     let mut edges: Vec<(String, String)> = Vec::new();
@@ -537,16 +537,15 @@ fn collect_single_graph(
     let mut expanded_nodes: HashSet<String> = HashSet::new();
     let mut queued_nodes: HashSet<String> = HashSet::new();
 
-    // Optimization: Prefetch active issue metadata to avoid N+1 queries during traversal
     let metadata_cache = storage.get_active_issues_metadata()?;
+    let dependents_cache = storage.prefetch_blocking_dependents()?;
 
-    // Stack stores (current_id, path_to_this_node)
-    let mut stack: Vec<(String, Vec<String>)> = vec![(root_id.to_string(), vec![])];
+    let mut stack: Vec<String> = vec![root_id.to_string()];
     queued_nodes.insert(root_id.to_string());
 
     issues_by_id.insert(root_id.to_string(), root_issue.clone());
 
-    while let Some((current_id, path)) = stack.pop() {
+    while let Some(current_id) = stack.pop() {
         queued_nodes.remove(&current_id);
 
         if ordered_nodes.insert(current_id.clone()) {
@@ -557,14 +556,10 @@ fn collect_single_graph(
             continue;
         }
 
-        let mut dependents = storage.get_dependents_with_metadata(&current_id)?;
-        dependents.retain(|dep| {
-            dep.dep_type
-                .parse::<DependencyType>()
-                .unwrap_or(DependencyType::Blocks)
-                .affects_ready_work()
-        });
-        // Sort for deterministic traversal: priority then ID
+        let mut dependents: Vec<_> = dependents_cache
+            .get(&current_id)
+            .cloned()
+            .unwrap_or_default();
         dependents.sort_by(|a, b| a.priority.0.cmp(&b.priority.0).then(a.id.cmp(&b.id)));
 
         for dep in dependents.into_iter().rev() {
@@ -574,8 +569,6 @@ fn collect_single_graph(
             }
 
             if !issues_by_id.contains_key(&dep.id) {
-                // Use cache if available, otherwise preserve the dependency metadata
-                // placeholder instead of turning a missing issue back into a hard error.
                 let issue = if let Some(meta) = metadata_cache.get(&dep.id) {
                     Issue {
                         id: dep.id.clone(),
@@ -597,15 +590,11 @@ fn collect_single_graph(
                 issues_by_id.insert(dep.id.clone(), issue);
             }
 
-            // Cycle prevention: only descend if the child isn't already in the path to here
-            if !path.contains(&dep.id)
-                && dep.id != current_id
+            if dep.id != current_id
                 && !expanded_nodes.contains(&dep.id)
                 && queued_nodes.insert(dep.id.clone())
             {
-                let mut new_path = path.clone();
-                new_path.push(current_id.clone());
-                stack.push((dep.id.clone(), new_path));
+                stack.push(dep.id.clone());
             }
         }
     }
