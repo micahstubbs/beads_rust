@@ -113,7 +113,7 @@ fn main() {
                 .map_or(true, |staleness| staleness.jsonl_newer);
 
         if should_attempt_auto_import {
-            let _sync_lock = match ctx
+            let sync_lock = match ctx
                 .beads_dir
                 .as_deref()
                 .map(beads_rust::sync::try_sync_lock)
@@ -126,7 +126,7 @@ fn main() {
                 Some(Err(e)) => handle_error(&e, json_error_mode),
                 None => None,
             };
-            if _sync_lock.is_some() {
+            if sync_lock.is_some() {
                 let allow_external_jsonl = config::implicit_external_jsonl_allowed(
                     &paths.beads_dir,
                     &paths.db_path,
@@ -152,7 +152,7 @@ fn main() {
                     handle_error(&e, json_error_mode);
                 }
             }
-            // _sync_lock drops here, releasing the advisory lock before command execution
+            // sync_lock drops here, releasing the advisory lock before command execution
         }
     }
 
@@ -360,8 +360,10 @@ fn main() {
     }
 
     // Phase 5: Auto-Flush (with advisory flock to serialize concurrent access)
-    if is_mutating && !ctx.no_auto_flush() {
-        if let (Some(res), Some(paths)) = (storage_result.as_mut(), ctx.paths.as_ref()) {
+    if is_mutating
+        && !ctx.no_auto_flush()
+        && let (Some(res), Some(paths)) = (storage_result.as_mut(), ctx.paths.as_ref())
+    {
             let sync_lock = match beads_rust::sync::try_sync_lock(&paths.beads_dir) {
                 Ok(Some(lock)) => Some(lock),
                 Ok(None) => {
@@ -409,7 +411,6 @@ fn main() {
             }
         }
     }
-}
 
 struct StartupContext {
     overrides: config::CliOverrides,
@@ -568,7 +569,10 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
         // to prevent (issue #243). `--status` only renders status after open,
         // but opening storage can still apply schema/runtime defaults or
         // recover the DB family, so it must also serialize before open.
-        Commands::Sync(_) | Commands::Init { .. } => true,
+        // Doctor inspects a live SQLite DB family via snapshot copy + rollback
+        // write probe, so it must serialize with writers — merged into this arm
+        // (identical body as Sync/Init) to satisfy clippy::match_same_arms.
+        Commands::Sync(_) | Commands::Init { .. } | Commands::Doctor(_) => true,
         Commands::Config { command } => matches!(
             command,
             beads_rust::cli::ConfigCommands::Set { .. }
@@ -581,9 +585,6 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
                     | beads_rust::cli::HistoryCommands::Prune { .. }
             )
         ),
-        // Plain `br doctor` inspects a live SQLite DB family via snapshot copy
-        // and a rollback write probe, so it must serialize with writers too.
-        Commands::Doctor(_) => true,
         _ => false,
     }
 }
