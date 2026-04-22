@@ -1,7 +1,7 @@
 //! Version command implementation.
 
 use crate::cli::VersionArgs;
-use crate::error::Result;
+use crate::error::{BeadsError, Result};
 use crate::output::{OutputContext, OutputMode};
 use rich_rust::prelude::*;
 use serde::Serialize;
@@ -287,7 +287,7 @@ fn fetch_latest_version() -> Result<String> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map_err(|e| anyhow::anyhow!("Failed to spawn curl: {e}"))?;
+        .map_err(|e| BeadsError::external_command("curl", format!("Failed to spawn curl: {e}")))?;
 
     let mut output = String::new();
     if let Some(ref mut stdout) = handle.stdout {
@@ -296,18 +296,20 @@ fn fetch_latest_version() -> Result<String> {
 
     let status = handle.wait()?;
     if !status.success() {
-        return Err(anyhow::anyhow!("curl failed with status {status}").into());
+        return Err(BeadsError::external_command(
+            "curl",
+            format!("curl failed with status {status}"),
+        ));
     }
 
     // Parse JSON response
-    let json: serde_json::Value = serde_json::from_str(&output)
-        .map_err(|e| anyhow::anyhow!("Failed to parse GitHub response: {e}"))?;
+    let json: serde_json::Value = serde_json::from_str(&output)?;
 
     // Extract tag_name (e.g., "v0.1.7")
     let tag = json
         .get("tag_name")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("No tag_name in GitHub response"))?;
+        .ok_or_else(|| BeadsError::validation("GitHub response", "missing tag_name"))?;
 
     // Strip leading "v" if present
     let version = tag.strip_prefix('v').unwrap_or(tag);

@@ -378,7 +378,7 @@ fn generate_new_id(
     } else {
         // Standard ID generation for non-child issues
         let id_gen = IdGenerator::new(input.id_config.clone());
-        let id_check_err: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
+        let id_check_err: std::cell::RefCell<Option<BeadsError>> = std::cell::RefCell::new(None);
         let generated_id = id_gen.generate(
             input.title,
             input.description,
@@ -388,14 +388,14 @@ fn generate_new_id(
             |id| match storage.id_exists(id) {
                 Ok(exists) => exists,
                 Err(e) => {
-                    id_check_err.set(Some(format!("Failed to check ID existence: {e}")));
+                    id_check_err.replace(Some(e));
                     // Treat as "exists" to force retry with a different ID
                     true
                 }
             },
         );
-        if let Some(err_msg) = id_check_err.into_inner() {
-            return Err(anyhow::anyhow!(err_msg).into());
+        if let Some(err) = id_check_err.into_inner() {
+            return Err(err);
         }
         Ok(generated_id)
     }

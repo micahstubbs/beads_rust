@@ -6,7 +6,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::{Mutex, Once};
 
-use anyhow::Result;
+use crate::error::{BeadsError, Result};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 /// Initialize logging for the CLI.
@@ -38,9 +38,13 @@ pub fn init_logging(verbosity: u8, quiet: bool, log_file: Option<&Path>) -> Resu
             .with_writer(Mutex::new(file))
             .with_ansi(false)
             .json();
-        tracing::subscriber::set_global_default(subscriber.with(file_layer))?;
+        tracing::subscriber::set_global_default(subscriber.with(file_layer)).map_err(|err| {
+            BeadsError::internal(format!("failed to initialize tracing subscriber: {err}"))
+        })?;
     } else {
-        tracing::subscriber::set_global_default(subscriber)?;
+        tracing::subscriber::set_global_default(subscriber).map_err(|err| {
+            BeadsError::internal(format!("failed to initialize tracing subscriber: {err}"))
+        })?;
     }
 
     Ok(())
@@ -48,7 +52,8 @@ pub fn init_logging(verbosity: u8, quiet: bool, log_file: Option<&Path>) -> Resu
 
 fn resolve_env_filter(verbosity: u8, quiet: bool) -> Result<EnvFilter> {
     let filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new(default_filter(verbosity, quiet)))?;
+        .or_else(|_| EnvFilter::try_new(default_filter(verbosity, quiet)))
+        .map_err(|err| BeadsError::Config(format!("failed to build log filter: {err}")))?;
     Ok(filter)
 }
 
@@ -60,7 +65,8 @@ fn resolve_env_filter_with_override(
 ) -> Result<EnvFilter> {
     if let Some(value) = env_override {
         let filter = EnvFilter::try_new(value)
-            .or_else(|_| EnvFilter::try_new(default_filter(verbosity, quiet)))?;
+            .or_else(|_| EnvFilter::try_new(default_filter(verbosity, quiet)))
+            .map_err(|err| BeadsError::Config(format!("failed to build log filter: {err}")))?;
         return Ok(filter);
     }
     resolve_env_filter(verbosity, quiet)
