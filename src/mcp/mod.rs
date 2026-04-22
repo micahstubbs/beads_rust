@@ -134,14 +134,30 @@ impl BeadsState {
 
         // 3. Open storage.
         let mut storage = self.open_storage().map_err(to_mcp)?;
+        let dirty_before_mutation = storage.get_dirty_issue_metadata().map_err(to_mcp)?;
 
         // 4. Execute the mutation.
-        let result = f(&mut storage)?;
+        let result = match f(&mut storage) {
+            Ok(result) => result,
+            Err(err) => {
+                let dirty_after_error = storage.get_dirty_issue_metadata().map_err(to_mcp)?;
+                if dirty_after_error != dirty_before_mutation {
+                    self.flush_dirty_storage(&mut storage)?;
+                }
+                return Err(err);
+            }
+        };
 
         // 5. Auto-flush.
+        self.flush_dirty_storage(&mut storage)?;
+
+        Ok(result)
+    }
+
+    fn flush_dirty_storage(&self, storage: &mut SqliteStorage) -> fastmcp_rust::McpResult<()> {
         let dirty_before_flush = storage.get_dirty_issue_count().map_err(to_mcp)?;
         let flush_result = crate::sync::auto_flush(
-            &mut storage,
+            storage,
             &self.beads_dir,
             &self.jsonl_path,
             self.allow_external_jsonl,
@@ -159,7 +175,7 @@ impl BeadsState {
             }
         }
 
-        Ok(result)
+        Ok(())
     }
 }
 
@@ -278,6 +294,40 @@ mod tests {
         assert_eq!(storage.get_dirty_issue_count().unwrap(), 1);
         let jsonl = fs::read_to_string(jsonl_path).unwrap();
         assert!(jsonl.contains("<<<<<<<"));
+    }
+
+    #[test]
+    fn with_mutation_flushes_committed_changes_before_returning_late_error() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let state = test_state(&temp, jsonl_path.clone());
+
+        let err = state
+            .with_mutation(|storage| {
+                storage
+                    .create_issue(
+                        &test_issue("br-mcp-partial", "partial mutation"),
+                        "mcp-test",
+                    )
+                    .map_err(to_mcp)?;
+                Err(fastmcp_rust::McpError::invalid_params(
+                    "simulated side-effect failure",
+                ))
+            })
+            .unwrap_err();
+
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+
+        let storage = SqliteStorage::open(&state.db_path).unwrap();
+        assert!(storage.id_exists("br-mcp-partial").unwrap());
+        assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+
+        let jsonl = fs::read_to_string(jsonl_path).unwrap();
+        assert!(
+            jsonl.contains("\"id\":\"br-mcp-partial\""),
+            "late-error committed mutation must still reach JSONL"
+        );
     }
 }
 
