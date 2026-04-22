@@ -2353,6 +2353,9 @@ mod tests {
 
         assert_eq!(warning["warning_type"], "STORAGE_READ_FAILED");
         assert_eq!(warning["operation"], "get_blockers");
-        assert_eq!(warning["message"], "dependency lookup failed");
+        assert_eq!(
+            warning["message"],
+            "Configuration error: dependency lookup failed"
+        );
     }
 }
