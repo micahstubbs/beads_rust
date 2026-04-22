@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn test_hex_encode_length_invariant() {
         for len in [0, 1, 2, 16, 32, 64, 128, 255] {
-            let bytes: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let bytes: Vec<u8> = (0..len).map(|i: u32| u8::try_from(i).unwrap_or(0)).collect();
             let hex = hex_encode(&bytes);
             assert_eq!(
                 hex.len(),

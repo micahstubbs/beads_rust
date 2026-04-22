@@ -247,8 +247,13 @@ mod tests {
     fn with_mutation_reports_auto_flush_failure_and_preserves_dirty_state() {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
-        let jsonl_path = beads_dir.join("missing-parent").join("issues.jsonl");
+        let jsonl_path = beads_dir.join("issues.jsonl");
         let state = test_state(&temp, jsonl_path.clone());
+        fs::write(
+            &jsonl_path,
+            "<<<<<<< HEAD\n{}\n=======\n{}\n>>>>>>> branch\n",
+        )
+        .unwrap();
 
         let err = state
             .with_mutation(|storage| {
@@ -271,7 +276,8 @@ mod tests {
         let storage = SqliteStorage::open(&state.db_path).unwrap();
         assert!(storage.id_exists("br-mcp-dirty").unwrap());
         assert_eq!(storage.get_dirty_issue_count().unwrap(), 1);
-        assert!(!jsonl_path.exists());
+        let jsonl = fs::read_to_string(jsonl_path).unwrap();
+        assert!(jsonl.contains("<<<<<<<"));
     }
 }
 
