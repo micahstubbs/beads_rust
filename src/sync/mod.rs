@@ -4568,7 +4568,6 @@ mod tests {
     use crate::model::{Comment, Issue, IssueType, Priority, Status};
     use chrono::Utc;
     use fsqlite_types::SqliteValue;
-    use indicatif::{ProgressBar, ProgressStyle};
     use std::collections::HashMap;
     use std::io::{self, Write};
     #[cfg(unix)]
@@ -7960,43 +7959,6 @@ mod tests {
             result,
             MergeResult::Conflict(ConflictType::ConvergentCreation)
         ));
-    }
-
-    /// Create a progress bar if enabled.
-    #[allow(dead_code)]
-    fn progress_bar(show: bool, len: u64, message: &str) -> ProgressBar {
-        if !show {
-            return ProgressBar::hidden();
-        }
-        let pb = ProgressBar::new(len);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template(
-                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
-                )
-                .unwrap()
-                .progress_chars("#>-"),
-        );
-        pb.set_message(message.to_string());
-        pb
-    }
-
-    /// Create a progress spinner if enabled.
-    #[allow(dead_code)]
-    fn progress_spinner(show: bool, message: &str) -> ProgressBar {
-        if !show {
-            return ProgressBar::hidden();
-        }
-        let pb = ProgressBar::new_spinner();
-        pb.set_style(
-            ProgressStyle::default_spinner()
-                .tick_chars("/|\\\\- ")
-                .template("{spinner:.blue} {msg}")
-                .unwrap(),
-        );
-        pb.set_message(message.to_string());
-        pb.enable_steady_tick(std::time::Duration::from_millis(100));
-        pb
     }
 
     #[test]

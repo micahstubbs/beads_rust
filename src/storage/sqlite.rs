@@ -5305,37 +5305,6 @@ impl SqliteStorage {
         }
     }
 
-    /// Collect all descendant issue IDs via BFS through parent-child edges.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a database query fails.
-    #[allow(dead_code)]
-    fn collect_descendant_ids(&self, parent_id: &str) -> Result<Vec<String>> {
-        let mut result = Vec::new();
-        // Use a HashSet for O(1) visited-set lookups instead of the
-        // previous Vec::contains() which was O(n) per check (O(n^2) total).
-        let mut visited = std::collections::HashSet::new();
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back(parent_id.to_string());
-        while let Some(pid) = queue.pop_front() {
-            let rows = self.conn.query_with_params(
-                "SELECT issue_id FROM dependencies WHERE depends_on_id = ? AND type = 'parent-child'",
-                &[SqliteValue::from(pid.as_str())],
-            )?;
-            for row in &rows {
-                if let Some(id) = row.get(0).and_then(SqliteValue::as_text) {
-                    let id = id.to_string();
-                    if visited.insert(id.clone()) {
-                        queue.push_back(id.clone());
-                        result.push(id);
-                    }
-                }
-            }
-        }
-        Ok(result)
-    }
-
     /// Get IDs of issues that depend on this one.
     ///
     /// # Errors

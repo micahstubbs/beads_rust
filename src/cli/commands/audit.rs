@@ -439,22 +439,6 @@ fn label_entry(
     Ok(())
 }
 
-#[allow(dead_code)]
-fn no_fields_provided(args: &AuditRecordArgs) -> bool {
-    is_empty_opt(args.kind.as_deref())
-        && is_empty_opt(args.issue_id.as_deref())
-        && is_empty_opt(args.model.as_deref())
-        && is_empty_opt(args.prompt.as_deref())
-        && is_empty_opt(args.response.as_deref())
-        && is_empty_opt(args.tool_name.as_deref())
-        && is_empty_opt(args.error.as_deref())
-        && args.exit_code.is_none()
-}
-
-fn is_empty_opt(value: Option<&str>) -> bool {
-    value.is_none_or(|v| v.trim().is_empty())
-}
-
 fn clean_opt(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
