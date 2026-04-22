@@ -32,7 +32,6 @@
 //! - JSON: `--json` flag
 //! - Quiet: `--quiet` flag
 
-pub mod context;
 pub mod csv;
 pub mod markdown;
 mod output;
@@ -55,7 +54,7 @@ pub use text::{
 };
 
 // Rich output support
-pub use context::{OutputContext, OutputMode};
+pub use crate::output::{OutputContext, OutputMode};
 pub use theme::Theme;
 
 // Syntax highlighting

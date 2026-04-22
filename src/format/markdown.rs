@@ -14,14 +14,14 @@
 //!
 //! ```ignore
 //! use beads_rust::format::markdown::render_markdown;
-//! use beads_rust::format::OutputContext;
+//! use beads_rust::output::OutputContext;
 //!
 //! let content = "# Heading\n\nThis is **bold** and *italic*.";
 //! let ctx = OutputContext::detect();
 //! let rendered = render_markdown(content, &ctx);
 //! ```
 
-use crate::format::context::{OutputContext, OutputMode};
+use crate::output::{OutputContext, OutputMode};
 use rich_rust::color::ColorSystem;
 use rich_rust::renderables::markdown::Markdown;
 
@@ -51,7 +51,7 @@ use rich_rust::renderables::markdown::Markdown;
 pub fn render_markdown(content: &str, ctx: &OutputContext) -> String {
     match ctx.mode() {
         OutputMode::Quiet => String::new(),
-        OutputMode::Json => content.to_string(),
+        OutputMode::Json | OutputMode::Toon => content.to_string(),
         OutputMode::Plain => strip_markdown(content),
         OutputMode::Rich => render_rich_markdown(content, ctx.width()),
     }
@@ -395,6 +395,10 @@ mod tests {
         OutputContext::with_mode(OutputMode::Quiet)
     }
 
+    fn toon_ctx() -> OutputContext {
+        OutputContext::with_mode(OutputMode::Toon)
+    }
+
     fn rich_ctx() -> OutputContext {
         OutputContext::with_mode(OutputMode::Rich)
     }
@@ -422,6 +426,13 @@ mod tests {
         let content = "# Heading\n\nSome content";
         let result = render_markdown(content, &quiet_ctx());
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_render_markdown_toon_unchanged() {
+        let content = "# Heading\n\n**bold** text";
+        let result = render_markdown(content, &toon_ctx());
+        assert_eq!(result, content);
     }
 
     #[test]

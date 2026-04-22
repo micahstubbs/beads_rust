@@ -14,14 +14,14 @@
 //!
 //! ```ignore
 //! use beads_rust::format::syntax::highlight_code;
-//! use beads_rust::format::OutputContext;
+//! use beads_rust::output::OutputContext;
 //!
 //! let code = r#"fn main() { println!("Hello!"); }"#;
 //! let ctx = OutputContext::detect();
 //! let highlighted = highlight_code(code, "rust", &ctx);
 //! ```
 
-use crate::format::context::{OutputContext, OutputMode};
+use crate::output::{OutputContext, OutputMode};
 use rich_rust::color::ColorSystem;
 use rich_rust::renderables::syntax::{Syntax, SyntaxError};
 
@@ -48,7 +48,7 @@ use rich_rust::renderables::syntax::{Syntax, SyntaxError};
 pub fn highlight_code(code: &str, language: &str, ctx: &OutputContext) -> String {
     match ctx.mode() {
         OutputMode::Quiet => String::new(),
-        OutputMode::Json => code.to_string(),
+        OutputMode::Json | OutputMode::Toon => code.to_string(),
         OutputMode::Plain => format_plain_code(code),
         OutputMode::Rich => highlight_rich(code, language, ctx.width()),
     }
@@ -236,6 +236,10 @@ mod tests {
         OutputContext::with_mode(OutputMode::Quiet)
     }
 
+    fn toon_ctx() -> OutputContext {
+        OutputContext::with_mode(OutputMode::Toon)
+    }
+
     fn rich_ctx() -> OutputContext {
         OutputContext::with_mode(OutputMode::Rich)
     }
@@ -267,6 +271,13 @@ mod tests {
         let code = "fn main() {}";
         let result = highlight_code(code, "rust", &quiet_ctx());
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_highlight_code_toon_mode_unchanged() {
+        let code = "fn main() { println!(\"test\"); }";
+        let result = highlight_code(code, "rust", &toon_ctx());
+        assert_eq!(result, code);
     }
 
     #[test]

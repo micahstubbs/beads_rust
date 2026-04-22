@@ -61,6 +61,26 @@ impl Write for CountingWriter {
 }
 
 impl OutputContext {
+    /// Detect output mode from environment and terminal state without CLI args.
+    #[must_use]
+    pub fn detect() -> Self {
+        if let Some(format) = OutputFormat::from_env() {
+            return Self::from_output_format(format, false, false);
+        }
+        Self::from_flags(false, false, false)
+    }
+
+    /// Create a context with an explicit mode.
+    #[must_use]
+    pub fn with_mode(mode: OutputMode) -> Self {
+        Self {
+            mode,
+            width: OnceLock::new(),
+            console: OnceLock::new(),
+            theme: OnceLock::new(),
+        }
+    }
+
     /// Create from CLI global args.
     ///
     /// Only mode is set eagerly; console/theme/width are lazy-initialized
