@@ -188,41 +188,70 @@ mod tests {
 
     #[test]
     fn test_progress_bar_hidden_when_not_terminal() {
-        // In tests, stderr is typically not a terminal
         let pb = create_progress_bar(100, "Test", false);
+        assert_eq!(pb.length(), Some(100));
+        assert_eq!(pb.position(), 0);
+
         pb.inc(50);
+        assert_eq!(pb.position(), 50);
+
         pb.finish();
-        // Should not panic or produce output
+        assert!(pb.is_finished());
     }
 
     #[test]
     fn test_spinner_hidden_when_not_terminal() {
         let spinner = create_spinner("Testing...", false);
+        assert_eq!(spinner.length(), None);
+        assert_eq!(spinner.position(), 0);
+
         spinner.finish();
-        // Should not panic or produce output
+        assert!(spinner.is_finished());
     }
 
     #[test]
     fn test_progress_tracker_determinate() {
         let tracker = ProgressTracker::new(10, "Processing");
+        assert_eq!(tracker.bar().length(), Some(10));
+        assert_eq!(tracker.bar().position(), 0);
+        assert_eq!(tracker.is_showing(), should_show_progress());
+
         for _ in 0..10 {
             tracker.inc(1);
         }
+        assert_eq!(tracker.bar().position(), 10);
+
         tracker.finish_with_message("Done");
+        assert!(tracker.bar().is_finished());
+        assert_eq!(tracker.bar().message(), "Done");
     }
 
     #[test]
     fn test_progress_tracker_spinner() {
         let tracker = ProgressTracker::new_spinner("Loading...");
+        assert_eq!(tracker.bar().length(), None);
+        assert_eq!(tracker.is_showing(), should_show_progress());
+        let expected_initial_message = if tracker.is_showing() { "Loading..." } else { "" };
+        assert_eq!(tracker.bar().message(), expected_initial_message);
+
         tracker.set_message("Still loading...");
+        assert_eq!(tracker.bar().message(), "Still loading...");
+
         tracker.finish_and_clear();
+        assert!(tracker.bar().is_finished());
     }
 
     #[test]
     fn test_multi_progress_hidden() {
         let multi = create_multi_progress(false);
         let pb = multi.add(create_progress_bar(10, "Test", false));
+        assert_eq!(pb.length(), Some(10));
+        assert_eq!(pb.position(), 0);
+
         pb.inc(5);
+        assert_eq!(pb.position(), 5);
+
         pb.finish();
+        assert!(pb.is_finished());
     }
 }
