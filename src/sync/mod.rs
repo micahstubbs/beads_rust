@@ -2395,7 +2395,7 @@ fn restore_foreign_keys_after_import(
 
     if foreign_keys_enabled != 1 {
         return Err(BeadsError::internal(
-            "Import completed with foreign key enforcement still disabled"
+            "Import completed with foreign key enforcement still disabled",
         ));
     }
 

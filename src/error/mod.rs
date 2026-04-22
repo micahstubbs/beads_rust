@@ -171,7 +171,6 @@ pub enum BeadsError {
     /// All requested items were skipped (already closed, not found, etc.).
     #[error("Nothing to do: {reason}")]
     NothingToDo { reason: String },
-
 }
 
 impl BeadsError {
@@ -381,8 +380,9 @@ mod tests {
 
         assert_eq!(structured.code, ErrorCode::IoError);
         assert_eq!(err.exit_code(), 8);
+        let context = structured.context.expect("upgrade context");
         assert_eq!(
-            structured.context["operation"],
+            context["operation"],
             serde_json::Value::String("upgrade".to_string())
         );
     }
