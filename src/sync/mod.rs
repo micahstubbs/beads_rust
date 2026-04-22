@@ -1651,9 +1651,6 @@ pub fn export_to_jsonl_with_policy(
             issue.labels = labels;
         }
 
-        // Normalize for consistent round-trip hashing (matches import behavior)
-        normalize_issue_for_export(issue);
-
         // Comments
         if let Some(ref map) = all_comments {
             if let Some(comments) = map.get(&issue.id) {
@@ -1664,6 +1661,9 @@ pub fn export_to_jsonl_with_policy(
         {
             issue.comments = comments;
         }
+
+        // Normalize for consistent round-trip hashing (matches import behavior)
+        normalize_issue_for_export(issue);
     }
 
     // Write to temp file for atomic rename
@@ -1912,9 +1912,6 @@ pub fn export_to_writer_with_policy<W: Write>(
             issue.labels = labels;
         }
 
-        // Normalize for consistent round-trip hashing (matches import behavior)
-        normalize_issue_for_export(issue);
-
         // Comments
         if let Some(ref map) = all_comments {
             if let Some(comments) = map.get(&issue.id) {
@@ -1925,6 +1922,9 @@ pub fn export_to_writer_with_policy<W: Write>(
         {
             issue.comments = comments;
         }
+
+        // Normalize for consistent round-trip hashing (matches import behavior)
+        normalize_issue_for_export(issue);
     }
 
     let mut hasher = Sha256::new();

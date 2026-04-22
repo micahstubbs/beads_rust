@@ -1,12 +1,12 @@
 mod common;
 
-use beads_rust::model::{DependencyType, Issue, Priority, Status};
+use beads_rust::model::{Comment, DependencyType, Issue, Priority, Status};
 use beads_rust::storage::SqliteStorage;
 use beads_rust::sync::{
     ExportConfig, ImportConfig, export_to_jsonl, finalize_export, import_from_jsonl,
     read_issues_from_jsonl,
 };
-use chrono::{Duration, Utc};
+use chrono::{Duration, TimeZone, Utc};
 use common::fixtures;
 use std::fs;
 use tempfile::TempDir;
@@ -112,6 +112,46 @@ fn export_sorts_by_id() {
     let issues = read_issues_from_jsonl(&path).unwrap();
     let ids: Vec<&str> = issues.iter().map(|issue| issue.id.as_str()).collect();
     assert_eq!(ids, vec!["test-a", "test-b"]);
+}
+
+#[test]
+fn export_sorts_comments_canonically_after_loading_relations() {
+    let mut storage = SqliteStorage::open_memory().unwrap();
+    let timestamp = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+    let mut issue = issue_with_id("test-comment-sort", "Comment sort");
+    issue.created_at = timestamp;
+    issue.updated_at = timestamp;
+    issue.comments = vec![
+        Comment {
+            id: 0,
+            issue_id: issue.id.clone(),
+            author: "zara".to_string(),
+            body: "second by canonical order".to_string(),
+            created_at: timestamp,
+        },
+        Comment {
+            id: 0,
+            issue_id: issue.id.clone(),
+            author: "alice".to_string(),
+            body: "first by canonical order".to_string(),
+            created_at: timestamp,
+        },
+    ];
+
+    storage.create_issue(&issue, "tester").unwrap();
+
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("issues.jsonl");
+    export_to_jsonl(&storage, &path, &ExportConfig::default()).unwrap();
+
+    let issues = read_issues_from_jsonl(&path).unwrap();
+    assert_eq!(issues.len(), 1);
+    let authors: Vec<&str> = issues[0]
+        .comments
+        .iter()
+        .map(|comment| comment.author.as_str())
+        .collect();
+    assert_eq!(authors, vec!["alice", "zara"]);
 }
 
 #[test]
