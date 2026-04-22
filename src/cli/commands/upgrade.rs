@@ -181,21 +181,14 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, ctx: &OutputContex
     };
 
     let Some(release) = select_release_for_update(updater.as_ref(), current_version)? else {
-        let result = UpdateResult {
-            current_version: current_version.to_string(),
-            new_version: current_version.to_string(),
-            updated: false,
-            message: Some("Already up to date".to_string()),
-        };
-
-        if is_json {
-            ctx.json_pretty(&result);
-        } else if is_quiet {
-        } else if is_rich {
-            render_up_to_date_rich(current_version, current_version, ctx);
-        } else {
-            println!("\n\u{2713} Already up to date");
-        }
+        render_not_updated(
+            current_version,
+            current_version,
+            ctx,
+            is_json,
+            is_quiet,
+            is_rich,
+        );
         return Ok(());
     };
     let latest_version = &release.version;
@@ -207,21 +200,14 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, ctx: &OutputContex
     let update_available = args.force || version_newer(latest_version, current_version);
 
     if !update_available {
-        let result = UpdateResult {
-            current_version: current_version.to_string(),
-            new_version: latest_version.clone(),
-            updated: false,
-            message: Some("Already up to date".to_string()),
-        };
-
-        if is_json {
-            ctx.json_pretty(&result);
-        } else if is_quiet {
-        } else if is_rich {
-            render_up_to_date_rich(current_version, latest_version, ctx);
-        } else {
-            println!("\n\u{2713} Already up to date");
-        }
+        render_not_updated(
+            current_version,
+            latest_version,
+            ctx,
+            is_json,
+            is_quiet,
+            is_rich,
+        );
         return Ok(());
     }
 
@@ -281,6 +267,31 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, ctx: &OutputContex
     Ok(())
 }
 
+fn render_not_updated(
+    current_version: &str,
+    latest_version: &str,
+    ctx: &OutputContext,
+    is_json: bool,
+    is_quiet: bool,
+    is_rich: bool,
+) {
+    let result = UpdateResult {
+        current_version: current_version.to_string(),
+        new_version: latest_version.to_string(),
+        updated: false,
+        message: Some("Already up to date".to_string()),
+    };
+
+    if is_json {
+        ctx.json_pretty(&result);
+    } else if is_quiet {
+    } else if is_rich {
+        render_up_to_date_rich(current_version, latest_version, ctx);
+    } else {
+        println!("\n\u{2713} Already up to date");
+    }
+}
+
 /// Resolve a GitHub auth token from environment variables.
 ///
 /// Checks `GITHUB_TOKEN` first, then `GH_TOKEN`. Returns `None` if neither
@@ -312,9 +323,10 @@ fn asset_target_name() -> &'static str {
 }
 
 fn is_archive_asset_name(name: &str) -> bool {
-    (name.ends_with(".tar.gz") || name.ends_with(".zip"))
-        && !name.ends_with(".sha256")
-        && !name.ends_with(".minisig")
+    let lower_name = name.to_ascii_lowercase();
+    (lower_name.ends_with(".tar.gz") || lower_name.ends_with(".zip"))
+        && !lower_name.ends_with(".sha256")
+        && !lower_name.ends_with(".minisig")
 }
 
 fn release_binary_asset_for<'a>(
@@ -378,10 +390,10 @@ fn update_with_checksum(updater: &dyn ReleaseUpdate, release: &Release) -> Resul
             BeadsError::upgrade(format!("No release archive found for target `{target}`"))
         })?;
     let checksum_asset = checksum_asset_for(release, &target_asset.name).ok_or_else(|| {
+        let expected_checksum_name = format!("{}.sha256", target_asset.name);
         BeadsError::upgrade(format!(
             "Missing SHA256 checksum asset `{}` for release archive `{}`",
-            format!("{}.sha256", target_asset.name),
-            target_asset.name
+            expected_checksum_name, target_asset.name
         ))
     })?;
 
