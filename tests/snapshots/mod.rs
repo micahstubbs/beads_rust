@@ -669,6 +669,7 @@ mod json_output;
 mod jsonl_format;
 mod robot_output;
 mod schema_output;
+mod toon_output;
 
 // ============================================================================
 // Tests for Golden Text Snapshot System
