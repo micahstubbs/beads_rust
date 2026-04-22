@@ -131,7 +131,7 @@ proptest! {
                 &format!("part{i:03}"),
                 &format!("Partition test {i}"),
                 status.clone(),
-                priority.clone(),
+                *priority,
                 issue_type.clone(),
             );
             storage.create_issue(&issue, "proptest").unwrap();
