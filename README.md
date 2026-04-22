@@ -120,10 +120,19 @@ git add .beads/ && git commit -m "Update issues"
 
 ### 1. Non-Invasive by Default
 
-br **never** touches your source code or runs git commands automatically. Other tools might auto-commit or install hooks without asking. br doesn't.
+For normal issue tracking and sync, br keeps its state in `.beads/` and leaves
+git handoff to you. It never commits, pushes, pulls, installs hooks, or runs as a
+background service.
+
+Some explicit commands intentionally step outside that default storage boundary:
+`br agents` edits requested agent-instruction files, `br doctor --repair` can fix
+the project `.gitignore`, `br config edit/set` updates config files,
+`br completions -o` writes shell completion files, `br upgrade` updates the
+installed binary, and git-reporting commands such as `br changelog`, `br
+orphans`, and commit-activity `br stats` inspect git history.
 
 ```bash
-# br only touches .beads/ directory
+# Normal issue state lives under .beads/
 ls -la .beads/
 # beads.db       # SQLite database
 # issues.jsonl   # Git-friendly export
@@ -146,8 +155,9 @@ git diff .beads/issues.jsonl
 ### 3. Explicit Over Implicit
 
 State changes are explicit. Successful mutating commands update SQLite and
-auto-flush JSONL by default, but `br` still never runs git, pushes, pulls, or
-imports remote changes without a command.
+auto-flush JSONL by default, but `br` still never commits, pushes, pulls, or
+imports remote changes without a command. Git-inspection behavior is limited to
+explicit reporting commands and reads history only.
 
 ```bash
 # Mutations auto-flush .beads/issues.jsonl by default
@@ -223,7 +233,7 @@ git/VCS handoff, and no background services installed behind your back.
 
 | Aspect | br (Rust) | beads (Go) |
 |--------|-----------|------------|
-| Git operations | **Never** (explicit) | Auto-commit, hooks |
+| Git operations | **No automatic commits/pushes/pulls**; reporting commands can inspect git history | Auto-commit, hooks |
 | Storage | SQLite + JSONL | Dolt/SQLite |
 | Background daemon | **No** | Yes |
 | Hook installation | **Manual** | Automatic |
@@ -317,7 +327,8 @@ RUST_LOG=error br serve --actor codex
 
 The server uses MCP over stdio. It is launched by an MCP client, does not listen
 on a network port, and uses the same SQLite database, JSONL export path, write
-locks, audit events, and no-git safety model as the normal CLI. Use shell/JSON
+locks, audit events, and sync safety model as the normal CLI. It does not run
+git. Use shell/JSON
 commands for simple scripts; use MCP when an agent benefits from discoverable
 tools, resources, prompts, and structured recovery hints.
 
@@ -578,12 +589,12 @@ Pull from git       ──►      git pull         ──►    JSONL updated
 
 ### Safety Model
 
-br is designed to be **provably safe**:
+`br sync` is designed to be **provably safe**:
 
 | Guarantee | Implementation |
 |-----------|----------------|
-| Never executes git | No `Command::new("git")` calls in sync code |
-| Only touches `.beads/` | Path validation before all writes |
+| Sync never executes git | No runtime `Command::new("git")` calls in `src/sync/` or `src/cli/commands/sync.rs` |
+| Sync uses an allowlist for writes | Default writes stay in `.beads/`; external JSONL paths require `--allow-external-jsonl` or an explicit external DB/JSONL family and `.git/` paths are still rejected |
 | Atomic writes | Write to temp file, then rename |
 | No data loss | Guards prevent overwriting non-empty JSONL with empty DB |
 
@@ -836,9 +847,9 @@ Common route-aware operations include `show`, `update`, `close`, `reopen`,
 Routed mutations acquire the target workspace write lock and update the target
 workspace's storage, not the caller's local database.
 
-This is not automatic multi-repo synchronization. `br` still does not run git,
-push or pull remote repositories, copy issues between repositories, or provide
-real-time collaboration. Routes are a local dispatch table for explicit
+This is not automatic multi-repo synchronization. Routed issue operations still
+do not push or pull remote repositories, copy issues between repositories, or
+provide real-time collaboration. Routes are a local dispatch table for explicit
 cross-workspace operations. Commit and synchronize each affected repository's
 `.beads/` files through your normal VCS workflow.
 

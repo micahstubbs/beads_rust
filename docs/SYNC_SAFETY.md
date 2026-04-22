@@ -6,9 +6,14 @@
 
 ## Overview
 
-`br` (beads_rust) is a **non-invasive** issue tracker. The `br sync` command synchronizes your SQLite database with a JSONL file for git-based collaboration.
+`br` (beads_rust) is a local-first issue tracker. This document covers the
+safety model for the `br sync` command, which synchronizes your SQLite database
+with a JSONL file for git-based collaboration.
 
-**Key safety principle**: `br sync` will never modify your source code or execute git commands.
+**Key safety principle**: with the default `.beads/` paths, `br sync` will never
+modify your source code or execute git commands. External JSONL paths require
+explicit opt-in and remain subject to extension, symlink, traversal, and `.git/`
+guards.
 
 ---
 
@@ -28,14 +33,20 @@ All file I/O is confined to the `.beads/` directory by default.
 
 ## What br sync Will NEVER Do
 
-These are explicit design non-goals. `br` will never:
+These are explicit design non-goals for the sync command. `br sync` will never:
 
 1. **Execute git commands** - No commits, no pushes, no staging
-2. **Modify files outside `.beads/`** - Your source code is never touched
+2. **Modify files outside its sync allowlist** - Default writes stay in `.beads/`; external JSONL paths require explicit opt-in
 3. **Install or invoke git hooks** - Fully manual hook setup if desired
 4. **Run as a daemon** - Simple CLI only, no background processes
 5. **Auto-commit changes** - Every git operation requires explicit user action
 6. **Connect to external services** - Offline-first, no network calls
+
+Other explicitly requested br commands have their own scope: for example,
+`br changelog`, `br orphans`, and commit-activity `br stats` inspect git
+history, while `br agents`, `br doctor --repair`, `br config`, and `br
+completions -o` can write the user-requested files they manage. Those commands
+do not weaken the `br sync` invariants described here.
 
 ---
 
@@ -229,9 +240,9 @@ This incident motivated every design decision in `br`'s safety model.
 
 | Layer | Protection | Failure Mode Blocked |
 |-------|------------|---------------------|
-| **No git operations** | Cannot execute `git rm`, `git clean`, or any git command | Eliminates the primary attack vector from the original incident |
-| **Path confinement** | All writes strictly confined to `.beads/` directory | Prevents accidental modification of source code, configs, or system files |
-| **Path validation** | Rejects traversal (`../`), symlink escapes, and disallowed extensions | Blocks path injection attacks and symlink-based escapes |
+| **No sync git operations** | `br sync` has no runtime git subprocess path | Eliminates the primary attack vector from the original incident |
+| **Sync write allowlist** | Default writes stay in `.beads/`; external JSONL writes require opt-in | Prevents accidental modification of source code, configs, or system files |
+| **Path validation** | Rejects `.git`, traversal (`../`), symlink escapes, and disallowed extensions | Blocks path injection attacks and symlink-based escapes |
 | **Atomic writes** | Uses temp file + rename; partial failures don't corrupt | Prevents data loss from interrupted operations |
 | **Safety guards** | Empty DB and stale DB guards require `--force` to override | Makes destructive operations explicit and intentional |
 
@@ -265,11 +276,12 @@ If a safety guard triggers unexpectedly, the verbose log will show exactly why.
 
 ### The Core Guarantee
 
-**Even if `br sync` has a bug, it cannot delete your source code.**
+**With the default `.beads/` paths, even if `br sync` has a bug, it cannot
+delete your source code.**
 
 This is not a best-effort promise—it's an architectural constraint enforced by:
-1. Code that literally cannot call git (no git library, no shell-out to git)
-2. Path validation that rejects anything outside `.beads/`
+1. Sync code that does not call git
+2. Path validation that rejects anything outside `.beads/` unless an external JSONL path is explicitly allowed
 3. Tests that would fail if these constraints were violated
 
 ---
