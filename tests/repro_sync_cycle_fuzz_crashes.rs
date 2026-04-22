@@ -122,7 +122,9 @@ fn repro_sync_cycle_crash_export_upsert_orphan() {
     export_to_jsonl(&storage, &jsonl_path, &default_export_config(&beads_dir)).unwrap();
 
     let jsonl_content = fs::read_to_string(&jsonl_path).unwrap();
-    let modified = format!("{jsonl_content}\n{{\"id\":\"bd-orphan-test\",\"title\":\"orphan issue\",\"status\":\"open\",\"priority\":2,\"issue_type\":\"task\"}}\n");
+    let modified = format!(
+        "{jsonl_content}\n{{\"id\":\"bd-orphan-test\",\"title\":\"orphan issue\",\"status\":\"open\",\"priority\":2,\"issue_type\":\"task\"}}\n"
+    );
     fs::write(&jsonl_path, modified).unwrap();
 
     let config_strict = ImportConfig {
@@ -191,8 +193,8 @@ fn repro_sync_cycle_crash_mangled_binary() {
     export_to_jsonl(&storage, &jsonl_path, &default_export_config(&beads_dir)).unwrap();
 
     let mangled: Vec<u8> = vec![
-        0xbb, 0x61, 0x55, 0x04, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x64, 0x74, 0x40,
-        0x72, 0x69, 0x49, 0x4d, 0x4d, 0x45, 0x44, 0xf3, 0xf3, 0xf3, 0xf3, 0xf3, 0xf3, 0xf3,
+        0xbb, 0x61, 0x55, 0x04, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x64, 0x74, 0x40, 0x72,
+        0x69, 0x49, 0x4d, 0x4d, 0x45, 0x44, 0xf3, 0xf3, 0xf3, 0xf3, 0xf3, 0xf3, 0xf3,
     ];
     fs::write(&jsonl_path, &mangled).unwrap();
 
@@ -318,7 +320,7 @@ fn repro_sync_cycle_empty_jsonl() {
 /// Verify corrupt SQLite DB doesn't cause panics in sync paths.
 #[test]
 fn repro_sync_cycle_corrupt_db() {
-    let (_temp, beads_dir, jsonl_path) = setup_workspace();
+    let (_temp, beads_dir, _jsonl_path) = setup_workspace();
     let db_path = beads_dir.join("beads.db");
 
     fs::write(&db_path, b"not a sqlite database\n").unwrap();
@@ -366,11 +368,8 @@ fn repro_sync_cycle_preflight_malformed() {
 
     fs::write(&jsonl_path, b"{bad json\n{also bad\n").unwrap();
 
-    let preflight_result = preflight_import(
-        &jsonl_path,
-        &default_import_config(&beads_dir),
-        Some("bd"),
-    );
+    let preflight_result =
+        preflight_import(&jsonl_path, &default_import_config(&beads_dir), Some("bd"));
     match preflight_result {
         Ok(_) => {}
         Err(err) => assert!(!err.to_string().trim().is_empty()),
@@ -380,7 +379,7 @@ fn repro_sync_cycle_preflight_malformed() {
 /// Verify compute_jsonl_hash handles empty and malformed files.
 #[test]
 fn repro_sync_cycle_hash_edge_cases() {
-    let (_temp, beads_dir, jsonl_path) = setup_workspace();
+    let (_temp, _beads_dir, jsonl_path) = setup_workspace();
 
     fs::write(&jsonl_path, "").unwrap();
     let hash1 = compute_jsonl_hash(&jsonl_path);
