@@ -6,7 +6,7 @@
 
 use proptest::prelude::*;
 
-use beads_rust::model::{IssueType, Status};
+use beads_rust::model::{DependencyType, IssueType, Status};
 use beads_rust::util::content_hash_from_parts;
 
 fn arb_status_name() -> impl Strategy<Value = (&'static str, Status)> {
@@ -178,5 +178,54 @@ proptest! {
             IssueType::Custom(v) => prop_assert_eq!(v, &name),
             other => prop_assert!(false, "expected Custom, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn dep_type_deser_case_insensitive(
+        (canonical, expected) in prop_oneof![
+            Just(("blocks", DependencyType::Blocks)),
+            Just(("parent-child", DependencyType::ParentChild)),
+            Just(("conditional-blocks", DependencyType::ConditionalBlocks)),
+            Just(("waits-for", DependencyType::WaitsFor)),
+            Just(("related", DependencyType::Related)),
+            Just(("discovered-from", DependencyType::DiscoveredFrom)),
+            Just(("replies-to", DependencyType::RepliesTo)),
+            Just(("relates-to", DependencyType::RelatesTo)),
+            Just(("duplicates", DependencyType::Duplicates)),
+            Just(("supersedes", DependencyType::Supersedes)),
+            Just(("caused-by", DependencyType::CausedBy)),
+        ]
+    ) {
+        for variant in case_variants(canonical) {
+            let json = format!("\"{}\"", variant);
+            let deserialized: DependencyType = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("failed to deser DependencyType from {json}: {e}"));
+            prop_assert_eq!(
+                &deserialized, &expected,
+                "DependencyType '{}' should deser to {:?}, got {:?}",
+                variant, expected, deserialized
+            );
+        }
+    }
+
+    #[test]
+    fn dep_type_roundtrip(
+        (_, expected) in prop_oneof![
+            Just(("blocks", DependencyType::Blocks)),
+            Just(("parent-child", DependencyType::ParentChild)),
+            Just(("conditional-blocks", DependencyType::ConditionalBlocks)),
+            Just(("waits-for", DependencyType::WaitsFor)),
+            Just(("related", DependencyType::Related)),
+            Just(("discovered-from", DependencyType::DiscoveredFrom)),
+            Just(("replies-to", DependencyType::RepliesTo)),
+            Just(("relates-to", DependencyType::RelatesTo)),
+            Just(("duplicates", DependencyType::Duplicates)),
+            Just(("supersedes", DependencyType::Supersedes)),
+            Just(("caused-by", DependencyType::CausedBy)),
+        ]
+    ) {
+        let serialized = serde_json::to_string(&expected).unwrap();
+        let deserialized: DependencyType = serde_json::from_str(&serialized).unwrap();
+        prop_assert_eq!(&deserialized, &expected);
     }
 }

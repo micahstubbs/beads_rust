@@ -246,7 +246,7 @@ impl FromStr for IssueType {
 }
 
 /// Dependency relationship type.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum DependencyType {
     Blocks,
@@ -262,6 +262,26 @@ pub enum DependencyType {
     CausedBy,
     #[serde(untagged)]
     Custom(String),
+}
+
+impl<'de> Deserialize<'de> for DependencyType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.to_lowercase().as_str() {
+            "blocks" => Self::Blocks,
+            "parent-child" => Self::ParentChild,
+            "conditional-blocks" => Self::ConditionalBlocks,
+            "waits-for" => Self::WaitsFor,
+            "related" => Self::Related,
+            "discovered-from" => Self::DiscoveredFrom,
+            "replies-to" => Self::RepliesTo,
+            "relates-to" => Self::RelatesTo,
+            "duplicates" => Self::Duplicates,
+            "supersedes" => Self::Supersedes,
+            "caused-by" => Self::CausedBy,
+            _ => Self::Custom(value),
+        })
+    }
 }
 
 impl DependencyType {
