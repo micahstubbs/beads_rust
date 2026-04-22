@@ -1,6 +1,6 @@
 // Storage and sync performance benchmarks.
 //
-// Run with: cargo bench
+// Run with: cargo bench --bench storage_perf
 //
 // Performance Targets:
 // | Operation           | Target    | Description                      |
@@ -19,7 +19,7 @@
     clippy::cast_possible_wrap
 )]
 
-use beads_rust::model::{Issue, IssueType, Priority, Status};
+use beads_rust::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use beads_rust::storage::{IssueUpdate, ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
 use chrono::Utc;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -138,17 +138,43 @@ fn setup_db_with_deps(issue_count: usize, dep_count: usize) -> (TempDir, SqliteS
             .expect("Failed to create issue");
     }
 
-    // Create dependencies (avoiding cycles)
-    for d in 0..dep_count {
-        let from_idx = (d * 2 + 1) % issue_count;
-        let to_idx = (d * 2) % issue_count;
-        if from_idx != to_idx && from_idx > to_idx {
-            let from_id = format!("bench-{from_idx:06}");
+    // Create unique acyclic dependencies. Higher-index issues depend on
+    // lower-index issues, so this can scale to deep DAGs without cycles.
+    // Load them through the import helper so setup does not dominate
+    // `--quick` runs with per-edge cycle detection.
+    let mut added = 0usize;
+    'deps: for from_idx in 1..issue_count {
+        let from_id = format!("bench-{from_idx:06}");
+        let mut dependencies = Vec::new();
+        for to_idx in 0..from_idx {
             let to_id = format!("bench-{to_idx:06}");
-            // Ignore errors from duplicate dependencies
-            let _ = storage.add_dependency(&from_id, &to_id, "blocks", "benchmark");
+            dependencies.push(Dependency {
+                issue_id: from_id.clone(),
+                depends_on_id: to_id,
+                dep_type: DependencyType::Blocks,
+                created_at: Utc::now(),
+                created_by: Some("benchmark".to_string()),
+                metadata: None,
+                thread_id: None,
+            });
+            added += 1;
+            if added == dep_count {
+                break;
+            }
+        }
+        if !dependencies.is_empty() {
+            storage
+                .sync_dependencies_for_import(&from_id, &dependencies)
+                .expect("benchmark dependency import should succeed");
+        }
+        if added == dep_count {
+            break 'deps;
         }
     }
+
+    storage
+        .rebuild_blocked_cache(true)
+        .expect("benchmark blocked cache rebuild should succeed");
 
     (dir, storage)
 }
@@ -453,7 +479,7 @@ fn bench_ready_query(c: &mut Criterion) {
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
 
-    for (issues, deps) in [(100, 200), (500, 1000), (1000, 2000)] {
+    for (issues, deps) in [(100, 200), (500, 1000), (1000, 2000), (10000, 20000)] {
         let (_dir, storage) = setup_db_with_deps(issues, deps);
         let label = format!("{issues}i_{deps}d");
 
@@ -522,7 +548,7 @@ fn bench_export(c: &mut Criterion) {
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
 
-    for size in [100, 500, 1000, 2000, 5000] {
+    for size in [100, 500, 1000, 2000, 5000, 10000] {
         let (_dir, storage) = setup_db_with_issues(size);
 
         group.throughput(Throughput::Elements(size as u64));
@@ -550,7 +576,7 @@ fn bench_import(c: &mut Criterion) {
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
 
-    for size in [100, 500, 1000, 2000, 5000] {
+    for size in [100, 500, 1000, 2000, 5000, 10000] {
         // Create source data
         let (_src_dir, src_storage) = setup_db_with_issues(size);
         let mut buffer = Cursor::new(Vec::new());

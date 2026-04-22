@@ -3,6 +3,7 @@ name = "beads_rust"
 version = "0.1.45"
 edition = "2024"
 rust-version = "1.88"
+autobenches = false
 description = "Agent-first issue tracker (SQLite + JSONL)"
 license = "MIT"
 repository = "https://github.com/Dicklesworthstone/beads_rust"
@@ -125,7 +126,7 @@ proptest = "1.10"
 rand = "0.10"
 
 [[bench]]
-name = "benchmarks"
+name = "storage_perf"
 path = "benches/storage_perf.rs"
 harness = false
 

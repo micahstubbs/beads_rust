@@ -281,9 +281,9 @@ jobs:
         run: |
           set -euo pipefail
           if find target/criterion -path "*/main/estimates.json" -type f 2>/dev/null | grep -q .; then
-            cargo bench --bench benchmarks -- --baseline main --save-baseline main
+            cargo bench --bench storage_perf -- --baseline main --save-baseline main
           else
-            cargo bench --bench benchmarks -- --save-baseline main
+            cargo bench --bench storage_perf -- --save-baseline main
           fi
         continue-on-error: true
 
