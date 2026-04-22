@@ -1154,10 +1154,10 @@ mod tests {
     fn test_generate_id_seed() {
         let now = Utc::now();
         let seed = generate_id_seed("title", Some("desc"), Some("me"), now, 0);
-        assert!(seed.contains("title"));
-        assert!(seed.contains("desc"));
-        assert!(seed.contains("me"));
-        assert!(seed.ends_with("|0"));
+        assert!(seed.contains("5:title"));
+        assert!(seed.contains("4:desc"));
+        assert!(seed.contains("2:me"));
+        assert!(seed.ends_with("1:0"));
     }
 
     #[test]
