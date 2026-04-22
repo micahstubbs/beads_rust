@@ -42,3 +42,10 @@ path = "fuzz_targets/sync_cycle.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "markdown_import"
+path = "fuzz_targets/markdown_import.rs"
+test = false
+doc = false
+bench = false
