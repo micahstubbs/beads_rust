@@ -784,6 +784,7 @@ install_skills() {
     )
 
     local skill
+    local _skills_installed_count=0
     for skill in "${skills[@]}"; do
         local skill_name="${skill%%:*}"
         local files_str="${skill#*:}"
@@ -841,15 +842,16 @@ install_skills() {
 
         if [ "$files_installed" -gt 0 ]; then
             log_success "Installed skill: $skill_name ($files_installed files)"
+            _skills_installed_count=$((_skills_installed_count + 1))
         else
             log_warn "Skill $skill_name: no files could be downloaded"
         fi
     done
 
-    # Only show the fancy skills summary when we actually installed a skill.
-    # With bd-to-br-migration now opt-in (#261), the default install leaves
-    # nothing for the panel to advertise.
-    if [ "$INSTALL_MIGRATION_SKILL" -eq 1 ]; then
+    # Only show the fancy skills summary when at least one skill actually
+    # landed files on disk. Don't advertise skills that were skipped (e.g.
+    # bd-to-br-migration is opt-in per #261) or whose downloads all failed.
+    if [ "$_skills_installed_count" -gt 0 ]; then
         print_skills_summary "$claude_skills_dir" "$codex_skills_dir"
     fi
 }
