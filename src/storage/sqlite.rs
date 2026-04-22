@@ -435,6 +435,31 @@ impl SqliteStorage {
         Self::finish_foreign_key_suppressed_result(&self.conn, "blocked-cache refresh", result)
     }
 
+    fn handle_blocked_cache_refresh_error(&self, op: &str, error: BeadsError) -> Result<()> {
+        match Self::foreign_keys_enabled(&self.conn) {
+            Ok(true) => {
+                tracing::warn!(
+                    operation = op,
+                    error = %error,
+                    "Blocked cache refresh deferred after commit; cache remains marked stale"
+                );
+                Ok(())
+            }
+            Ok(false) => Err(BeadsError::WithContext {
+                context: format!(
+                    "post-commit blocked-cache refresh for {op} failed and SQLite foreign key enforcement is OFF"
+                ),
+                source: Box::new(error),
+            }),
+            Err(check_error) => Err(BeadsError::WithContext {
+                context: format!(
+                    "post-commit blocked-cache refresh for {op} failed and SQLite foreign key enforcement status could not be verified: {check_error}"
+                ),
+                source: Box::new(error),
+            }),
+        }
+    }
+
     pub(crate) fn blocked_cache_marked_stale(&self) -> Result<bool> {
         Self::metadata_equals(
             &self.conn,
@@ -1180,11 +1205,7 @@ impl SqliteStorage {
             }
             Some(ref plan) => {
                 if let Err(error) = self.refresh_blocked_cache_after_commit(op, plan) {
-                    tracing::warn!(
-                        operation = op,
-                        error = %error,
-                        "Blocked cache refresh deferred after commit; cache remains marked stale"
-                    );
+                    self.handle_blocked_cache_refresh_error(op, error)?;
                 }
             }
             None => {}
@@ -10342,6 +10363,49 @@ mod tests {
                 );
             }
         }
+        assert!(SqliteStorage::foreign_keys_enabled(&storage.conn).unwrap());
+    }
+
+    #[test]
+    fn test_blocked_cache_refresh_restores_foreign_keys_after_rebuild() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        storage.conn.execute("PRAGMA foreign_keys = OFF").unwrap();
+
+        storage
+            .refresh_blocked_cache_after_commit("test refresh", &BlockedCacheRefreshPlan::Full)
+            .unwrap();
+
+        assert!(
+            SqliteStorage::foreign_keys_enabled(&storage.conn).unwrap(),
+            "blocked-cache refresh must restore foreign key enforcement"
+        );
+    }
+
+    #[test]
+    fn test_blocked_cache_refresh_error_with_foreign_keys_off_is_not_deferred() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        storage.conn.execute("PRAGMA foreign_keys = OFF").unwrap();
+
+        let err = storage
+            .handle_blocked_cache_refresh_error(
+                "test mutation",
+                BeadsError::Config("refresh failed".to_string()),
+            )
+            .unwrap_err();
+
+        match err {
+            BeadsError::WithContext { context, source } => {
+                assert!(context.contains("test mutation"));
+                assert!(context.contains("foreign key enforcement is OFF"));
+                assert!(source.to_string().contains("refresh failed"));
+            }
+            other => assert!(
+                matches!(other, BeadsError::WithContext { .. }),
+                "expected WithContext error"
+            ),
+        }
+
+        storage.conn.execute("PRAGMA foreign_keys = ON").unwrap();
         assert!(SqliteStorage::foreign_keys_enabled(&storage.conn).unwrap());
     }
 
