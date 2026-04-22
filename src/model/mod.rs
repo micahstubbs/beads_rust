@@ -168,7 +168,7 @@ impl FromStr for Priority {
 }
 
 /// Issue type category.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum IssueType {
     #[default]
@@ -181,6 +181,22 @@ pub enum IssueType {
     Question,
     #[serde(untagged)]
     Custom(String),
+}
+
+impl<'de> Deserialize<'de> for IssueType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.to_lowercase().as_str() {
+            "task" => Self::Task,
+            "bug" => Self::Bug,
+            "feature" => Self::Feature,
+            "epic" => Self::Epic,
+            "chore" => Self::Chore,
+            "docs" => Self::Docs,
+            "question" => Self::Question,
+            _ => Self::Custom(value),
+        })
+    }
 }
 
 impl IssueType {
