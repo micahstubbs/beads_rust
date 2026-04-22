@@ -146,7 +146,7 @@ fn require_valid_issue(storage: &SqliteStorage, id: &str) -> McpResult<()> {
     if let Some(err) = detect_placeholder(id) {
         return Err(err);
     }
-    Err(issue_not_found_err(storage, id))
+    Err(issue_not_found_err(storage, id)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -238,8 +238,8 @@ fn beads_to_mcp(err: impl Into<crate::BeadsError>) -> McpError {
 
 /// Build a structured "issue not found" `McpError` with fuzzy ID suggestions
 /// and `suggested_tool_calls` pointing to the best next action.
-fn issue_not_found_err(storage: &SqliteStorage, id: &str) -> McpError {
-    let all_ids = storage.get_all_ids().unwrap_or_default();
+fn issue_not_found_err(storage: &SqliteStorage, id: &str) -> McpResult<McpError> {
+    let all_ids = storage.get_all_ids().map_err(beads_to_mcp)?;
     let structured = StructuredError::issue_not_found(id, &all_ids);
 
     let mut data = json!({
@@ -273,7 +273,31 @@ fn issue_not_found_err(storage: &SqliteStorage, id: &str) -> McpError {
     suggested_calls.push(json!({"tool": "list_issues", "arguments": {}}));
     data["suggested_tool_calls"] = json!(suggested_calls);
 
-    McpError::with_data(McpErrorCode::ToolExecutionError, structured.message, data)
+    Ok(McpError::with_data(
+        McpErrorCode::ToolExecutionError,
+        structured.message,
+        data,
+    ))
+}
+
+fn storage_read_warning(operation: &str, err: &crate::BeadsError) -> serde_json::Value {
+    let structured = StructuredError::from_error(err);
+    let mut warning = json!({
+        "warning_type": "STORAGE_READ_FAILED",
+        "operation": operation,
+        "error_type": structured.code.as_str(),
+        "message": structured.message,
+        "recoverable": structured.retryable,
+    });
+
+    if let Some(hint) = structured.hint {
+        warning["hint"] = json!(hint);
+    }
+    if let Some(context) = structured.context {
+        warning["context"] = context;
+    }
+
+    warning
 }
 
 fn open(state: &BeadsState) -> McpResult<SqliteStorage> {
@@ -1024,10 +1048,13 @@ impl ToolHandler for ShowIssueTool {
 
         let storage = open(&self.0)?;
 
-        let details = storage
+        let maybe_details = storage
             .get_issue_details(&id, true, true, 20)
-            .map_err(beads_to_mcp)?
-            .ok_or_else(|| issue_not_found_err(&storage, &id))?;
+            .map_err(beads_to_mcp)?;
+        let details = match maybe_details {
+            Some(details) => details,
+            None => return Err(issue_not_found_err(&storage, &id)?),
+        };
 
         let mut result = serde_json::to_value(&details.issue).unwrap_or_default();
         if let Some(obj) = result.as_object_mut() {
@@ -1446,10 +1473,13 @@ impl ToolHandler for UpdateIssueTool {
                     .update_issue(&id, &updates, &self.0.actor)
                     .map_err(beads_to_mcp)?
             } else if has_side_effects {
-                storage
-                    .get_issue_details(&id, false, false, 0).map_err(beads_to_mcp)?
-                    .ok_or_else(|| issue_not_found_err(storage, &id))?
-                    .issue
+                match storage
+                    .get_issue_details(&id, false, false, 0)
+                    .map_err(beads_to_mcp)?
+                {
+                    Some(details) => details.issue,
+                    None => return Err(issue_not_found_err(storage, &id)?),
+                }
             } else {
                 return Err(McpError::with_data(
                     McpErrorCode::ToolExecutionError,
@@ -1564,41 +1594,56 @@ impl ToolHandler for CloseIssueTool {
 
         let reason = optional_str_arg(&args, "reason")?;
 
-        let (issue, our_blockers, dependents) = self.0.with_mutation(|storage| {
-            // Validate ID exists (with placeholder detection + fuzzy suggestions)
-            require_valid_issue(storage, &id)?;
+        let (issue, already_closed, our_blockers, dependents, warnings) =
+            self.0.with_mutation(|storage| {
+                // Validate ID exists (with placeholder detection + fuzzy suggestions)
+                require_valid_issue(storage, &id)?;
 
-            // Idempotency: if already closed, return existing state without error
-            if let Some(details) = storage
-                .get_issue_details(&id, false, false, 0)
-                .map_err(beads_to_mcp)?
-                && details.issue.status == Status::Closed
-            {
-                return Ok((details.issue, None, None));
-            }
+                // Idempotency: if already closed, return existing state without error
+                if let Some(details) = storage
+                    .get_issue_details(&id, false, false, 0)
+                    .map_err(beads_to_mcp)?
+                    && details.issue.status == Status::Closed
+                {
+                    return Ok((details.issue, true, None, None, Vec::new()));
+                }
 
-            let now = chrono::Utc::now();
-            let close_update = IssueUpdate {
-                status: Some(Status::Closed),
-                closed_at: Some(Some(now)),
-                close_reason: Some(reason.clone()),
-                ..IssueUpdate::default()
-            };
+                let now = chrono::Utc::now();
+                let close_update = IssueUpdate {
+                    status: Some(Status::Closed),
+                    closed_at: Some(Some(now)),
+                    close_reason: Some(reason.clone()),
+                    ..IssueUpdate::default()
+                };
 
-            let issue = storage
-                .update_issue(&id, &close_update, &self.0.actor)
-                .map_err(beads_to_mcp)?;
+                let issue = storage
+                    .update_issue(&id, &close_update, &self.0.actor)
+                    .map_err(beads_to_mcp)?;
 
-            // Check for blockers this issue had (warn about closing a blocked issue)
-            let our_blockers = storage.get_blockers(&id).unwrap_or_default();
+                let mut warnings = Vec::new();
 
-            // Check what this issue was blocking (now potentially unblocked)
-            let dependents = storage.get_blocked_issue_ids(&id).unwrap_or_default();
+                // Check for blockers this issue had (warn about closing a blocked issue)
+                let our_blockers = match storage.get_blockers(&id) {
+                    Ok(blockers) => Some(blockers),
+                    Err(err) => {
+                        warnings.push(storage_read_warning("get_blockers", &err));
+                        None
+                    }
+                };
 
-            Ok((issue, Some(our_blockers), Some(dependents)))
-        })?;
+                // Check what this issue was blocking (now potentially unblocked)
+                let dependents = match storage.get_blocked_issue_ids(&id) {
+                    Ok(dependents) => Some(dependents),
+                    Err(err) => {
+                        warnings.push(storage_read_warning("get_blocked_issue_ids", &err));
+                        None
+                    }
+                };
 
-        if our_blockers.is_none() {
+                Ok((issue, false, our_blockers, dependents, warnings))
+            })?;
+
+        if already_closed {
             return Ok(vec![Content::text(
                 json!({
                     "id": issue.id,
@@ -1620,6 +1665,10 @@ impl ToolHandler for CloseIssueTool {
             "closed_at": issue.closed_at,
             "close_reason": reason,
         });
+
+        if !warnings.is_empty() {
+            result["warnings"] = json!(warnings);
+        }
 
         if let Some(our_blockers) = our_blockers
             && !our_blockers.is_empty()
@@ -1645,6 +1694,9 @@ impl ToolHandler for CloseIssueTool {
                     "Use show_issue on these to check if they're now ready for work"
                 ]);
             }
+        } else {
+            result["next_actions"] =
+                json!(["Issue closed successfully. Dependent lookup failed; see warnings."]);
         }
 
         Ok(vec![Content::text(result.to_string())])
@@ -2007,7 +2059,12 @@ impl ToolHandler for ProjectOverviewTool {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_list_filters, optional_string_array_arg, parse_update_fields};
+    use super::{
+        build_list_filters, issue_not_found_err, optional_string_array_arg, parse_update_fields,
+        storage_read_warning,
+    };
+    use crate::error::BeadsError;
+    use crate::storage::SqliteStorage;
     use serde_json::json;
 
     #[test]
@@ -2055,5 +2112,33 @@ mod tests {
             err.to_string()
                 .contains("'limit' must be a non-negative integer")
         );
+    }
+
+    #[test]
+    fn issue_not_found_err_surfaces_id_scan_failure() {
+        let storage = SqliteStorage::open_memory().expect("storage");
+        storage
+            .execute_raw("DROP TABLE issues")
+            .expect("drop issues table");
+
+        let err = issue_not_found_err(&storage, "bd-missing")
+            .expect_err("ID scan failure must be returned to MCP clients");
+
+        assert!(
+            err.to_string().contains("issues") || err.to_string().contains("no such table"),
+            "unexpected MCP error: {err}"
+        );
+    }
+
+    #[test]
+    fn storage_read_warning_carries_structured_source_error() {
+        let warning = storage_read_warning(
+            "get_blockers",
+            &BeadsError::Config("dependency lookup failed".to_string()),
+        );
+
+        assert_eq!(warning["warning_type"], "STORAGE_READ_FAILED");
+        assert_eq!(warning["operation"], "get_blockers");
+        assert_eq!(warning["message"], "dependency lookup failed");
     }
 }

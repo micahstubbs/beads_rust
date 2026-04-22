@@ -18,10 +18,14 @@ use crate::storage::{ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
 
 use super::{BeadsState, to_mcp};
 
+fn read_project_config(storage: &SqliteStorage) -> McpResult<HashMap<String, String>> {
+    storage.get_all_config().map_err(to_mcp)
+}
+
 /// Build a structured "issue not found" error with fuzzy suggestions,
 /// mirroring the tools.rs pattern for consistent agent UX.
-fn issue_not_found_resource(storage: &SqliteStorage, id: &str) -> McpError {
-    let all_ids = storage.get_all_ids().unwrap_or_default();
+fn issue_not_found_resource(storage: &SqliteStorage, id: &str) -> McpResult<McpError> {
+    let all_ids = storage.get_all_ids().map_err(to_mcp)?;
     let structured = StructuredError::issue_not_found(id, &all_ids);
 
     let mut data = json!({
@@ -42,7 +46,11 @@ fn issue_not_found_resource(storage: &SqliteStorage, id: &str) -> McpError {
 
     data["suggested_tool_calls"] = json!([{"tool": "list_issues", "arguments": {}}]);
 
-    McpError::with_data(McpErrorCode::ToolExecutionError, structured.message, data)
+    Ok(McpError::with_data(
+        McpErrorCode::ToolExecutionError,
+        structured.message,
+        data,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -77,7 +85,7 @@ impl ResourceHandler for ProjectInfoResource {
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
         let storage = self.0.open_storage().map_err(to_mcp)?;
 
-        let config = storage.get_all_config().unwrap_or_default();
+        let config = read_project_config(&storage)?;
         let prefix = self.0.issue_prefix.as_deref().unwrap_or("br");
 
         let info = json!({
@@ -154,10 +162,13 @@ impl ResourceHandler for IssueResource {
 
         let storage = self.0.open_storage().map_err(to_mcp)?;
 
-        let details = storage
+        let maybe_details = storage
             .get_issue_details(id, true, true, 20)
-            .map_err(to_mcp)?
-            .ok_or_else(|| issue_not_found_resource(&storage, id))?;
+            .map_err(to_mcp)?;
+        let details = match maybe_details {
+            Some(details) => details,
+            None => return Err(issue_not_found_resource(&storage, id)?),
+        };
 
         let mut result = serde_json::to_value(&details.issue).unwrap_or_default();
         if let Some(obj) = result.as_object_mut() {
@@ -904,5 +915,43 @@ impl ResourceHandler for BottlenecksResource {
             text: Some(bottlenecks.to_string()),
             blob: None,
         }])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{issue_not_found_resource, read_project_config};
+    use crate::storage::SqliteStorage;
+
+    #[test]
+    fn issue_not_found_resource_surfaces_id_scan_failure() {
+        let storage = SqliteStorage::open_memory().expect("storage");
+        storage
+            .execute_raw("DROP TABLE issues")
+            .expect("drop issues table");
+
+        let err = issue_not_found_resource(&storage, "bd-missing")
+            .expect_err("ID scan failure must be returned to MCP clients");
+
+        assert!(
+            err.to_string().contains("issues") || err.to_string().contains("no such table"),
+            "unexpected MCP error: {err}"
+        );
+    }
+
+    #[test]
+    fn read_project_config_surfaces_storage_failure() {
+        let storage = SqliteStorage::open_memory().expect("storage");
+        storage
+            .execute_raw("DROP TABLE config")
+            .expect("drop config table");
+
+        let err = read_project_config(&storage)
+            .expect_err("config read failure must be returned to MCP clients");
+
+        assert!(
+            err.to_string().contains("config") || err.to_string().contains("no such table"),
+            "unexpected MCP error: {err}"
+        );
     }
 }
