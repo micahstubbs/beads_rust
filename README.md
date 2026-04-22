@@ -338,7 +338,7 @@ tools, resources, prompts, and structured recovery hints.
 
 ```bash
 br --version
-# br 0.1.0 (rustc 1.85.0-nightly)
+# br 0.1.45
 ```
 
 ---
