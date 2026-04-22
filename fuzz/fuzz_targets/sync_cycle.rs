@@ -1,5 +1,7 @@
 #![no_main]
 
+mod common;
+
 use beads_rust::model::{DependencyType, Issue, IssueType, Priority, Status};
 use beads_rust::storage::SqliteStorage;
 use beads_rust::sync::{
@@ -7,6 +9,7 @@ use beads_rust::sync::{
     ensure_no_conflict_markers, export_to_jsonl, import_from_jsonl, preflight_import,
 };
 use chrono::Utc;
+use common::{BuiltInIssueCursorExt, ByteCursor};
 use libfuzzer_sys::fuzz_target;
 use std::collections::HashSet;
 use std::error::Error;
@@ -717,82 +720,5 @@ fn non_empty(value: String, fallback: &str) -> String {
         fallback.to_string()
     } else {
         value
-    }
-}
-
-struct ByteCursor<'a> {
-    data: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> ByteCursor<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, offset: 0 }
-    }
-
-    fn next_byte(&mut self) -> u8 {
-        if self.data.is_empty() {
-            return 0;
-        }
-        let byte = self.data[self.offset % self.data.len()];
-        self.offset = self.offset.wrapping_add(1);
-        byte
-    }
-
-    fn next_bool(&mut self) -> bool {
-        self.next_byte() & 1 == 1
-    }
-
-    fn usize(&mut self, max_exclusive: usize) -> usize {
-        if max_exclusive == 0 {
-            0
-        } else {
-            usize::from(self.next_byte()) % max_exclusive
-        }
-    }
-
-    fn bytes(&mut self, max_len: usize) -> Vec<u8> {
-        let len = self.usize(max_len + 1);
-        let mut bytes = Vec::with_capacity(len);
-        for _ in 0..len {
-            bytes.push(self.next_byte());
-        }
-        bytes
-    }
-
-    fn optional_text(&mut self, max_len: usize) -> Option<String> {
-        if self.next_byte().is_multiple_of(4) {
-            None
-        } else {
-            Some(self.text(max_len))
-        }
-    }
-
-    fn text(&mut self, max_len: usize) -> String {
-        String::from_utf8_lossy(&self.bytes(max_len)).into_owned()
-    }
-
-    fn status(&mut self) -> Status {
-        match self.next_byte() % 7 {
-            0 => Status::Open,
-            1 => Status::InProgress,
-            2 => Status::Blocked,
-            3 => Status::Deferred,
-            4 => Status::Draft,
-            5 => Status::Closed,
-            _ => Status::Tombstone,
-        }
-    }
-
-    fn issue_type(&mut self) -> IssueType {
-        match self.next_byte() % 7 {
-            0 => IssueType::Task,
-            1 => IssueType::Bug,
-            2 => IssueType::Feature,
-            3 => IssueType::Epic,
-            4 => IssueType::Chore,
-            5 => IssueType::Docs,
-            _ => IssueType::Question,
-        }
     }
 }

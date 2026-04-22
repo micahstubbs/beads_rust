@@ -1,7 +1,10 @@
 #![no_main]
 
-use beads_rust::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
+mod common;
+
+use beads_rust::model::{Comment, Dependency, DependencyType, Issue, Priority};
 use beads_rust::util::content_hash;
+use common::{ByteCursor, EmptyCustomIssueCursorExt};
 use libfuzzer_sys::fuzz_target;
 use serde_json::Value;
 use std::error::Error;
@@ -368,76 +371,5 @@ fn non_empty(value: String, fallback: &str) -> String {
         fallback.to_string()
     } else {
         value
-    }
-}
-
-struct ByteCursor<'a> {
-    data: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> ByteCursor<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, offset: 0 }
-    }
-
-    fn next_byte(&mut self) -> u8 {
-        if self.data.is_empty() {
-            return 0;
-        }
-        let byte = self.data[self.offset % self.data.len()];
-        self.offset = self.offset.wrapping_add(1);
-        byte
-    }
-
-    fn next_bool(&mut self) -> bool {
-        self.next_byte() & 1 == 1
-    }
-
-    fn optional_text(&mut self, max_len: usize) -> Option<String> {
-        if self.next_byte().is_multiple_of(4) {
-            None
-        } else {
-            Some(self.text(max_len))
-        }
-    }
-
-    fn text(&mut self, max_len: usize) -> String {
-        if self.data.is_empty() {
-            return String::new();
-        }
-
-        let len = usize::from(self.next_byte()) % (max_len + 1);
-        let mut bytes = Vec::with_capacity(len);
-        for _ in 0..len {
-            bytes.push(self.next_byte());
-        }
-        String::from_utf8_lossy(&bytes).into_owned()
-    }
-
-    fn status(&mut self) -> Status {
-        match self.next_byte() % 8 {
-            0 => Status::Open,
-            1 => Status::InProgress,
-            2 => Status::Blocked,
-            3 => Status::Deferred,
-            4 => Status::Draft,
-            5 => Status::Closed,
-            6 => Status::Tombstone,
-            _ => Status::Custom(non_empty(self.text(32), "custom-status")),
-        }
-    }
-
-    fn issue_type(&mut self) -> IssueType {
-        match self.next_byte() % 8 {
-            0 => IssueType::Task,
-            1 => IssueType::Bug,
-            2 => IssueType::Feature,
-            3 => IssueType::Epic,
-            4 => IssueType::Chore,
-            5 => IssueType::Docs,
-            6 => IssueType::Question,
-            _ => IssueType::Custom(non_empty(self.text(32), "custom-type")),
-        }
     }
 }
