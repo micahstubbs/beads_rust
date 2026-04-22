@@ -6,7 +6,7 @@
 
 mod common;
 
-use beads_rust::model::{DependencyType, EventType, Issue, IssueType, Priority, Status};
+use beads_rust::model::{Comment, DependencyType, EventType, Issue, IssueType, Priority, Status};
 use beads_rust::storage::{IssueUpdate, SqliteStorage};
 use chrono::{Duration, Utc};
 use common::{fixtures, test_db, test_db_with_dir};
@@ -217,6 +217,54 @@ fn get_issue_for_export_includes_relations() {
     assert!(!exported.labels.is_empty());
     assert!(!exported.comments.is_empty());
     assert!(exported.labels.contains(&"test-label".to_string()));
+}
+
+#[test]
+fn comments_with_same_timestamp_are_ordered_by_id() {
+    let mut storage = test_db();
+    let issue = fixtures::issue("same-timestamp-comments");
+    let created_at = Utc::now();
+
+    storage.create_issue(&issue, "tester").unwrap();
+    storage
+        .sync_comments_for_import(
+            &issue.id,
+            &[
+                Comment {
+                    id: 20,
+                    issue_id: issue.id.clone(),
+                    author: "reviewer".to_string(),
+                    body: "second by id".to_string(),
+                    created_at,
+                },
+                Comment {
+                    id: 10,
+                    issue_id: issue.id.clone(),
+                    author: "reviewer".to_string(),
+                    body: "first by id".to_string(),
+                    created_at,
+                },
+            ],
+        )
+        .unwrap();
+
+    let comments = storage.get_comments(&issue.id).unwrap();
+    let ids = comments
+        .iter()
+        .map(|comment| comment.id)
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![10, 20]);
+
+    let exported = storage
+        .get_issue_for_export(&issue.id)
+        .unwrap()
+        .expect("issue exists");
+    let exported_ids = exported
+        .comments
+        .iter()
+        .map(|comment| comment.id)
+        .collect::<Vec<_>>();
+    assert_eq!(exported_ids, vec![10, 20]);
 }
 
 #[test]

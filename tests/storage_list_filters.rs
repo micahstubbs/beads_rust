@@ -541,6 +541,41 @@ fn filter_with_limit_zero_returns_all() {
 }
 
 #[test]
+fn filter_with_limit_zero_still_applies_offset() {
+    let mut storage = test_db();
+
+    for i in 0..5 {
+        let issue = IssueBuilder::new(&format!("limit-zero-offset-{i}")).build();
+        storage.create_issue(&issue, "tester").unwrap();
+    }
+
+    let all_results = storage
+        .list_issues(&ListFilters {
+            limit: Some(0),
+            ..Default::default()
+        })
+        .unwrap();
+    let offset_results = storage
+        .list_issues(&ListFilters {
+            limit: Some(0),
+            offset: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let all_ids = all_results
+        .iter()
+        .map(|issue| &issue.id)
+        .collect::<Vec<_>>();
+    let offset_ids = offset_results
+        .iter()
+        .map(|issue| &issue.id)
+        .collect::<Vec<_>>();
+
+    assert_eq!(offset_ids, all_ids[2..]);
+}
+
+#[test]
 fn filter_with_limit_larger_than_result_count() {
     let mut storage = test_db();
 

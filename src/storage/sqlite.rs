@@ -2253,15 +2253,19 @@ impl SqliteStorage {
             sql.push_str(" ORDER BY priority ASC, created_at DESC");
         }
 
-        if let Some(limit) = filters.limit
-            && limit > 0
-        {
-            let _ = write!(sql, " LIMIT {limit}");
-            if let Some(offset) = filters.offset
-                && offset > 0
-            {
-                let _ = write!(sql, " OFFSET {offset}");
+        match (filters.limit, filters.offset) {
+            (Some(limit), offset) if limit > 0 => {
+                let _ = write!(sql, " LIMIT {limit}");
+                if let Some(offset) = offset
+                    && offset > 0
+                {
+                    let _ = write!(sql, " OFFSET {offset}");
+                }
             }
+            (_, Some(offset)) if offset > 0 => {
+                let _ = write!(sql, " LIMIT -1 OFFSET {offset}");
+            }
+            _ => {}
         }
 
         let rows = self.conn.query_with_params(&sql, &params)?;
@@ -4967,7 +4971,7 @@ impl SqliteStorage {
             "SELECT id, issue_id, author, text, created_at
              FROM comments
              WHERE issue_id = ?
-             ORDER BY created_at ASC",
+             ORDER BY created_at ASC, id ASC",
             &[SqliteValue::from(issue_id)],
         )?;
 
@@ -4997,7 +5001,7 @@ impl SqliteStorage {
                 "SELECT id, issue_id, author, text, created_at
                  FROM comments
                  WHERE issue_id IN ({})
-                 ORDER BY created_at ASC",
+                 ORDER BY issue_id ASC, created_at ASC, id ASC",
                 placeholders.join(",")
             );
 
@@ -5697,7 +5701,7 @@ impl SqliteStorage {
         let rows = self.conn.query(
             "SELECT id, issue_id, author, text, created_at
              FROM comments
-             ORDER BY issue_id, created_at ASC",
+             ORDER BY issue_id ASC, created_at ASC, id ASC",
         )?;
 
         let mut map: HashMap<String, Vec<Comment>> = HashMap::new();
