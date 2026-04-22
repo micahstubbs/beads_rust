@@ -6935,14 +6935,15 @@ fn epoch_remainder_u32(n: i64, divisor: i64) -> Result<u32> {
 }
 
 fn datetime_from_epoch_seconds_f64(f: f64) -> Result<DateTime<Utc>> {
+    const MIN_I64_AS_F64: f64 = -9_223_372_036_854_775_808.0;
+    const MAX_I64_AS_F64: f64 = 9_223_372_036_854_775_807.0;
+
     if !f.is_finite() {
         return Err(BeadsError::Config(format!(
             "non-finite datetime column value: {f}"
         )));
     }
     let whole_seconds = f.trunc();
-    const MIN_I64_AS_F64: f64 = -9_223_372_036_854_775_808.0;
-    const MAX_I64_AS_F64: f64 = 9_223_372_036_854_775_807.0;
     if !(MIN_I64_AS_F64..=MAX_I64_AS_F64).contains(&whole_seconds) {
         return Err(BeadsError::Config(format!(
             "invalid epoch value in datetime column: {f}"
