@@ -226,42 +226,81 @@ mod tests {
     #[test]
     fn test_default_theme() {
         let theme = Theme::default();
-        // Verify status styles exist
-        let _ = theme.status_style(&Status::Open);
-        let _ = theme.status_style(&Status::InProgress);
-        let _ = theme.status_style(&Status::Blocked);
-        let _ = theme.status_style(&Status::Closed);
+
+        assert_eq!(theme.status_style(&Status::Open), &theme.status_open);
+        assert_eq!(
+            theme.status_style(&Status::InProgress),
+            &theme.status_in_progress
+        );
+        assert_eq!(theme.status_style(&Status::Blocked), &theme.status_blocked);
+        assert_eq!(
+            theme.status_style(&Status::Deferred),
+            &theme.status_deferred
+        );
+        assert_eq!(theme.status_style(&Status::Closed), &theme.status_closed);
+        assert_eq!(
+            theme.status_style(&Status::Custom("waiting".to_string())),
+            &theme.muted
+        );
     }
 
     #[test]
     fn test_priority_styles() {
         let theme = Theme::default();
-        let _ = theme.priority_style(&Priority::CRITICAL);
-        let _ = theme.priority_style(&Priority::HIGH);
-        let _ = theme.priority_style(&Priority::MEDIUM);
-        let _ = theme.priority_style(&Priority::LOW);
+
+        assert_eq!(
+            theme.priority_style(&Priority::CRITICAL),
+            &theme.priority_critical
+        );
+        assert_eq!(theme.priority_style(&Priority::HIGH), &theme.priority_high);
+        assert_eq!(
+            theme.priority_style(&Priority::MEDIUM),
+            &theme.priority_medium
+        );
+        assert_eq!(theme.priority_style(&Priority::LOW), &theme.priority_low);
+        assert_eq!(theme.priority_style(&Priority(99)), &theme.muted);
     }
 
     #[test]
     fn test_type_styles() {
         let theme = Theme::default();
-        let _ = theme.type_style(&IssueType::Bug);
-        let _ = theme.type_style(&IssueType::Feature);
-        let _ = theme.type_style(&IssueType::Task);
-        let _ = theme.type_style(&IssueType::Epic);
+
+        assert_eq!(theme.type_style(&IssueType::Bug), &theme.type_bug);
+        assert_eq!(theme.type_style(&IssueType::Feature), &theme.type_feature);
+        assert_eq!(theme.type_style(&IssueType::Task), &theme.type_task);
+        assert_eq!(
+            theme.type_style(&IssueType::Custom("ops".to_string())),
+            &theme.type_task
+        );
+        assert_eq!(theme.type_style(&IssueType::Epic), &theme.type_epic);
+        assert_eq!(theme.type_style(&IssueType::Docs), &theme.type_docs);
+        assert_eq!(theme.type_style(&IssueType::Chore), &theme.type_chore);
     }
 
     #[test]
     fn test_dark_theme() {
         let theme = Theme::dark();
-        // Should be able to create a dark theme variant
-        let _ = theme.status_style(&Status::Open);
+        let default_theme = Theme::default();
+
+        assert_eq!(theme.status_style(&Status::Open), &theme.status_open);
+        assert_ne!(
+            theme.status_style(&Status::Open),
+            default_theme.status_style(&Status::Open)
+        );
+        assert_eq!(
+            theme.priority_style(&Priority::CRITICAL),
+            &theme.priority_critical
+        );
     }
 
     #[test]
     fn test_minimal_theme() {
         let theme = Theme::minimal();
-        // Should be able to create a minimal theme variant
-        let _ = theme.status_style(&Status::Open);
+
+        assert_eq!(theme.status_style(&Status::Open), &Style::new());
+        assert_eq!(theme.status_style(&Status::Blocked), &Style::new().bold());
+        assert_eq!(theme.status_style(&Status::Closed), &Style::new().dim());
+        assert_eq!(theme.type_style(&IssueType::Bug), &Style::new().bold());
+        assert_eq!(theme.type_style(&IssueType::Chore), &Style::new().dim());
     }
 }

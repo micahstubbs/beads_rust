@@ -399,7 +399,13 @@ mod tests {
         ];
         let theme = Theme::default();
         let table = RichIssueTable::new(&issues, &theme);
-        let _ = table.build_table();
+        let rendered = table.build_table().render_plain(120);
+
+        assert!(rendered.contains("test-1"));
+        assert!(rendered.contains("First issue"));
+        assert!(rendered.contains("test-2"));
+        assert!(rendered.contains("Second issue"));
+        assert!(rendered.contains("task"));
     }
 
     #[test]
@@ -407,7 +413,13 @@ mod tests {
         let issue = make_test_issue("test-1", "Test issue");
         let theme = Theme::default();
         let panel = RichIssuePanel::new(&issue, &theme);
-        let _ = panel.build_panel();
+        let rendered = panel.build_panel().render_plain(80);
+
+        assert!(rendered.contains("test-1"));
+        assert!(rendered.contains("Test issue"));
+        assert!(rendered.contains("Test description"));
+        assert!(rendered.contains("task"));
+        assert!(rendered.contains("open"));
     }
 
     #[test]
@@ -444,20 +456,32 @@ mod tests {
     #[test]
     fn test_format_status_badge() {
         let theme = Theme::default();
-        let _ = format_status_badge(&Status::Open, &theme);
-        let _ = format_status_badge(&Status::Blocked, &theme);
+        let open = format_status_badge(&Status::Open, &theme);
+        let blocked = format_status_badge(&Status::Blocked, &theme);
+
+        assert!(open.plain().contains("OPEN"));
+        assert!(!open.spans().is_empty());
+        assert!(blocked.plain().contains("BLOCKED"));
+        assert!(!blocked.spans().is_empty());
     }
 
     #[test]
     fn test_format_count_badges() {
         let theme = Theme::default();
-        let _ = format_count_badges(5, 2, 1, 3, &theme);
+        let badges = format_count_badges(5, 2, 1, 3, &theme);
+
+        assert_eq!(badges.plain(), "5 open 2 in progress 1 blocked 3 closed");
+        assert_eq!(badges.spans().len(), 4);
     }
 
     #[test]
     fn test_build_completion_bar() {
         let theme = Theme::default();
-        let _ = build_completion_bar(7, 10, &theme);
+        let bar = build_completion_bar(7, 10, &theme);
+
+        assert!((bar.progress() - 0.7).abs() < f64::EPSILON);
+        assert!(!bar.is_finished());
+        assert!(!bar.render_plain(20).is_empty());
     }
 
     #[test]
@@ -465,7 +489,11 @@ mod tests {
         let issues = vec![make_test_issue("test-1", "Issue")];
         let theme = Theme::default();
         let table = RichIssueTable::new(&issues, &theme).show_type(false);
-        let _ = table.build_table();
+        let rendered = table.build_table().render_plain(80);
+
+        assert!(rendered.contains("test-1"));
+        assert!(rendered.contains("Issue"));
+        assert!(!rendered.contains("Type"));
     }
 
     #[test]
@@ -476,6 +504,10 @@ mod tests {
         )];
         let theme = Theme::default();
         let table = RichIssueTable::new(&issues, &theme).max_title_width(20);
-        let _ = table.build_table();
+        let rendered = table.build_table().render_plain(80);
+
+        assert!(rendered.contains("test-1"));
+        assert!(rendered.contains("A very long title..."));
+        assert!(!rendered.contains("A very long title that should be truncated"));
     }
 }
