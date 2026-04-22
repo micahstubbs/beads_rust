@@ -783,11 +783,13 @@ impl SqliteStorage {
         // good desynchronization under concurrent access.
         const MAX_RETRIES: u32 = 8;
         let base_backoff_ms: u64 = 50;
+        let mut last_error: Option<crate::error::BeadsError> = None;
 
         for attempt in 0..MAX_RETRIES {
             match self.conn.execute("BEGIN IMMEDIATE") {
                 Ok(_) => {}
                 Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
+                    last_error = Some(e.into());
                     let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
                     std::thread::sleep(Duration::from_millis(backoff));
                     continue;
@@ -813,6 +815,7 @@ impl SqliteStorage {
                             if let Err(rb_err) = self.conn.execute("ROLLBACK") {
                                 tracing::warn!(error = %rb_err, "ROLLBACK failed after transient COMMIT error");
                             }
+                            last_error = Some(e.into());
                             let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
                             std::thread::sleep(Duration::from_millis(backoff));
                             // retry
@@ -830,6 +833,7 @@ impl SqliteStorage {
                         tracing::warn!(error = %rb_err, "ROLLBACK failed after transaction error");
                     }
                     if e.is_transient() && attempt < MAX_RETRIES - 1 {
+                        last_error = Some(e);
                         let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
                         std::thread::sleep(Duration::from_millis(backoff));
                         // retry
@@ -839,7 +843,11 @@ impl SqliteStorage {
                 }
             }
         }
-        unreachable!("Retry loop exited without returning")
+        Err(last_error.unwrap_or_else(|| {
+            crate::error::BeadsError::Config(
+                "write transaction retry loop exhausted without producing an error".into(),
+            )
+        }))
     }
 
     /// Compute exponential backoff with random jitter (+/-25%) to prevent
@@ -12238,6 +12246,37 @@ mod tests {
             open_children,
             vec!["a_b.1".to_string()],
             "underscore in parent id must be escaped so `a_b.1` matches but `aXb.1` does not"
+        );
+    }
+
+    #[test]
+    fn jittered_backoff_increases_with_attempt() {
+        let b0 = SqliteStorage::jittered_backoff(50, 0);
+        let b1 = SqliteStorage::jittered_backoff(50, 1);
+        let b2 = SqliteStorage::jittered_backoff(50, 2);
+        assert!(b0 >= 25 && b0 <= 75, "attempt 0: {b0}");
+        assert!(b1 >= 50 && b1 <= 150, "attempt 1: {b1}");
+        assert!(b2 >= 100 && b2 <= 300, "attempt 2: {b2}");
+    }
+
+    #[test]
+    fn jittered_backoff_zero_base_returns_positive() {
+        let b = SqliteStorage::jittered_backoff(0, 0);
+        assert!(b >= 0, "zero base should not underflow");
+    }
+
+    #[test]
+    fn write_transaction_propagates_body_error() {
+        let dir = TempDir::new().unwrap();
+        let mut storage = SqliteStorage::open(dir.path().join("test.db")).unwrap();
+        let result: Result<()> = storage.with_write_transaction(|_| {
+            Err(crate::error::BeadsError::Config("test error".into()))
+        });
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("test error"),
+            "should propagate body error, got: {err_msg}"
         );
     }
 }
