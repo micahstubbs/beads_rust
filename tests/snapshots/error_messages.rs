@@ -57,6 +57,20 @@ fn snapshot_error_self_dependency() {
 }
 
 #[test]
+fn snapshot_error_invalid_label() {
+    let workspace = init_workspace();
+    let id = create_issue(&workspace, "Label test", "create_for_label");
+
+    let output = run_br(
+        &workspace,
+        ["label", "add", &id, "bad label"],
+        "label_add_bad",
+    );
+    assert!(!output.status.success(), "expected label validation failure");
+    assert_snapshot!("error_invalid_label", normalize_output(&output.stderr));
+}
+
+#[test]
 fn snapshot_error_update_closed_issue() {
     let workspace = init_workspace();
     let id = create_issue(&workspace, "Will close", "create_for_close");
