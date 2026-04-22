@@ -1075,18 +1075,31 @@ fn write_manifest_atomically(manifest_path: &Path, manifest: &serde_json::Value)
     let temp_path = manifest_path.with_extension(format!("json.{}.tmp", std::process::id()));
     let content = serde_json::to_string_pretty(manifest)?;
 
+    let cleanup = |path: &Path| {
+        let _ = fs::remove_file(path);
+    };
+
     let mut file = File::create(&temp_path).map_err(|e| {
         BeadsError::Config(format!(
             "failed to create temp manifest file {}: {e}",
             temp_path.display()
         ))
     })?;
-    file.write_all(content.as_bytes())?;
-    file.sync_all()?;
+
+    // write_all / sync_all / durable_rename all must clean up the temp
+    // file on failure; otherwise a torn manifest.json.<pid>.tmp can
+    // accumulate on disk or, worse, confuse a concurrent attempt that
+    // reuses the same PID-derived path after wraparound.
+    file.write_all(content.as_bytes()).inspect_err(|_| {
+        cleanup(&temp_path);
+    })?;
+    file.sync_all().inspect_err(|_| {
+        cleanup(&temp_path);
+    })?;
     drop(file);
 
     crate::util::durable_rename(&temp_path, manifest_path).inspect_err(|_| {
-        let _ = fs::remove_file(&temp_path);
+        cleanup(&temp_path);
     })?;
 
     Ok(())
