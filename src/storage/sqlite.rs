@@ -2755,26 +2755,22 @@ impl SqliteStorage {
         }
 
         // Filter by parent (--parent flag)
+        let mut cte_prefix = String::new();
         if let Some(ref parent_id) = filters.parent {
             if filters.recursive {
-                // Collect all descendants via Rust-side BFS instead of
-                // WITH RECURSIVE (not yet supported in fsqlite subqueries).
-                let descendant_ids = self.collect_descendant_ids(parent_id)?;
-                if descendant_ids.is_empty() {
-                    // No descendants — short-circuit to empty result.
-                    sql.push_str(" AND 1 = 0");
-                } else {
-                    let mut chunks_sql = Vec::new();
-                    for chunk in descendant_ids.chunks(900) {
-                        let placeholders: Vec<String> =
-                            chunk.iter().map(|_| "?".to_string()).collect();
-                        chunks_sql.push(format!("id IN ({})", placeholders.join(",")));
-                        for id in chunk {
-                            params.push(SqliteValue::from(id.as_str()));
-                        }
-                    }
-                    let _ = write!(sql, " AND ({})", chunks_sql.join(" OR "));
-                }
+                cte_prefix = String::from(
+                    "WITH RECURSIVE _descendants(did) AS (\
+                        SELECT issue_id FROM dependencies WHERE depends_on_id = ? AND type = 'parent-child' \
+                        UNION \
+                        SELECT d.issue_id FROM dependencies d \
+                        JOIN _descendants ON d.depends_on_id = _descendants.did \
+                        WHERE d.type = 'parent-child'\
+                    ) ",
+                );
+                // The CTE is prepended to the SQL, so its ? appears first.
+                // Insert the parent_id param at position 0 to match.
+                params.insert(0, SqliteValue::from(parent_id.as_str()));
+                sql.push_str(" AND id IN (SELECT did FROM _descendants)");
             } else {
                 sql.push_str(
                     " AND id IN (
@@ -2806,6 +2802,10 @@ impl SqliteStorage {
             && limit > 0
         {
             let _ = write!(sql, " LIMIT {limit}");
+        }
+
+        if !cte_prefix.is_empty() {
+            sql = format!("{cte_prefix}{sql}");
         }
 
         Ok((sql, params))
@@ -5238,6 +5238,7 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if a database query fails.
+    #[allow(dead_code)]
     fn collect_descendant_ids(&self, parent_id: &str) -> Result<Vec<String>> {
         let mut result = Vec::new();
         // Use a HashSet for O(1) visited-set lookups instead of the
