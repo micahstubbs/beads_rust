@@ -304,7 +304,7 @@ mod tests {
         let state = test_state(&temp, jsonl_path.clone());
 
         let err = state
-            .with_mutation(|storage| {
+            .with_mutation(|storage| -> fastmcp_rust::McpResult<()> {
                 storage
                     .create_issue(
                         &test_issue("br-mcp-partial", "partial mutation"),
