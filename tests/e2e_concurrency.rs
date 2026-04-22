@@ -1591,7 +1591,13 @@ fn e2e_sync_status_observer_stays_available_during_writes() {
             for _ in 0..6 {
                 results.push(run_br_in_dir(
                     &root,
-                    ["--lock-timeout", "50", "sync", "--status", "--json"],
+                    [
+                        "--lock-timeout",
+                        CONTENTION_SUCCESS_LOCK_TIMEOUT_MS,
+                        "sync",
+                        "--status",
+                        "--json",
+                    ],
                 ));
                 thread::sleep(Duration::from_millis(10));
             }
@@ -1896,7 +1902,7 @@ fn e2e_external_access_and_background_status_are_bounded_during_mutation() {
         for i in 0..8 {
             let args = vec![
                 "--lock-timeout".to_string(),
-                "50".to_string(),
+                CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                 "create".to_string(),
                 format!("local-mutation-{i}"),
             ];
@@ -1917,14 +1923,14 @@ fn e2e_external_access_and_background_status_are_bounded_during_mutation() {
             let args = if i % 2 == 0 {
                 vec![
                     "--lock-timeout".to_string(),
-                    "25".to_string(),
+                    CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                     "list".to_string(),
                     "--json".to_string(),
                 ]
             } else {
                 vec![
                     "--lock-timeout".to_string(),
-                    "25".to_string(),
+                    CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                     "show".to_string(),
                     read_issue_id.as_ref().clone(),
                     "--json".to_string(),
@@ -1949,7 +1955,7 @@ fn e2e_external_access_and_background_status_are_bounded_during_mutation() {
         for _ in 0..10 {
             let args = vec![
                 "--lock-timeout".to_string(),
-                "25".to_string(),
+                CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                 "sync".to_string(),
                 "--status".to_string(),
                 "--json".to_string(),
