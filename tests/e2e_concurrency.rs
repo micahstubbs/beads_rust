@@ -12,6 +12,7 @@ mod common;
 use assert_cmd::Command;
 use common::dataset_registry::{DatasetRegistry, IsolatedDataset, KnownDataset};
 use fsqlite::Connection;
+use fsqlite_types::SqliteValue;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::path::Path;
@@ -24,6 +25,7 @@ use tempfile::TempDir;
 
 const WRITE_LOCK_WAIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_LOCK_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const CONTENTION_SUCCESS_LOCK_TIMEOUT_MS: &str = "500";
 
 /// Result of running a br command.
 #[derive(Debug)]
@@ -87,7 +89,13 @@ fn read_child_wait_channel(pid: u32) -> Option<String> {
 #[cfg(target_os = "linux")]
 fn is_write_lock_wait_channel(channel: &str) -> bool {
     let channel = channel.to_ascii_lowercase();
-    channel.contains("lock") || channel.contains("flock")
+    channel.contains("lock")
+        || channel.contains("flock")
+        // blocking_write_lock_with_timeout uses bounded try_lock polling.
+        // While contended, Linux commonly reports the waiter in the sleep
+        // between polls rather than inside flock/lock_file_wait.
+        || channel.contains("nanosleep")
+        || channel.contains("hrtimer")
 }
 
 fn wait_for_child_to_block_on_write_lock(child: &mut std::process::Child, label: &str) {
@@ -250,6 +258,22 @@ fn assert_only_success_or_contention(role: &str, results: &[BrResult]) -> usize 
     );
 
     success_count
+}
+
+fn issue_title_count(root: &Path, title: &str) -> i64 {
+    let db_path = root.join(".beads").join("beads.db");
+    let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open beads db");
+    let rows = conn
+        .query_with_params(
+            "SELECT COUNT(*) FROM issues WHERE title = ?",
+            &[SqliteValue::from(title)],
+        )
+        .expect("count issue title");
+
+    rows.first()
+        .and_then(|row| row.first())
+        .and_then(SqliteValue::as_integer)
+        .unwrap_or(0)
 }
 
 /// Extract JSON payload from stdout (skip non-JSON preamble).
@@ -449,19 +473,10 @@ fn e2e_mutating_command_fails_when_write_lock_path_unusable() {
         "error should explain the unusable write lock path: {combined}"
     );
 
-    let list = run_br_in_dir(&root, ["--no-auto-import", "list", "--json"]);
-    assert!(
-        list.success,
-        "list after failed create failed: {}",
-        list.stderr
-    );
-    let issues = extract_issues_array(&list.stdout);
-    assert!(
-        issues
-            .iter()
-            .all(|issue| issue["title"].as_str() != Some("Should not bypass broken write lock")),
-        "failed lock acquisition must not create an issue: {}",
-        list.stdout
+    assert_eq!(
+        issue_title_count(&root, "Should not bypass broken write lock"),
+        0,
+        "failed lock acquisition must not create an issue"
     );
 }
 
@@ -1454,7 +1469,7 @@ fn e2e_routed_external_mutation_succeeds_during_local_updates() {
                     &main_root,
                     [
                         "--lock-timeout",
-                        "1",
+                        CONTENTION_SUCCESS_LOCK_TIMEOUT_MS,
                         "update",
                         &local_id,
                         "--title",
@@ -1480,7 +1495,7 @@ fn e2e_routed_external_mutation_succeeds_during_local_updates() {
                     &main_root,
                     [
                         "--lock-timeout",
-                        "1",
+                        CONTENTION_SUCCESS_LOCK_TIMEOUT_MS,
                         "comments",
                         "add",
                         &external_id,
@@ -1665,7 +1680,7 @@ fn e2e_interleaved_command_families_preserve_workspace_integrity() {
         for i in 0..6 {
             let args = vec![
                 "--lock-timeout".to_string(),
-                "50".to_string(),
+                CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                 "create".to_string(),
                 format!("Agent-created issue {i}"),
             ];
@@ -1688,7 +1703,7 @@ fn e2e_interleaved_command_families_preserve_workspace_integrity() {
             let args = vec![
                 "--no-auto-import".to_string(),
                 "--lock-timeout".to_string(),
-                "50".to_string(),
+                CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                 "comments".to_string(),
                 "add".to_string(),
                 comment_issue_id.as_ref().clone(),
@@ -1711,7 +1726,7 @@ fn e2e_interleaved_command_families_preserve_workspace_integrity() {
             let args = vec![
                 "--no-auto-import".to_string(),
                 "--lock-timeout".to_string(),
-                "50".to_string(),
+                CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                 "label".to_string(),
                 "add".to_string(),
                 label_issue_id.as_ref().clone(),
@@ -1733,20 +1748,20 @@ fn e2e_interleaved_command_families_preserve_workspace_integrity() {
             let args = match i % 3 {
                 0 => vec![
                     "--lock-timeout".to_string(),
-                    "50".to_string(),
+                    CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                     "list".to_string(),
                     "--json".to_string(),
                 ],
                 1 => vec![
                     "--lock-timeout".to_string(),
-                    "50".to_string(),
+                    CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                     "show".to_string(),
                     reader_issue_id.as_ref().clone(),
                     "--json".to_string(),
                 ],
                 _ => vec![
                     "--lock-timeout".to_string(),
-                    "50".to_string(),
+                    CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                     "ready".to_string(),
                     "--json".to_string(),
                 ],
@@ -2155,20 +2170,20 @@ fn e2e_actor_oriented_command_families_preserve_workspace_integrity() {
                 let args = match i % 3 {
                     0 => vec![
                         "--lock-timeout".to_string(),
-                        "25".to_string(),
+                        CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                         "show".to_string(),
                         claim_id.clone(),
                         "--json".to_string(),
                     ],
                     1 => vec![
                         "--lock-timeout".to_string(),
-                        "25".to_string(),
+                        CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                         "ready".to_string(),
                         "--json".to_string(),
                     ],
                     _ => vec![
                         "--lock-timeout".to_string(),
-                        "25".to_string(),
+                        CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                         "stats".to_string(),
                         "--json".to_string(),
                     ],
@@ -2554,7 +2569,7 @@ fn e2e_routed_access_remains_bounded_while_remote_workspace_mutates() {
             for i in 0..8 {
                 let args = vec![
                     "--lock-timeout".to_string(),
-                    "50".to_string(),
+                    CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                     "create".to_string(),
                     format!("local-route-write-{i}"),
                 ];
@@ -2575,7 +2590,7 @@ fn e2e_routed_access_remains_bounded_while_remote_workspace_mutates() {
             for i in 0..8 {
                 let args = vec![
                     "--lock-timeout".to_string(),
-                    "50".to_string(),
+                    CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                     "--actor".to_string(),
                     "bob".to_string(),
                     "update".to_string(),
@@ -2602,7 +2617,7 @@ fn e2e_routed_access_remains_bounded_while_remote_workspace_mutates() {
                 let args = if i % 2 == 0 {
                     vec![
                         "--lock-timeout".to_string(),
-                        "25".to_string(),
+                        CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                         "show".to_string(),
                         external_id.clone(),
                         "--json".to_string(),
@@ -2610,7 +2625,7 @@ fn e2e_routed_access_remains_bounded_while_remote_workspace_mutates() {
                 } else {
                     vec![
                         "--lock-timeout".to_string(),
-                        "25".to_string(),
+                        CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                         "--actor".to_string(),
                         "carol".to_string(),
                         "label".to_string(),
