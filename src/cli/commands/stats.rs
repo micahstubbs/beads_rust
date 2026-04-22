@@ -692,6 +692,12 @@ fn parse_issue_activity_patch(patch: &str) -> ActivityCounts {
     count_issue_activity_transitions(&removed, &added)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IssuePatchMarker {
+    Added,
+    Removed,
+}
+
 fn record_issue_activity_patch_line(
     line: &str,
     removed: &mut BTreeMap<String, Issue>,
@@ -703,13 +709,12 @@ fn record_issue_activity_patch_line(
 
     match serde_json::from_str::<Issue>(payload) {
         Ok(issue) => match marker {
-            '+' => {
+            IssuePatchMarker::Added => {
                 added.insert(issue.id.clone(), issue);
             }
-            '-' => {
+            IssuePatchMarker::Removed => {
                 removed.insert(issue.id.clone(), issue);
             }
-            _ => unreachable!("parse_issue_patch_line only returns +/- markers"),
         },
         Err(err) => {
             debug!(%err, "Skipping unparsable issue line from git diff");
@@ -732,7 +737,7 @@ fn count_issue_activity_transitions(
     counts
 }
 
-fn parse_issue_patch_line(line: &str) -> Option<(char, &str)> {
+fn parse_issue_patch_line(line: &str) -> Option<(IssuePatchMarker, &str)> {
     if line.starts_with("+++ ")
         || line.starts_with("--- ")
         || line.starts_with("@@")
@@ -746,9 +751,11 @@ fn parse_issue_patch_line(line: &str) -> Option<(char, &str)> {
     }
 
     let marker = *line.as_bytes().first()? as char;
-    if !matches!(marker, '+' | '-') {
-        return None;
-    }
+    let marker = match marker {
+        '+' => IssuePatchMarker::Added,
+        '-' => IssuePatchMarker::Removed,
+        _ => return None,
+    };
 
     let payload = &line[1..];
     if !payload.starts_with('{') {
@@ -1700,6 +1707,27 @@ mod tests {
         assert_eq!(counts.updated, 0);
         assert_eq!(counts.reopened, 0);
         assert_eq!(counts.total_changes(), 1);
+    }
+
+    #[test]
+    fn test_parse_issue_activity_patch_skips_non_issue_markers() {
+        let issue = make_issue("bd-skipped", Status::Open, IssueType::Task);
+        let issue_json = serde_json::to_string(&issue).expect("serialize skipped issue");
+        let patch = format!(
+            "diff --git a/.beads/issues.jsonl b/.beads/issues.jsonl\n\
+             @@ -1 +1 @@\n\
+             !{issue_json}\n\
+             ~{issue_json}\n\
+             context line\n"
+        );
+
+        assert_eq!(parse_issue_patch_line(&format!("!{issue_json}")), None);
+        let counts = parse_issue_activity_patch(&patch);
+        assert_eq!(counts.created, 0);
+        assert_eq!(counts.closed, 0);
+        assert_eq!(counts.updated, 0);
+        assert_eq!(counts.reopened, 0);
+        assert_eq!(counts.total_changes(), 0);
     }
 
     #[test]
