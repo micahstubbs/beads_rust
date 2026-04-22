@@ -5,10 +5,13 @@
 
 use beads_rust::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use beads_rust::storage::SqliteStorage;
-use beads_rust::sync::{ExportConfig, ImportConfig, export_to_jsonl, import_from_jsonl};
+use beads_rust::sync::{
+    ExportConfig, ImportConfig, export_to_jsonl, import_from_jsonl, read_issues_from_jsonl,
+};
 use chrono::{Duration, TimeZone, Utc};
 use proptest::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use tempfile::TempDir;
 use tracing::info;
 
@@ -161,6 +164,147 @@ fn populate_storage(case: &RoundTripCase) -> SqliteStorage {
         .sync_comments_for_import(&case.source.id, &case.comments)
         .unwrap();
     storage
+}
+
+fn assert_mixed_case_known_value_round_trip(
+    raw_status: &str,
+    raw_issue_type: &str,
+    expected_status: Status,
+    expected_issue_type: IssueType,
+    suffix: &str,
+) {
+    let temp = TempDir::new().unwrap();
+    let input_path = temp.path().join("mixed-case.jsonl");
+    let export_path = temp.path().join("exported.jsonl");
+    let canonical_path = temp.path().join("canonical.jsonl");
+
+    let canonical_issue = make_issue(
+        format!("bd-{suffix}"),
+        format!("Mixed case import {suffix}"),
+        Some("Import should normalize known enum case variants".to_string()),
+        None,
+        None,
+        None,
+        expected_status.clone(),
+        Priority::HIGH,
+        expected_issue_type.clone(),
+        Some("proptest".to_string()),
+        None,
+        None,
+        Some("proptest".to_string()),
+        None,
+        None,
+        false,
+        false,
+        0,
+        30,
+    );
+    let expected_hash = canonical_issue.compute_content_hash();
+
+    let mut incoming = serde_json::to_value(&canonical_issue).unwrap();
+    incoming["status"] = serde_json::Value::String(raw_status.to_string());
+    incoming["issue_type"] = serde_json::Value::String(raw_issue_type.to_string());
+    fs::write(
+        &input_path,
+        format!("{}\n", serde_json::to_string(&incoming).unwrap()),
+    )
+    .unwrap();
+
+    let mut imported = SqliteStorage::open_memory().unwrap();
+    let import_result = import_from_jsonl(
+        &mut imported,
+        &input_path,
+        &ImportConfig::default(),
+        Some("bd-"),
+    )
+    .unwrap();
+    assert_eq!(import_result.imported_count, 1);
+
+    let stored = imported
+        .get_issue(&canonical_issue.id)
+        .unwrap()
+        .expect("mixed-case issue imported");
+    assert_eq!(stored.status, expected_status);
+    assert_eq!(stored.issue_type, expected_issue_type);
+    assert_eq!(stored.content_hash.as_deref(), Some(expected_hash.as_str()));
+
+    let export_result = export_to_jsonl(&imported, &export_path, &ExportConfig::default()).unwrap();
+    let exported_issues = read_issues_from_jsonl(&export_path).unwrap();
+    let exported = find_issue(&exported_issues, &canonical_issue.id);
+    assert_eq!(exported.status, stored.status);
+    assert_eq!(exported.issue_type, stored.issue_type);
+    assert_eq!(
+        hash_map(&export_result.issue_hashes).get(&canonical_issue.id),
+        Some(&expected_hash)
+    );
+
+    let mut canonical_storage = SqliteStorage::open_memory().unwrap();
+    canonical_storage
+        .create_issue(&canonical_issue, "proptest")
+        .unwrap();
+    let canonical_export = export_to_jsonl(
+        &canonical_storage,
+        &canonical_path,
+        &ExportConfig::default(),
+    )
+    .unwrap();
+
+    assert_eq!(export_result.content_hash, canonical_export.content_hash);
+    assert_eq!(
+        fs::read_to_string(&export_path).unwrap(),
+        fs::read_to_string(&canonical_path).unwrap(),
+        "mixed-case import should canonicalize to byte-identical JSONL"
+    );
+}
+
+#[test]
+fn jsonl_import_normalizes_mixed_case_known_status_and_issue_type() {
+    assert_mixed_case_known_value_round_trip(
+        "In_Progress",
+        "Bug",
+        Status::InProgress,
+        IssueType::Bug,
+        "mixedcase0",
+    );
+    assert_mixed_case_known_value_round_trip(
+        "INPROGRESS",
+        "FEATURE",
+        Status::InProgress,
+        IssueType::Feature,
+        "mixedcase1",
+    );
+    assert_mixed_case_known_value_round_trip(
+        "DRAFT",
+        "Question",
+        Status::Draft,
+        IssueType::Question,
+        "mixedcase2",
+    );
+    assert_mixed_case_known_value_round_trip(
+        "TOMBSTONE",
+        "Docs",
+        Status::Tombstone,
+        IssueType::Docs,
+        "mixedcase3",
+    );
+    assert_mixed_case_known_value_round_trip(
+        "PINNED",
+        "Task",
+        Status::Pinned,
+        IssueType::Task,
+        "mixedcase4",
+    );
+}
+
+#[test]
+fn jsonl_import_preserves_custom_status_and_issue_type_case() {
+    assert_mixed_case_known_value_round_trip(
+        "QaReview",
+        "Odd_Type",
+        Status::Custom("QaReview".to_string()),
+        IssueType::Custom("Odd_Type".to_string()),
+        "customcase",
+    );
 }
 
 prop_compose! {
