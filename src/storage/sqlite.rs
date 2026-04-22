@@ -12598,6 +12598,83 @@ mod tests {
     }
 
     #[test]
+    fn open_auto_migrates_legacy_integer_datetimes_and_done_status() {
+        // Simulate the exact on-disk corruption observed in the wild: a v5
+        // DB (pre-migration user_version) with integer-typed DATETIME
+        // columns on some rows and a legacy Go-beads "done" status on
+        // another. Opening the DB with the fixed binary must auto-promote
+        // to v6 and normalize both.
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("legacy.db");
+        {
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            // Drop the user_version so we exercise the v5 → v6 path.
+            storage.conn.execute("PRAGMA user_version = 5").unwrap();
+            storage
+                .conn
+                .execute(
+                    "INSERT INTO issues (id, title, status, priority, issue_type, \
+                      created_at, updated_at, closed_at, close_reason) VALUES \
+                      ('legacy-int', 'integer timestamps', 'closed', 2, 'task', \
+                      '2026-04-19T21:34:04.000000000Z', 1776651488000000, 1776651488000000, 'done')",
+                )
+                .unwrap();
+            storage
+                .conn
+                .execute(
+                    "INSERT INTO issues (id, title, status, priority, issue_type, \
+                      created_at, updated_at) VALUES \
+                      ('legacy-done', 'bd done status', 'done', 2, 'task', \
+                      '2026-04-02T20:00:00Z', '2026-04-03T01:00:00Z')",
+                )
+                .unwrap();
+        }
+
+        // Reopen — this triggers run_migrations(), which must repair both.
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let row = storage
+            .conn
+            .query_row(
+                "SELECT typeof(updated_at), typeof(closed_at), status FROM issues WHERE id='legacy-int'",
+            )
+            .unwrap();
+        assert_eq!(
+            row.get(0).and_then(SqliteValue::as_text),
+            Some("text"),
+            "updated_at should have been rewritten to TEXT"
+        );
+        assert_eq!(
+            row.get(1).and_then(SqliteValue::as_text),
+            Some("text"),
+            "closed_at should have been rewritten to TEXT"
+        );
+        assert_eq!(row.get(2).and_then(SqliteValue::as_text), Some("closed"));
+
+        let row = storage
+            .conn
+            .query_row("SELECT status, closed_at FROM issues WHERE id='legacy-done'")
+            .unwrap();
+        assert_eq!(row.get(0).and_then(SqliteValue::as_text), Some("closed"));
+        assert!(
+            row.get(1).and_then(SqliteValue::as_text).is_some(),
+            "closed_at should be populated for migrated done issue"
+        );
+
+        // The export path must now produce a correct Issue — the reader
+        // regression (silent 1970-01-01 / null) is gone.
+        let issue = storage
+            .get_issue_for_export("legacy-int")
+            .unwrap()
+            .expect("issue exists");
+        assert_eq!(issue.updated_at.year(), 2026);
+        assert_eq!(issue.updated_at.month(), 4);
+        assert_eq!(issue.updated_at.day(), 20);
+        assert!(issue.closed_at.is_some());
+        assert_eq!(issue.closed_at.unwrap().year(), 2026);
+    }
+
+    #[test]
     fn connection_write_transaction_propagates_body_error() {
         let dir = TempDir::new().unwrap();
         let storage = SqliteStorage::open(&dir.path().join("test.db")).unwrap();
