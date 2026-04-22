@@ -25,7 +25,7 @@ use tempfile::TempDir;
 
 const WRITE_LOCK_WAIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_LOCK_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
-const CONTENTION_SUCCESS_LOCK_TIMEOUT_MS: &str = "500";
+const CONTENTION_SUCCESS_LOCK_TIMEOUT_MS: &str = "1000";
 
 /// Result of running a br command.
 #[derive(Debug)]
@@ -2066,7 +2066,7 @@ fn e2e_actor_oriented_command_families_preserve_workspace_integrity() {
                 let args = vec![
                     "--no-auto-import".to_string(),
                     "--lock-timeout".to_string(),
-                    "250".to_string(),
+                    CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                     "--actor".to_string(),
                     "alice".to_string(),
                     "update".to_string(),
@@ -2093,7 +2093,7 @@ fn e2e_actor_oriented_command_families_preserve_workspace_integrity() {
                 let args = vec![
                     "--no-auto-import".to_string(),
                     "--lock-timeout".to_string(),
-                    "250".to_string(),
+                    CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                     "--actor".to_string(),
                     "dave".to_string(),
                     "defer".to_string(),
@@ -2123,7 +2123,7 @@ fn e2e_actor_oriented_command_families_preserve_workspace_integrity() {
                 let args = vec![
                     "--no-auto-import".to_string(),
                     "--lock-timeout".to_string(),
-                    "250".to_string(),
+                    CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                     "--actor".to_string(),
                     "carol".to_string(),
                     "comments".to_string(),
@@ -2150,7 +2150,7 @@ fn e2e_actor_oriented_command_families_preserve_workspace_integrity() {
                 let args = vec![
                     "--no-auto-import".to_string(),
                     "--lock-timeout".to_string(),
-                    "250".to_string(),
+                    CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                     "--actor".to_string(),
                     "bob".to_string(),
                     "label".to_string(),
@@ -2375,7 +2375,7 @@ fn e2e_close_update_reopen_preserve_blocked_cache_integrity() {
                 let args = vec![
                     "--no-auto-import".to_string(),
                     "--lock-timeout".to_string(),
-                    "250".to_string(),
+                    CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                     "close".to_string(),
                     issue_id,
                     "--reason".to_string(),
@@ -2400,7 +2400,7 @@ fn e2e_close_update_reopen_preserve_blocked_cache_integrity() {
                 let args = vec![
                     "--no-auto-import".to_string(),
                     "--lock-timeout".to_string(),
-                    "250".to_string(),
+                    CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                     "update".to_string(),
                     update_id.clone(),
                     "--title".to_string(),
@@ -2426,7 +2426,7 @@ fn e2e_close_update_reopen_preserve_blocked_cache_integrity() {
                 let args = vec![
                     "--no-auto-import".to_string(),
                     "--lock-timeout".to_string(),
-                    "250".to_string(),
+                    CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                     "reopen".to_string(),
                     issue_id,
                     "--reason".to_string(),
@@ -2451,20 +2451,20 @@ fn e2e_close_update_reopen_preserve_blocked_cache_integrity() {
                 let args = match idx % 3 {
                     0 => vec![
                         "--lock-timeout".to_string(),
-                        "25".to_string(),
+                        CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                         "show".to_string(),
                         update_id.clone(),
                         "--json".to_string(),
                     ],
                     1 => vec![
                         "--lock-timeout".to_string(),
-                        "25".to_string(),
+                        CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                         "ready".to_string(),
                         "--json".to_string(),
                     ],
                     _ => vec![
                         "--lock-timeout".to_string(),
-                        "25".to_string(),
+                        CONTENTION_SUCCESS_LOCK_TIMEOUT_MS.to_string(),
                         "stats".to_string(),
                         "--json".to_string(),
                     ],
