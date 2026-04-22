@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use serde_json::Value;
 use tempfile::TempDir;
 
 #[test]
@@ -31,10 +32,40 @@ epic1
     .unwrap();
 
     let mut cmd = Command::cargo_bin("br").unwrap();
-    cmd.arg("create")
+    let imported = cmd
+        .arg("create")
         .arg("-f")
         .arg(&file_path)
+        .arg("--json")
         .env("BEADS_DIR", &beads_dir)
-        .assert()
-        .success();
+        .output()
+        .unwrap();
+    assert!(
+        imported.status.success(),
+        "markdown import failed: {}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+
+    let issues: Vec<Value> = serde_json::from_slice(&imported.stdout).expect("import json");
+    assert_eq!(issues.len(), 2);
+
+    let epic = issues
+        .iter()
+        .find(|issue| issue["title"].as_str() == Some("My Epic"))
+        .expect("imported epic");
+    assert_eq!(epic["issue_type"].as_str(), Some("epic"));
+    let epic_id = epic["id"].as_str().expect("epic id");
+
+    let task = issues
+        .iter()
+        .find(|issue| issue["title"].as_str() == Some("My Task"))
+        .expect("imported task");
+    let dependencies = task["dependencies"].as_array().expect("dependencies array");
+    assert!(
+        dependencies.iter().any(|dep| {
+            dep["depends_on_id"].as_str() == Some(epic_id)
+                && dep["type"].as_str() == Some("parent-child")
+        }),
+        "parent stand-in should resolve to epic {epic_id}, got {dependencies:?}"
+    );
 }
