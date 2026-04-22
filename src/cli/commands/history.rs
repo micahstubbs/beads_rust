@@ -1444,4 +1444,48 @@ mod tests {
             ),
         }
     }
+
+    #[test]
+    fn commit_restored_target_replaces_existing_atomically() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target.jsonl");
+        let temp = dir.path().join("temp.jsonl");
+
+        fs::write(&target, "original content\n").unwrap();
+        fs::write(&temp, "restored content\n").unwrap();
+
+        let result =
+            commit_restored_target_with_rollback(&temp, &target, None, crate::util::durable_rename);
+        assert!(result.is_ok(), "rename over existing should succeed");
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "restored content\n",
+            "target should have restored content"
+        );
+        assert!(!temp.exists(), "temp should be gone after rename");
+    }
+
+    #[test]
+    fn commit_restored_target_rollback_on_rename_failure() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target.jsonl");
+        let rollback_path = dir.path().join("rollback.jsonl");
+
+        fs::write(&target, "original\n").unwrap();
+        fs::write(&rollback_path, "original\n").unwrap();
+        let mut rollback_guard = TempRestoreGuard::new(rollback_path.clone());
+
+        let result = commit_restored_target_with_rollback(
+            &dir.path().join("nonexistent_temp.jsonl"),
+            &target,
+            Some(&mut rollback_guard),
+            |_from, _to| Err(io::Error::new(io::ErrorKind::Other, "injected")),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "original\n",
+            "target should be unchanged after failed rename"
+        );
+    }
 }

@@ -798,3 +798,74 @@ fn e2e_history_prune_quiet_mode() {
         prune.stdout
     );
 }
+
+#[test]
+fn e2e_history_restore_force_no_missing_target_window() {
+    let _log = common::test_log("e2e_history_restore_force_no_missing_target_window");
+    let workspace = setup_workspace_with_jsonl();
+
+    create_issue(&workspace, "Extra issue", "create_extra");
+    sync_flush(&workspace);
+
+    thread::sleep(Duration::from_millis(1100));
+
+    create_issue(&workspace, "Another issue", "create_another");
+    sync_flush(&workspace);
+
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let pre_restore_content = fs::read(&jsonl_path).expect("read jsonl before restore");
+    assert!(
+        !pre_restore_content.is_empty(),
+        "jsonl should have content before restore"
+    );
+
+    let backups = list_backup_files(&workspace);
+    assert!(
+        backups.len() >= 2,
+        "should have at least 2 backups: {backups:?}"
+    );
+    let backup_file = backups.last().unwrap();
+    let backup_path = workspace
+        .root
+        .join(".beads")
+        .join(".br_history")
+        .join(backup_file);
+    let expected_content = fs::read(&backup_path).expect("read backup");
+
+    let restore = run_br(
+        &workspace,
+        ["history", "restore", backup_file, "--force"],
+        "restore_atomic",
+    );
+    assert!(
+        restore.status.success(),
+        "force restore failed: {}",
+        restore.stderr
+    );
+
+    assert!(
+        jsonl_path.exists(),
+        "target JSONL must exist after force restore (no missing-file window)"
+    );
+
+    let post_restore_content = fs::read(&jsonl_path).expect("read jsonl after restore");
+    assert_eq!(
+        post_restore_content, expected_content,
+        "restored content should match the backup exactly"
+    );
+
+    let beads_dir = workspace.root.join(".beads");
+    let leftover_temps: Vec<_> = fs::read_dir(&beads_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(
+        leftover_temps.is_empty(),
+        "no temp files should remain after restore: {:?}",
+        leftover_temps
+            .iter()
+            .map(|e| e.file_name())
+            .collect::<Vec<_>>()
+    );
+}
