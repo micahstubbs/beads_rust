@@ -546,11 +546,6 @@ fn restore_backup(
             "overwrite history restore target",
         )?;
         rollback_guard = Some(create_restore_rollback_snapshot(&target_path, beads_dir)?);
-        if let Err(err) = fs::remove_file(&target_path)
-            && err.kind() != io::ErrorKind::NotFound
-        {
-            return Err(err.into());
-        }
     }
     commit_restored_target_with_rollback(
         &temp_path,
