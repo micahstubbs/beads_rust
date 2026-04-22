@@ -361,47 +361,56 @@ fn resolve_since(
 
 fn git_commit_date(reference: &str, repo_root: Option<&Path>) -> Result<DateTime<Utc>> {
     if reference.starts_with('-') {
-        return Err(BeadsError::Config(
-            "Invalid git reference: cannot start with '-'".to_string(),
+        return Err(BeadsError::validation(
+            "git reference",
+            "cannot start with '-'",
         ));
     }
 
     let repo_root = repo_root.ok_or_else(|| {
-        BeadsError::Config(format!(
+        BeadsError::external_command(
+            "git",
+            format!(
             "Cannot resolve git reference '{reference}' without a git repository for the targeted project"
-        ))
+            ),
+        )
     })?;
     let output = Command::new("git")
         .args(["show", "-s", "--format=%cI", reference])
         .current_dir(repo_root)
         .output()
-        .map_err(|e| BeadsError::Config(format!("Failed to run git: {e}")))?;
+        .map_err(|e| BeadsError::external_command("git", format!("Failed to run git: {e}")))?;
 
     if !output.status.success() {
-        return Err(BeadsError::Config(format!(
-            "Failed to resolve git reference: {reference}"
-        )));
+        return Err(BeadsError::external_command(
+            "git",
+            format!("Failed to resolve git reference: {reference}"),
+        ));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stamp = stdout.trim();
     let dt = DateTime::parse_from_rfc3339(stamp)
-        .map_err(|e| BeadsError::Config(format!("Invalid git date: {e}")))?
+        .map_err(|e| BeadsError::external_command("git", format!("Invalid git date: {e}")))?
         .with_timezone(&Utc);
     Ok(dt)
 }
 
 fn git_tag_date(reference: &str, repo_root: Option<&Path>) -> Result<DateTime<Utc>> {
     if reference.starts_with('-') {
-        return Err(BeadsError::Config(
-            "Invalid git tag reference: cannot start with '-'".to_string(),
+        return Err(BeadsError::validation(
+            "git tag reference",
+            "cannot start with '-'",
         ));
     }
 
     let repo_root = repo_root.ok_or_else(|| {
-        BeadsError::Config(format!(
+        BeadsError::external_command(
+            "git",
+            format!(
             "Cannot resolve git tag '{reference}' without a git repository for the targeted project"
-        ))
+            ),
+        )
     })?;
     let tag_ref = format!("refs/tags/{reference}");
 
@@ -409,12 +418,13 @@ fn git_tag_date(reference: &str, repo_root: Option<&Path>) -> Result<DateTime<Ut
         .args(["rev-parse", "--verify", "--quiet", &tag_ref])
         .current_dir(repo_root)
         .output()
-        .map_err(|e| BeadsError::Config(format!("Failed to run git: {e}")))?;
+        .map_err(|e| BeadsError::external_command("git", format!("Failed to run git: {e}")))?;
 
     if !verify.status.success() {
-        return Err(BeadsError::Config(format!(
-            "Failed to resolve git tag: {reference}"
-        )));
+        return Err(BeadsError::external_command(
+            "git",
+            format!("Failed to resolve git tag: {reference}"),
+        ));
     }
 
     // Annotated tags carry their own timestamp, which is what --since-tag promises.
@@ -427,12 +437,13 @@ fn git_tag_date(reference: &str, repo_root: Option<&Path>) -> Result<DateTime<Ut
         ])
         .current_dir(repo_root)
         .output()
-        .map_err(|e| BeadsError::Config(format!("Failed to run git: {e}")))?;
+        .map_err(|e| BeadsError::external_command("git", format!("Failed to run git: {e}")))?;
 
     if !output.status.success() {
-        return Err(BeadsError::Config(format!(
-            "Failed to resolve git tag: {reference}"
-        )));
+        return Err(BeadsError::external_command(
+            "git",
+            format!("Failed to resolve git tag: {reference}"),
+        ));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -443,7 +454,7 @@ fn git_tag_date(reference: &str, repo_root: Option<&Path>) -> Result<DateTime<Ut
 
     DateTime::parse_from_rfc3339(stamp)
         .map(|dt| dt.with_timezone(&Utc))
-        .map_err(|e| BeadsError::Config(format!("Invalid git tag date: {e}")))
+        .map_err(|e| BeadsError::external_command("git", format!("Invalid git tag date: {e}")))
 }
 
 fn git_repo_root_for_path(path: &Path) -> Option<PathBuf> {

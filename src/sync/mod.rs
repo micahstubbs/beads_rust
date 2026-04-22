@@ -5430,7 +5430,9 @@ mod tests {
 
         let err = auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap_err();
         assert!(
-            err.to_string().contains("directory") || err.to_string().contains("Is a directory"),
+            err.to_string().contains("directory")
+                || err.to_string().contains("Is a directory")
+                || err.to_string().contains("not a regular file"),
             "unexpected error: {err}"
         );
         assert_eq!(

@@ -127,6 +127,14 @@ pub enum BeadsError {
     #[error("Configuration error: {0}")]
     Config(String),
 
+    /// External command failed or returned unusable output.
+    #[error("External command failed: {command}: {reason}")]
+    ExternalCommand { command: String, reason: String },
+
+    /// Internal consistency check failed.
+    #[error("Internal error: {message}")]
+    Internal { message: String },
+
     /// Beads workspace not initialized.
     #[error("Beads not initialized: run 'br init' first")]
     NotInitialized,
@@ -286,6 +294,23 @@ impl BeadsError {
         }
     }
 
+    /// Create an external command failure.
+    #[must_use]
+    pub fn external_command(command: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::ExternalCommand {
+            command: command.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// Create an internal consistency error.
+    #[must_use]
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::Internal {
+            message: message.into(),
+        }
+    }
+
     /// Create from multiple validation errors.
     #[must_use]
     pub fn from_validation_errors(errors: Vec<ValidationError>) -> Self {
@@ -322,6 +347,24 @@ mod tests {
     fn test_validation_error() {
         let err = BeadsError::validation("title", "cannot be empty");
         assert_eq!(err.to_string(), "Validation failed: title: cannot be empty");
+    }
+
+    #[test]
+    fn test_external_command_uses_io_error_code() {
+        let err = BeadsError::external_command("git", "failed to resolve ref");
+        let structured = StructuredError::from_error(&err);
+
+        assert_eq!(structured.code, ErrorCode::IoError);
+        assert_eq!(err.exit_code(), 8);
+    }
+
+    #[test]
+    fn test_internal_uses_internal_error_code() {
+        let err = BeadsError::internal("routed command produced mismatched counts");
+        let structured = StructuredError::from_error(&err);
+
+        assert_eq!(structured.code, ErrorCode::InternalError);
+        assert_eq!(err.exit_code(), 1);
     }
 
     #[test]

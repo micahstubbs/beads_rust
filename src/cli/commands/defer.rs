@@ -599,7 +599,7 @@ fn reorder_routed_items_by_requested_inputs<T>(
     let mut ordered_items: Vec<Option<T>> = (0..requested_inputs.len()).map(|_| None).collect();
     for (batch_inputs, batch_items) in routed_items {
         if batch_inputs.len() != batch_items.len() {
-            return Err(BeadsError::Config(format!(
+            return Err(BeadsError::internal(format!(
                 "{context} produced mismatched issue/result counts"
             )));
         }
@@ -609,7 +609,7 @@ fn reorder_routed_items_by_requested_inputs<T>(
                 .get_mut(input.as_str())
                 .and_then(VecDeque::pop_front)
             else {
-                return Err(BeadsError::Config(format!(
+                return Err(BeadsError::internal(format!(
                     "{context} returned unexpected issue input {input}"
                 )));
             };
@@ -622,7 +622,7 @@ fn reorder_routed_items_by_requested_inputs<T>(
         .enumerate()
         .map(|(index, item)| {
             item.ok_or_else(|| {
-                BeadsError::Config(format!(
+                BeadsError::internal(format!(
                     "{context} did not produce a result for {}",
                     requested_inputs[index]
                 ))

@@ -362,7 +362,7 @@ fn get_git_commit_refs(prefix: &str, repo_root: &Path) -> Result<Vec<(String, St
         } else {
             format!("git log failed: {stderr}")
         };
-        return Err(crate::error::BeadsError::Config(detail));
+        return Err(crate::error::BeadsError::external_command("git", detail));
     }
 
     refs_result
@@ -382,12 +382,12 @@ fn parse_git_log<R: BufRead>(reader: R, prefix: &str) -> Result<Vec<(String, Str
         regex::escape(prefix)
     );
     let re = Regex::new(&pattern)
-        .map_err(|e| crate::error::BeadsError::Config(format!("Invalid regex pattern: {e}")))?;
+        .map_err(|e| crate::error::BeadsError::internal(format!("Invalid regex pattern: {e}")))?;
 
     let mut results = Vec::new();
 
     for line in reader.lines() {
-        let line = line.map_err(|e| crate::error::BeadsError::Config(format!("IO error: {e}")))?;
+        let line = line.map_err(crate::error::BeadsError::Io)?;
 
         // Each line is: <short_hash> <message>
         let parts: Vec<&str> = line.splitn(2, ' ').collect();

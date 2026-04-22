@@ -640,6 +640,13 @@ impl StructuredError {
                 (ErrorCode::NothingToDo, Some(json!({"reason": reason})))
             }
             BeadsError::Config(_) => (ErrorCode::ConfigError, None),
+            BeadsError::ExternalCommand { command, reason } => (
+                ErrorCode::IoError,
+                Some(json!({"command": command, "reason": reason})),
+            ),
+            BeadsError::Internal { message } => {
+                (ErrorCode::InternalError, Some(json!({"message": message})))
+            }
             BeadsError::Io(_) => (ErrorCode::IoError, None),
             BeadsError::Json(_) => (ErrorCode::JsonError, None),
             BeadsError::Yaml(_) => (ErrorCode::YamlError, None),
