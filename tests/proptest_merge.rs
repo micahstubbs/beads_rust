@@ -24,6 +24,16 @@ fn status_strategy() -> impl Strategy<Value = Status> {
     ]
 }
 
+fn status_with_custom_strategy() -> impl Strategy<Value = Status> {
+    prop_oneof![
+        Just(Status::Open),
+        Just(Status::InProgress),
+        Just(Status::Draft),
+        Just(Status::Closed),
+        "[a-z_]{3,15}".prop_map(Status::Custom),
+    ]
+}
+
 fn issue_type_strategy() -> impl Strategy<Value = IssueType> {
     prop_oneof![
         Just(IssueType::Task),
@@ -401,5 +411,145 @@ proptest! {
 
         // At most 1 action per ID (or 0 for NoAction/identical).
         prop_assert!(all_actions <= 1, "At most one action per ID, got {}", all_actions);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Custom status variant tests (beads_rust-jvkc)
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Both sides change to different Custom statuses → Conflict(BothModified) under Manual.
+    #[test]
+    fn merge_both_custom_status_manual_is_conflict(
+        left_custom in "[a-z_]{3,15}",
+        right_custom in "[a-z_]{3,15}",
+    ) {
+        prop_assume!(left_custom != right_custom);
+
+        let base = make_issue("bd-cust", "Custom test", Status::Open, Priority(1), IssueType::Task, 0);
+
+        let mut left = base.clone();
+        left.status = Status::Custom(left_custom);
+        left.updated_at = base.updated_at + Duration::seconds(10);
+
+        let mut right = base.clone();
+        right.status = Status::Custom(right_custom);
+        right.updated_at = base.updated_at + Duration::seconds(20);
+
+        let result = merge_issue(Some(&base), Some(&left), Some(&right), ConflictResolution::Manual);
+        match result {
+            MergeResult::Conflict(ConflictType::BothModified) => {}
+            other => prop_assert!(false, "Expected Conflict(BothModified), got {:?}", other),
+        }
+    }
+
+    /// Both sides change to the same Custom status → convergent (Keep, not conflict).
+    #[test]
+    fn merge_same_custom_status_both_sides_is_keep(
+        custom_name in "[a-z_]{3,15}",
+    ) {
+        let base = make_issue("bd-conv", "Converge", Status::Open, Priority(1), IssueType::Task, 0);
+
+        let mut left = base.clone();
+        left.status = Status::Custom(custom_name.clone());
+        left.updated_at = base.updated_at + Duration::seconds(10);
+
+        let mut right = base.clone();
+        right.status = Status::Custom(custom_name);
+        right.updated_at = base.updated_at + Duration::seconds(10);
+
+        let result = merge_issue(Some(&base), Some(&left), Some(&right), ConflictResolution::Manual);
+        match result {
+            MergeResult::Keep(_) | MergeResult::KeepWithNote(_, _) => {}
+            MergeResult::Conflict(_) => prop_assert!(false, "Same custom status on both sides should not conflict"),
+            other => prop_assert!(false, "Unexpected result: {:?}", other),
+        }
+    }
+
+    /// PreferNewer with different Custom statuses → keeps the newer side.
+    #[test]
+    fn merge_custom_status_prefer_newer_keeps_newer(
+        left_custom in "[a-z_]{3,15}",
+        right_custom in "[a-z_]{3,15}",
+        left_newer in any::<bool>(),
+    ) {
+        prop_assume!(left_custom != right_custom);
+
+        let base = make_issue("bd-newer", "Newer test", Status::Open, Priority(1), IssueType::Task, 0);
+
+        let mut left = base.clone();
+        left.status = Status::Custom(left_custom.clone());
+        left.updated_at = base.updated_at + Duration::seconds(if left_newer { 20 } else { 10 });
+
+        let mut right = base.clone();
+        right.status = Status::Custom(right_custom.clone());
+        right.updated_at = base.updated_at + Duration::seconds(if left_newer { 10 } else { 20 });
+
+        let result = merge_issue(Some(&base), Some(&left), Some(&right), ConflictResolution::PreferNewer);
+        match result {
+            MergeResult::Keep(kept) | MergeResult::KeepWithNote(kept, _) => {
+                let expected_status = if left_newer {
+                    Status::Custom(left_custom)
+                } else {
+                    Status::Custom(right_custom)
+                };
+                prop_assert_eq!(kept.status, expected_status);
+            }
+            other => prop_assert!(false, "Expected Keep, got {:?}", other),
+        }
+    }
+
+    /// Only one side changes to Custom status → the changed side wins (no conflict).
+    #[test]
+    fn merge_one_side_custom_status_no_conflict(
+        custom_name in "[a-z_]{3,15}",
+        change_left in any::<bool>(),
+        strategy in strategy_strategy(),
+    ) {
+        let base = make_issue("bd-one", "One side", Status::Open, Priority(1), IssueType::Task, 0);
+
+        let mut left = base.clone();
+        let mut right = base.clone();
+
+        if change_left {
+            left.status = Status::Custom(custom_name);
+            left.updated_at = base.updated_at + Duration::seconds(10);
+        } else {
+            right.status = Status::Custom(custom_name);
+            right.updated_at = base.updated_at + Duration::seconds(10);
+        }
+
+        let result = merge_issue(Some(&base), Some(&left), Some(&right), strategy);
+        match result {
+            MergeResult::Keep(_) | MergeResult::KeepWithNote(_, _) => {}
+            MergeResult::Conflict(_) => {
+                prop_assert!(false, "One-sided custom status change should not conflict");
+            }
+            other => prop_assert!(false, "Unexpected result: {:?}", other),
+        }
+    }
+
+    /// Determinism holds when Custom statuses are involved.
+    #[test]
+    fn merge_custom_status_deterministic(
+        base_status in status_with_custom_strategy(),
+        left_status in status_with_custom_strategy(),
+        right_status in status_with_custom_strategy(),
+        strategy in strategy_strategy(),
+    ) {
+        let base = make_issue("bd-cdet", "Det", base_status, Priority(1), IssueType::Task, 0);
+        let mut left = base.clone();
+        left.status = left_status;
+        left.updated_at = base.updated_at + Duration::seconds(5);
+        let mut right = base.clone();
+        right.status = right_status;
+        right.updated_at = base.updated_at + Duration::seconds(10);
+
+        let r1 = merge_issue(Some(&base), Some(&left), Some(&right), strategy);
+        let r2 = merge_issue(Some(&base), Some(&left), Some(&right), strategy);
+        prop_assert_eq!(r1, r2);
     }
 }
