@@ -18,7 +18,7 @@
 #   --quiet            Suppress non-error output
 #   --no-gum           Disable gum formatting even if available
 #   --skip-skills      Don't install any Claude Code / Codex skills
-#   --no-migration-skill  Skip the bd-to-br-migration skill only (keeps other skills)
+#   --with-migration-skill  Install the bd-to-br-migration skill (opt-in; default is to skip it)
 #   --uninstall        Remove br and clean up
 #   --help             Show this help
 #
@@ -124,12 +124,12 @@ LOCK_FILE="/tmp/br-install.lock"
 SYSTEM=0
 NO_GUM=0
 SKIP_SKILLS=0
-# Per-skill opt-outs. Each entry is a skill name matching the first half of
-# entries in the `skills` array in install_skills(). When set to 1, that
-# specific skill is skipped. --no-migration-skill toggles this for
-# bd-to-br-migration (see #261 — letting users keep `br` in clean agent
-# sandboxes without pulling in the migration skill).
-NO_MIGRATION_SKILL=0
+# Per-skill opt-ins. Default is to NOT install the bd-to-br-migration skill
+# (see #261 — once a user has migrated, the skill just pollutes context;
+# it's a one-time tool, not a steady-state surface). Pass
+# --with-migration-skill to include it. --skip-skills still wins and
+# suppresses every skill regardless of this flag.
+INSTALL_MIGRATION_SKILL=0
 MAX_RETRIES=3
 DOWNLOAD_TIMEOUT=120
 INSTALLER_VERSION="2.0.0"
@@ -404,7 +404,7 @@ usage() {
         gum style --faint "    --quiet            Suppress progress messages"
         gum style --faint "    --no-gum           Disable gum formatting"
         gum style --faint "    --skip-skills      Don't install any Claude/Codex skills"
-        gum style --faint "    --no-migration-skill  Skip the bd-to-br-migration skill only"
+        gum style --faint "    --with-migration-skill  Install the bd-to-br-migration skill (opt-in)"
         echo ""
         gum style --foreground 39 "  Maintenance"
         gum style --faint "    --uninstall        Remove br and clean up"
@@ -463,7 +463,7 @@ Options:
   --quiet            Suppress non-error output
   --no-gum           Disable gum formatting even if available
   --skip-skills      Don't install any Claude Code / Codex skills
-  --no-migration-skill  Skip the bd-to-br-migration skill only
+  --with-migration-skill  Install the bd-to-br-migration skill (opt-in)
   --uninstall        Remove br and clean up
 
 Environment Variables:
@@ -515,7 +515,7 @@ while [ $# -gt 0 ]; do
         --quiet|-q) QUIET=1; shift;;
         --no-gum) NO_GUM=1; shift;;
         --skip-skills) SKIP_SKILLS=1; shift;;
-        --no-migration-skill) NO_MIGRATION_SKILL=1; shift;;
+        --with-migration-skill) INSTALL_MIGRATION_SKILL=1; shift;;
         --uninstall) UNINSTALL=1; shift;;
         -h|--help) usage;;
         *) shift;;
@@ -782,11 +782,11 @@ install_skills() {
         local skill_name="${skill%%:*}"
         local files_str="${skill#*:}"
 
-        # Per-skill opt-outs: map skill_name to its flag var.
+        # Per-skill opt-ins: map skill_name to its flag var.
         case "$skill_name" in
             bd-to-br-migration)
-                if [ "$NO_MIGRATION_SKILL" -eq 1 ]; then
-                    log_step "Skipping skill: $skill_name (--no-migration-skill)"
+                if [ "$INSTALL_MIGRATION_SKILL" -ne 1 ]; then
+                    log_step "Skipping skill: $skill_name (opt-in via --with-migration-skill)"
                     continue
                 fi
                 ;;
@@ -836,8 +836,12 @@ install_skills() {
         fi
     done
 
-    # Print fancy skills summary
-    print_skills_summary "$claude_skills_dir" "$codex_skills_dir"
+    # Only show the fancy skills summary when we actually installed a skill.
+    # With bd-to-br-migration now opt-in (#261), the default install leaves
+    # nothing for the panel to advertise.
+    if [ "$INSTALL_MIGRATION_SKILL" -eq 1 ]; then
+        print_skills_summary "$claude_skills_dir" "$codex_skills_dir"
+    fi
 }
 
 # Print beautiful skills installation summary
