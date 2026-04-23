@@ -2413,6 +2413,29 @@ fn restore_foreign_keys_after_import(
     Ok(())
 }
 
+fn finish_import_after_foreign_key_restore(
+    apply_result: Result<ImportResult>,
+    fk_restore_result: Result<()>,
+) -> Result<ImportResult> {
+    match (apply_result, fk_restore_result) {
+        (Ok(import_result), Ok(())) => Ok(import_result),
+        (Ok(_), Err(fk_err)) => Err(fk_err),
+        (Err(import_err), Ok(())) => Err(import_err),
+        (Err(import_err), Err(fk_err)) => {
+            tracing::error!(
+                error = %fk_err,
+                "Failed to restore foreign key enforcement after failed import"
+            );
+            Err(BeadsError::WithContext {
+                context: format!(
+                    "jsonl import failed, and SQLite foreign key enforcement could not be re-enabled: {fk_err}"
+                ),
+                source: Box::new(import_err),
+            })
+        }
+    }
+}
+
 fn find_post_import_fk_violation(storage: &SqliteStorage) -> Result<Option<(String, String)>> {
     let fk_backed_tables = [
         ("dependencies", "issue_id"),
@@ -3630,26 +3653,14 @@ pub fn import_from_jsonl(
     let validate_foreign_keys = apply_result.is_ok();
     let fk_restore_result = restore_foreign_keys_after_import(storage, validate_foreign_keys);
 
-    match (apply_result, fk_restore_result) {
-        (Ok(import_result), Ok(())) => {
+    match finish_import_after_foreign_key_restore(apply_result, fk_restore_result) {
+        Ok(import_result) => {
             progress.finish_with_message("Import complete");
             Ok(import_result)
         }
-        (Ok(_), Err(fk_err)) => {
+        Err(err) => {
             progress.finish_and_clear();
-            Err(fk_err)
-        }
-        (Err(import_err), Ok(())) => {
-            progress.finish_and_clear();
-            Err(import_err)
-        }
-        (Err(import_err), Err(fk_err)) => {
-            tracing::error!(
-                error = %fk_err,
-                "Failed to restore foreign key enforcement after failed import"
-            );
-            progress.finish_and_clear();
-            Err(import_err)
+            Err(err)
         }
     }
 }
@@ -6021,6 +6032,46 @@ mod tests {
             .and_then(SqliteValue::as_integer)
             .unwrap_or(0);
         assert_eq!(fk_enabled, 1, "foreign key enforcement should be restored");
+    }
+
+    #[test]
+    fn test_import_error_reports_foreign_key_restore_failure_when_both_fail() {
+        let apply_result: Result<ImportResult> =
+            Err(BeadsError::Config("stream import failed".to_string()));
+        let fk_restore_result: Result<()> = Err(BeadsError::Config(
+            "foreign keys stayed disabled".to_string(),
+        ));
+
+        let err =
+            finish_import_after_foreign_key_restore(apply_result, fk_restore_result).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains(
+                "jsonl import failed, and SQLite foreign key enforcement could not be re-enabled"
+            ),
+            "unexpected error message: {msg}"
+        );
+        assert!(
+            msg.contains("foreign keys stayed disabled"),
+            "restore error should be included: {msg}"
+        );
+        assert!(
+            msg.contains("stream import failed"),
+            "original import error should be preserved as the source: {msg}"
+        );
+
+        assert!(
+            matches!(&err, BeadsError::WithContext { .. }),
+            "expected WithContext wrapping both failures"
+        );
+        if let BeadsError::WithContext { context, source } = err {
+            assert!(context.contains("foreign keys stayed disabled"));
+            assert_eq!(
+                source.to_string(),
+                "Configuration error: stream import failed"
+            );
+        }
     }
 
     #[test]

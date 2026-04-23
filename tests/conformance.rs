@@ -11912,13 +11912,11 @@ fn conformance_audit_record_with_error() {
 fn extract_audit_entry_id(output: &str) -> String {
     let json = extract_json_payload(output);
     let v: Value = serde_json::from_str(&json).expect("parse audit entry json");
-    if let Some(id) = v.get("id").and_then(|v| v.as_str()) {
-        return id.to_string();
-    }
-    if let Some(id) = v.get("entry_id").and_then(|v| v.as_str()) {
-        return id.to_string();
-    }
-    panic!("audit entry JSON should include id or entry_id: {v:?}");
+    v.get("id")
+        .or_else(|| v.get("entry_id"))
+        .and_then(|value| value.as_str())
+        .expect("audit entry JSON should include id or entry_id")
+        .to_string()
 }
 
 // ============================================================================

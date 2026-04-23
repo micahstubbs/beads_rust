@@ -1330,9 +1330,12 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
     Ok(())
 }
 
-/// Rewrite any DATETIME column on `issues` that is stored as INTEGER (epoch
-/// micros from stray writers) into canonical RFC 3339 TEXT. Idempotent; rows
-/// that are already TEXT are left untouched.
+/// Rewrite any DATETIME column on `issues` that is stored as INTEGER into
+/// canonical RFC 3339 TEXT. The unit (seconds / ms / µs / ns) is inferred
+/// from magnitude exactly like the runtime reader's `datetime_from_epoch_auto`
+/// so both paths give the same answer — any other split would silently
+/// corrupt rows whose writer picked a different unit than we assumed.
+/// Idempotent; rows already stored as TEXT are left untouched.
 fn repair_integer_datetime_columns(conn: &Connection) -> Result<()> {
     const DATETIME_COLUMNS: &[&str] = &[
         "created_at",
@@ -1343,18 +1346,23 @@ fn repair_integer_datetime_columns(conn: &Connection) -> Result<()> {
         "deleted_at",
         "compacted_at",
     ];
+    // Must stay in lock-step with datetime_from_epoch_auto in
+    // src/storage/sqlite.rs. Each threshold is the smallest integer that,
+    // in that unit, still lands within ±2286 AD — i.e. 10^10 seconds,
+    // 10^13 ms, 10^16 µs, 10^19 ns all represent the same year 2286,
+    // giving non-overlapping magnitude buckets.
     for column in DATETIME_COLUMNS {
         if !column_exists(conn, "issues", column) {
             continue;
         }
-        // Use strftime over the integer microseconds interpretation. The
-        // integers observed in the wild are 16-digit epoch µs (ingested from
-        // chrono `.timestamp_micros()` or equivalent). We preserve six
-        // fractional digits; divisions use `/1000000.0` so the REAL argument
-        // to `strftime` is in fractional seconds.
         let sql = format!(
-            "UPDATE issues \
-             SET {column} = strftime('%Y-%m-%dT%H:%M:%f', {column} / 1000000.0, 'unixepoch') || 'Z' \
+            "UPDATE issues SET {column} = \
+                strftime('%Y-%m-%dT%H:%M:%fZ', CASE \
+                    WHEN ABS({column}) < 10000000000 THEN {column} * 1.0 \
+                    WHEN ABS({column}) < 10000000000000 THEN {column} / 1000.0 \
+                    WHEN ABS({column}) < 10000000000000000 THEN {column} / 1000000.0 \
+                    ELSE {column} / 1000000000.0 \
+                END, 'unixepoch') \
              WHERE typeof({column}) = 'integer'"
         );
         conn.execute(&sql)?;
@@ -1431,46 +1439,78 @@ mod tests {
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
         apply_schema(&conn).expect("Failed to apply schema");
 
-        // Seed an issue whose updated_at/closed_at were written as INTEGER
-        // microseconds (the bug signature observed in the wild). We bypass
-        // the normal create_issue path by inserting raw so the column
-        // storage class is actually Integer.
-        conn.execute(
-            "INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at, closed_at, close_reason) \
-             VALUES ('bug-1', 'legacy', 'closed', 2, 'task', '2026-04-19T21:34:04.000000000Z', 1776651488000000, 1776651488000000, 'Completed')",
-        )
-        .expect("seed integer datetime row");
+        // Seed one row per integer epoch unit (seconds / ms / µs / ns), all
+        // encoding the same instant 2026-04-20T02:18:08Z. The migration's
+        // magnitude detection must recover the same year/day/time regardless
+        // of unit — previously it hard-coded /1000000.0 and would corrupt
+        // the other three rows.
+        let rows: [(&str, i64); 4] = [
+            ("bug-sec", 1_776_651_488),
+            ("bug-ms", 1_776_651_488_000),
+            ("bug-us", 1_776_651_488_000_000),
+            ("bug-ns", 1_776_651_488_000_000_000),
+        ];
+        for (id, epoch) in rows {
+            let stmt = format!(
+                "INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at, closed_at, close_reason) \
+                 VALUES ('{id}', 'legacy', 'closed', 2, 'task', '2026-04-19T21:34:04.000000000Z', {epoch}, {epoch}, 'Completed')"
+            );
+            conn.execute(&stmt).expect("seed integer datetime row");
+        }
 
-        // Sanity: typeof() must confirm the bad state.
-        let row = conn
-            .query_row("SELECT typeof(updated_at), typeof(closed_at) FROM issues WHERE id='bug-1'")
-            .unwrap();
-        assert_eq!(row.get(0).and_then(SqliteValue::as_text), Some("integer"));
-        assert_eq!(row.get(1).and_then(SqliteValue::as_text), Some("integer"));
+        // Sanity: every updated_at/closed_at must be integer-typed pre-repair.
+        for (id, _) in rows {
+            let row = conn
+                .query_row(&format!(
+                    "SELECT typeof(updated_at), typeof(closed_at) FROM issues WHERE id='{id}'"
+                ))
+                .unwrap();
+            assert_eq!(
+                row.get(0).and_then(SqliteValue::as_text),
+                Some("integer"),
+                "{id} updated_at should be integer pre-repair"
+            );
+            assert_eq!(
+                row.get(1).and_then(SqliteValue::as_text),
+                Some("integer"),
+                "{id} closed_at should be integer pre-repair"
+            );
+        }
 
         repair_integer_datetime_columns(&conn).expect("repair should succeed");
 
+        for (id, _) in rows {
+            let row = conn
+                .query_row(&format!(
+                    "SELECT typeof(updated_at), updated_at, typeof(closed_at), closed_at FROM issues WHERE id='{id}'"
+                ))
+                .unwrap();
+            assert_eq!(
+                row.get(0).and_then(SqliteValue::as_text),
+                Some("text"),
+                "{id} updated_at must be TEXT after repair"
+            );
+            let updated_at = row
+                .get(1)
+                .and_then(SqliteValue::as_text)
+                .expect("updated_at text");
+            assert!(
+                updated_at.starts_with("2026-04-20T02:18:08"),
+                "{id}: expected 2026-04-20 timestamp, got {updated_at}"
+            );
+            assert_eq!(
+                row.get(2).and_then(SqliteValue::as_text),
+                Some("text"),
+                "{id} closed_at must be TEXT after repair"
+            );
+        }
+
+        // Idempotency: a second pass is a no-op and leaves the rows TEXT.
+        repair_integer_datetime_columns(&conn).expect("second pass should succeed");
         let row = conn
-            .query_row("SELECT typeof(updated_at), updated_at, typeof(closed_at), closed_at FROM issues WHERE id='bug-1'")
+            .query_row("SELECT typeof(updated_at) FROM issues WHERE id='bug-us'")
             .unwrap();
-        assert_eq!(
-            row.get(0).and_then(SqliteValue::as_text),
-            Some("text"),
-            "updated_at must be TEXT after repair"
-        );
-        let updated_at = row
-            .get(1)
-            .and_then(SqliteValue::as_text)
-            .expect("updated_at text");
-        assert!(
-            updated_at.starts_with("2026-04-20T02:18:08"),
-            "expected 2026-04-20 timestamp, got {updated_at}"
-        );
-        assert_eq!(
-            row.get(2).and_then(SqliteValue::as_text),
-            Some("text"),
-            "closed_at must be TEXT after repair"
-        );
+        assert_eq!(row.get(0).and_then(SqliteValue::as_text), Some("text"));
     }
 
     #[test]

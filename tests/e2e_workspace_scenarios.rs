@@ -21,8 +21,8 @@ use tempfile::TempDir;
 
 fn parse_json_stdout(stdout: &str, context: &str) -> Value {
     let payload = extract_json_payload(stdout);
-    serde_json::from_str(&payload)
-        .unwrap_or_else(|error| panic!("parse {context} json failed: {error}; payload={payload}"))
+    let message = format!("parse {context} json payload: {payload}");
+    serde_json::from_str(&payload).expect(&message)
 }
 
 fn assert_doctor_json_has_healthy_checks(json: &Value) {
