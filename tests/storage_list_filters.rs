@@ -251,12 +251,12 @@ fn filter_by_all_priority_levels() {
         );
 
         let ids: Vec<_> = results.iter().map(|issue| issue.id.as_str()).collect();
-        match prio {
-            Priority::CRITICAL => assert_eq!(ids, vec![p0.id.as_str()]),
-            Priority::BACKLOG => assert_eq!(ids, vec![p4.id.as_str()]),
-            Priority::HIGH | Priority::MEDIUM | Priority::LOW => {
-                assert!(ids.is_empty(), "unexpected issues for {prio:?}: {ids:?}");
-            }
+        if prio == Priority::CRITICAL {
+            assert_eq!(ids, vec![p0.id.as_str()]);
+        } else if prio == Priority::BACKLOG {
+            assert_eq!(ids, vec![p4.id.as_str()]);
+        } else {
+            assert!(ids.is_empty(), "unexpected issues for {prio:?}: {ids:?}");
         }
     }
 }
@@ -348,7 +348,7 @@ fn filter_by_all_issue_types() {
         IssueType::Docs,
     ] {
         let filters = ListFilters {
-            types: Some(vec![issue_type]),
+            types: Some(vec![issue_type.clone()]),
             ..Default::default()
         };
         let results = storage.list_issues(&filters).unwrap();

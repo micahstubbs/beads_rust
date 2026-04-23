@@ -12128,12 +12128,20 @@ mod tests {
 
     #[test]
     fn test_parse_datetime_value_integer_negative_is_pre_epoch() {
-        // -1_000_000 µs = -1.0 s = 1969-12-31T23:59:59Z. Confirms the
-        // integer branch routes negatives through div_euclid/rem_euclid
-        // correctly rather than producing a nonsense future date.
-        let v = SqliteValue::Integer(-1_000_000);
+        // -3600 s = 1969-12-31T23:00:00Z. Confirms negatives route through
+        // the seconds branch correctly (not mis-classified as a larger
+        // unit, and no wrap-around via unsigned_abs).
+        let v = SqliteValue::Integer(-3600);
         let dt = parse_datetime_value(Some(&v)).unwrap();
-        assert_eq!(dt.timestamp(), -1);
+        assert_eq!(dt.timestamp(), -3600);
+        assert_eq!(dt.timestamp_subsec_nanos(), 0);
+
+        // Negative microseconds pick up div_euclid/rem_euclid's floor
+        // semantics: -1_500_000 µs = -1.5 s → (secs=-2, nanos=5e8). Must
+        // match datetime_from_epoch_seconds_f64(-1.5).
+        let v = SqliteValue::Integer(-1_500_000_000_000_000); // µs-range magnitude
+        let dt = parse_datetime_value(Some(&v)).unwrap();
+        assert_eq!(dt.timestamp(), -1_500_000_000);
         assert_eq!(dt.timestamp_subsec_nanos(), 0);
     }
 
