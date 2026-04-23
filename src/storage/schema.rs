@@ -1424,7 +1424,7 @@ fn rebuild_content_hashes_for_go_parity(conn: &Connection) -> Result<usize> {
                 row.get(7)
                     .and_then(SqliteValue::as_integer)
                     .and_then(|value| i32::try_from(value).ok())
-                    .unwrap_or(Priority::default().0),
+                    .unwrap_or_else(|| Priority::default().0),
             );
             let issue_type_raw =
                 row_text(row, 8).unwrap_or_else(|| IssueType::default().as_str().into());
