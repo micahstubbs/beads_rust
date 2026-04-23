@@ -623,9 +623,8 @@ impl Default for Issue {
 impl Issue {
     /// Compute the deterministic content hash for this issue.
     ///
-    /// Includes: title, description, design, `acceptance_criteria`, notes,
-    /// status, priority, `issue_type`, assignee, `external_ref`, pinned, `is_template`.
-    /// Excludes: id, timestamps, relations, tombstones.
+    /// Uses the Go bd canonical field order for cross-tool deduplication.
+    /// Excludes IDs, timestamps, relations, and tombstone metadata.
     ///
     /// Delegates to [`crate::util::hash::content_hash`] for the canonical implementation.
     #[must_use]

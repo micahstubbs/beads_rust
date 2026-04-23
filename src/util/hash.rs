@@ -1,7 +1,7 @@
 //! Content hashing for issue deduplication and sync.
 //!
 //! Uses SHA256 over stable ordered fields with null separators.
-//! Matches classic bd behavior for export/import compatibility.
+//! Matches classic Go bd behavior for export/import compatibility.
 
 use sha2::{Digest, Sha256};
 
@@ -39,6 +39,7 @@ impl ContentHashable for Issue {
 /// - assignee, owner, `created_by`
 /// - `external_ref`, `source_system`
 /// - pinned, `is_template`
+/// - empty/default placeholders for Go bd fields not represented in Rust
 ///
 /// Fields excluded:
 /// - id, `content_hash` (circular)
@@ -96,15 +97,36 @@ pub fn content_hash_from_parts(
     writer.field_opt(acceptance_criteria);
     writer.field_opt(notes);
     writer.field(status.as_str());
-    writer.field(&format!("P{}", priority.0));
+    writer.field(&priority.0.to_string());
     writer.field(issue_type.as_str());
     writer.field_opt(assignee);
     writer.field_opt(owner);
     writer.field_opt(created_by);
     writer.field_opt(external_ref);
     writer.field_opt(source_system);
-    writer.field_bool(pinned);
-    writer.field_bool(is_template);
+    writer.field_flag(pinned, "pinned");
+    writer.field_flag(is_template, "template");
+
+    // Go bd hashes several newer fields that Rust does not model yet. Hash
+    // their Go zero values so Rust remains byte-for-byte compatible for every
+    // field in the shared schema.
+    writer.field(""); // quality_score nil
+    writer.field_flag(false, "crystallizes");
+    writer.field(""); // await_type
+    writer.field(""); // await_id
+    writer.field("0"); // timeout duration
+    writer.field(""); // holder
+    writer.field(""); // hook_bead
+    writer.field(""); // role_bead
+    writer.field(""); // agent_state
+    writer.field(""); // role_type
+    writer.field(""); // rig
+    writer.field(""); // mol_type
+    writer.field(""); // work_type
+    writer.field(""); // event_kind
+    writer.field(""); // actor
+    writer.field(""); // target
+    writer.field(""); // payload
 
     writer.finalize()
 }
@@ -121,21 +143,7 @@ impl HashFieldWriter {
     }
 
     fn field(&mut self, value: &str) {
-        if !value.contains('\0') {
-            self.hasher.update(value.as_bytes());
-            self.hasher.update(b"\x00");
-            return;
-        }
-
-        let mut last_idx = 0;
-        for (i, b) in value.bytes().enumerate() {
-            if b == b'\0' {
-                self.hasher.update(&value.as_bytes()[last_idx..i]);
-                self.hasher.update(b" ");
-                last_idx = i + 1;
-            }
-        }
-        self.hasher.update(&value.as_bytes()[last_idx..]);
+        self.hasher.update(value.as_bytes());
         self.hasher.update(b"\x00");
     }
 
@@ -143,8 +151,8 @@ impl HashFieldWriter {
         self.field(value.unwrap_or(""));
     }
 
-    fn field_bool(&mut self, value: bool) {
-        self.field(if value { "true" } else { "false" });
+    fn field_flag(&mut self, value: bool, label: &str) {
+        self.field(if value { label } else { "" });
     }
 
     fn finalize(self) -> String {

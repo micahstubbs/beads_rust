@@ -4,8 +4,10 @@ use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
 
 use crate::error::{BeadsError, Result};
+use crate::model::{IssueType, Priority, Status};
+use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 6;
+pub const CURRENT_SCHEMA_VERSION: i32 = 7;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -1229,6 +1231,15 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         }
     }
 
+    // v7: Recompute stored content hashes after aligning Rust's algorithm to
+    // Go bd's canonical hash writer. Marking all rows dirty is intentional:
+    // the per-issue export hashes were computed with the old Rust algorithm,
+    // so the next flush must rewrite JSONL tracking metadata.
+    if user_version < 7 && table_exists(conn, "issues") {
+        tracing::info!("Migrating database to schema version 7 (Go bd content hashes)");
+        rebuild_content_hashes_for_go_parity(conn)?;
+    }
+
     // Note: source_repo and is_template column backfills are handled in
     // run_pre_schema_migrations() via ensure_columns(). Repeating ALTER TABLE
     // here can create duplicate column definitions on some engines.
@@ -1382,6 +1393,126 @@ fn repair_legacy_status_values(conn: &Connection) -> Result<()> {
          WHERE LOWER(status) IN ('done', 'complete', 'completed', 'finished', 'resolved')",
     )?;
     Ok(())
+}
+
+fn rebuild_content_hashes_for_go_parity(conn: &Connection) -> Result<usize> {
+    let rows = conn.query(
+        "SELECT id, title, description, design, acceptance_criteria, notes, \
+                status, priority, issue_type, assignee, owner, created_by, \
+                external_ref, source_system, pinned, is_template \
+         FROM issues ORDER BY id",
+    )?;
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    conn.execute("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<usize> {
+        let mut updated = 0;
+        for row in &rows {
+            let id = row_text(row, 0).ok_or_else(|| BeadsError::Internal {
+                message: "content hash migration found issue row without id".to_string(),
+            })?;
+            let title = row_text(row, 1).unwrap_or_default();
+            let description = row_optional_text(row, 2);
+            let design = row_optional_text(row, 3);
+            let acceptance_criteria = row_optional_text(row, 4);
+            let notes = row_optional_text(row, 5);
+            let status_raw = row_text(row, 6).unwrap_or_else(|| Status::default().as_str().into());
+            let priority = Priority(
+                row.get(7)
+                    .and_then(SqliteValue::as_integer)
+                    .and_then(|value| i32::try_from(value).ok())
+                    .unwrap_or(Priority::default().0),
+            );
+            let issue_type_raw =
+                row_text(row, 8).unwrap_or_else(|| IssueType::default().as_str().into());
+            let assignee = row_optional_text(row, 9);
+            let owner = row_optional_text(row, 10);
+            let created_by = row_optional_text(row, 11);
+            let external_ref = row_optional_text(row, 12);
+            let source_system = row_optional_text(row, 13);
+            let pinned = row_bool(row, 14);
+            let is_template = row_bool(row, 15);
+
+            let status = status_raw
+                .parse::<Status>()
+                .unwrap_or_else(|_| Status::Custom(status_raw.clone()));
+            let issue_type = issue_type_raw
+                .parse::<IssueType>()
+                .unwrap_or_else(|_| IssueType::Custom(issue_type_raw.clone()));
+            let content_hash = content_hash_from_parts(
+                &title,
+                description.as_deref(),
+                design.as_deref(),
+                acceptance_criteria.as_deref(),
+                notes.as_deref(),
+                &status,
+                &priority,
+                &issue_type,
+                assignee.as_deref(),
+                owner.as_deref(),
+                created_by.as_deref(),
+                external_ref.as_deref(),
+                source_system.as_deref(),
+                pinned,
+                is_template,
+            );
+
+            conn.execute_with_params(
+                "UPDATE issues SET content_hash = ? WHERE id = ?",
+                &[
+                    SqliteValue::from(content_hash.as_str()),
+                    SqliteValue::from(id.as_str()),
+                ],
+            )?;
+            conn.execute_with_params(
+                "DELETE FROM dirty_issues WHERE issue_id = ?",
+                &[SqliteValue::from(id.as_str())],
+            )?;
+            conn.execute_with_params(
+                "INSERT INTO dirty_issues (issue_id) VALUES (?)",
+                &[SqliteValue::from(id.as_str())],
+            )?;
+            updated += 1;
+        }
+
+        if table_exists(conn, "export_hashes") {
+            conn.execute("DELETE FROM export_hashes")?;
+        }
+
+        Ok(updated)
+    })();
+
+    match result {
+        Ok(updated) => {
+            conn.execute("COMMIT")?;
+            Ok(updated)
+        }
+        Err(error) => {
+            let _ = conn.execute("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn row_text(row: &fsqlite::Row, index: usize) -> Option<String> {
+    row.get(index)
+        .and_then(SqliteValue::as_text)
+        .map(str::to_string)
+}
+
+fn row_optional_text(row: &fsqlite::Row, index: usize) -> Option<String> {
+    row_text(row, index).filter(|value| !value.is_empty())
+}
+
+fn row_bool(row: &fsqlite::Row, index: usize) -> bool {
+    row.get(index).is_some_and(|value| {
+        value
+            .as_integer()
+            .map_or_else(|| value.as_text().is_some_and(|text| text != "0"), |int| int != 0)
+    })
 }
 
 #[cfg(test)]
