@@ -394,6 +394,35 @@ fn sha256_hex(input: &str) -> String {
     beads_rust::util::hex_encode(&hasher.finalize())
 }
 
+#[test]
+fn conformance_content_hash_matches_go_bd_fixture() {
+    use beads_rust::model::{IssueType, Priority, Status};
+
+    let hash = beads_rust::util::content_hash_from_parts(
+        "Fix authentication bug",
+        Some("Users are getting logged out unexpectedly"),
+        Some("Use token refresh"),
+        Some("Session survives refresh"),
+        Some("Check logs"),
+        &Status::InProgress,
+        &Priority::HIGH,
+        &IssueType::Bug,
+        Some("bob"),
+        Some("alice"),
+        Some("pane6"),
+        Some("github:org/repo#123"),
+        Some("github"),
+        true,
+        true,
+    );
+
+    assert_eq!(
+        hash,
+        "ad16572b6b2e1a60df3520b2b91d181246707390f487a73caa24082dcd24e00e",
+        "content_hash must match the Go bd ComputeContentHash fixture"
+    );
+}
+
 fn collect_dir_listing(path: &PathBuf) -> Vec<String> {
     let mut entries = Vec::new();
     if let Ok(read_dir) = fs::read_dir(path) {
