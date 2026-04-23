@@ -1509,9 +1509,10 @@ fn row_optional_text(row: &fsqlite::Row, index: usize) -> Option<String> {
 
 fn row_bool(row: &fsqlite::Row, index: usize) -> bool {
     row.get(index).is_some_and(|value| {
-        value
-            .as_integer()
-            .map_or_else(|| value.as_text().is_some_and(|text| text != "0"), |int| int != 0)
+        value.as_integer().map_or_else(
+            || value.as_text().is_some_and(|text| text != "0"),
+            |int| int != 0,
+        )
     })
 }
 
@@ -1700,7 +1701,8 @@ mod tests {
         conn.execute(
             "INSERT INTO export_hashes (issue_id, content_hash, exported_at) \
              VALUES ('bd-hash', 'old-rust-hash', '2026-04-03T01:00:00Z')",
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute("DELETE FROM dirty_issues").unwrap();
         conn.execute("PRAGMA user_version = 6").unwrap();
 

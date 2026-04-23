@@ -417,8 +417,7 @@ fn conformance_content_hash_matches_go_bd_fixture() {
     );
 
     assert_eq!(
-        hash,
-        "ad16572b6b2e1a60df3520b2b91d181246707390f487a73caa24082dcd24e00e",
+        hash, "ad16572b6b2e1a60df3520b2b91d181246707390f487a73caa24082dcd24e00e",
         "content_hash must match the Go bd ComputeContentHash fixture"
     );
 }

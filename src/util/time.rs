@@ -2,6 +2,13 @@
 
 use crate::error::{BeadsError, Result};
 use chrono::{DateTime, Duration, Local, NaiveDate, NaiveTime, TimeZone, Utc};
+use std::num::IntErrorKind;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelativeTimeError {
+    InvalidUnit,
+    OutOfRange,
+}
 
 /// Parse a flexible time specification into a `DateTime<Utc>`.
 ///
@@ -26,8 +33,8 @@ pub fn parse_flexible_timestamp(s: &str, field_name: &str) -> Result<DateTime<Ut
     let s = s.trim();
 
     // Try RFC3339 first
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Ok(dt.with_timezone(&Utc));
+    if let Some(dt) = parse_rfc3339_timestamp(s) {
+        return Ok(dt);
     }
 
     // Try simple date (YYYY-MM-DD) - default to 9:00 AM local time
@@ -37,31 +44,20 @@ pub fn parse_flexible_timestamp(s: &str, field_name: &str) -> Result<DateTime<Ut
         return local_to_utc(&naive_dt, field_name);
     }
 
-    // Try relative duration (+1h, +2d, +1w, +30m, -7d)
-    if let Some(rest) = s.strip_prefix(['+', '-'].as_ref()) {
-        let is_negative = s.starts_with('-');
-        if let Some(unit_char) = rest.chars().last() {
-            let amount_str = &rest[..rest.len() - unit_char.len_utf8()];
-            if let Ok(amount) = amount_str.parse::<i64>() {
-                let signed_amount = if is_negative { -amount } else { amount };
-                // Clamp amount to a safe range to avoid panic in Duration methods.
-                // 1000 years is plenty for any issue tracker.
-                let max_safe_amount = 365 * 1000;
-                let clamped_amount = signed_amount.clamp(-max_safe_amount, max_safe_amount);
-                let duration = match unit_char {
-                    'm' => Duration::minutes(clamped_amount),
-                    'h' => Duration::hours(clamped_amount),
-                    'd' => Duration::days(clamped_amount),
-                    'w' => Duration::weeks(clamped_amount.clamp(-52000, 52000)), // ~1000 years in weeks
-                    _ => {
-                        return Err(BeadsError::validation(
-                            field_name,
-                            "invalid unit (use m, h, d, w)",
-                        ));
-                    }
-                };
-                return Ok(Utc::now() + duration);
-            }
+    match parse_relative_timestamp(s) {
+        Ok(Some(dt)) => return Ok(dt),
+        Ok(None) => {}
+        Err(RelativeTimeError::InvalidUnit) => {
+            return Err(BeadsError::validation(
+                field_name,
+                "invalid unit (use m, h, d, w)",
+            ));
+        }
+        Err(RelativeTimeError::OutOfRange) => {
+            return Err(BeadsError::validation(
+                field_name,
+                "relative duration is out of supported range",
+            ));
         }
     }
 
@@ -109,26 +105,8 @@ pub fn parse_flexible_timestamp(s: &str, field_name: &str) -> Result<DateTime<Ut
 pub fn parse_relative_time(s: &str) -> Option<DateTime<Utc>> {
     let s = s.trim();
 
-    // Try relative duration (+1h, -2d, +1w, -30m)
-    if let Some(rest) = s.strip_prefix(['+', '-'].as_ref()) {
-        let is_negative = s.starts_with('-');
-        if let Some(unit_char) = rest.chars().last() {
-            let amount_str = &rest[..rest.len() - unit_char.len_utf8()];
-            if let Ok(amount) = amount_str.parse::<i64>() {
-                let signed_amount = if is_negative { -amount } else { amount };
-                // Clamp amount to a safe range to avoid panic in Duration methods.
-                let max_safe_amount = 365 * 1000;
-                let clamped_amount = signed_amount.clamp(-max_safe_amount, max_safe_amount);
-                let duration = match unit_char {
-                    'm' => Duration::minutes(clamped_amount),
-                    'h' => Duration::hours(clamped_amount),
-                    'd' => Duration::days(clamped_amount),
-                    'w' => Duration::weeks(clamped_amount.clamp(-52000, 52000)),
-                    _ => return None,
-                };
-                return Some(Utc::now() + duration);
-            }
-        }
+    if let Ok(Some(dt)) = parse_relative_timestamp(s) {
+        return Some(dt);
     }
 
     // Try keywords
@@ -159,6 +137,84 @@ pub fn parse_relative_time(s: &str) -> Option<DateTime<Utc>> {
         }
         _ => None,
     }
+}
+
+fn parse_rfc3339_timestamp(s: &str) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+
+    let normalized = strip_zero_offset_seconds(s)?;
+    DateTime::parse_from_rfc3339(&normalized)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn strip_zero_offset_seconds(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let sign_pos = bytes.len().checked_sub(9)?;
+    if !matches!(bytes.get(sign_pos), Some(b'+' | b'-'))
+        || bytes.get(sign_pos + 3) != Some(&b':')
+        || bytes.get(sign_pos + 6) != Some(&b':')
+    {
+        return None;
+    }
+
+    let offset_digits = [
+        bytes.get(sign_pos + 1)?,
+        bytes.get(sign_pos + 2)?,
+        bytes.get(sign_pos + 4)?,
+        bytes.get(sign_pos + 5)?,
+        bytes.get(sign_pos + 7)?,
+        bytes.get(sign_pos + 8)?,
+    ];
+    if !offset_digits.iter().all(|byte| byte.is_ascii_digit())
+        || bytes.get(sign_pos + 7..sign_pos + 9) != Some(b"00")
+    {
+        return None;
+    }
+
+    Some(s[..bytes.len() - 3].to_string())
+}
+
+fn parse_relative_timestamp(
+    s: &str,
+) -> std::result::Result<Option<DateTime<Utc>>, RelativeTimeError> {
+    let Some(rest) = s.strip_prefix(['+', '-'].as_ref()) else {
+        return Ok(None);
+    };
+    let Some(unit_char) = rest.chars().last() else {
+        return Ok(None);
+    };
+
+    let amount_end = s.len() - unit_char.len_utf8();
+    let amount_str = &s[..amount_end];
+    let amount = match amount_str.parse::<i64>() {
+        Ok(amount) => amount,
+        Err(err)
+            if matches!(
+                err.kind(),
+                IntErrorKind::PosOverflow | IntErrorKind::NegOverflow
+            ) =>
+        {
+            return Err(RelativeTimeError::OutOfRange);
+        }
+        Err(_) => return Ok(None),
+    };
+
+    let duration = match unit_char {
+        'm' => Duration::try_minutes(amount),
+        'h' => Duration::try_hours(amount),
+        'd' => Duration::try_days(amount),
+        'w' => Duration::try_weeks(amount),
+        _ => return Err(RelativeTimeError::InvalidUnit),
+    }
+    .ok_or(RelativeTimeError::OutOfRange)?;
+
+    Utc::now()
+        .checked_add_signed(duration)
+        .ok_or(RelativeTimeError::OutOfRange)
+        .map(Some)
 }
 
 /// Format a duration as a human-readable relative time string (e.g., "2 days ago").
@@ -280,6 +336,32 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_flexible_rfc3339_zero_offset_spellings() {
+        let z = parse_flexible_timestamp("2025-01-15T12:00:00Z", "test").unwrap();
+        let short_offset = parse_flexible_timestamp("2025-01-15T12:00:00+00:00", "test").unwrap();
+        let long_offset = parse_flexible_timestamp("2025-01-15T12:00:00+00:00:00", "test").unwrap();
+
+        assert_eq!(short_offset, z);
+        assert_eq!(long_offset, z);
+    }
+
+    #[test]
+    fn test_parse_flexible_rfc3339_preserves_pre_epoch_nanoseconds() {
+        let result = parse_flexible_timestamp("1969-12-31T23:59:59.123456789Z", "test").unwrap();
+
+        assert_eq!(result.timestamp(), -1);
+        assert_eq!(result.timestamp_subsec_nanos(), 123_456_789);
+    }
+
+    #[test]
+    fn test_parse_flexible_rfc3339_rejects_nonzero_offset_seconds() {
+        let err = parse_flexible_timestamp("2025-01-15T12:00:00+00:00:01", "test")
+            .expect_err("nonzero offset seconds are not supported");
+
+        assert!(err.to_string().contains("invalid time format"));
+    }
+
+    #[test]
     fn test_parse_flexible_simple_date() {
         let result = parse_flexible_timestamp("2025-06-20", "test").unwrap();
         assert_eq!(result.year(), 2025);
@@ -300,6 +382,28 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_flexible_relative_does_not_silently_clamp_large_valid_offsets() {
+        let before = Utc::now();
+        let result = parse_flexible_timestamp("+600000h", "test").unwrap();
+        let after = Utc::now();
+
+        assert!(result >= before + Duration::hours(600_000));
+        assert!(result <= after + Duration::hours(600_000));
+    }
+
+    #[test]
+    fn test_parse_flexible_relative_rejects_out_of_range_offsets() {
+        let err = parse_flexible_timestamp("+9999999999999999999d", "test")
+            .expect_err("overflowing relative duration should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("relative duration is out of supported range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn test_parse_flexible_keywords() {
         let result = parse_flexible_timestamp("tomorrow", "test").unwrap();
         assert!(result > Utc::now());
@@ -315,6 +419,21 @@ mod tests {
     fn test_parse_relative_time_negative() {
         let result = parse_relative_time("-7d").unwrap();
         assert!(result < Utc::now());
+    }
+
+    #[test]
+    fn test_parse_relative_time_does_not_silently_clamp_large_valid_offsets() {
+        let before = Utc::now();
+        let result = parse_relative_time("+600000m").unwrap();
+        let after = Utc::now();
+
+        assert!(result >= before + Duration::minutes(600_000));
+        assert!(result <= after + Duration::minutes(600_000));
+    }
+
+    #[test]
+    fn test_parse_relative_time_rejects_out_of_range_offsets() {
+        assert!(parse_relative_time("+9999999999999999999d").is_none());
     }
 
     #[test]

@@ -281,8 +281,7 @@ fn content_hash_deterministic_fixture() {
 
     assert_eq!(hash1, hash2, "Content hash must be deterministic");
     assert_eq!(
-        hash1,
-        "b13c137c6f248ddd75a5affe1cafdb6acfc7789b97a461c4644293f597cb4224",
+        hash1, "b13c137c6f248ddd75a5affe1cafdb6acfc7789b97a461c4644293f597cb4224",
         "Content hash must match the Go bd ComputeContentHash fixture"
     );
     assert_eq!(hash1.len(), 64, "SHA256 hash should be 64 hex chars");
