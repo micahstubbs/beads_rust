@@ -562,6 +562,71 @@ mod tests {
     }
 
     #[test]
+    fn detect_mode_global_flag_matrix_has_unambiguous_precedence() {
+        for quiet in [false, true] {
+            for json in [false, true] {
+                for robot in [false, true] {
+                    for no_color in [false, true] {
+                        let mut argv = vec!["br"];
+                        if quiet {
+                            argv.push("--quiet");
+                        }
+                        if json {
+                            argv.push("--json");
+                        }
+                        if no_color {
+                            argv.push("--no-color");
+                        }
+                        argv.extend(["sync", "--status"]);
+                        if robot {
+                            argv.push("--robot");
+                        }
+
+                        let cli = Cli::parse_from(argv);
+                        let mode = OutputContext::detect_mode_with_env(&cli, None);
+
+                        if json || robot {
+                            assert_eq!(
+                                mode,
+                                OutputMode::Json,
+                                "json/robot must override quiet/no-color: quiet={quiet}, json={json}, robot={robot}, no_color={no_color}"
+                            );
+                        } else if quiet {
+                            assert_eq!(
+                                mode,
+                                OutputMode::Quiet,
+                                "quiet must override no-color: quiet={quiet}, json={json}, robot={robot}, no_color={no_color}"
+                            );
+                        } else if no_color {
+                            assert_eq!(
+                                mode,
+                                OutputMode::Plain,
+                                "no-color must force plain output: quiet={quiet}, json={json}, robot={robot}, no_color={no_color}"
+                            );
+                        } else {
+                            assert!(
+                                matches!(mode, OutputMode::Rich | OutputMode::Plain),
+                                "no explicit output controls should be TTY-dependent, got {mode:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn detect_mode_short_quiet_alias_matches_long_quiet() {
+        let short = Cli::parse_from(["br", "-q", "sync", "--status"]);
+        let long = Cli::parse_from(["br", "--quiet", "sync", "--status"]);
+
+        assert_eq!(
+            OutputContext::detect_mode_with_env(&short, None),
+            OutputContext::detect_mode_with_env(&long, None)
+        );
+    }
+
+    #[test]
     fn should_emit_toon_stats_when_flag_is_set() {
         assert!(OutputContext::should_emit_toon_stats(true, false));
     }
