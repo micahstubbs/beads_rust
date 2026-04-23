@@ -1687,6 +1687,46 @@ mod tests {
     }
 
     #[test]
+    fn test_v7_rebuilds_content_hashes_and_marks_dirty() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("Failed to apply schema");
+
+        conn.execute(
+            "INSERT INTO issues (id, content_hash, title, status, priority, issue_type, created_at, updated_at) \
+             VALUES ('bd-hash', 'old-rust-hash', 'Test', 'open', 2, 'task', '2026-04-02T20:00:00Z', '2026-04-03T01:00:00Z')",
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO export_hashes (issue_id, content_hash, exported_at) \
+             VALUES ('bd-hash', 'old-rust-hash', '2026-04-03T01:00:00Z')",
+        ).unwrap();
+        conn.execute("DELETE FROM dirty_issues").unwrap();
+        conn.execute("PRAGMA user_version = 6").unwrap();
+
+        run_migrations(&conn, false).expect("v7 migration should succeed");
+
+        let row = conn
+            .query_row("SELECT content_hash FROM issues WHERE id = 'bd-hash'")
+            .unwrap();
+        assert_eq!(
+            row.get(0).and_then(SqliteValue::as_text),
+            Some("c8e7e2783cc1fbb37322ae61efcf0e5c7d79a2cc6203e878fa6556c41742398d"),
+            "v7 should rewrite stored issue hashes to Go bd canonical values"
+        );
+
+        let dirty_row = conn
+            .query_row("SELECT COUNT(*) FROM dirty_issues WHERE issue_id = 'bd-hash'")
+            .unwrap();
+        assert_eq!(dirty_row.get(0).and_then(SqliteValue::as_integer), Some(1));
+
+        let export_row = conn
+            .query_row("SELECT COUNT(*) FROM export_hashes")
+            .unwrap();
+        assert_eq!(export_row.get(0).and_then(SqliteValue::as_integer), Some(0));
+    }
+
+    #[test]
     fn test_apply_schema_file_backed_has_no_duplicate_issues_columns() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("beads.db");
