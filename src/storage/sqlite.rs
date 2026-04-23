@@ -6933,18 +6933,23 @@ fn datetime_from_epoch_seconds_f64(f: f64) -> Result<DateTime<Utc>> {
             "non-finite datetime column value: {f}"
         )));
     }
-    let whole_seconds = f.trunc();
-    if !(MIN_I64_AS_F64..=MAX_I64_AS_F64).contains(&whole_seconds) {
+    // Use floor/fract so the (secs, nanos) split is correct for negative
+    // timestamps too — with trunc() and abs() on the fraction, `-1.5`
+    // resolves to `(-1, 500_000_000)` = `-0.5` rather than the intended
+    // `(-2, 500_000_000)` = `-1.5`. The `fract()` here is f − floor(f),
+    // which is always in [0, 1) regardless of sign.
+    let floor_seconds = f.floor();
+    if !(MIN_I64_AS_F64..=MAX_I64_AS_F64).contains(&floor_seconds) {
         return Err(BeadsError::Config(format!(
             "invalid epoch value in datetime column: {f}"
         )));
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    let secs = whole_seconds as i64;
-    let nanos_f64 = ((f - whole_seconds).abs() * 1_000_000_000.0)
+    let secs = floor_seconds as i64;
+    let nanos_f64 = ((f - floor_seconds) * 1_000_000_000.0)
         .round()
-        .min(999_999_999.0);
+        .clamp(0.0, 999_999_999.0);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let nanos = nanos_f64 as u32;
     DateTime::<Utc>::from_timestamp(secs, nanos)
@@ -12102,6 +12107,34 @@ mod tests {
         let v = SqliteValue::Blob(std::sync::Arc::from(b"bad".as_slice()));
         assert!(parse_datetime_value(Some(&v)).is_err());
         assert!(parse_opt_datetime_value(Some(&v)).is_err());
+    }
+
+    #[test]
+    fn test_datetime_from_epoch_seconds_f64_negative_fraction_floor_split() {
+        // Regression: the (secs, nanos) split must use floor(), not trunc(),
+        // so negative fractional seconds round the right way. With trunc()
+        // and abs(), `-1.5` incorrectly resolved to `-0.5` (secs=-1,
+        // nanos=5e8), one second higher than intended.
+        let dt = datetime_from_epoch_seconds_f64(-1.5).unwrap();
+        // -1.5 s before epoch = 1969-12-31T23:59:58.5Z
+        assert_eq!(dt.timestamp(), -2);
+        assert_eq!(dt.timestamp_subsec_nanos(), 500_000_000);
+
+        // Positive fractional remains correct after the fix.
+        let dt = datetime_from_epoch_seconds_f64(1_776_651_488.25).unwrap();
+        assert_eq!(dt.timestamp(), 1_776_651_488);
+        assert_eq!(dt.timestamp_subsec_nanos(), 250_000_000);
+    }
+
+    #[test]
+    fn test_parse_datetime_value_integer_negative_is_pre_epoch() {
+        // -1_000_000 µs = -1.0 s = 1969-12-31T23:59:59Z. Confirms the
+        // integer branch routes negatives through div_euclid/rem_euclid
+        // correctly rather than producing a nonsense future date.
+        let v = SqliteValue::Integer(-1_000_000);
+        let dt = parse_datetime_value(Some(&v)).unwrap();
+        assert_eq!(dt.timestamp(), -1);
+        assert_eq!(dt.timestamp_subsec_nanos(), 0);
     }
 
     #[test]
