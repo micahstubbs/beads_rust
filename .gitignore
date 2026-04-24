@@ -35,6 +35,11 @@ Thumbs.db
 .beads/last-touched
 .beads/.bv.lock
 .beads/*.lock
+.beads/.br_history/
+
+# Multi-agent swarm coordination scratch state
+.swarm/
+.swarm_marching_orders.md
 
 # Coverage reports
 /coverage/
