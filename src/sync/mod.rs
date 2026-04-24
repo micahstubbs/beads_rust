@@ -2665,16 +2665,16 @@ fn persist_jsonl_temp_output(
 ) -> Result<()> {
     let JsonlTempOutput {
         temp_path,
-        mut temp_guard,
+        temp_guard,
         writer,
     } = temp_output;
 
     sync_jsonl_writer(writer)?;
-    rename_jsonl_temp_output(temp_path, temp_guard, output_path, config)
+    rename_jsonl_temp_output(&temp_path, temp_guard, output_path, config)
 }
 
 fn rename_jsonl_temp_output(
-    temp_path: PathBuf,
+    temp_path: &Path,
     mut temp_guard: TempFileGuard,
     output_path: &Path,
     config: &ExportConfig,
@@ -2828,7 +2828,7 @@ fn write_jsonl_lines_atomically(
         )));
     }
 
-    rename_jsonl_temp_output(temp_path, temp_guard, output_path, config)?;
+    rename_jsonl_temp_output(&temp_path, temp_guard, output_path, config)?;
 
     Ok(hex_encode(&hasher.finalize()))
 }
