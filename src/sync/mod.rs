@@ -2681,7 +2681,7 @@ fn rename_jsonl_temp_output(
 ) -> Result<()> {
     if let Some(ref beads_dir) = config.beads_dir {
         require_safe_sync_overwrite_path(
-            &temp_path,
+            temp_path,
             beads_dir,
             config.allow_external_jsonl,
             "rename temp file",
@@ -2694,7 +2694,7 @@ fn rename_jsonl_temp_output(
         )?;
     }
 
-    crate::util::durable_rename(&temp_path, output_path)?;
+    crate::util::durable_rename(temp_path, output_path)?;
     temp_guard.persist();
     Ok(())
 }
