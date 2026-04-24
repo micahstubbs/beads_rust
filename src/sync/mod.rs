@@ -2532,6 +2532,12 @@ enum ExistingJsonlReplacementWrite {
     Fallback,
 }
 
+struct JsonlTempOutput {
+    temp_path: PathBuf,
+    temp_guard: TempFileGuard,
+    writer: BufWriter<File>,
+}
+
 fn scan_existing_jsonl_replacements(
     path: &Path,
     replacement_lines: &HashMap<String, String>,
@@ -2596,6 +2602,115 @@ fn scan_existing_jsonl_replacements(
     })
 }
 
+fn prepare_jsonl_temp_output(
+    output_path: &Path,
+    config: &ExportConfig,
+) -> Result<JsonlTempOutput> {
+    if let Some(ref beads_dir) = config.beads_dir {
+        validate_sync_path_with_external(output_path, beads_dir, config.allow_external_jsonl)?;
+        let output_abs = absolute_or_current_dir_join(output_path);
+        history::backup_before_export(beads_dir, &config.history, &output_abs)?;
+    }
+
+    let parent_dir = output_path.parent().ok_or_else(|| {
+        BeadsError::Config(format!("Invalid output path: {}", output_path.display()))
+    })?;
+    fs::create_dir_all(parent_dir)?;
+
+    let temp_path = export_temp_path(output_path);
+    if let Some(ref beads_dir) = config.beads_dir {
+        validate_temp_file_path(
+            &temp_path,
+            output_path,
+            beads_dir,
+            config.allow_external_jsonl,
+        )?;
+    }
+
+    let temp_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                BeadsError::Config(format!(
+                    "Temporary export file already exists: {}",
+                    temp_path.display()
+                ))
+            } else {
+                err.into()
+            }
+        })?;
+    let temp_guard = TempFileGuard::new(temp_path.clone());
+    set_restrictive_jsonl_permissions(&temp_path);
+
+    Ok(JsonlTempOutput {
+        temp_path,
+        temp_guard,
+        writer: BufWriter::new(temp_file),
+    })
+}
+
+fn absolute_or_current_dir_join(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn persist_jsonl_temp_output(
+    temp_output: JsonlTempOutput,
+    output_path: &Path,
+    config: &ExportConfig,
+) -> Result<()> {
+    let JsonlTempOutput {
+        temp_path,
+        mut temp_guard,
+        writer,
+    } = temp_output;
+
+    sync_jsonl_writer(writer)?;
+    rename_jsonl_temp_output(temp_path, temp_guard, output_path, config)
+}
+
+fn rename_jsonl_temp_output(
+    temp_path: PathBuf,
+    mut temp_guard: TempFileGuard,
+    output_path: &Path,
+    config: &ExportConfig,
+) -> Result<()> {
+    if let Some(ref beads_dir) = config.beads_dir {
+        require_safe_sync_overwrite_path(
+            &temp_path,
+            beads_dir,
+            config.allow_external_jsonl,
+            "rename temp file",
+        )?;
+        require_safe_sync_overwrite_path(
+            output_path,
+            beads_dir,
+            config.allow_external_jsonl,
+            "overwrite JSONL output",
+        )?;
+    }
+
+    crate::util::durable_rename(&temp_path, output_path)?;
+    temp_guard.persist();
+    Ok(())
+}
+
+fn sync_jsonl_writer(mut writer: BufWriter<File>) -> Result<()> {
+    writer.flush()?;
+    writer
+        .into_inner()
+        .map_err(|e| BeadsError::Io(e.into_error()))?
+        .sync_all()?;
+    Ok(())
+}
+
 fn try_write_existing_jsonl_replacements_atomically(
     replacement_lines: &HashMap<String, String>,
     output_path: &Path,
@@ -2626,54 +2741,9 @@ fn write_existing_jsonl_replacements_atomically(
     output_path: &Path,
     config: &ExportConfig,
 ) -> Result<(String, usize)> {
-    if let Some(ref beads_dir) = config.beads_dir {
-        validate_sync_path_with_external(output_path, beads_dir, config.allow_external_jsonl)?;
-
-        let output_abs = if output_path.is_absolute() {
-            output_path.to_path_buf()
-        } else if let Ok(cwd) = std::env::current_dir() {
-            cwd.join(output_path)
-        } else {
-            output_path.to_path_buf()
-        };
-
-        history::backup_before_export(beads_dir, &config.history, &output_abs)?;
-    }
-
-    let parent_dir = output_path.parent().ok_or_else(|| {
-        BeadsError::Config(format!("Invalid output path: {}", output_path.display()))
-    })?;
-    fs::create_dir_all(parent_dir)?;
-
-    let temp_path = export_temp_path(output_path);
-    if let Some(ref beads_dir) = config.beads_dir {
-        validate_temp_file_path(
-            &temp_path,
-            output_path,
-            beads_dir,
-            config.allow_external_jsonl,
-        )?;
-    }
-
     let input_file = File::open(output_path)?;
     let mut reader = BufReader::new(input_file);
-    let temp_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::AlreadyExists {
-                BeadsError::Config(format!(
-                    "Temporary export file already exists: {}",
-                    temp_path.display()
-                ))
-            } else {
-                err.into()
-            }
-        })?;
-    let mut temp_guard = TempFileGuard::new(temp_path.clone());
-    set_restrictive_jsonl_permissions(&temp_path);
-    let mut writer = BufWriter::new(temp_file);
+    let mut temp_output = prepare_jsonl_temp_output(output_path, config)?;
     let mut hasher = Sha256::new();
     let mut seen_ids = HashSet::new();
     let mut replaced_ids = HashSet::with_capacity(replacement_lines.len());
@@ -2713,7 +2783,7 @@ fn write_existing_jsonl_replacements_atomically(
             trimmed
         };
 
-        writeln!(writer, "{output_line}")?;
+        writeln!(temp_output.writer, "{output_line}")?;
         hasher.update(output_line.as_bytes());
         hasher.update(b"\n");
         exported_count += 1;
@@ -2726,29 +2796,7 @@ fn write_existing_jsonl_replacements_atomically(
         )));
     }
 
-    writer.flush()?;
-    writer
-        .into_inner()
-        .map_err(|e| BeadsError::Io(e.into_error()))?
-        .sync_all()?;
-
-    if let Some(ref beads_dir) = config.beads_dir {
-        require_safe_sync_overwrite_path(
-            &temp_path,
-            beads_dir,
-            config.allow_external_jsonl,
-            "rename temp file",
-        )?;
-        require_safe_sync_overwrite_path(
-            output_path,
-            beads_dir,
-            config.allow_external_jsonl,
-            "overwrite JSONL output",
-        )?;
-    }
-
-    crate::util::durable_rename(&temp_path, output_path)?;
-    temp_guard.persist();
+    persist_jsonl_temp_output(temp_output, output_path, config)?;
 
     Ok((hex_encode(&hasher.finalize()), exported_count))
 }
@@ -2758,66 +2806,22 @@ fn write_jsonl_lines_atomically(
     output_path: &Path,
     config: &ExportConfig,
 ) -> Result<String> {
-    if let Some(ref beads_dir) = config.beads_dir {
-        validate_sync_path_with_external(output_path, beads_dir, config.allow_external_jsonl)?;
-
-        let output_abs = if output_path.is_absolute() {
-            output_path.to_path_buf()
-        } else if let Ok(cwd) = std::env::current_dir() {
-            cwd.join(output_path)
-        } else {
-            output_path.to_path_buf()
-        };
-
-        history::backup_before_export(beads_dir, &config.history, &output_abs)?;
-    }
-
-    let parent_dir = output_path.parent().ok_or_else(|| {
-        BeadsError::Config(format!("Invalid output path: {}", output_path.display()))
-    })?;
-    fs::create_dir_all(parent_dir)?;
-
-    let temp_path = export_temp_path(output_path);
-    if let Some(ref beads_dir) = config.beads_dir {
-        validate_temp_file_path(
-            &temp_path,
-            output_path,
-            beads_dir,
-            config.allow_external_jsonl,
-        )?;
-    }
-
-    let temp_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::AlreadyExists {
-                BeadsError::Config(format!(
-                    "Temporary export file already exists: {}",
-                    temp_path.display()
-                ))
-            } else {
-                err.into()
-            }
-        })?;
-    let mut temp_guard = TempFileGuard::new(temp_path.clone());
-    set_restrictive_jsonl_permissions(&temp_path);
-    let mut writer = BufWriter::new(temp_file);
+    let mut temp_output = prepare_jsonl_temp_output(output_path, config)?;
     let mut hasher = Sha256::new();
 
     for line in lines_by_id.values() {
-        writeln!(writer, "{line}")?;
+        writeln!(temp_output.writer, "{line}")?;
         hasher.update(line.as_bytes());
         hasher.update(b"\n");
     }
 
-    writer.flush()?;
-    writer
-        .into_inner()
-        .map_err(|e| BeadsError::Io(e.into_error()))?
-        .sync_all()?;
+    let JsonlTempOutput {
+        temp_path,
+        temp_guard,
+        writer,
+    } = temp_output;
 
+    sync_jsonl_writer(writer)?;
     let actual_count = count_issues_in_jsonl(&temp_path)?;
     if actual_count != lines_by_id.len() {
         return Err(BeadsError::Config(format!(
@@ -2827,42 +2831,22 @@ fn write_jsonl_lines_atomically(
         )));
     }
 
-    if let Some(ref beads_dir) = config.beads_dir {
-        require_safe_sync_overwrite_path(
-            &temp_path,
-            beads_dir,
-            config.allow_external_jsonl,
-            "rename temp file",
-        )?;
-        require_safe_sync_overwrite_path(
-            output_path,
-            beads_dir,
-            config.allow_external_jsonl,
-            "overwrite JSONL output",
-        )?;
-    }
-
-    crate::util::durable_rename(&temp_path, output_path)?;
-    temp_guard.persist();
+    rename_jsonl_temp_output(temp_path, temp_guard, output_path, config)?;
 
     Ok(hex_encode(&hasher.finalize()))
 }
 
-fn try_incremental_auto_flush(
-    storage: &mut SqliteStorage,
-    beads_dir: &Path,
-    jsonl_path: &Path,
-    allow_external_jsonl: bool,
-) -> Result<Option<AutoFlushResult>> {
-    if !jsonl_path.exists() {
-        return Ok(None);
-    }
+struct IncrementalAutoFlushChanges {
+    dirty_metadata: Vec<(String, String)>,
+    removed_hash_ids: Vec<String>,
+    issue_hashes: Vec<(String, String)>,
+    replacement_lines: HashMap<String, String>,
+}
 
-    let dirty_metadata = storage.get_dirty_issue_metadata()?;
-    if dirty_metadata.is_empty() {
-        return Ok(Some(AutoFlushResult::default()));
-    }
-
+fn collect_incremental_auto_flush_changes(
+    storage: &SqliteStorage,
+    dirty_metadata: Vec<(String, String)>,
+) -> Result<IncrementalAutoFlushChanges> {
     let dirty_len = dirty_metadata.len();
     let mut removed_hash_ids = Vec::with_capacity(dirty_len);
     let mut issue_hashes = Vec::with_capacity(dirty_len);
@@ -2870,9 +2854,9 @@ fn try_incremental_auto_flush(
 
     let dirty_ids: Vec<String> = dirty_metadata.iter().map(|(id, _)| id.clone()).collect();
     let batch_issues = storage.get_issues_for_export(&dirty_ids)?;
-    let mut issues_by_id: std::collections::HashMap<String, crate::model::Issue> = batch_issues
+    let mut issues_by_id: HashMap<String, crate::model::Issue> = batch_issues
         .into_iter()
-        .map(|i| (i.id.clone(), i))
+        .map(|issue| (issue.id.clone(), issue))
         .collect();
 
     for (issue_id, _) in &dirty_metadata {
@@ -2896,12 +2880,101 @@ fn try_incremental_auto_flush(
                 ));
                 replacement_lines.insert(issue_id.clone(), json);
             }
-            Some(_) | None => {
-                removed_hash_ids.push(issue_id.clone());
-            }
+            Some(_) | None => removed_hash_ids.push(issue_id.clone()),
         }
     }
 
+    Ok(IncrementalAutoFlushChanges {
+        dirty_metadata,
+        removed_hash_ids,
+        issue_hashes,
+        replacement_lines,
+    })
+}
+
+fn try_existing_line_auto_flush(
+    storage: &mut SqliteStorage,
+    jsonl_path: &Path,
+    export_config: &ExportConfig,
+    changes: &IncrementalAutoFlushChanges,
+) -> Result<Option<AutoFlushResult>> {
+    if !changes.removed_hash_ids.is_empty() || changes.replacement_lines.is_empty() {
+        return Ok(None);
+    }
+
+    let result = try_write_existing_jsonl_replacements_atomically(
+        &changes.replacement_lines,
+        jsonl_path,
+        export_config,
+    )?;
+
+    match result {
+        ExistingJsonlReplacementWrite::Unchanged { .. } => {
+            finalize_incremental_auto_flush(
+                storage,
+                &changes.dirty_metadata,
+                &changes.removed_hash_ids,
+                &changes.issue_hashes,
+                None,
+                None,
+            )?;
+            Ok(Some(AutoFlushResult::default()))
+        }
+        ExistingJsonlReplacementWrite::Written {
+            content_hash,
+            exported_count,
+        } => {
+            finalize_incremental_auto_flush(
+                storage,
+                &changes.dirty_metadata,
+                &changes.removed_hash_ids,
+                &changes.issue_hashes,
+                Some(&content_hash),
+                Some(jsonl_path),
+            )?;
+            Ok(Some(AutoFlushResult {
+                flushed: true,
+                exported_count,
+                content_hash,
+            }))
+        }
+        ExistingJsonlReplacementWrite::Fallback => Ok(None),
+    }
+}
+
+fn apply_incremental_auto_flush_changes(
+    lines_by_id: &mut BTreeMap<String, String>,
+    changes: &IncrementalAutoFlushChanges,
+) -> bool {
+    let mut changed = false;
+    for (issue_id, json) in &changes.replacement_lines {
+        if lines_by_id.get(issue_id) != Some(json) {
+            lines_by_id.insert(issue_id.clone(), json.clone());
+            changed = true;
+        }
+    }
+    for issue_id in &changes.removed_hash_ids {
+        changed |= lines_by_id.remove(issue_id).is_some();
+    }
+    changed
+}
+
+fn try_incremental_auto_flush(
+    storage: &mut SqliteStorage,
+    beads_dir: &Path,
+    jsonl_path: &Path,
+    allow_external_jsonl: bool,
+) -> Result<Option<AutoFlushResult>> {
+    if !jsonl_path.exists() {
+        return Ok(None);
+    }
+
+    let dirty_metadata = storage.get_dirty_issue_metadata()?;
+    if dirty_metadata.is_empty() {
+        return Ok(Some(AutoFlushResult::default()));
+    }
+
+    let changes = collect_incremental_auto_flush_changes(storage, dirty_metadata)?;
     let export_config = ExportConfig {
         force: false,
         beads_dir: Some(beads_dir.to_path_buf()),
@@ -2909,63 +2982,21 @@ fn try_incremental_auto_flush(
         ..Default::default()
     };
 
-    if removed_hash_ids.is_empty() && !replacement_lines.is_empty() {
-        match try_write_existing_jsonl_replacements_atomically(
-            &replacement_lines,
-            jsonl_path,
-            &export_config,
-        )? {
-            ExistingJsonlReplacementWrite::Unchanged { .. } => {
-                finalize_incremental_auto_flush(
-                    storage,
-                    &dirty_metadata,
-                    &removed_hash_ids,
-                    &issue_hashes,
-                    None,
-                    None,
-                )?;
-                return Ok(Some(AutoFlushResult::default()));
-            }
-            ExistingJsonlReplacementWrite::Written {
-                content_hash,
-                exported_count,
-            } => {
-                finalize_incremental_auto_flush(
-                    storage,
-                    &dirty_metadata,
-                    &removed_hash_ids,
-                    &issue_hashes,
-                    Some(&content_hash),
-                    Some(jsonl_path),
-                )?;
-                return Ok(Some(AutoFlushResult {
-                    flushed: true,
-                    exported_count,
-                    content_hash,
-                }));
-            }
-            ExistingJsonlReplacementWrite::Fallback => {}
-        }
+    if let Some(result) =
+        try_existing_line_auto_flush(storage, jsonl_path, &export_config, &changes)?
+    {
+        return Ok(Some(result));
     }
 
     let mut lines_by_id = read_jsonl_lines_by_id(jsonl_path)?;
-    let mut changed = false;
-    for (issue_id, json) in &replacement_lines {
-        if lines_by_id.get(issue_id) != Some(json) {
-            lines_by_id.insert(issue_id.clone(), json.clone());
-            changed = true;
-        }
-    }
-    for issue_id in &removed_hash_ids {
-        changed |= lines_by_id.remove(issue_id).is_some();
-    }
+    let changed = apply_incremental_auto_flush_changes(&mut lines_by_id, &changes);
 
     if !changed {
         finalize_incremental_auto_flush(
             storage,
-            &dirty_metadata,
-            &removed_hash_ids,
-            &issue_hashes,
+            &changes.dirty_metadata,
+            &changes.removed_hash_ids,
+            &changes.issue_hashes,
             None,
             None,
         )?;
@@ -2975,9 +3006,9 @@ fn try_incremental_auto_flush(
     let content_hash = write_jsonl_lines_atomically(&lines_by_id, jsonl_path, &export_config)?;
     finalize_incremental_auto_flush(
         storage,
-        &dirty_metadata,
-        &removed_hash_ids,
-        &issue_hashes,
+        &changes.dirty_metadata,
+        &changes.removed_hash_ids,
+        &changes.issue_hashes,
         Some(&content_hash),
         Some(jsonl_path),
     )?;
