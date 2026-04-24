@@ -105,7 +105,8 @@ Each route is one JSON object per line:
 
 Route resolution:
 
-1. Extract the issue prefix before the first hyphen, including the hyphen.
+1. Extract the issue prefix before the final hyphen, including the hyphen, so
+   hyphenated prefixes such as `document-intelligence-` route correctly.
 2. Search the local `.beads/routes.jsonl`.
 3. If a parent town root with `mayor/town.json` exists, search its
    `.beads/routes.jsonl`.
