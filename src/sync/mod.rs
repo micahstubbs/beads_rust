@@ -2602,10 +2602,7 @@ fn scan_existing_jsonl_replacements(
     })
 }
 
-fn prepare_jsonl_temp_output(
-    output_path: &Path,
-    config: &ExportConfig,
-) -> Result<JsonlTempOutput> {
+fn prepare_jsonl_temp_output(output_path: &Path, config: &ExportConfig) -> Result<JsonlTempOutput> {
     if let Some(ref beads_dir) = config.beads_dir {
         validate_sync_path_with_external(output_path, beads_dir, config.allow_external_jsonl)?;
         let output_abs = absolute_or_current_dir_join(output_path);
