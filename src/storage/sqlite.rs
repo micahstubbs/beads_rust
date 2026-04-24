@@ -17,6 +17,7 @@ use crate::util::id::{normalize_prefix, parse_id};
 use crate::validation::IssueValidator;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use fsqlite::Connection;
+use fsqlite::compat::{OpenFlags, open_with_flags};
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
 use std::collections::{HashMap, HashSet};
@@ -539,6 +540,27 @@ impl SqliteStorage {
             conn,
             mutation_count: 0,
         })
+    }
+
+    pub(crate) fn open_current_read_only(path: &Path) -> Result<Option<Self>> {
+        let current_schema_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
+        if database_header_user_version(path).is_none_or(|version| version < current_schema_version)
+        {
+            return Ok(None);
+        }
+
+        let conn = open_with_flags(
+            path.to_string_lossy().as_ref(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        if runtime_schema_compatible(&conn) {
+            return Ok(Some(Self {
+                conn,
+                mutation_count: 0,
+            }));
+        }
+
+        Ok(None)
     }
 
     /// Open an in-memory database for testing.
@@ -10033,6 +10055,56 @@ mod tests {
         );
 
         lock_conn.execute("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn test_open_current_read_only_skips_metadata_default_seeding() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("readonly_current.db");
+
+        {
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            storage
+                .conn
+                .execute_with_params(
+                    "DELETE FROM metadata WHERE key = ?",
+                    &[SqliteValue::from(METADATA_JSONL_CONTENT_HASH)],
+                )
+                .unwrap();
+        }
+
+        let storage = SqliteStorage::open_current_read_only(&db_path)
+            .unwrap()
+            .expect("current DB should open read-only");
+        let rows = storage
+            .conn
+            .query_with_params(
+                "SELECT 1 FROM metadata WHERE key = ? LIMIT 1",
+                &[SqliteValue::from(METADATA_JSONL_CONTENT_HASH)],
+            )
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "read-only current open must not reseed missing metadata defaults"
+        );
+    }
+
+    #[test]
+    fn test_open_current_read_only_declines_stale_schema_header() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("readonly_stale.db");
+
+        {
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            storage.conn.execute("PRAGMA user_version = 0").unwrap();
+        }
+
+        assert!(
+            SqliteStorage::open_current_read_only(&db_path)
+                .unwrap()
+                .is_none(),
+            "stale schema headers must fall back to the normal repair-capable open path"
+        );
     }
 
     #[test]

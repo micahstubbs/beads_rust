@@ -2547,6 +2547,28 @@ pub fn open_storage_with_startup_config(
                 resolved_lock_timeout,
                 &merged_layer,
             )?
+        } else if cli.read_only_fast_open {
+            match SqliteStorage::open_current_read_only(&paths.db_path) {
+                Ok(Some(storage)) => (storage, false, None),
+                Ok(None) => open_sqlite_storage_with_recovery(
+                    &beads_dir,
+                    &paths,
+                    resolved_lock_timeout,
+                    &merged_layer,
+                )?,
+                Err(err) => {
+                    tracing::debug!(
+                        error = %err,
+                        "read-only fast open failed; falling back to normal storage open"
+                    );
+                    open_sqlite_storage_with_recovery(
+                        &beads_dir,
+                        &paths,
+                        resolved_lock_timeout,
+                        &merged_layer,
+                    )?
+                }
+            }
         } else {
             open_sqlite_storage_with_recovery(
                 &beads_dir,
@@ -2987,6 +3009,7 @@ pub struct CliOverrides {
     pub no_auto_flush: Option<bool>,
     pub no_auto_import: Option<bool>,
     pub lock_timeout: Option<u64>,
+    pub read_only_fast_open: bool,
 }
 
 impl CliOverrides {
@@ -4523,6 +4546,7 @@ labels:
             no_auto_import: Some(true),
             lock_timeout: Some(5000),
             identity: None,
+            read_only_fast_open: false,
         };
 
         let layer = cli.as_layer();

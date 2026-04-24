@@ -640,6 +640,21 @@ const fn should_auto_import(cmd: &Commands) -> bool {
     }
 }
 
+const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
+    matches!(
+        cmd,
+        Commands::List(_)
+            | Commands::Show(_)
+            | Commands::Search(_)
+            | Commands::Ready(_)
+            | Commands::Blocked(_)
+            | Commands::Count(_)
+            | Commands::Stale(_)
+            | Commands::Stats(_)
+            | Commands::Status(_)
+    )
+}
+
 fn command_requested_output_format(cmd: &Commands) -> Option<OutputFormat> {
     match cmd {
         Commands::List(args) => args.format,
@@ -733,6 +748,10 @@ fn build_cli_overrides(cli: &Cli) -> config::CliOverrides {
         no_auto_flush: if cli.no_auto_flush { Some(true) } else { None },
         no_auto_import: if cli.no_auto_import { Some(true) } else { None },
         lock_timeout: cli.lock_timeout,
+        read_only_fast_open: cli.no_auto_import
+            && cli.no_auto_flush
+            && !cli.no_db
+            && supports_read_only_fast_open(&cli.command),
     }
 }
 
@@ -844,6 +863,24 @@ mod tests {
         assert_eq!(overrides.no_auto_flush, None);
         assert_eq!(overrides.no_auto_import, None);
         assert_eq!(overrides.allow_stale, None);
+    }
+
+    #[test]
+    fn read_only_fast_open_requires_explicit_read_suppression() {
+        let ready = Cli::parse_from(["br", "--no-auto-import", "--no-auto-flush", "ready"]);
+        assert!(build_cli_overrides(&ready).read_only_fast_open);
+
+        let missing_auto_flush = Cli::parse_from(["br", "--no-auto-import", "ready"]);
+        assert!(!build_cli_overrides(&missing_auto_flush).read_only_fast_open);
+
+        let mutating = Cli::parse_from([
+            "br",
+            "--no-auto-import",
+            "--no-auto-flush",
+            "create",
+            "write path",
+        ]);
+        assert!(!build_cli_overrides(&mutating).read_only_fast_open);
     }
 
     #[test]
