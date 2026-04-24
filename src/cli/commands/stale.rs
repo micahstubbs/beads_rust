@@ -272,7 +272,7 @@ mod tests {
         let threshold = now - Duration::days(threshold_days);
         let mut stale: Vec<Issue> = issues
             .into_iter()
-            .filter(|i| i.updated_at < threshold)
+            .filter(|i| i.updated_at <= threshold)
             .collect();
         // Sort by updated_at ascending (oldest first)
         stale.sort_by_key(|a| a.updated_at);
@@ -288,12 +288,14 @@ mod tests {
             make_issue("bd-1", now - Duration::days(10)),
             make_issue("bd-2", now - Duration::days(40)),
             make_issue("bd-3", now - Duration::days(60)),
+            make_issue("bd-4", now - Duration::days(30)),
         ];
 
         let stale = filter_stale_issues(issues, now, 30);
-        assert_eq!(stale.len(), 2);
+        assert_eq!(stale.len(), 3);
         assert_eq!(stale[0].id, "bd-3");
         assert_eq!(stale[1].id, "bd-2");
+        assert_eq!(stale[2].id, "bd-4");
         info!("test_filter_stale_issues_orders_oldest_first: assertions passed");
     }
 }
