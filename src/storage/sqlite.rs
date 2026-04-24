@@ -14,6 +14,7 @@ use crate::sync::{
     METADATA_LAST_EXPORT_TIME, METADATA_LAST_IMPORT_TIME,
 };
 use crate::util::id::{normalize_prefix, parse_id};
+use crate::validation::IssueValidator;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use fsqlite::Connection;
 use fsqlite_error::FrankenError;
@@ -1841,8 +1842,13 @@ impl SqliteStorage {
             }
 
             // Always update updated_at
+            let updated_at = Utc::now();
+            issue.updated_at = updated_at;
+
+            IssueValidator::validate(&issue).map_err(BeadsError::from_validation_errors)?;
+
             set_clauses.push("updated_at = ?".to_string());
-            params.push(SqliteValue::from(Utc::now().to_rfc3339()));
+            params.push(SqliteValue::from(updated_at.to_rfc3339()));
 
             // Update content hash
             let new_hash = issue.compute_content_hash();

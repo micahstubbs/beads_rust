@@ -447,6 +447,50 @@ fn update_nonexistent_issue_fails() {
 }
 
 #[test]
+fn update_issue_rejects_empty_title_without_persisting() {
+    let mut storage = test_db();
+    let issue = fixtures::issue("reject-empty-title-update");
+
+    storage.create_issue(&issue, "tester").unwrap();
+
+    let update = IssueUpdate {
+        title: Some("   ".to_string()),
+        ..Default::default()
+    };
+
+    let error = storage
+        .update_issue(&issue.id, &update, "updater")
+        .expect_err("empty updated title must fail validation");
+
+    assert!(error.to_string().contains("title"));
+
+    let retrieved = storage.get_issue(&issue.id).unwrap().expect("issue exists");
+    assert_eq!(retrieved.title, issue.title);
+}
+
+#[test]
+fn update_issue_rejects_negative_estimate_without_persisting() {
+    let mut storage = test_db();
+    let issue = fixtures::issue("reject-negative-estimate-update");
+
+    storage.create_issue(&issue, "tester").unwrap();
+
+    let update = IssueUpdate {
+        estimated_minutes: Some(Some(-1)),
+        ..Default::default()
+    };
+
+    let error = storage
+        .update_issue(&issue.id, &update, "updater")
+        .expect_err("negative updated estimate must fail validation");
+
+    assert!(error.to_string().contains("estimated_minutes"));
+
+    let retrieved = storage.get_issue(&issue.id).unwrap().expect("issue exists");
+    assert_eq!(retrieved.estimated_minutes, issue.estimated_minutes);
+}
+
+#[test]
 fn update_issue_clear_optional_fields() {
     let mut storage = test_db();
 
