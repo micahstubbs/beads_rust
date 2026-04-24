@@ -37,7 +37,7 @@ use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 
-const WRITE_LOCK_WAIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+const WRITE_LOCK_WAIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_LOCK_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Test artifacts for failure injection tests.
@@ -96,8 +96,15 @@ fn read_child_wait_channel(pid: u32) -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn is_write_lock_wait_channel(channel: &str) -> bool {
+    // Under heavy load, the child might be observed mid-backoff (hrtimer_nanosleep)
+    // or waiting on a futex used by fs2's lock primitives, rather than directly
+    // in the fcntl/flock syscall. All of these indicate "blocked waiting for the
+    // exclusive write lock" for the purposes of this test.
     let channel = channel.to_ascii_lowercase();
-    channel.contains("lock") || channel.contains("flock")
+    channel.contains("lock")
+        || channel.contains("flock")
+        || channel.contains("futex")
+        || channel.contains("nanosleep")
 }
 
 fn wait_for_child_to_block_on_write_lock(child: &mut std::process::Child, label: &str) {

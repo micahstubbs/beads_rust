@@ -652,6 +652,10 @@ const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
             | Commands::Stale(_)
             | Commands::Stats(_)
             | Commands::Status(_)
+            | Commands::Comments(beads_rust::cli::CommentsArgs {
+                command: None | Some(beads_rust::cli::CommentCommands::List(_)),
+                ..
+            })
     )
 }
 
@@ -870,6 +874,25 @@ mod tests {
         let ready = Cli::parse_from(["br", "--no-auto-import", "--no-auto-flush", "ready"]);
         assert!(build_cli_overrides(&ready).read_only_fast_open);
 
+        let comments_list = Cli::parse_from([
+            "br",
+            "--no-auto-import",
+            "--no-auto-flush",
+            "comments",
+            "list",
+            "bd-abc",
+        ]);
+        assert!(build_cli_overrides(&comments_list).read_only_fast_open);
+
+        let comments_shorthand = Cli::parse_from([
+            "br",
+            "--no-auto-import",
+            "--no-auto-flush",
+            "comments",
+            "bd-abc",
+        ]);
+        assert!(build_cli_overrides(&comments_shorthand).read_only_fast_open);
+
         let missing_auto_flush = Cli::parse_from(["br", "--no-auto-import", "ready"]);
         assert!(!build_cli_overrides(&missing_auto_flush).read_only_fast_open);
 
@@ -881,6 +904,17 @@ mod tests {
             "write path",
         ]);
         assert!(!build_cli_overrides(&mutating).read_only_fast_open);
+
+        let comments_add = Cli::parse_from([
+            "br",
+            "--no-auto-import",
+            "--no-auto-flush",
+            "comments",
+            "add",
+            "bd-abc",
+            "write path",
+        ]);
+        assert!(!build_cli_overrides(&comments_add).read_only_fast_open);
     }
 
     #[test]
