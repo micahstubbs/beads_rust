@@ -11,7 +11,7 @@
 //!
 //! # Resolution Order
 //!
-//! 1. Extract prefix from issue ID (substring before first `-`, plus hyphen)
+//! 1. Extract prefix from issue ID (substring before final `-`, plus hyphen)
 //! 2. Search local `.beads/routes.jsonl`
 //! 3. Search town root `.beads/routes.jsonl` if different
 //! 4. If route found with `path == "."`, use town-level `.beads`
@@ -82,8 +82,10 @@ impl RoutingResult {
 
 /// Extract the prefix from an issue ID.
 ///
-/// The prefix is the substring before the first hyphen, plus the hyphen.
-/// For example, "bd-abc123" returns "bd-".
+/// The prefix is the substring before the final hyphen, plus the hyphen. This
+/// matches ID parsing for hyphenated prefixes.
+/// For example, "bd-abc123" returns "bd-" and
+/// "document-intelligence-0sa" returns "document-intelligence-".
 ///
 /// Returns `None` if the ID has no hyphen.
 #[must_use]
@@ -525,14 +527,18 @@ mod tests {
         fs::write(beads_dir.join("redirect"), "..").unwrap();
 
         let err = follow_redirects(&beads_dir, 10).unwrap_err();
-        match err {
-            BeadsError::Config(msg) => assert!(
-                msg.contains("must be a .beads directory")
-                    || msg.contains("must be a .beads or _beads directory"),
-                "unexpected config error: {msg}"
-            ),
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let BeadsError::Config(msg) = err else {
+            return;
+        };
+        assert!(
+            msg.contains("must be a .beads directory")
+                || msg.contains("must be a .beads or _beads directory"),
+            "unexpected config error: {msg}"
+        );
     }
 
     #[test]
@@ -550,10 +556,14 @@ mod tests {
         fs::write(second.join("redirect"), "../../third/.beads").unwrap();
 
         let err = follow_redirects(&first, 1).unwrap_err();
-        match err {
-            BeadsError::Config(msg) => assert!(msg.contains("max depth")),
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let BeadsError::Config(msg) = err else {
+            return;
+        };
+        assert!(msg.contains("max depth"));
     }
 
     #[test]
@@ -581,10 +591,14 @@ mod tests {
         fs::write(second.join("redirect"), "../../first/./.beads").unwrap();
 
         let err = follow_redirects(&first, 10).unwrap_err();
-        match err {
-            BeadsError::Config(msg) => assert!(msg.contains("loop detected")),
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let BeadsError::Config(msg) = err else {
+            return;
+        };
+        assert!(msg.contains("loop detected"));
     }
 
     #[test]
