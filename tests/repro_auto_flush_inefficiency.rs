@@ -18,13 +18,11 @@ fn make_issue(id: &str) -> Issue {
     }
 }
 
-// Ignored pending the auto-flush no-op optimization.  `auto_flush` currently
-// re-exports any time a dirty flag is set, even when the resulting JSONL would
-// be byte-identical to the previous one (e.g., a change-then-revert pair).
-// The optimization is useful but not yet implemented; keeping this test as a
-// skipped spec prevents quiet regressions if the optimization is re-added.
+// `update_issue` always advances `updated_at`, so a change-then-revert pair is
+// still a real JSONL content change. This remains ignored until the integration
+// surface has a supported way to reproduce a byte-identical dirty marker.
 #[test]
-#[ignore = "optimization not implemented: auto_flush always rewrites when dirty"]
+#[ignore = "integration test cannot mark an issue dirty without changing JSONL bytes"]
 fn test_auto_flush_optimizes_no_content_change() {
     let temp_dir = TempDir::new().unwrap();
     let beads_dir = temp_dir.path().join(".beads");

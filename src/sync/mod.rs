@@ -2513,6 +2513,246 @@ fn finalize_incremental_auto_flush(
     Ok(())
 }
 
+struct ExistingJsonlReplacementScan {
+    exported_count: usize,
+    changed: bool,
+    all_replacements_seen: bool,
+    sorted_by_id: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ExistingJsonlReplacementWrite {
+    Unchanged {
+        exported_count: usize,
+    },
+    Written {
+        content_hash: String,
+        exported_count: usize,
+    },
+    Fallback,
+}
+
+fn scan_existing_jsonl_replacements(
+    path: &Path,
+    replacement_lines: &HashMap<String, String>,
+) -> Result<ExistingJsonlReplacementScan> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut seen_ids = HashSet::new();
+    let mut seen_replacements = HashSet::with_capacity(replacement_lines.len());
+    let mut previous_id: Option<String> = None;
+    let mut line_buf = String::new();
+    let mut line_num = 0;
+    let mut exported_count = 0;
+    let mut changed = false;
+    let mut sorted_by_id = true;
+
+    loop {
+        line_buf.clear();
+        let bytes = reader.read_line(&mut line_buf)?;
+        if bytes == 0 {
+            break;
+        }
+
+        line_num += 1;
+        let trimmed = line_buf.trim_end_matches(['\n', '\r']);
+        if trimmed.trim().is_empty() {
+            continue;
+        }
+
+        let partial: PartialId = serde_json::from_str(trimmed)
+            .map_err(|e| BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num, e)))?;
+
+        if !seen_ids.insert(partial.id.clone()) {
+            return Err(BeadsError::Config(format!(
+                "Duplicate issue id '{}' in {} at line {}",
+                partial.id,
+                path.display(),
+                line_num
+            )));
+        }
+
+        if previous_id
+            .as_ref()
+            .is_some_and(|previous| previous > &partial.id)
+        {
+            sorted_by_id = false;
+        }
+        previous_id = Some(partial.id.clone());
+
+        if let Some(replacement) = replacement_lines.get(&partial.id) {
+            seen_replacements.insert(partial.id);
+            changed |= replacement != trimmed;
+        }
+
+        exported_count += 1;
+    }
+
+    Ok(ExistingJsonlReplacementScan {
+        exported_count,
+        changed,
+        all_replacements_seen: seen_replacements.len() == replacement_lines.len(),
+        sorted_by_id,
+    })
+}
+
+fn try_write_existing_jsonl_replacements_atomically(
+    replacement_lines: &HashMap<String, String>,
+    output_path: &Path,
+    config: &ExportConfig,
+) -> Result<ExistingJsonlReplacementWrite> {
+    let scan = scan_existing_jsonl_replacements(output_path, replacement_lines)?;
+
+    if !scan.all_replacements_seen || (scan.changed && !scan.sorted_by_id) {
+        return Ok(ExistingJsonlReplacementWrite::Fallback);
+    }
+
+    if !scan.changed {
+        return Ok(ExistingJsonlReplacementWrite::Unchanged {
+            exported_count: scan.exported_count,
+        });
+    }
+
+    let (content_hash, exported_count) =
+        write_existing_jsonl_replacements_atomically(replacement_lines, output_path, config)?;
+    Ok(ExistingJsonlReplacementWrite::Written {
+        content_hash,
+        exported_count,
+    })
+}
+
+fn write_existing_jsonl_replacements_atomically(
+    replacement_lines: &HashMap<String, String>,
+    output_path: &Path,
+    config: &ExportConfig,
+) -> Result<(String, usize)> {
+    if let Some(ref beads_dir) = config.beads_dir {
+        validate_sync_path_with_external(output_path, beads_dir, config.allow_external_jsonl)?;
+
+        let output_abs = if output_path.is_absolute() {
+            output_path.to_path_buf()
+        } else if let Ok(cwd) = std::env::current_dir() {
+            cwd.join(output_path)
+        } else {
+            output_path.to_path_buf()
+        };
+
+        history::backup_before_export(beads_dir, &config.history, &output_abs)?;
+    }
+
+    let parent_dir = output_path.parent().ok_or_else(|| {
+        BeadsError::Config(format!("Invalid output path: {}", output_path.display()))
+    })?;
+    fs::create_dir_all(parent_dir)?;
+
+    let temp_path = export_temp_path(output_path);
+    if let Some(ref beads_dir) = config.beads_dir {
+        validate_temp_file_path(
+            &temp_path,
+            output_path,
+            beads_dir,
+            config.allow_external_jsonl,
+        )?;
+    }
+
+    let input_file = File::open(output_path)?;
+    let mut reader = BufReader::new(input_file);
+    let temp_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                BeadsError::Config(format!(
+                    "Temporary export file already exists: {}",
+                    temp_path.display()
+                ))
+            } else {
+                err.into()
+            }
+        })?;
+    let mut temp_guard = TempFileGuard::new(temp_path.clone());
+    set_restrictive_jsonl_permissions(&temp_path);
+    let mut writer = BufWriter::new(temp_file);
+    let mut hasher = Sha256::new();
+    let mut seen_ids = HashSet::new();
+    let mut replaced_ids = HashSet::with_capacity(replacement_lines.len());
+    let mut line_buf = String::new();
+    let mut line_num = 0;
+    let mut exported_count = 0;
+
+    loop {
+        line_buf.clear();
+        let bytes = reader.read_line(&mut line_buf)?;
+        if bytes == 0 {
+            break;
+        }
+
+        line_num += 1;
+        let trimmed = line_buf.trim_end_matches(['\n', '\r']);
+        if trimmed.trim().is_empty() {
+            continue;
+        }
+
+        let partial: PartialId = serde_json::from_str(trimmed)
+            .map_err(|e| BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num, e)))?;
+
+        if !seen_ids.insert(partial.id.clone()) {
+            return Err(BeadsError::Config(format!(
+                "Duplicate issue id '{}' in {} at line {}",
+                partial.id,
+                output_path.display(),
+                line_num
+            )));
+        }
+
+        let output_line = if let Some(replacement) = replacement_lines.get(&partial.id) {
+            replaced_ids.insert(partial.id);
+            replacement.as_str()
+        } else {
+            trimmed
+        };
+
+        writeln!(writer, "{output_line}")?;
+        hasher.update(output_line.as_bytes());
+        hasher.update(b"\n");
+        exported_count += 1;
+    }
+
+    if replaced_ids.len() != replacement_lines.len() {
+        return Err(BeadsError::Config(format!(
+            "JSONL changed while preparing incremental auto-flush for {} replacement(s)",
+            replacement_lines.len()
+        )));
+    }
+
+    writer.flush()?;
+    writer
+        .into_inner()
+        .map_err(|e| BeadsError::Io(e.into_error()))?
+        .sync_all()?;
+
+    if let Some(ref beads_dir) = config.beads_dir {
+        require_safe_sync_overwrite_path(
+            &temp_path,
+            beads_dir,
+            config.allow_external_jsonl,
+            "rename temp file",
+        )?;
+        require_safe_sync_overwrite_path(
+            output_path,
+            beads_dir,
+            config.allow_external_jsonl,
+            "overwrite JSONL output",
+        )?;
+    }
+
+    crate::util::durable_rename(&temp_path, output_path)?;
+    temp_guard.persist();
+
+    Ok((hex_encode(&hasher.finalize()), exported_count))
+}
+
 fn write_jsonl_lines_atomically(
     lines_by_id: &BTreeMap<String, String>,
     output_path: &Path,
@@ -2618,7 +2858,6 @@ fn try_incremental_auto_flush(
         return Ok(None);
     }
 
-    let mut lines_by_id = read_jsonl_lines_by_id(jsonl_path)?;
     let dirty_metadata = storage.get_dirty_issue_metadata()?;
     if dirty_metadata.is_empty() {
         return Ok(Some(AutoFlushResult::default()));
@@ -2627,7 +2866,7 @@ fn try_incremental_auto_flush(
     let dirty_len = dirty_metadata.len();
     let mut removed_hash_ids = Vec::with_capacity(dirty_len);
     let mut issue_hashes = Vec::with_capacity(dirty_len);
-    let mut changed = false;
+    let mut replacement_lines = HashMap::with_capacity(dirty_len);
 
     let dirty_ids: Vec<String> = dirty_metadata.iter().map(|(id, _)| id.clone()).collect();
     let batch_issues = storage.get_issues_for_export(&dirty_ids)?;
@@ -2648,11 +2887,6 @@ fn try_incremental_auto_flush(
                     ))
                 })?;
 
-                if lines_by_id.get(issue_id) != Some(&json) {
-                    lines_by_id.insert(issue_id.clone(), json);
-                    changed = true;
-                }
-
                 issue_hashes.push((
                     issue_id.clone(),
                     issue
@@ -2660,12 +2894,70 @@ fn try_incremental_auto_flush(
                         .clone()
                         .unwrap_or_else(|| issue.compute_content_hash()),
                 ));
+                replacement_lines.insert(issue_id.clone(), json);
             }
             Some(_) | None => {
                 removed_hash_ids.push(issue_id.clone());
-                changed |= lines_by_id.remove(issue_id).is_some();
             }
         }
+    }
+
+    let export_config = ExportConfig {
+        force: false,
+        beads_dir: Some(beads_dir.to_path_buf()),
+        allow_external_jsonl,
+        ..Default::default()
+    };
+
+    if removed_hash_ids.is_empty() && !replacement_lines.is_empty() {
+        match try_write_existing_jsonl_replacements_atomically(
+            &replacement_lines,
+            jsonl_path,
+            &export_config,
+        )? {
+            ExistingJsonlReplacementWrite::Unchanged { .. } => {
+                finalize_incremental_auto_flush(
+                    storage,
+                    &dirty_metadata,
+                    &removed_hash_ids,
+                    &issue_hashes,
+                    None,
+                    None,
+                )?;
+                return Ok(Some(AutoFlushResult::default()));
+            }
+            ExistingJsonlReplacementWrite::Written {
+                content_hash,
+                exported_count,
+            } => {
+                finalize_incremental_auto_flush(
+                    storage,
+                    &dirty_metadata,
+                    &removed_hash_ids,
+                    &issue_hashes,
+                    Some(&content_hash),
+                    Some(jsonl_path),
+                )?;
+                return Ok(Some(AutoFlushResult {
+                    flushed: true,
+                    exported_count,
+                    content_hash,
+                }));
+            }
+            ExistingJsonlReplacementWrite::Fallback => {}
+        }
+    }
+
+    let mut lines_by_id = read_jsonl_lines_by_id(jsonl_path)?;
+    let mut changed = false;
+    for (issue_id, json) in &replacement_lines {
+        if lines_by_id.get(issue_id) != Some(json) {
+            lines_by_id.insert(issue_id.clone(), json.clone());
+            changed = true;
+        }
+    }
+    for issue_id in &removed_hash_ids {
+        changed |= lines_by_id.remove(issue_id).is_some();
     }
 
     if !changed {
@@ -2680,12 +2972,6 @@ fn try_incremental_auto_flush(
         return Ok(Some(AutoFlushResult::default()));
     }
 
-    let export_config = ExportConfig {
-        force: false,
-        beads_dir: Some(beads_dir.to_path_buf()),
-        allow_external_jsonl,
-        ..Default::default()
-    };
     let content_hash = write_jsonl_lines_atomically(&lines_by_id, jsonl_path, &export_config)?;
     finalize_incremental_auto_flush(
         storage,
@@ -6546,6 +6832,34 @@ mod tests {
                 .is_some()
         );
         assert!(storage.get_metadata(METADATA_JSONL_SIZE).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_auto_flush_clears_byte_identical_dirty_marker_without_rewrite() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        let output_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let issue = make_test_issue("bd-noop", "No-op dirty marker");
+        storage.create_issue(&issue, "test").unwrap();
+
+        let first = auto_flush(&mut storage, &beads_dir, &output_path, false).unwrap();
+        assert!(first.flushed);
+        let before = fs::read_to_string(&output_path).unwrap();
+
+        storage
+            .replace_dirty_issue_marker("bd-noop", "manual-dirty-marker")
+            .unwrap();
+
+        let second = auto_flush(&mut storage, &beads_dir, &output_path, false).unwrap();
+        assert!(
+            !second.flushed,
+            "byte-identical dirty markers should not rewrite JSONL"
+        );
+        assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
+        assert_eq!(fs::read_to_string(&output_path).unwrap(), before);
     }
 
     #[test]
