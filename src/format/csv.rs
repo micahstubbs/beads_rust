@@ -42,14 +42,12 @@ pub const ALL_FIELDS: &[&str] = &[
 /// Wraps in double quotes if the value contains commas, quotes, or newlines.
 /// Doubles any existing quotes within the value.
 /// Prefixes with a single quote to prevent formula injection in spreadsheets
-/// when the value starts with `=`, `+`, `-`, `@`, `\t`, or `\r`.
+/// when the value starts with `=`, `+`, `-`, `@`, `\t`, `\r`, or `\n`.
 #[must_use]
 pub fn escape_field(value: &str) -> String {
     // Mitigate CSV formula injection: prefix dangerous characters with a
     // single-quote so spreadsheets treat the cell as a literal string.
-    if value.starts_with(['=', '+', '@', '\t', '\r'])
-        || (value.starts_with('-') && value.len() > 1 && value.as_bytes()[1].is_ascii_digit())
-    {
+    if value.starts_with(['=', '+', '-', '@', '\t', '\r', '\n']) {
         let escaped = value.replace('"', "\"\"");
         return format!("\"'{escaped}\"");
     }
@@ -315,16 +313,15 @@ mod tests {
     }
 
     #[test]
-    fn test_escape_field_negative_number_prefix() {
-        // "-3 items" starts with dash+digit: protect against formula injection
+    fn test_escape_field_dash_prefix() {
         assert_eq!(escape_field("-3 items"), "\"'-3 items\"");
+        assert_eq!(escape_field("-abc"), "\"'-abc\"");
+        assert_eq!(escape_field("-"), "\"'-\"");
     }
 
     #[test]
-    fn test_escape_field_plain_dash_not_formula() {
-        // A plain dash or dash-followed-by-letter is not a formula risk
-        assert_eq!(escape_field("-"), "-");
-        assert_eq!(escape_field("-abc"), "-abc");
+    fn test_escape_field_newline_prefix() {
+        assert_eq!(escape_field("\n=1+1"), "\"'\n=1+1\"");
     }
 
     #[test]
