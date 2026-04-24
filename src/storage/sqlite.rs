@@ -1770,9 +1770,9 @@ impl SqliteStorage {
             // Priority
             if let Some(priority) = updates.priority {
                 let old_priority = issue.priority.0;
-                issue.priority = priority;
-                add_update("priority", SqliteValue::from(i64::from(priority.0)));
                 if priority.0 != old_priority {
+                    issue.priority = priority;
+                    add_update("priority", SqliteValue::from(i64::from(priority.0)));
                     ctx.record_field_change(
                         EventType::PriorityChanged,
                         id,
@@ -1910,7 +1910,11 @@ impl SqliteStorage {
                 );
             }
 
-            // Always update updated_at
+            if set_clauses.is_empty() {
+                return Ok(());
+            }
+
+            // Update updated_at only when a stored field needs rewriting.
             let updated_at = Utc::now();
             issue.updated_at = updated_at;
 
@@ -8332,6 +8336,40 @@ mod tests {
         assert_eq!(updated.priority, Priority::HIGH);
         assert_eq!(updated.assignee.as_deref(), Some("alice"));
         assert_eq!(updated.description.as_deref(), Some("New description"));
+    }
+
+    #[test]
+    fn test_update_issue_same_priority_is_noop() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 5, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-u-priority",
+            "No-op priority",
+            Status::Open,
+            1,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        storage.clear_all_dirty_issues().unwrap();
+
+        let before = storage.get_issue("bd-u-priority").unwrap().unwrap();
+        let updated = storage
+            .update_issue(
+                "bd-u-priority",
+                &IssueUpdate {
+                    priority: Some(Priority::HIGH),
+                    ..IssueUpdate::default()
+                },
+                "tester",
+            )
+            .unwrap();
+
+        assert_eq!(updated.priority, Priority::HIGH);
+        assert_eq!(updated.updated_at, before.updated_at);
+        assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
     }
 
     /*
