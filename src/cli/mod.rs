@@ -1936,7 +1936,7 @@ pub struct CountArgs {
     #[arg(long)]
     pub unassigned: bool,
 
-    /// Include closed and tombstone issues
+    /// Include closed issues; tombstones require `--status tombstone`
     #[arg(long)]
     pub include_closed: bool,
 

@@ -554,7 +554,7 @@ br count [OPTIONS]
 | `--priority <PRIORITY>` | Filter by priority (repeatable or comma-separated) |
 | `--assignee <NAME>` | Filter by assignee |
 | `--unassigned` | Only include unassigned issues |
-| `--include-closed` | Include closed and tombstone issues |
+| `--include-closed` | Include closed issues; use `--status tombstone` for tombstones |
 | `--include-templates` | Include template issues |
 | `--title-contains <TEXT>` | Title contains substring |
 

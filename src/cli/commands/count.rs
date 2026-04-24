@@ -202,21 +202,21 @@ fn render_count_grouped_rich(
 fn parse_statuses(values: &[String]) -> Result<Vec<Status>> {
     values
         .iter()
-        .map(|value| value.parse())
+        .map(|value| value.trim().parse())
         .collect::<Result<Vec<Status>>>()
 }
 
 fn parse_types(values: &[String]) -> Result<Vec<IssueType>> {
     values
         .iter()
-        .map(|value| value.parse())
+        .map(|value| value.trim().parse())
         .collect::<Result<Vec<IssueType>>>()
 }
 
 fn parse_priorities(values: &[String]) -> Result<Vec<Priority>> {
     values
         .iter()
-        .map(|value| value.parse())
+        .map(|value| value.trim().parse())
         .collect::<Result<Vec<Priority>>>()
 }
 
@@ -338,23 +338,23 @@ mod tests {
     }
 
     #[test]
-    fn test_group_counts_status() {
+    fn test_group_counts_status() -> Result<()> {
         init_logging();
         info!("test_group_counts_status: starting");
-        let mut storage = SqliteStorage::open_memory().unwrap();
+        let mut storage = SqliteStorage::open_memory()?;
         let issue1 = make_issue("bd-1", Status::Open, Priority::MEDIUM, IssueType::Task);
         let issue2 = make_issue("bd-2", Status::InProgress, Priority::HIGH, IssueType::Bug);
 
-        storage.create_issue(&issue1, "tester").unwrap();
-        storage.create_issue(&issue2, "tester").unwrap();
+        storage.create_issue(&issue1, "tester")?;
+        storage.create_issue(&issue2, "tester")?;
 
         let filters = ListFilters {
             include_closed: true,
             include_templates: true,
             ..Default::default()
         };
-        let listed_issues = storage.list_issues(&filters).unwrap();
-        let groups = group_counts(&storage, &listed_issues, CountBy::Status).unwrap();
+        let listed_issues = storage.list_issues(&filters)?;
+        let groups = group_counts(&storage, &listed_issues, CountBy::Status)?;
 
         let mut map = BTreeMap::new();
         for group in groups {
@@ -364,27 +364,29 @@ mod tests {
         assert_eq!(map.get("open"), Some(&1));
         assert_eq!(map.get("in_progress"), Some(&1));
         info!("test_group_counts_status: assertions passed");
+
+        Ok(())
     }
 
     #[test]
-    fn test_group_counts_label_includes_unlabeled() {
+    fn test_group_counts_label_includes_unlabeled() -> Result<()> {
         init_logging();
         info!("test_group_counts_label_includes_unlabeled: starting");
-        let mut storage = SqliteStorage::open_memory().unwrap();
+        let mut storage = SqliteStorage::open_memory()?;
         let issue1 = make_issue("bd-1", Status::Open, Priority::MEDIUM, IssueType::Task);
         let issue2 = make_issue("bd-2", Status::Open, Priority::LOW, IssueType::Task);
 
-        storage.create_issue(&issue1, "tester").unwrap();
-        storage.create_issue(&issue2, "tester").unwrap();
-        storage.add_label("bd-1", "backend", "tester").unwrap();
+        storage.create_issue(&issue1, "tester")?;
+        storage.create_issue(&issue2, "tester")?;
+        storage.add_label("bd-1", "backend", "tester")?;
 
         let filters = ListFilters {
             include_closed: true,
             include_templates: true,
             ..Default::default()
         };
-        let listed_issues = storage.list_issues(&filters).unwrap();
-        let groups = group_counts(&storage, &listed_issues, CountBy::Label).unwrap();
+        let listed_issues = storage.list_issues(&filters)?;
+        let groups = group_counts(&storage, &listed_issues, CountBy::Label)?;
 
         let mut map = BTreeMap::new();
         for group in groups {
@@ -394,5 +396,24 @@ mod tests {
         assert_eq!(map.get("backend"), Some(&1));
         assert_eq!(map.get("(no labels)"), Some(&1));
         info!("test_group_counts_label_includes_unlabeled: assertions passed");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_count_filters_trim_delimited_whitespace() -> Result<()> {
+        init_logging();
+        info!("test_parse_count_filters_trim_delimited_whitespace: starting");
+
+        let statuses = parse_statuses(&["open".to_string(), " closed ".to_string()])?;
+        let types = parse_types(&["bug".to_string(), " feature ".to_string()])?;
+        let priorities = parse_priorities(&["P0".to_string(), " 1 ".to_string()])?;
+
+        assert_eq!(statuses, vec![Status::Open, Status::Closed]);
+        assert_eq!(types, vec![IssueType::Bug, IssueType::Feature]);
+        assert_eq!(priorities, vec![Priority::CRITICAL, Priority::HIGH]);
+        info!("test_parse_count_filters_trim_delimited_whitespace: assertions passed");
+
+        Ok(())
     }
 }
