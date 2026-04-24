@@ -317,10 +317,14 @@ impl SqliteStorage {
 
     fn upsert_metadata_key_in_tx(conn: &Connection, key: &str, value: &str) -> Result<()> {
         let updated = conn.execute_with_params(
-            "UPDATE metadata SET value = ? WHERE key = ?",
-            &[SqliteValue::from(value), SqliteValue::from(key)],
+            "UPDATE metadata SET value = ? WHERE key = ? AND value != ?",
+            &[
+                SqliteValue::from(value),
+                SqliteValue::from(key),
+                SqliteValue::from(value),
+            ],
         )?;
-        if updated == 0 {
+        if updated == 0 && !Self::metadata_equals(conn, key, value)? {
             conn.execute_with_params(
                 "INSERT INTO metadata (key, value) VALUES (?, ?)",
                 &[SqliteValue::from(key), SqliteValue::from(value)],
@@ -1001,6 +1005,49 @@ impl SqliteStorage {
                 )?;
                 count += 1;
             }
+        }
+
+        Ok(count)
+    }
+
+    /// Set only export hashes whose content changed, using the caller's active transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub(crate) fn set_changed_export_hashes_in_tx(
+        &self,
+        exports: &[(String, String)],
+    ) -> Result<usize> {
+        let unique_exports = Self::dedupe_export_hash_batch(exports);
+        if unique_exports.is_empty() {
+            return Ok(0);
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let mut count = 0;
+
+        for (issue_id, content_hash) in &unique_exports {
+            if self
+                .get_export_hash(issue_id)?
+                .is_some_and(|(existing_hash, _)| existing_hash == *content_hash)
+            {
+                continue;
+            }
+
+            self.conn.execute_with_params(
+                "DELETE FROM export_hashes WHERE issue_id = ?",
+                &[SqliteValue::from(issue_id.as_str())],
+            )?;
+            self.conn.execute_with_params(
+                "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
+                &[
+                    SqliteValue::from(issue_id.as_str()),
+                    SqliteValue::from(content_hash.as_str()),
+                    SqliteValue::from(now.as_str()),
+                ],
+            )?;
+            count += 1;
         }
 
         Ok(count)
@@ -10497,6 +10544,39 @@ mod tests {
 
         let (content_hash, _) = storage.get_export_hash("bd-hash-1").unwrap().unwrap();
         assert_eq!(content_hash, "hash-new");
+    }
+
+    #[test]
+    fn test_set_changed_export_hashes_skips_unchanged_rows() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
+        let issue = make_issue("bd-hash-1", "Hash target", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .set_export_hashes(&[("bd-hash-1".to_string(), "hash-stable".to_string())])
+            .unwrap();
+
+        let (_, exported_at) = storage.get_export_hash("bd-hash-1").unwrap().unwrap();
+        let unchanged = storage
+            .set_changed_export_hashes_in_tx(&[(
+                "bd-hash-1".to_string(),
+                "hash-stable".to_string(),
+            )])
+            .unwrap();
+        assert_eq!(unchanged, 0);
+        assert_eq!(
+            storage.get_export_hash("bd-hash-1").unwrap().unwrap(),
+            ("hash-stable".to_string(), exported_at)
+        );
+
+        let changed = storage
+            .set_changed_export_hashes_in_tx(&[("bd-hash-1".to_string(), "hash-new".to_string())])
+            .unwrap();
+        assert_eq!(changed, 1);
+        assert_eq!(
+            storage.get_export_hash("bd-hash-1").unwrap().unwrap().0,
+            "hash-new"
+        );
     }
 
     #[test]

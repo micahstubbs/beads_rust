@@ -2499,7 +2499,7 @@ fn finalize_incremental_auto_flush(
             storage.clear_export_hashes_in_tx(removed_hash_ids)?;
         }
         if !issue_hashes.is_empty() {
-            storage.set_export_hashes_in_tx(issue_hashes)?;
+            storage.set_changed_export_hashes_in_tx(issue_hashes)?;
         }
         if let Some((content_hash, observed_jsonl)) = &export_metadata {
             storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, content_hash)?;
