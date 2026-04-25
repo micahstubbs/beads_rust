@@ -454,8 +454,9 @@ fn finalize_sync_result(
     }
 }
 
-fn suppress_human_sync_output(ctx: &OutputContext, use_json: bool) -> bool {
-    ctx.is_quiet() && !use_json
+fn should_render_human_sync_output(ctx: &OutputContext, use_json: bool) -> bool {
+    // Keep JSON/robot output paths alive even when quiet suppresses human text.
+    !ctx.is_quiet() || use_json
 }
 
 fn validate_sync_paths(
@@ -698,7 +699,7 @@ fn execute_status(
         "Computed sync staleness"
     );
 
-    if suppress_human_sync_output(ctx, use_json) {
+    if !should_render_human_sync_output(ctx, use_json) {
         return Ok(());
     }
 
@@ -922,7 +923,7 @@ fn execute_flush(
                 manifest_path: None,
             };
             ctx.json_pretty(&result);
-        } else if !suppress_human_sync_output(ctx, use_json) {
+        } else if should_render_human_sync_output(ctx, use_json) {
             println!("Nothing to export (no dirty issues)");
         }
         return Ok(());
@@ -1006,7 +1007,7 @@ fn execute_flush(
 
     if use_json {
         ctx.json_pretty(&result);
-    } else if suppress_human_sync_output(ctx, use_json) {
+    } else if !should_render_human_sync_output(ctx, use_json) {
         return Ok(());
     } else if ctx.is_rich() {
         render_flush_result_rich(&result, &report.errors, ctx);
@@ -1365,7 +1366,7 @@ fn emit_auto_rebuild_import_result(
     };
     if use_json {
         ctx.json_pretty(&result);
-    } else if !suppress_human_sync_output(ctx, use_json) {
+    } else if should_render_human_sync_output(ctx, use_json) {
         if ctx.is_rich() {
             render_import_result_rich(&result, ctx);
         } else {
@@ -1483,7 +1484,7 @@ fn execute_import(
                 blocked_cache_rebuilt: false,
             };
             ctx.json_pretty(&result);
-        } else if !suppress_human_sync_output(ctx, use_json) {
+        } else if should_render_human_sync_output(ctx, use_json) {
             println!("No JSONL file found at {}", jsonl_path.display());
         }
         return Ok(());
@@ -1514,7 +1515,7 @@ fn execute_import(
                         blocked_cache_rebuilt: false,
                     };
                     ctx.json_pretty(&result);
-                } else if !suppress_human_sync_output(ctx, use_json) {
+                } else if should_render_human_sync_output(ctx, use_json) {
                     println!("JSONL is current (hash unchanged since last import)");
                 }
                 return Ok(());
@@ -1782,7 +1783,7 @@ fn execute_import(
 
     if use_json {
         ctx.json_pretty(&result);
-    } else if suppress_human_sync_output(ctx, use_json) {
+    } else if !should_render_human_sync_output(ctx, use_json) {
         return Ok(());
     } else if ctx.is_rich() {
         render_import_result_rich(&result, ctx);
@@ -2073,7 +2074,7 @@ fn execute_merge(
             "notes": report.notes,
         });
         ctx.json_pretty(&output);
-    } else if suppress_human_sync_output(ctx, use_json) {
+    } else if !should_render_human_sync_output(ctx, use_json) {
         return Ok(());
     } else if ctx.is_rich() {
         render_merge_result_rich(&report, ctx);
@@ -2199,13 +2200,15 @@ mod tests {
         SyncOperation, auto_rebuild_semantic_conflict_field,
         auto_rebuild_semantic_flag_conflict_reason, detect_prefix_from_jsonl,
         jsonl_contains_duplicate_external_refs, jsonl_contains_prefix_mismatch,
-        merge_conflict_resolution, should_defer_jsonl_recovery, sync_operation,
-        validate_operator_requested_sync_path, validate_sync_mode_args, validate_sync_paths,
+        merge_conflict_resolution, should_defer_jsonl_recovery, should_render_human_sync_output,
+        sync_operation, validate_operator_requested_sync_path, validate_sync_mode_args,
+        validate_sync_paths,
     };
     use crate::cli::SyncArgs;
     use crate::config::{self, CliOverrides};
     use crate::error::BeadsError;
     use crate::model::{Issue, IssueType, Priority, Status};
+    use crate::output::OutputContext;
     use crate::storage::SqliteStorage;
     use crate::sync::{
         ConflictResolution, PreservedTombstone, restore_tombstones,
@@ -2260,6 +2263,17 @@ mod tests {
             dependencies: vec![],
             comments: vec![],
         }
+    }
+
+    #[test]
+    fn should_render_human_sync_output_preserves_quiet_json_semantics() {
+        let quiet_ctx = OutputContext::from_flags(false, true, true);
+        let plain_ctx = OutputContext::from_flags(false, false, true);
+
+        assert!(!should_render_human_sync_output(&quiet_ctx, false));
+        assert!(should_render_human_sync_output(&quiet_ctx, true));
+        assert!(should_render_human_sync_output(&plain_ctx, false));
+        assert!(should_render_human_sync_output(&plain_ctx, true));
     }
 
     #[test]
