@@ -420,8 +420,8 @@ fn needs_client_filters(args: &ListArgs) -> bool {
         || args.overdue
 }
 
-fn requires_post_query_ordering(args: &ListArgs, client_filters: bool) -> bool {
-    client_filters || args.sort.is_some()
+fn requires_post_query_ordering(_args: &ListArgs, client_filters: bool) -> bool {
+    client_filters
 }
 
 fn apply_client_filters(
@@ -666,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn test_requires_post_query_ordering_only_for_client_filters_or_explicit_sort() {
+    fn test_requires_post_query_ordering_only_for_client_filters() {
         let args = ListArgs::default();
         assert!(!requires_post_query_ordering(&args, false));
 
@@ -680,7 +680,7 @@ mod tests {
             sort: Some("updated".to_string()),
             ..ListArgs::default()
         };
-        assert!(requires_post_query_ordering(&args, false));
+        assert!(!requires_post_query_ordering(&args, false));
 
         let args = ListArgs {
             desc_contains: Some("needle".to_string()),
