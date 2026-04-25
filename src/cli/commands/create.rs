@@ -410,7 +410,21 @@ fn resolve_dependency_id(
         return Ok(input.to_string());
     }
 
-    resolve_issue_id(storage, resolver, input)
+    match resolve_issue_id(storage, resolver, input) {
+        Ok(id) => Ok(id),
+        Err(id_error) => match storage.find_ids_by_exact_title(input)?.as_slice() {
+            [] => Err(id_error),
+            [id] => Ok(id.clone()),
+            ids => Err(BeadsError::validation(
+                "deps",
+                format!(
+                    "dependency title '{}' matches multiple issues: {}",
+                    input.trim(),
+                    ids.join(", ")
+                ),
+            )),
+        },
+    }
 }
 
 fn validate_relations(args: &CreateArgs, issue_id: &str) -> Result<()> {

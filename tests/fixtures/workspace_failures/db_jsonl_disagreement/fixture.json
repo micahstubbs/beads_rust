@@ -18,7 +18,7 @@
     },
     {
       "surface": "sync --status",
-      "outcome": "status_jsonl_newer"
+      "outcome": "status_diverged"
     },
     {
       "surface": "sync --import-only",

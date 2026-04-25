@@ -1,7 +1,7 @@
 #![allow(dead_code, unused_imports)]
 
 use beads_rust::storage::SqliteStorage;
-use std::sync::Once;
+use std::sync::{Mutex, Once, OnceLock};
 use std::time::Instant;
 use tempfile::TempDir;
 use tracing::info;
@@ -42,6 +42,14 @@ pub use scenarios::{
 };
 
 static INIT: Once = Once::new();
+static WORKSPACE_REPLAY_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+pub fn workspace_replay_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    WORKSPACE_REPLAY_TEST_MUTEX
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 pub fn init_test_logging() {
     INIT.call_once(|| {

@@ -4181,6 +4181,22 @@ impl SqliteStorage {
         Ok(Self::get_issue_from_conn(&self.conn, id)?.is_some())
     }
 
+    /// Find issue IDs with a title that exactly matches `title`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn find_ids_by_exact_title(&self, title: &str) -> Result<Vec<String>> {
+        let rows = self.conn.query_with_params(
+            "SELECT id FROM issues WHERE title = ? ORDER BY created_at ASC, id ASC",
+            &[SqliteValue::from(title.trim())],
+        )?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from))
+            .collect())
+    }
+
     fn issue_status_in_tx(conn: &Connection, id: &str) -> Result<Option<Status>> {
         Ok(Self::get_issue_from_conn(conn, id)?.map(|issue| issue.status))
     }

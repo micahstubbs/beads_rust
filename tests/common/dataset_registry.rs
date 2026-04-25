@@ -132,9 +132,12 @@ pub enum WorkspaceFailureCommandOutcome {
     RepairNoop,
     StatusInSync,
     StatusJsonlNewer,
+    StatusDiverged,
+    StatusDbNewer,
     FailsPrefixMismatch,
     FailsConflictMarkers,
     FailsInvalidJson,
+    FailsRepeatedRepair,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]

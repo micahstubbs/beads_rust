@@ -383,30 +383,14 @@ pub fn escape_markdown(content: &str) -> String {
 mod tests {
     use super::*;
 
-    fn plain_ctx() -> OutputContext {
-        OutputContext::with_mode(OutputMode::Plain)
-    }
-
-    fn json_ctx() -> OutputContext {
-        OutputContext::with_mode(OutputMode::Json)
-    }
-
-    fn quiet_ctx() -> OutputContext {
-        OutputContext::with_mode(OutputMode::Quiet)
-    }
-
-    fn toon_ctx() -> OutputContext {
-        OutputContext::with_mode(OutputMode::Toon)
-    }
-
-    fn rich_ctx() -> OutputContext {
-        OutputContext::with_mode(OutputMode::Rich)
+    fn ctx(mode: OutputMode) -> OutputContext {
+        OutputContext::with_mode(mode)
     }
 
     #[test]
     fn test_render_markdown_plain_strips_formatting() {
         let content = "# Heading\n\nThis is **bold** and *italic*.";
-        let result = render_markdown(content, &plain_ctx());
+        let result = render_markdown(content, &ctx(OutputMode::Plain));
         assert!(result.contains("Heading"));
         assert!(result.contains("bold"));
         assert!(result.contains("italic"));
@@ -417,28 +401,28 @@ mod tests {
     #[test]
     fn test_render_markdown_json_unchanged() {
         let content = "# Heading\n\n**bold** text";
-        let result = render_markdown(content, &json_ctx());
+        let result = render_markdown(content, &ctx(OutputMode::Json));
         assert_eq!(result, content);
     }
 
     #[test]
     fn test_render_markdown_quiet_empty() {
         let content = "# Heading\n\nSome content";
-        let result = render_markdown(content, &quiet_ctx());
+        let result = render_markdown(content, &ctx(OutputMode::Quiet));
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_render_markdown_toon_unchanged() {
         let content = "# Heading\n\n**bold** text";
-        let result = render_markdown(content, &toon_ctx());
+        let result = render_markdown(content, &ctx(OutputMode::Toon));
         assert_eq!(result, content);
     }
 
     #[test]
     fn test_render_markdown_rich_contains_content() {
         let content = "# Heading\n\nThis is **bold** text.";
-        let result = render_markdown(content, &rich_ctx());
+        let result = render_markdown(content, &ctx(OutputMode::Rich));
         assert!(result.contains("Heading"));
         assert!(result.contains("bold"));
         assert!(result.contains("text"));
@@ -554,7 +538,7 @@ mod tests {
     #[test]
     fn test_render_markdown_multiline() {
         let content = "# Title\n\nParagraph one.\n\nParagraph two.";
-        let result = render_markdown(content, &plain_ctx());
+        let result = render_markdown(content, &ctx(OutputMode::Plain));
         assert!(result.contains("Title"));
         assert!(result.contains("Paragraph one"));
         assert!(result.contains("Paragraph two"));

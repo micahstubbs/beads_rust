@@ -25,25 +25,35 @@ use beads_rust::util::{ContentHashable, content_hash, content_hash_from_parts};
 #[test]
 fn id_seed_deterministic_fixture() {
     let title = "Fix authentication bug";
-    let description = Some("Users are getting logged out unexpectedly");
-    let creator = Some("alice");
+    let description_value = "Users are getting logged out unexpectedly";
+    let description = Some(description_value);
+    let creator_value = "alice";
+    let creator = Some(creator_value);
     // Use a fixed timestamp for reproducibility
     let created_at = Utc.with_ymd_and_hms(2026, 1, 15, 10, 30, 0).unwrap();
     let nonce = 0u32;
 
     let seed = generate_id_seed(title, description, creator, created_at, nonce);
 
-    // Verify seed format: title|description|creator|timestamp_nanos|nonce
-    assert!(
-        seed.starts_with("Fix authentication bug|"),
-        "Seed should start with title"
+    // Verify seed format: length-prefixed fields in the order
+    // title, description, creator, timestamp_nanos, nonce.
+    let timestamp = created_at.timestamp_nanos_opt().unwrap().to_string();
+    let expected_seed = [
+        format!("{}:{title}", title.len()),
+        format!("{}:{description_value}", description_value.len()),
+        format!("{}:{creator_value}", creator_value.len()),
+        format!("{}:{timestamp}", timestamp.len()),
+        format!("{}:{nonce}", nonce.to_string().len()),
+    ]
+    .concat();
+    assert_eq!(seed, expected_seed, "Seed should be length-prefixed");
+
+    let title_separator_seed = generate_id_seed("a|b", Some(""), None, created_at, nonce);
+    let description_separator_seed = generate_id_seed("a", Some("b|"), None, created_at, nonce);
+    assert_ne!(
+        title_separator_seed, description_separator_seed,
+        "Length prefixes must keep embedded separators unambiguous"
     );
-    assert!(
-        seed.contains("|Users are getting logged out unexpectedly|"),
-        "Seed should contain description"
-    );
-    assert!(seed.contains("|alice|"), "Seed should contain creator");
-    assert!(seed.ends_with("|0"), "Seed should end with nonce 0");
 
     // Verify determinism - same inputs produce same seed
     let seed2 = generate_id_seed(title, description, creator, created_at, nonce);

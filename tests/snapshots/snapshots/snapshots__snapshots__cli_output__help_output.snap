@@ -44,7 +44,6 @@ Commands:
   sync         Sync database with JSONL file (export or import)
   undefer      Undefer issues (make ready again)
   update       Update an issue
-  serve        Start an MCP (Model Context Protocol) server on stdio
   upgrade      Upgrade br to the latest version
   version      Show version information
   where        Show the active .beads directory
@@ -58,7 +57,7 @@ Options:
       --ID-REDACTED                Skip auto JSONL export
       --ID-REDACTED               Skip auto import check
       --ID-REDACTED                  Allow stale DB (bypass freshness check warning)
-      --ID-REDACTED <LOCK_TIMEOUT>  `SQLite` busy timeout in ms
+      --ID-REDACTED <LOCK_TIMEOUT>  `SQLite` busy/ID-REDACTED timeout in ms
       --no-db                        ID-REDACTED mode (no DB connection)
   -v, --verbose...                   Increase logging verbosity (-v, -vv)
   -q, --quiet                        Quiet mode (no output except errors)

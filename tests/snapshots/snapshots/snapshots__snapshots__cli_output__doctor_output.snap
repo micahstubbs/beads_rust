@@ -4,6 +4,7 @@ assertion_line: 137
 expression: normalize_output(&output.stdout)
 ---
 br doctor
+HEALTH workspace: degraded
 OK jsonl.merge_artifacts
 OK sync_jsonl_path: JSONL path is within sync allowlist
 OK sync_conflict_markers: No merge conflict markers found
@@ -14,8 +15,8 @@ OK schema.tables
 OK schema.columns
 OK db.recoverable_anomalies
 OK db.null_defaults
-WARN sqlite.integrity_check: database disk image is malformed: page 4 is never used
+OK sqlite.integrity_check
 OK counts.db_vs_jsonl: Both have 0 records
 OK sync.metadata: External changes pending import
 OK db.write_probe: No issues available for ID-REDACTED write probe
-WARN sqlite3.integrity_check: *** in database main ***; Page 4: never used; Page 5: never used; Page 6: never used; Page 7: never used; Page 8: never used; Page 9: never used; Page 10: never used; Page 37: never used; Page 38: never used; Page 39: never used; Page 40: never used; Page 41: never used; Page 42: never used; Page 43: never used; Page 51: never used; Page 52: never used; Page 53: never used; Page 54: never used; Page 55: never used; Page 56: never used; Page 57: never used; Page 62: never used; Page 63: never used; Page 64: never used; Page 65: never used; Page 66: never used; Page 67: never used; Page 68: never used; Page 82: never used; Page 83: never used; Page 84: never used; Page 85: never used; Page 86: never used; Page 87: never used; Page 88: never used; Page 92: never used; Page 93: never used; Page 94: never used; Page 95: never used; Page 96: never used; Page 97: never used; Page 98: never used
+OK sqlite3.integrity_check

@@ -224,30 +224,14 @@ pub fn available_themes() -> Vec<String> {
 mod tests {
     use super::*;
 
-    fn plain_ctx() -> OutputContext {
-        OutputContext::with_mode(OutputMode::Plain)
-    }
-
-    fn json_ctx() -> OutputContext {
-        OutputContext::with_mode(OutputMode::Json)
-    }
-
-    fn quiet_ctx() -> OutputContext {
-        OutputContext::with_mode(OutputMode::Quiet)
-    }
-
-    fn toon_ctx() -> OutputContext {
-        OutputContext::with_mode(OutputMode::Toon)
-    }
-
-    fn rich_ctx() -> OutputContext {
-        OutputContext::with_mode(OutputMode::Rich)
+    fn ctx(mode: OutputMode) -> OutputContext {
+        OutputContext::with_mode(mode)
     }
 
     #[test]
     fn test_highlight_code_plain_mode() {
         let code = "fn main() {}";
-        let result = highlight_code(code, "rust", &plain_ctx());
+        let result = highlight_code(code, "rust", &ctx(OutputMode::Plain));
         assert_eq!(result, "    fn main() {}");
         assert!(!result.contains("\x1b[")); // No ANSI codes
     }
@@ -255,35 +239,35 @@ mod tests {
     #[test]
     fn test_highlight_code_plain_multiline() {
         let code = "line1\nline2\nline3";
-        let result = highlight_code(code, "text", &plain_ctx());
+        let result = highlight_code(code, "text", &ctx(OutputMode::Plain));
         assert_eq!(result, "    line1\n    line2\n    line3");
     }
 
     #[test]
     fn test_highlight_code_json_mode_unchanged() {
         let code = "fn main() { println!(\"test\"); }";
-        let result = highlight_code(code, "rust", &json_ctx());
+        let result = highlight_code(code, "rust", &ctx(OutputMode::Json));
         assert_eq!(result, code); // Unchanged
     }
 
     #[test]
     fn test_highlight_code_quiet_mode_empty() {
         let code = "fn main() {}";
-        let result = highlight_code(code, "rust", &quiet_ctx());
+        let result = highlight_code(code, "rust", &ctx(OutputMode::Quiet));
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_highlight_code_toon_mode_unchanged() {
         let code = "fn main() { println!(\"test\"); }";
-        let result = highlight_code(code, "rust", &toon_ctx());
+        let result = highlight_code(code, "rust", &ctx(OutputMode::Toon));
         assert_eq!(result, code);
     }
 
     #[test]
     fn test_highlight_code_rich_mode_rust() {
         let code = "fn main() { println!(\"Hello\"); }";
-        let result = highlight_code(code, "rust", &rich_ctx());
+        let result = highlight_code(code, "rust", &ctx(OutputMode::Rich));
         // Should contain the code text
         assert!(result.contains("fn"));
         assert!(result.contains("main"));
@@ -293,7 +277,7 @@ mod tests {
     #[test]
     fn test_highlight_code_rich_mode_python() {
         let code = "def hello():\n    print('world')";
-        let result = highlight_code(code, "python", &rich_ctx());
+        let result = highlight_code(code, "python", &ctx(OutputMode::Rich));
         assert!(result.contains("def"));
         assert!(result.contains("hello"));
     }
@@ -301,14 +285,14 @@ mod tests {
     #[test]
     fn test_highlight_code_unknown_language_fallback() {
         let code = "some random text";
-        let result = highlight_code(code, "nonexistent_language_xyz", &rich_ctx());
+        let result = highlight_code(code, "nonexistent_language_xyz", &ctx(OutputMode::Rich));
         // Should fall back to plain formatting
         assert!(result.contains("some random text"));
     }
 
     #[test]
     fn test_highlight_code_empty() {
-        let result = highlight_code("", "rust", &rich_ctx());
+        let result = highlight_code("", "rust", &ctx(OutputMode::Rich));
         assert!(result.is_empty() || result.chars().all(char::is_whitespace));
     }
 
@@ -390,7 +374,7 @@ mod tests {
     fn test_highlight_long_code_with_line_numbers() {
         // Code with > 5 lines should show line numbers in rich mode
         let code = "line1\nline2\nline3\nline4\nline5\nline6\nline7";
-        let result = highlight_code(code, "text", &rich_ctx());
+        let result = highlight_code(code, "text", &ctx(OutputMode::Rich));
         // Just verify it doesn't crash and contains the content
         assert!(result.contains("line1"));
         assert!(result.contains("line7"));

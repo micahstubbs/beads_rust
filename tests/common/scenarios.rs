@@ -4341,6 +4341,7 @@ mod tests {
 
     #[test]
     fn workspace_evolution_dependency_story_materializes_replayable_workspace() {
+        let _guard = super::super::workspace_replay_test_guard();
         let materialized = catalog::long_lived_dependency_story(23)
             .execute()
             .expect("dependency story should execute");
@@ -4381,6 +4382,7 @@ mod tests {
 
     #[test]
     fn workspace_evolution_recovery_story_restores_clean_replay_input() {
+        let _guard = super::super::workspace_replay_test_guard();
         let materialized = catalog::long_lived_recovery_story(29)
             .execute()
             .expect("recovery story should execute");

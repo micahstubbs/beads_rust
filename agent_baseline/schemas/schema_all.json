@@ -1,6 +1,6 @@
 {
   "tool": "br",
-  "generated_at": "2026-04-21T21:18:56.521535267Z",
+  "generated_at": "2026-04-25T00:17:56.050349701Z",
   "schemas": {
     "BlockedIssue": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",

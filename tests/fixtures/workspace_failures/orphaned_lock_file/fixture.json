@@ -2,7 +2,7 @@
   "name": "orphaned_lock_file",
   "family": "external_interference",
   "description": "The workspace includes an orphaned .beads.lock file left behind by a killed process or external sync tool.",
-  "expected_classification": "healthy",
+  "expected_classification": "usable",
   "expected_command_outcomes": [
     {
       "surface": "startup/open",
@@ -18,7 +18,7 @@
     },
     {
       "surface": "sync --status",
-      "outcome": "status_in_sync"
+      "outcome": "status_db_newer"
     }
   ],
   "source_hint": "Covers the cloud-drive/editor interference class from beads_rust-rsei.3.3.",

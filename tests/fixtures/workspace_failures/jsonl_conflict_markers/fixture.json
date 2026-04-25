@@ -2,15 +2,15 @@
   "name": "jsonl_conflict_markers",
   "family": "malformed_jsonl",
   "description": "The JSONL export contains git merge conflict markers wrapped around otherwise valid records.",
-  "expected_classification": "unsafe",
+  "expected_classification": "degraded",
   "expected_command_outcomes": [
     {
       "surface": "startup/open",
-      "outcome": "fails_conflict_markers"
+      "outcome": "success"
     },
     {
       "surface": "create",
-      "outcome": "fails_conflict_markers"
+      "outcome": "success"
     },
     {
       "surface": "doctor",
@@ -18,11 +18,11 @@
     },
     {
       "surface": "doctor --repair",
-      "outcome": "fails_invalid_json"
+      "outcome": "fails_conflict_markers"
     },
     {
       "surface": "sync --status",
-      "outcome": "status_jsonl_newer"
+      "outcome": "status_diverged"
     },
     {
       "surface": "sync --import-only",

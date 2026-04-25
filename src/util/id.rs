@@ -177,7 +177,8 @@ impl IdGenerator {
 
 /// Generate the seed string for ID generation.
 ///
-/// Inputs: `title | description | creator | created_at (ns) | nonce`
+/// Inputs are length-prefixed as `len:value` fields so embedded separators in
+/// titles or descriptions cannot collide with adjacent fields.
 #[must_use]
 pub fn generate_id_seed(
     title: &str,

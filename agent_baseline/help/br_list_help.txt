@@ -90,9 +90,9 @@ Options:
 
       --fields <FIELDS>
           CSV fields to include (comma-separated)
-          
+
           Available: id, title, description, status, priority, `issue_type`, assignee, owner, `created_at`, `updated_at`, `closed_at`, `due_at`, `defer_until`, notes, `external_ref`
-          
+
           Default: id, title, status, priority, `issue_type`, assignee, `created_at`, `updated_at`
 
       --db <DB>

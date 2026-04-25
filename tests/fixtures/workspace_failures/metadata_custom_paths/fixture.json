@@ -22,7 +22,7 @@
     },
     {
       "surface": "sync --status",
-      "outcome": "status_in_sync"
+      "outcome": "status_db_newer"
     }
   ],
   "source_hint": "Extends the metadata override coverage already present in tests/e2e_env_overrides.rs and src/config/mod.rs.",

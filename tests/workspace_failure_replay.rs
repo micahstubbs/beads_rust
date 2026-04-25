@@ -479,14 +479,27 @@ fn assert_surface_outcome(
             let json = parse_stdout_json(&run, &context);
             assert_status_surface(&context, &json, true, false);
         }
+        WorkspaceFailureCommandOutcome::StatusDiverged => {
+            assert!(run.status.success(), "{context} failed: {}", run.stderr);
+            let json = parse_stdout_json(&run, &context);
+            assert_status_surface(&context, &json, true, true);
+        }
+        WorkspaceFailureCommandOutcome::StatusDbNewer => {
+            assert!(run.status.success(), "{context} failed: {}", run.stderr);
+            let json = parse_stdout_json(&run, &context);
+            assert_status_surface(&context, &json, false, true);
+        }
         WorkspaceFailureCommandOutcome::FailsPrefixMismatch => {
             assert_config_error(&run, "Prefix mismatch", &context);
         }
         WorkspaceFailureCommandOutcome::FailsConflictMarkers => {
-            assert_config_error(&run, "Merge conflict markers detected", &context);
+            assert_config_error(&run, "conflict marker", &context);
         }
         WorkspaceFailureCommandOutcome::FailsInvalidJson => {
             assert_config_error(&run, "invalid issue record", &context);
+        }
+        WorkspaceFailureCommandOutcome::FailsRepeatedRepair => {
+            assert_config_error(&run, "--allow-repeated-repair", &context);
         }
     }
 }
@@ -572,7 +585,7 @@ fn assert_core_read_failure(
         WorkspaceFailureCommandOutcome::FailsConflictMarkers => {
             assert_config_error(
                 &ready,
-                "Merge conflict markers detected",
+                "conflict marker",
                 &format!("{} core ready", fixture.metadata.name),
             );
         }
@@ -601,7 +614,7 @@ fn assert_core_read_failure(
         WorkspaceFailureCommandOutcome::FailsConflictMarkers => {
             assert_config_error(
                 &show,
-                "Merge conflict markers detected",
+                "conflict marker",
                 &format!("{} core show", fixture.metadata.name),
             );
         }
@@ -728,7 +741,7 @@ fn assert_core_write_failure(
         WorkspaceFailureCommandOutcome::FailsConflictMarkers => {
             assert_config_error(
                 create,
-                "Merge conflict markers detected",
+                "conflict marker",
                 &format!("{} core create", fixture.metadata.name),
             );
         }
@@ -741,6 +754,7 @@ fn assert_core_write_failure(
 
 #[test]
 fn workspace_failure_replay_manifest_expectations_hold_on_fresh_copies() {
+    let _guard = common::workspace_replay_test_guard();
     let _log =
         common::test_log("workspace_failure_replay_manifest_expectations_hold_on_fresh_copies");
     let fixtures = list_workspace_failure_fixtures().expect("fixture catalog");
@@ -755,6 +769,7 @@ fn workspace_failure_replay_manifest_expectations_hold_on_fresh_copies() {
 
 #[test]
 fn workspace_failure_replay_doctor_reliability_audit_matches_fixture_posture() {
+    let _guard = common::workspace_replay_test_guard();
     let _log = common::test_log(
         "workspace_failure_replay_doctor_reliability_audit_matches_fixture_posture",
     );
@@ -775,6 +790,7 @@ fn workspace_failure_replay_doctor_reliability_audit_matches_fixture_posture() {
 
 #[test]
 fn workspace_failure_replay_core_read_surfaces_match_expected_posture() {
+    let _guard = common::workspace_replay_test_guard();
     let _log =
         common::test_log("workspace_failure_replay_core_read_surfaces_match_expected_posture");
     let fixtures = list_workspace_failure_fixtures().expect("fixture catalog");
@@ -836,6 +852,7 @@ fn workspace_failure_replay_core_read_surfaces_match_expected_posture() {
 
 #[test]
 fn workspace_failure_replay_core_write_surfaces_match_expected_posture() {
+    let _guard = common::workspace_replay_test_guard();
     let _log =
         common::test_log("workspace_failure_replay_core_write_surfaces_match_expected_posture");
     let fixtures = list_workspace_failure_fixtures().expect("fixture catalog");
@@ -897,7 +914,10 @@ fn infer_classification(metadata: &WorkspaceFailureFixtureMetadata) -> &'static 
         matches!(doctor, Some(WorkspaceFailureCommandOutcome::ReportsErrors));
     let sync_shows_drift = matches!(
         sync_status,
-        Some(WorkspaceFailureCommandOutcome::StatusJsonlNewer)
+        Some(
+            WorkspaceFailureCommandOutcome::StatusJsonlNewer
+                | WorkspaceFailureCommandOutcome::StatusDiverged
+        )
     );
 
     if startup_fails {
@@ -931,6 +951,7 @@ fn infer_classification(metadata: &WorkspaceFailureFixtureMetadata) -> &'static 
 
 #[test]
 fn workspace_failure_replay_classification_coherence() {
+    let _guard = common::workspace_replay_test_guard();
     let _log = common::test_log("workspace_failure_replay_classification_coherence");
     let fixtures = list_workspace_failure_fixtures().expect("fixture catalog");
 

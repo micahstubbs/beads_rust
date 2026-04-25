@@ -68,7 +68,8 @@ static HOME_PATH_RE: LazyLock<Regex> =
 static USERS_PATH_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"/Users/[a-zA-Z0-9_-]+").expect("users path regex"));
 static TMP_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"/tmp/\.tmp[a-zA-Z0-9]+|/var/folders/[a-zA-Z0-9/_-]+").expect("tmp path regex")
+    Regex::new(r"(?:/data)?/tmp/[A-Za-z0-9_-]*/?\.tmp[a-zA-Z0-9]+|/var/folders/[a-zA-Z0-9/_-]+")
+        .expect("tmp path regex")
 });
 static VERSION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\((main|master)@[a-f0-9]+\)").expect("version regex"));

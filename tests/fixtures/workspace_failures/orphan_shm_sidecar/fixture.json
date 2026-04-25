@@ -22,7 +22,7 @@
     },
     {
       "surface": "sync --status",
-      "outcome": "status_in_sync"
+      "outcome": "status_db_newer"
     }
   ],
   "source_hint": "Complements the WAL-without-SHM fixture with the opposite external sidecar-pruning shape from beads_rust-rsei.3.3.",

@@ -35,7 +35,9 @@ fn test_create_deps_colon_title() {
         &file_path,
         r"
 ## My Task
-[depends_on: Task: With colon]
+
+### Dependencies
+- Task: With colon
 ",
     )
     .unwrap();
