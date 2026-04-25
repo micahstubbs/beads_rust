@@ -25,6 +25,18 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
+const PRIORITY_DETAIL_HINT: &str =
+    "Priority must be 0-4 (or P0-P4): 0=critical, 1=high, 2=medium, 3=low, 4=backlog";
+const PRIORITY_SHORT_HINT: &str = "Priority must be 0-4 (0=critical, 4=backlog).";
+const VALID_STATUS_HINT: &str =
+    "Valid statuses: open, in_progress, blocked, deferred, draft, closed, tombstone, pinned";
+const VALID_TYPE_HINT: &str = "Valid types: task, bug, feature, epic, chore, docs, question";
+
+#[must_use]
+fn flag_value_hint(flag: &str, detected: &str) -> String {
+    format!("Did you mean --{flag} {detected}?")
+}
+
 /// Machine-readable error codes.
 ///
 /// These codes are stable and can be used for programmatic error handling.
@@ -400,16 +412,10 @@ impl StructuredError {
     /// Create a structured error for invalid priority.
     #[must_use]
     pub fn invalid_priority(provided: &str) -> Self {
-        let hint = if let Some(detected) = detect_priority_intent(provided) {
-            Some(format!(
-                "Did you mean --priority {detected}? Priority must be 0-4 (or P0-P4): 0=critical, 1=high, 2=medium, 3=low, 4=backlog"
-            ))
-        } else {
-            Some(
-                "Priority must be 0-4 (or P0-P4): 0=critical, 1=high, 2=medium, 3=low, 4=backlog"
-                    .to_string(),
-            )
-        };
+        let hint = Some(detect_priority_intent(provided).map_or_else(
+            || PRIORITY_DETAIL_HINT.to_string(),
+            |detected| format!("Did you mean --priority {detected}? {PRIORITY_DETAIL_HINT}"),
+        ));
 
         let context = json!({
             "provided": provided,
@@ -435,14 +441,10 @@ impl StructuredError {
     /// Create a structured error for invalid status.
     #[must_use]
     pub fn invalid_status(provided: &str) -> Self {
-        let hint = if let Some(detected) = detect_status_intent(provided) {
-            Some(format!("Did you mean --status {detected}?"))
-        } else {
-            Some(
-                "Valid statuses: open, in_progress, blocked, deferred, draft, closed, tombstone, pinned"
-                    .to_string(),
-            )
-        };
+        let hint = Some(detect_status_intent(provided).map_or_else(
+            || VALID_STATUS_HINT.to_string(),
+            |detected| flag_value_hint("status", detected),
+        ));
 
         let context = json!({
             "provided": provided,
@@ -461,11 +463,10 @@ impl StructuredError {
     /// Create a structured error for invalid issue type.
     #[must_use]
     pub fn invalid_type(provided: &str) -> Self {
-        let hint = if let Some(detected) = detect_type_intent(provided) {
-            Some(format!("Did you mean --type {detected}?"))
-        } else {
-            Some("Valid types: task, bug, feature, epic, chore, docs, question".to_string())
-        };
+        let hint = Some(detect_type_intent(provided).map_or_else(
+            || VALID_TYPE_HINT.to_string(),
+            |detected| flag_value_hint("type", detected),
+        ));
 
         let context = json!({
             "provided": provided,
@@ -568,7 +569,7 @@ impl StructuredError {
             ),
             BeadsError::InvalidStatus { status } => {
                 let hint = detect_status_intent(status)
-                    .map(|detected| format!("Did you mean --status {detected}?"));
+                    .map(|detected| flag_value_hint("status", detected));
 
                 (
                     ErrorCode::InvalidStatus,
@@ -580,7 +581,7 @@ impl StructuredError {
             }
             BeadsError::InvalidType { issue_type } => {
                 let hint = detect_type_intent(issue_type)
-                    .map(|detected| format!("Did you mean --type {detected}?"));
+                    .map(|detected| flag_value_hint("type", detected));
 
                 (
                     ErrorCode::InvalidType,
@@ -591,10 +592,10 @@ impl StructuredError {
                 )
             }
             BeadsError::InvalidPriority { priority } => {
-                let hint = detect_priority_intent(priority).map_or_else(
-                    || Some("Priority must be 0-4 (0=critical, 4=backlog).".to_string()),
-                    |detected| Some(format!("Did you mean --priority {detected}?")),
-                );
+                let hint = Some(detect_priority_intent(priority).map_or_else(
+                    || PRIORITY_SHORT_HINT.to_string(),
+                    |detected| flag_value_hint("priority", detected),
+                ));
 
                 (
                     ErrorCode::InvalidPriority,
@@ -699,25 +700,16 @@ impl StructuredError {
                 Some("Run 'br list' to see available issues.".to_string())
             }
             BeadsError::InvalidPriority { priority } => {
-                if let Some(detected) = detect_priority_intent(priority) {
-                    Some(format!("Did you mean --priority {detected}?"))
-                } else {
-                    Some("Priority must be 0-4 (0=critical, 4=backlog).".to_string())
-                }
+                Some(detect_priority_intent(priority).map_or_else(
+                    || PRIORITY_SHORT_HINT.to_string(),
+                    |detected| flag_value_hint("priority", detected),
+                ))
             }
             BeadsError::InvalidStatus { status } => {
-                if let Some(detected) = detect_status_intent(status) {
-                    Some(format!("Did you mean --status {detected}?"))
-                } else {
-                    None
-                }
+                detect_status_intent(status).map(|detected| flag_value_hint("status", detected))
             }
             BeadsError::InvalidType { issue_type } => {
-                if let Some(detected) = detect_type_intent(issue_type) {
-                    Some(format!("Did you mean --type {detected}?"))
-                } else {
-                    None
-                }
+                detect_type_intent(issue_type).map(|detected| flag_value_hint("type", detected))
             }
             BeadsError::HasDependents { id, .. } => {
                 if let Some(ctx) = context
