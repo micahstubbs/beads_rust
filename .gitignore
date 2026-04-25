@@ -169,3 +169,30 @@ report.json
 # but repeat here so they stay ignored on fresh clones or machines
 # without the global entry).
 .ntm/logs/*.log
+
+# Skill-loop / refactor-pass run artifacts that should NOT be tracked.
+# Each pass's directory under refactor/artifacts/ legitimately contains
+# small markdown ledgers, scoring files, and golden replay JSON which
+# are tracked. The patterns below cover the consistently-large or
+# obviously-runtime entries that don't belong in git:
+#  - ast_grep_functions.json: 9.6MB+ AST function dumps used as scan
+#    input for one pass; trivially regeneratable via ast-grep.
+#  - tests_before.txt / tests_current.txt: raw `cargo test` output
+#    captures (1.1MB+ each); the LEDGER and verify_report markdown
+#    summarize them.
+#  - golden_workspace/: a live `br` workspace (beads.db, .br_history,
+#    .sync.lock, .write.lock, last-touched) used to record golden
+#    replays, regenerated each pass.
+refactor/artifacts/*/ast_grep_functions.json
+refactor/artifacts/*/tests_before.txt
+refactor/artifacts/*/tests_current.txt
+refactor/artifacts/*/golden_workspace/
+
+# Per-run perf profiling capture tree (2GB+ of perf.data, beads.db
+# workspaces per scenario, criterion-style throughput dumps). The
+# LEDGER and bench-summary markdown files are written elsewhere by
+# the perf scripts; this tree is purely raw data.
+tests/artifacts/perf/
+tests/artifacts/perf/**/perf.data
+tests/artifacts/perf/**/*.beads/
+*.perf.data
