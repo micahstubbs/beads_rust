@@ -2,7 +2,7 @@ use crate::cli::{CountArgs, CountBy};
 use crate::config;
 use crate::error::Result;
 use crate::model::Status;
-use crate::output::{OutputContext, OutputMode};
+use crate::output::OutputContext;
 use crate::storage::{ListFilters, SqliteStorage};
 use rich_rust::prelude::*;
 use serde::Serialize;
@@ -99,7 +99,7 @@ fn execute_inner(args: &CountArgs, ctx: &OutputContext, storage: &SqliteStorage)
         None
     });
 
-    if matches!(ctx.mode(), OutputMode::Quiet) {
+    if ctx.is_quiet() {
         return Ok(());
     }
 
@@ -109,7 +109,7 @@ fn execute_inner(args: &CountArgs, ctx: &OutputContext, storage: &SqliteStorage)
                 ctx.toon(&CountOutput { count: total });
             } else if ctx.is_json() {
                 ctx.json_pretty(&CountOutput { count: total });
-            } else if matches!(ctx.mode(), OutputMode::Rich) {
+            } else if ctx.is_rich() {
                 render_count_simple_rich(total, ctx);
             } else {
                 println!("{total}");
@@ -121,7 +121,7 @@ fn execute_inner(args: &CountArgs, ctx: &OutputContext, storage: &SqliteStorage)
                 ctx.toon(&CountGroupedOutput { total, groups });
             } else if ctx.is_json() {
                 ctx.json_pretty(&CountGroupedOutput { total, groups });
-            } else if matches!(ctx.mode(), OutputMode::Rich) {
+            } else if ctx.is_rich() {
                 render_count_grouped_rich(total, &groups, by, ctx);
             } else {
                 println!("Total: {total}");
