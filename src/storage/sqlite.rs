@@ -4201,11 +4201,7 @@ impl SqliteStorage {
         Ok(Self::get_issue_from_conn(conn, id)?.map(|issue| issue.status))
     }
 
-    fn ensure_label_target_mutable_in_tx(
-        conn: &Connection,
-        issue_id: &str,
-        action: &str,
-    ) -> Result<()> {
+    fn ensure_issue_mutable_in_tx(conn: &Connection, issue_id: &str, action: &str) -> Result<()> {
         match Self::issue_status_in_tx(conn, issue_id)? {
             Some(Status::Tombstone) => Err(BeadsError::Validation {
                 field: "issue_id".to_string(),
@@ -4876,7 +4872,7 @@ impl SqliteStorage {
     /// Returns an error if the database update fails.
     pub fn remove_all_labels(&mut self, issue_id: &str, actor: &str) -> Result<usize> {
         self.mutate("remove_all_labels", actor, |conn, ctx| {
-            Self::ensure_label_target_mutable_in_tx(conn, issue_id, "remove labels from")?;
+            Self::ensure_issue_mutable_in_tx(conn, issue_id, "remove labels from")?;
 
             let rows = conn.execute_with_params(
                 "DELETE FROM labels WHERE issue_id = ?",
@@ -4911,7 +4907,7 @@ impl SqliteStorage {
     /// Returns an error if the database update fails.
     pub fn set_labels(&mut self, issue_id: &str, labels: &[String], actor: &str) -> Result<()> {
         self.mutate("set_labels", actor, |conn, ctx| {
-            Self::ensure_label_target_mutable_in_tx(conn, issue_id, "set labels on")?;
+            Self::ensure_issue_mutable_in_tx(conn, issue_id, "set labels on")?;
 
             let old_rows = conn.query_with_params(
                 "SELECT label FROM labels WHERE issue_id = ?",
@@ -5287,6 +5283,8 @@ impl SqliteStorage {
             ));
         }
         self.mutate("add_comment", author, |conn, ctx| {
+            Self::ensure_issue_mutable_in_tx(conn, issue_id, "add comment to")?;
+
             let comment_id = insert_comment_row(conn, issue_id, author, text)?;
 
             conn.execute_with_params(
@@ -9201,6 +9199,45 @@ mod tests {
         let comments = storage.get_comments("bd-c2").unwrap();
         assert_eq!(comments.len(), 1);
         assert_eq!(comments[0], comment);
+    }
+
+    #[test]
+    fn test_add_comment_rejects_tombstone_issue() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-c-tomb",
+            "Deleted comment target",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        let original_comment = storage
+            .add_comment("bd-c-tomb", "alice", "Before delete")
+            .unwrap();
+        storage
+            .delete_issue("bd-c-tomb", "tester", "delete comment target", None)
+            .unwrap();
+
+        let error = storage
+            .add_comment("bd-c-tomb", "bob", "After delete")
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                BeadsError::Validation { field, reason }
+                    if field == "issue_id"
+                        && reason.contains("cannot add comment to tombstone issue: bd-c-tomb")
+            ),
+            "unexpected add_comment error: {error:?}"
+        );
+
+        let comments = storage.get_comments("bd-c-tomb").unwrap();
+        assert_eq!(comments, vec![original_comment]);
     }
 
     #[test]
