@@ -59,6 +59,7 @@ perf.data.old
 
 # Large source images (webp versions are committed)
 *.png
+!gh_og_share_image.png
 
 # Claude Code temp files
 claude-upgrade-progress.json
