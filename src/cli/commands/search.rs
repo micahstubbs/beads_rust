@@ -88,10 +88,10 @@ fn collect_search_results(
     let mut filters = build_filters(list_args)?;
     let client_filters = needs_client_filters(list_args);
     let needs_post_query_ordering = requires_post_query_ordering(list_args, client_filters);
-    let limit = if needs_post_query_ordering {
-        filters.limit.take()
+    let (offset, limit) = if needs_post_query_ordering {
+        (filters.offset.take(), filters.limit.take())
     } else {
-        None
+        (None, None)
     };
     if needs_post_query_ordering {
         filters.sort = None;
@@ -109,6 +109,15 @@ fn collect_search_results(
         apply_issue_sort(&mut issues, list_args.sort.as_deref())?;
         if list_args.reverse {
             issues.reverse();
+        }
+        if let Some(offset) = offset
+            && offset > 0
+        {
+            if offset >= issues.len() {
+                issues.clear();
+            } else {
+                issues = issues.split_off(offset);
+            }
         }
         if let Some(limit) = limit
             && limit > 0
@@ -699,6 +708,68 @@ mod tests {
         apply_issue_sort(&mut items, Some("updated")).expect("sort");
         items.truncate(1);
         assert_eq!(items[0].id, "bd-b");
+    }
+
+    #[test]
+    fn test_search_applies_offset_after_explicit_sort() {
+        let mut storage = SqliteStorage::open_memory().expect("db");
+        let t1 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2025, 1, 2, 0, 0, 0).unwrap();
+        let t3 = Utc.with_ymd_and_hms(2025, 1, 3, 0, 0, 0).unwrap();
+
+        let alpha = make_issue("bd-alpha", "match Alpha", None, t2);
+        let bravo = make_issue("bd-bravo", "match Bravo", None, t1);
+        let zulu = make_issue("bd-zulu", "match Zulu", None, t3);
+
+        storage.create_issue(&alpha, "tester").expect("create");
+        storage.create_issue(&bravo, "tester").expect("create");
+        storage.create_issue(&zulu, "tester").expect("create");
+
+        let args = ListArgs {
+            sort: Some("title".to_string()),
+            offset: Some(1),
+            limit: Some(1),
+            ..Default::default()
+        };
+
+        let results = collect_search_results(&storage, "match", &args).expect("search");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "bd-bravo");
+    }
+
+    #[test]
+    fn test_search_applies_offset_after_client_filters() {
+        let mut storage = SqliteStorage::open_memory().expect("db");
+        let t1 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2025, 1, 2, 0, 0, 0).unwrap();
+        let t3 = Utc.with_ymd_and_hms(2025, 1, 3, 0, 0, 0).unwrap();
+
+        let older_match = make_issue("bd-old", "match old", Some("needle"), t1);
+        let newer_match = make_issue("bd-mid", "match mid", Some("needle"), t2);
+        let newest_nonmatch = make_issue("bd-new", "match new", Some("other"), t3);
+
+        storage
+            .create_issue(&older_match, "tester")
+            .expect("create");
+        storage
+            .create_issue(&newer_match, "tester")
+            .expect("create");
+        storage
+            .create_issue(&newest_nonmatch, "tester")
+            .expect("create");
+
+        let args = ListArgs {
+            desc_contains: Some("needle".to_string()),
+            offset: Some(1),
+            limit: Some(1),
+            ..Default::default()
+        };
+
+        let results = collect_search_results(&storage, "match", &args).expect("search");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "bd-old");
     }
 
     #[test]
