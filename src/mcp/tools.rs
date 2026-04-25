@@ -18,7 +18,7 @@ use serde_json::json;
 use crate::error::{BeadsError, ErrorCode, StructuredError};
 use crate::model::{Issue, IssueType, Priority, Status};
 use crate::storage::{IssueUpdate, ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
-use crate::validation::LabelValidator;
+use crate::validation::{IssueValidator, LabelValidator};
 
 use super::BeadsState;
 
@@ -1384,6 +1384,10 @@ impl ToolHandler for CreateIssueTool {
                 ..Issue::default()
             };
 
+            IssueValidator::validate(&issue)
+                .map_err(BeadsError::from_validation_errors)
+                .map_err(beads_to_mcp)?;
+
             storage
                 .create_issue(&issue, &self.0.actor)
                 .map_err(beads_to_mcp)?;
@@ -2158,15 +2162,33 @@ impl ToolHandler for ProjectOverviewTool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_list_filters, generate_issue_id_with_checked_lookup, issue_not_found_err,
-        next_available_child_id, optional_label_array_arg, optional_string_array_arg,
-        parse_update_fields, storage_read_warning,
+        CreateIssueTool, build_list_filters, generate_issue_id_with_checked_lookup,
+        issue_not_found_err, next_available_child_id, optional_label_array_arg,
+        optional_string_array_arg, parse_update_fields, storage_read_warning,
     };
     use crate::error::BeadsError;
+    use crate::mcp::BeadsState;
     use crate::storage::SqliteStorage;
     use chrono::TimeZone;
+    use fastmcp_rust::{Cx, McpContext, McpErrorCode, ToolHandler};
     use serde_json::json;
-    use std::cell::Cell;
+    use std::{cell::Cell, fs, sync::Arc};
+    use tempfile::TempDir;
+
+    fn mcp_test_state(temp: &TempDir) -> Arc<BeadsState> {
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        let db_path = beads_dir.join("beads.db");
+        SqliteStorage::open(&db_path).expect("initialize storage");
+        Arc::new(BeadsState {
+            db_path,
+            beads_dir: beads_dir.clone(),
+            jsonl_path: beads_dir.join("issues.jsonl"),
+            allow_external_jsonl: false,
+            actor: "mcp-test".to_string(),
+            issue_prefix: Some("br".to_string()),
+        })
+    }
 
     #[test]
     fn parse_update_fields_rejects_non_string_priority() {
@@ -2219,6 +2241,37 @@ mod tests {
                 .expect("valid labels");
 
         assert_eq!(labels, vec!["bug", "team:backend"]);
+    }
+
+    #[test]
+    fn create_issue_rejects_description_over_validator_limit_without_persisting() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        let tool = CreateIssueTool::new(Arc::clone(&state));
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let description = "x".repeat(102_401);
+
+        let err = tool
+            .call(
+                &ctx,
+                json!({
+                    "title": "MCP validator parity",
+                    "description": description
+                }),
+            )
+            .expect_err("MCP create must enforce full issue validation");
+
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+        assert!(
+            err.message.contains("description") && err.message.contains("exceeds 100KB"),
+            "unexpected MCP error: {err:?}"
+        );
+
+        let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        assert!(
+            storage.get_all_ids().expect("ids").is_empty(),
+            "invalid MCP issue should not be persisted"
+        );
     }
 
     #[test]
