@@ -203,18 +203,21 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
             .collect::<Vec<_>>();
         validate_multi_issue_external_ref_update(args.external_ref.as_deref(), &all_resolved_ids)?;
 
+        let use_machine_output = update_uses_machine_output(ctx);
+        let use_human_output = update_uses_human_output(ctx);
+
         for (issue_inputs, prepared_route) in prepared_routes {
             let route_output = execute_prepared_route(prepared_route, ctx)?;
 
-            if ctx.is_json() || ctx.is_toon() {
+            if use_machine_output {
                 routed_updated_issues.push((issue_inputs.clone(), route_output.updated_issues));
-            } else if !ctx.is_quiet() {
+            } else if use_human_output {
                 routed_render_items.push((issue_inputs.clone(), route_output.render_items));
             }
             routed_resolved_ids.push((issue_inputs, route_output.resolved_ids));
         }
 
-        let updated_issues = if ctx.is_json() || ctx.is_toon() {
+        let updated_issues = if use_machine_output {
             reorder_routed_items_by_requested_inputs(
                 &target_inputs,
                 routed_updated_issues,
@@ -223,7 +226,7 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         } else {
             Vec::new()
         };
-        let render_items = if !ctx.is_quiet() && !ctx.is_json() && !ctx.is_toon() {
+        let render_items = if use_human_output {
             reorder_routed_items_by_requested_inputs(
                 &target_inputs,
                 routed_render_items,
@@ -338,6 +341,8 @@ fn execute_prepared_route(
     let mut updated_issues: Vec<UpdatedIssueOutput> = Vec::new();
     let mut render_items = Vec::new();
     let resolved_ids = prepared.resolved_ids.clone();
+    let use_machine_output = update_uses_machine_output(ctx);
+    let use_human_output = update_uses_human_output(ctx);
     let mut route_has_mutated = false;
     let mut blocked_cache_dirty = false;
     let defer_blocked_cache_rebuild = prepared.update.status.is_some()
@@ -461,13 +466,11 @@ fn execute_prepared_route(
             issue_after_result,
         )?;
 
-        if ctx.is_json() || ctx.is_toon() {
+        if use_machine_output {
             if let Some(ref issue) = issue_after {
                 updated_issues.push(UpdatedIssueOutput::from(issue));
             }
-        } else if ctx.is_quiet() {
-            // No rendering in quiet mode.
-        } else if prepared.has_updates {
+        } else if use_human_output && prepared.has_updates {
             // Derive the rendered title and diff from the validated
             // pre-mutation snapshot + the user's requested update.  If a
             // title change was requested use the requested new title, else
@@ -493,7 +496,7 @@ fn execute_prepared_route(
                 title,
                 diff: Box::new(diff),
             });
-        } else {
+        } else if use_human_output {
             render_items.push(UpdateRenderItem::NoUpdates { id: id.clone() });
         }
     }
@@ -523,6 +526,14 @@ fn execute_prepared_route(
         render_items,
         resolved_ids,
     })
+}
+
+fn update_uses_machine_output(ctx: &OutputContext) -> bool {
+    ctx.is_json() || ctx.is_toon()
+}
+
+fn update_uses_human_output(ctx: &OutputContext) -> bool {
+    !ctx.is_quiet() && !update_uses_machine_output(ctx)
 }
 
 fn validate_multi_issue_external_ref_update(
@@ -940,7 +951,7 @@ mod tests {
     use crate::config::CliOverrides;
     use crate::logging::init_test_logging;
     use crate::model::{Issue, IssueType, Priority, Status};
-    use crate::output::OutputContext;
+    use crate::output::{OutputContext, OutputMode};
     use crate::storage::SqliteStorage;
     use chrono::{Datelike, Timelike};
     use std::fs;
@@ -1120,6 +1131,24 @@ mod tests {
         let update = build_update(&args, "test_actor", false).unwrap();
         assert!(update.is_empty());
         info!("test_build_update_empty: assertions passed");
+    }
+
+    #[test]
+    fn test_update_output_partition_matches_previous_mode_checks() {
+        let cases = [
+            (OutputMode::Json, true, false),
+            (OutputMode::Toon, true, false),
+            (OutputMode::Quiet, false, false),
+            (OutputMode::Rich, false, true),
+            (OutputMode::Plain, false, true),
+        ];
+
+        for (mode, expected_machine, expected_human) in cases {
+            let ctx = OutputContext::with_mode(mode);
+
+            assert_eq!(update_uses_machine_output(&ctx), expected_machine);
+            assert_eq!(update_uses_human_output(&ctx), expected_human);
+        }
     }
 
     #[test]
