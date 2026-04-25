@@ -42,16 +42,12 @@ enum OrphanRenderMode {
 }
 
 const fn resolve_render_mode(json: bool, output_mode: OutputMode) -> OrphanRenderMode {
-    if json || matches!(output_mode, OutputMode::Json) {
-        return OrphanRenderMode::Json;
-    }
-
-    match output_mode {
-        OutputMode::Json => OrphanRenderMode::Json,
-        OutputMode::Quiet => OrphanRenderMode::Quiet,
-        OutputMode::Toon => OrphanRenderMode::Toon,
-        OutputMode::Rich => OrphanRenderMode::Rich,
-        OutputMode::Plain => OrphanRenderMode::Plain,
+    match (json, output_mode) {
+        (true, _) | (false, OutputMode::Json) => OrphanRenderMode::Json,
+        (false, OutputMode::Quiet) => OrphanRenderMode::Quiet,
+        (false, OutputMode::Toon) => OrphanRenderMode::Toon,
+        (false, OutputMode::Rich) => OrphanRenderMode::Rich,
+        (false, OutputMode::Plain) => OrphanRenderMode::Plain,
     }
 }
 

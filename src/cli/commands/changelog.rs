@@ -194,16 +194,12 @@ pub fn execute_with_storage_ctx(
 }
 
 const fn resolve_render_mode(json: bool, output_mode: OutputMode) -> ChangelogRenderMode {
-    if json || matches!(output_mode, OutputMode::Json) {
-        return ChangelogRenderMode::Json;
-    }
-
-    match output_mode {
-        OutputMode::Json => ChangelogRenderMode::Json,
-        OutputMode::Quiet => ChangelogRenderMode::Quiet,
-        OutputMode::Toon => ChangelogRenderMode::Toon,
-        OutputMode::Rich => ChangelogRenderMode::Rich,
-        OutputMode::Plain => ChangelogRenderMode::Plain,
+    match (json, output_mode) {
+        (true, _) | (false, OutputMode::Json) => ChangelogRenderMode::Json,
+        (false, OutputMode::Quiet) => ChangelogRenderMode::Quiet,
+        (false, OutputMode::Toon) => ChangelogRenderMode::Toon,
+        (false, OutputMode::Rich) => ChangelogRenderMode::Rich,
+        (false, OutputMode::Plain) => ChangelogRenderMode::Plain,
     }
 }
 
