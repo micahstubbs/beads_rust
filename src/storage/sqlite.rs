@@ -1600,6 +1600,13 @@ impl SqliteStorage {
                 BeadsError::IssueNotFound { id: id.to_string() }
             })?;
 
+            if issue.status == Status::Tombstone {
+                return Err(BeadsError::Validation {
+                    field: "issue_id".to_string(),
+                    reason: format!("cannot update tombstone issue: {id}"),
+                });
+            }
+
             // Atomic claim guard: check assignee INSIDE the CONCURRENT transaction
             // to prevent TOCTOU races where two agents both see "unassigned".
             if updates.expect_unassigned {
@@ -8434,6 +8441,56 @@ mod tests {
 
         assert_eq!(updated.priority, Priority::HIGH);
         assert_eq!(updated.updated_at, before.updated_at);
+        assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_update_issue_rejects_existing_tombstone() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 5, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-u-tomb",
+            "Do not resurrect",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        let tombstone = storage
+            .delete_issue("bd-u-tomb", "tester", "delete for update test", None)
+            .unwrap();
+        storage.clear_all_dirty_issues().unwrap();
+
+        let err = storage
+            .update_issue(
+                "bd-u-tomb",
+                &IssueUpdate {
+                    title: Some("Resurrected title".to_string()),
+                    status: Some(Status::Open),
+                    deleted_at: Some(None),
+                    deleted_by: Some(None),
+                    delete_reason: Some(None),
+                    ..IssueUpdate::default()
+                },
+                "tester",
+            )
+            .unwrap_err();
+
+        let BeadsError::Validation { field, reason } = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert_eq!(field, "issue_id");
+        assert!(reason.contains("cannot update tombstone issue: bd-u-tomb"));
+
+        let after = storage.get_issue("bd-u-tomb").unwrap().unwrap();
+        assert_eq!(after.status, Status::Tombstone);
+        assert_eq!(after.title, tombstone.title);
+        assert_eq!(after.deleted_at, tombstone.deleted_at);
+        assert_eq!(after.deleted_by, tombstone.deleted_by);
+        assert_eq!(after.delete_reason, tombstone.delete_reason);
         assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
     }
 
