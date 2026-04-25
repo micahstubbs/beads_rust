@@ -4201,6 +4201,23 @@ impl SqliteStorage {
         Ok(Self::get_issue_from_conn(conn, id)?.map(|issue| issue.status))
     }
 
+    fn ensure_label_target_mutable_in_tx(
+        conn: &Connection,
+        issue_id: &str,
+        action: &str,
+    ) -> Result<()> {
+        match Self::issue_status_in_tx(conn, issue_id)? {
+            Some(Status::Tombstone) => Err(BeadsError::Validation {
+                field: "issue_id".to_string(),
+                reason: format!("cannot {action} tombstone issue: {issue_id}"),
+            }),
+            Some(_) => Ok(()),
+            None => Err(BeadsError::IssueNotFound {
+                id: issue_id.to_string(),
+            }),
+        }
+    }
+
     fn ensure_dependency_target_exists_in_tx(conn: &Connection, depends_on_id: &str) -> Result<()> {
         if depends_on_id.starts_with("external:") {
             return Ok(());
@@ -4859,6 +4876,8 @@ impl SqliteStorage {
     /// Returns an error if the database update fails.
     pub fn remove_all_labels(&mut self, issue_id: &str, actor: &str) -> Result<usize> {
         self.mutate("remove_all_labels", actor, |conn, ctx| {
+            Self::ensure_label_target_mutable_in_tx(conn, issue_id, "remove labels from")?;
+
             let rows = conn.execute_with_params(
                 "DELETE FROM labels WHERE issue_id = ?",
                 &[SqliteValue::from(issue_id)],
@@ -4892,6 +4911,8 @@ impl SqliteStorage {
     /// Returns an error if the database update fails.
     pub fn set_labels(&mut self, issue_id: &str, labels: &[String], actor: &str) -> Result<()> {
         self.mutate("set_labels", actor, |conn, ctx| {
+            Self::ensure_label_target_mutable_in_tx(conn, issue_id, "set labels on")?;
+
             let old_rows = conn.query_with_params(
                 "SELECT label FROM labels WHERE issue_id = ?",
                 &[SqliteValue::from(issue_id)],
@@ -8679,6 +8700,58 @@ mod tests {
 
         let labels = storage.get_labels("bd-l2").unwrap();
         assert_eq!(labels, vec!["api".to_string(), "backend".to_string()]);
+    }
+
+    #[test]
+    fn test_bulk_label_mutations_reject_tombstones() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-l-tomb",
+            "Deleted label target",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .add_label("bd-l-tomb", "existing", "tester")
+            .unwrap();
+        storage
+            .delete_issue("bd-l-tomb", "tester", "delete label target", None)
+            .unwrap();
+
+        let set_error = storage
+            .set_labels("bd-l-tomb", &["new".to_string()], "tester")
+            .unwrap_err();
+        assert!(
+            matches!(
+                &set_error,
+                BeadsError::Validation { field, reason }
+                    if field == "issue_id"
+                        && reason.contains("cannot set labels on tombstone issue: bd-l-tomb")
+            ),
+            "unexpected set_labels error: {set_error:?}"
+        );
+
+        let remove_error = storage
+            .remove_all_labels("bd-l-tomb", "tester")
+            .unwrap_err();
+        assert!(
+            matches!(
+                &remove_error,
+                BeadsError::Validation { field, reason }
+                    if field == "issue_id"
+                        && reason.contains("cannot remove labels from tombstone issue: bd-l-tomb")
+            ),
+            "unexpected remove_all_labels error: {remove_error:?}"
+        );
+
+        let labels = storage.get_labels("bd-l-tomb").unwrap();
+        assert_eq!(labels, vec!["existing".to_string()]);
     }
 
     #[test]
