@@ -205,49 +205,11 @@ fn execute_inner(
 
     match output_format {
         OutputFormat::Json => {
-            let output: Vec<BlockedIssueOutput> = blocked_issues
-                .iter()
-                .map(|bi| BlockedIssueOutput {
-                    blocked_by: bi
-                        .blocked_by
-                        .iter()
-                        .map(|blocker_ref| blocker_id_from_ref(blocker_ref).to_string())
-                        .collect(),
-                    blocked_by_count: bi.blocked_by_count,
-                    created_at: bi.issue.created_at,
-                    created_by: bi.issue.created_by.clone(),
-                    description: bi.issue.description.clone(),
-                    id: bi.issue.id.clone(),
-                    issue_type: bi.issue.issue_type.clone(),
-                    priority: bi.issue.priority,
-                    status: bi.issue.status.clone(),
-                    title: bi.issue.title.clone(),
-                    updated_at: bi.issue.updated_at,
-                })
-                .collect();
+            let output = blocked_issue_outputs(&blocked_issues);
             ctx.json_pretty(&output);
         }
         OutputFormat::Toon => {
-            let output: Vec<BlockedIssueOutput> = blocked_issues
-                .iter()
-                .map(|bi| BlockedIssueOutput {
-                    blocked_by: bi
-                        .blocked_by
-                        .iter()
-                        .map(|blocker_ref| blocker_id_from_ref(blocker_ref).to_string())
-                        .collect(),
-                    blocked_by_count: bi.blocked_by_count,
-                    created_at: bi.issue.created_at,
-                    created_by: bi.issue.created_by.clone(),
-                    description: bi.issue.description.clone(),
-                    id: bi.issue.id.clone(),
-                    issue_type: bi.issue.issue_type.clone(),
-                    priority: bi.issue.priority,
-                    status: bi.issue.status.clone(),
-                    title: bi.issue.title.clone(),
-                    updated_at: bi.issue.updated_at,
-                })
-                .collect();
+            let output = blocked_issue_outputs(&blocked_issues);
             ctx.toon_with_stats(&output, args.stats);
         }
         OutputFormat::Text | OutputFormat::Csv => {
@@ -265,6 +227,30 @@ fn execute_inner(
 
 fn include_in_blocked_list(status: &crate::model::Status) -> bool {
     !status.is_terminal()
+}
+
+fn blocked_issue_outputs(blocked_issues: &[BlockedIssue]) -> Vec<BlockedIssueOutput> {
+    blocked_issues.iter().map(blocked_issue_output).collect()
+}
+
+fn blocked_issue_output(bi: &BlockedIssue) -> BlockedIssueOutput {
+    BlockedIssueOutput {
+        blocked_by: bi
+            .blocked_by
+            .iter()
+            .map(|blocker_ref| blocker_id_from_ref(blocker_ref).to_string())
+            .collect(),
+        blocked_by_count: bi.blocked_by_count,
+        created_at: bi.issue.created_at,
+        created_by: bi.issue.created_by.clone(),
+        description: bi.issue.description.clone(),
+        id: bi.issue.id.clone(),
+        issue_type: bi.issue.issue_type.clone(),
+        priority: bi.issue.priority,
+        status: bi.issue.status.clone(),
+        title: bi.issue.title.clone(),
+        updated_at: bi.issue.updated_at,
+    }
 }
 
 /// Sort blocked issues by priority (ascending), then by blocker count (descending).
