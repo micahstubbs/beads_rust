@@ -504,6 +504,17 @@ fn execute_undefer_route(
             continue;
         }
 
+        if issue.status.is_terminal() {
+            tracing::debug!(id = %id, status = ?issue.status, "Issue is terminal");
+            let skipped = SkippedIssue {
+                id: id.clone(),
+                reason: format!("cannot undefer {} issue", issue.status.as_str()),
+            };
+            ordered_outcomes.push(DeferredOutcome::Skipped(skipped.clone()));
+            skipped_issues.push(skipped);
+            continue;
+        }
+
         let restored_status = restored_status_after_undefer(&issue);
         let status_update = if issue.status == Status::Deferred {
             Some(Status::Open)
@@ -1057,5 +1068,49 @@ mod tests {
         let updated = storage.get_issue(&issue_id).expect("get").unwrap();
         assert_eq!(updated.status, Status::InProgress);
         assert!(updated.defer_until.is_none());
+    }
+
+    #[test]
+    fn execute_undefer_skips_terminal_issue_with_stale_defer_until() -> Result<()> {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new()?;
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx)?;
+
+        let beads_dir = temp.path().join(".beads");
+        let mut storage = SqliteStorage::open(&beads_dir.join("beads.db"))?;
+        let issue_id = format!(
+            "{}-terminal-defer-1",
+            storage
+                .get_config("issue_prefix")?
+                .ok_or_else(|| BeadsError::internal("workspace prefix missing"))?
+        );
+        let mut issue = make_issue(&issue_id, "Closed with stale defer date");
+        issue.status = Status::Closed;
+        issue.closed_at = Some(Utc::now());
+        issue.defer_until = Some(Utc::now() + Duration::days(1));
+        storage.create_issue(&issue, "tester")?;
+
+        let cli = CliOverrides {
+            db: Some(beads_dir.join("beads.db")),
+            ..CliOverrides::default()
+        };
+        let undefer_args = UndeferArgs {
+            ids: vec![issue_id.clone()],
+            robot: true,
+        };
+        execute_undefer(&undefer_args, true, &cli, &ctx)?;
+
+        let updated = storage
+            .get_issue(&issue_id)?
+            .ok_or_else(|| BeadsError::IssueNotFound {
+                id: issue_id.clone(),
+            })?;
+        assert_eq!(updated.status, Status::Closed);
+        assert!(updated.defer_until.is_some());
+
+        Ok(())
     }
 }
