@@ -4513,6 +4513,8 @@ impl SqliteStorage {
         actor: &str,
     ) -> Result<bool> {
         self.mutate("remove_dependency", actor, |conn, ctx| {
+            Self::ensure_issue_mutable_in_tx(conn, issue_id, "remove dependency from")?;
+
             let rows = conn.execute_with_params(
                 "DELETE FROM dependencies WHERE issue_id = ? AND depends_on_id = ?",
                 &[
@@ -4682,6 +4684,13 @@ impl SqliteStorage {
         skip_cache_rebuild: bool,
     ) -> Result<()> {
         self.mutate("set_parent", actor, |conn, ctx| {
+            let action = if parent_id.is_some() {
+                "set parent on"
+            } else {
+                "clear parent from"
+            };
+            Self::ensure_issue_mutable_in_tx(conn, issue_id, action)?;
+
             let previous_parent = conn
                 .query_with_params(
                     "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type = 'parent-child' LIMIT 1",
@@ -8806,6 +8815,87 @@ mod tests {
         assert!(removed);
         let deps = storage.get_dependencies("bd-a1").unwrap();
         assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_dependency_mutations_reject_tombstone_issue() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let child = make_issue("bd-dep-child", "Child", Status::Open, 2, None, t1, None);
+        let old_parent = make_issue(
+            "bd-dep-old-parent",
+            "Old parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let new_parent = make_issue(
+            "bd-dep-new-parent",
+            "New parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&child, "tester").unwrap();
+        storage.create_issue(&old_parent, "tester").unwrap();
+        storage.create_issue(&new_parent, "tester").unwrap();
+        storage
+            .set_parent("bd-dep-child", Some("bd-dep-old-parent"), "tester")
+            .unwrap();
+        storage
+            .delete_issue("bd-dep-child", "tester", "delete dependency target", None)
+            .unwrap();
+
+        let remove_error = storage
+            .remove_dependency("bd-dep-child", "bd-dep-old-parent", "tester")
+            .unwrap_err();
+        assert!(
+            matches!(
+                &remove_error,
+                BeadsError::Validation { field, reason }
+                    if field == "issue_id"
+                        && reason.contains(
+                            "cannot remove dependency from tombstone issue: bd-dep-child"
+                        )
+            ),
+            "unexpected remove_dependency error: {remove_error:?}"
+        );
+
+        let clear_parent_error = storage
+            .set_parent("bd-dep-child", None, "tester")
+            .unwrap_err();
+        assert!(
+            matches!(
+                &clear_parent_error,
+                BeadsError::Validation { field, reason }
+                    if field == "issue_id"
+                        && reason.contains(
+                            "cannot clear parent from tombstone issue: bd-dep-child"
+                        )
+            ),
+            "unexpected clear parent error: {clear_parent_error:?}"
+        );
+
+        let set_parent_error = storage
+            .set_parent("bd-dep-child", Some("bd-dep-new-parent"), "tester")
+            .unwrap_err();
+        assert!(
+            matches!(
+                &set_parent_error,
+                BeadsError::Validation { field, reason }
+                    if field == "issue_id"
+                        && reason.contains("cannot set parent on tombstone issue: bd-dep-child")
+            ),
+            "unexpected set parent error: {set_parent_error:?}"
+        );
+
+        let deps = storage.get_dependencies("bd-dep-child").unwrap();
+        assert_eq!(deps, vec!["bd-dep-old-parent".to_string()]);
     }
 
     #[test]
