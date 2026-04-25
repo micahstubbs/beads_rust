@@ -1,7 +1,7 @@
 use crate::cli::{CountArgs, CountBy};
 use crate::config;
 use crate::error::Result;
-use crate::model::{IssueType, Priority, Status};
+use crate::model::Status;
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
 use rich_rust::prelude::*;
@@ -56,9 +56,9 @@ pub fn execute_with_storage(
 
 fn execute_inner(args: &CountArgs, ctx: &OutputContext, storage: &SqliteStorage) -> Result<()> {
     let mut filters = ListFilters::default();
-    let statuses = parse_statuses(&args.status)?;
-    let types = parse_types(&args.types)?;
-    let priorities = parse_priorities(&args.priority)?;
+    let statuses = parse_trimmed_values(&args.status)?;
+    let types = parse_trimmed_values(&args.types)?;
+    let priorities = parse_trimmed_values(&args.priority)?;
 
     if !statuses.is_empty() {
         if statuses.iter().any(Status::is_terminal) {
@@ -199,25 +199,14 @@ fn render_count_grouped_rich(
     ctx.render(&panel);
 }
 
-fn parse_statuses(values: &[String]) -> Result<Vec<Status>> {
+fn parse_trimmed_values<T>(values: &[String]) -> Result<Vec<T>>
+where
+    T: std::str::FromStr<Err = crate::error::BeadsError>,
+{
     values
         .iter()
         .map(|value| value.trim().parse())
-        .collect::<Result<Vec<Status>>>()
-}
-
-fn parse_types(values: &[String]) -> Result<Vec<IssueType>> {
-    values
-        .iter()
-        .map(|value| value.trim().parse())
-        .collect::<Result<Vec<IssueType>>>()
-}
-
-fn parse_priorities(values: &[String]) -> Result<Vec<Priority>> {
-    values
-        .iter()
-        .map(|value| value.trim().parse())
-        .collect::<Result<Vec<Priority>>>()
+        .collect::<Result<Vec<T>>>()
 }
 
 fn group_counts(
@@ -405,15 +394,24 @@ mod tests {
         init_logging();
         info!("test_parse_count_filters_trim_delimited_whitespace: starting");
 
-        let statuses = parse_statuses(&["open".to_string(), " closed ".to_string()])?;
-        let types = parse_types(&["bug".to_string(), " feature ".to_string()])?;
-        let priorities = parse_priorities(&["P0".to_string(), " 1 ".to_string()])?;
+        let statuses =
+            parse_trimmed_values::<Status>(&["open".to_string(), " closed ".to_string()])?;
+        let types =
+            parse_trimmed_values::<IssueType>(&["bug".to_string(), " feature ".to_string()])?;
+        let priorities = parse_trimmed_values::<Priority>(&["P0".to_string(), " 1 ".to_string()])?;
 
         assert_eq!(statuses, vec![Status::Open, Status::Closed]);
         assert_eq!(types, vec![IssueType::Bug, IssueType::Feature]);
         assert_eq!(priorities, vec![Priority::CRITICAL, Priority::HIGH]);
-        info!("test_parse_count_filters_trim_delimited_whitespace: assertions passed");
 
+        let empty: &[String] = &[];
+        assert!(parse_trimmed_values::<Status>(empty)?.is_empty());
+        assert!(matches!(
+            parse_trimmed_values::<Priority>(&[" nope ".to_string()]),
+            Err(crate::error::BeadsError::InvalidPriority { priority }) if priority == "NOPE"
+        ));
+
+        info!("test_parse_count_filters_trim_delimited_whitespace: assertions passed");
         Ok(())
     }
 }
