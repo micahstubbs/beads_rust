@@ -517,12 +517,7 @@ fn get_config_value(
     let layer = merge_layers(&layers);
     let canonical_key = canonical_config_key(key);
 
-    // Look for the key in both runtime and startup
-    let value = layer
-        .runtime
-        .get(&canonical_key)
-        .or_else(|| layer.startup.get(&canonical_key))
-        .cloned();
+    let value = layer.get(&canonical_key).map(str::to_owned);
 
     if ctx.is_json() {
         let output = json!({
@@ -998,17 +993,12 @@ fn show_config(
         keys.dedup();
 
         for key in keys {
-            let value = layer
-                .runtime
-                .get(key)
-                .or_else(|| layer.startup.get(key))
-                .cloned()
-                .unwrap_or_default();
+            let value = layer.get(key).unwrap_or_default();
             let source = resolve_source(key, &layers);
             trace!(key, source = ?source, "Config source resolved");
             entries.push(ConfigEntry {
                 key: key.clone(),
-                value: format_config_value(&value),
+                value: format_config_value(value),
                 source,
             });
         }
@@ -1090,14 +1080,10 @@ fn output_layer(layer: &ConfigLayer, source: ConfigSource, _json_mode: bool, ctx
         let entries = all_keys
             .into_iter()
             .filter_map(|key| {
-                let value = layer
-                    .runtime
-                    .get(key)
-                    .or_else(|| layer.startup.get(key))
-                    .cloned()?;
+                let value = layer.get(key)?;
                 Some(ConfigEntry {
                     key: key.clone(),
-                    value: format_config_value(&value),
+                    value: format_config_value(value),
                     source,
                 })
             })
@@ -1120,11 +1106,7 @@ fn output_layer(layer: &ConfigLayer, source: ConfigSource, _json_mode: bool, ctx
             println!("  (empty)");
         } else {
             for key in all_keys {
-                let value = layer
-                    .runtime
-                    .get(key)
-                    .or_else(|| layer.startup.get(key))
-                    .unwrap();
+                let value = layer.get(key).unwrap();
                 println!("  {key}: {value}");
             }
         }

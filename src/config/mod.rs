@@ -2885,6 +2885,15 @@ pub struct ConfigLayer {
 }
 
 impl ConfigLayer {
+    /// Return a value from this layer, checking runtime keys before startup keys.
+    #[must_use]
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.runtime
+            .get(key)
+            .or_else(|| self.startup.get(key))
+            .map(String::as_str)
+    }
+
     /// Merge another layer on top of this one (higher precedence wins).
     ///
     /// Keys are normalized (hyphens replaced with underscores) before insertion
@@ -3809,6 +3818,24 @@ mod tests {
 
         let merged = ConfigLayer::merge_layers(&[defaults, db, yaml, env_layer, cli]);
         assert_eq!(merged.runtime.get("issue_prefix").unwrap(), "cli");
+    }
+
+    #[test]
+    fn config_layer_get_checks_runtime_then_startup_without_canonicalizing() {
+        let mut layer = ConfigLayer::default();
+        layer
+            .startup
+            .insert("shared".to_string(), "startup".to_string());
+        layer
+            .runtime
+            .insert("shared".to_string(), "runtime".to_string());
+        layer
+            .startup
+            .insert("startup_only".to_string(), "startup-only".to_string());
+
+        assert_eq!(layer.get("shared"), Some("runtime"));
+        assert_eq!(layer.get("startup_only"), Some("startup-only"));
+        assert_eq!(layer.get("startup-only"), None);
     }
 
     #[test]
