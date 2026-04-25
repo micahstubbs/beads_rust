@@ -426,6 +426,36 @@ fn q_empty_title_fails() {
 }
 
 #[test]
+fn q_rejects_overlong_title_without_persisting() {
+    let _log = common::test_log("q_rejects_overlong_title_without_persisting");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let title = "x".repeat(501);
+    let quick = run_br(&workspace, ["q", title.as_str()], "quick_overlong_title");
+    assert!(
+        !quick.status.success(),
+        "q should fail with an overlong title"
+    );
+    assert!(
+        quick.stderr.contains("title") && quick.stderr.contains("exceeds 500"),
+        "error should mention the title length limit: {}",
+        quick.stderr
+    );
+
+    let list = run_br(&workspace, ["list", "--json"], "list_after_overlong_q");
+    assert!(list.status.success(), "list failed: {}", list.stderr);
+    let payload = extract_json_payload(&list.stdout);
+    let issues = extract_issues_array(&payload);
+    assert!(
+        issues.is_empty(),
+        "invalid quick-capture issue should not be persisted: {payload}"
+    );
+}
+
+#[test]
 fn q_with_custom_type_succeeds() {
     let _log = common::test_log("q_with_custom_type_succeeds");
     // br (unlike bd) allows custom issue types for flexibility

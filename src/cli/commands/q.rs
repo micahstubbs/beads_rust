@@ -5,7 +5,7 @@ use crate::format::sanitize_terminal_inline;
 use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::util::id::{IdGenerator, IdResolver, ResolverConfig, child_id};
-use crate::validation::LabelValidator;
+use crate::validation::{IssueValidator, LabelValidator};
 use chrono::Utc;
 use rich_rust::prelude::*;
 use std::collections::HashSet;
@@ -193,6 +193,8 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
 
     // Compute content hash
     issue.content_hash = Some(issue.compute_content_hash());
+
+    IssueValidator::validate(&issue).map_err(BeadsError::from_validation_errors)?;
 
     storage.create_issue(&issue, &actor)?;
     let created_id = issue.id.clone();
