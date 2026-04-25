@@ -5150,7 +5150,10 @@ impl SqliteStorage {
 
         self.mutate("rename_label", actor, |conn, ctx| {
             let id_rows = conn.query_with_params(
-                "SELECT issue_id FROM labels WHERE label = ?",
+                "SELECT l.issue_id
+                 FROM labels l
+                 JOIN issues i ON l.issue_id = i.id
+                 WHERE l.label = ? AND i.status != 'tombstone'",
                 &[SqliteValue::from(old_name)],
             )?;
             let issue_ids: Vec<String> = id_rows
@@ -5159,7 +5162,12 @@ impl SqliteStorage {
                 .collect();
 
             let conflict_rows = conn.query_with_params(
-                "SELECT issue_id FROM labels WHERE label = ? AND issue_id IN (SELECT issue_id FROM labels WHERE label = ?)",
+                "SELECT l.issue_id
+                 FROM labels l
+                 JOIN issues i ON l.issue_id = i.id
+                 WHERE l.label = ?
+                   AND i.status != 'tombstone'
+                   AND l.issue_id IN (SELECT issue_id FROM labels WHERE label = ?)",
                 &[SqliteValue::from(new_name), SqliteValue::from(old_name)],
             )?;
             let conflicts: Vec<String> = conflict_rows
@@ -5170,13 +5178,19 @@ impl SqliteStorage {
             for conflict_id in &conflicts {
                 conn.execute_with_params(
                     "DELETE FROM labels WHERE issue_id = ? AND label = ?",
-                    &[SqliteValue::from(conflict_id.as_str()), SqliteValue::from(old_name)],
+                    &[
+                        SqliteValue::from(conflict_id.as_str()),
+                        SqliteValue::from(old_name),
+                    ],
                 )?;
                 ctx.mark_dirty(conflict_id);
             }
 
             let renamed = conn.execute_with_params(
-                "UPDATE labels SET label = ? WHERE label = ?",
+                "UPDATE labels
+                 SET label = ?
+                 WHERE label = ?
+                   AND issue_id IN (SELECT id FROM issues WHERE status != 'tombstone')",
                 &[SqliteValue::from(new_name), SqliteValue::from(old_name)],
             )?;
 
@@ -5191,7 +5205,10 @@ impl SqliteStorage {
 
                 conn.execute_with_params(
                     "UPDATE issues SET updated_at = ? WHERE id = ?",
-                    &[SqliteValue::from(now.as_str()), SqliteValue::from(issue_id.as_str())],
+                    &[
+                        SqliteValue::from(now.as_str()),
+                        SqliteValue::from(issue_id.as_str()),
+                    ],
                 )?;
             }
 
@@ -8783,6 +8800,54 @@ mod tests {
         assert_eq!(
             storage.get_events("bd-l3", 100).unwrap().len(),
             event_count_before
+        );
+    }
+
+    #[test]
+    fn test_rename_label_skips_tombstone_issues() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        let active = make_issue(
+            "bd-l-active",
+            "Active label target",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let tombstone = make_issue(
+            "bd-l-deleted",
+            "Deleted label target",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&active, "tester").unwrap();
+        storage.create_issue(&tombstone, "tester").unwrap();
+        storage
+            .add_label("bd-l-active", "legacy", "tester")
+            .unwrap();
+        storage
+            .add_label("bd-l-deleted", "legacy", "tester")
+            .unwrap();
+        storage
+            .delete_issue("bd-l-deleted", "tester", "delete label target", None)
+            .unwrap();
+
+        let affected = storage.rename_label("legacy", "renamed", "tester").unwrap();
+
+        assert_eq!(affected, 1);
+        assert_eq!(
+            storage.get_labels("bd-l-active").unwrap(),
+            vec!["renamed".to_string()]
+        );
+        assert_eq!(
+            storage.get_labels("bd-l-deleted").unwrap(),
+            vec!["legacy".to_string()]
         );
     }
 
