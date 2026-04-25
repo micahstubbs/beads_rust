@@ -8479,11 +8479,18 @@ mod tests {
             )
             .unwrap_err();
 
-        let BeadsError::Validation { field, reason } = err else {
-            panic!("unexpected error: {err:?}");
-        };
-        assert_eq!(field, "issue_id");
-        assert!(reason.contains("cannot update tombstone issue: bd-u-tomb"));
+        assert!(
+            matches!(
+                err,
+                BeadsError::Validation {
+                    ref field,
+                    ref reason
+                }
+                    if field == "issue_id"
+                        && reason.contains("cannot update tombstone issue: bd-u-tomb")
+            ),
+            "unexpected error: {err:?}"
+        );
 
         let after = storage.get_issue("bd-u-tomb").unwrap().unwrap();
         assert_eq!(after.status, Status::Tombstone);
