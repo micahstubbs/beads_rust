@@ -2005,6 +2005,10 @@ impl SqliteStorage {
             .get_issue(id)?
             .ok_or_else(|| BeadsError::IssueNotFound { id: id.to_string() })?;
 
+        if issue.status == Status::Tombstone {
+            return Ok(issue);
+        }
+
         let was_terminal = issue.status.is_terminal();
         let original_type = issue.issue_type.as_str().to_string();
         let timestamp = deleted_at.unwrap_or_else(Utc::now);
@@ -8580,6 +8584,40 @@ mod tests {
         assert_eq!(
             deleted.content_hash.as_deref(),
             Some(crate::util::content_hash(&deleted).as_str())
+        );
+    }
+
+    #[test]
+    fn test_delete_issue_is_idempotent_for_tombstones() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
+        let deleted_at = Utc.with_ymd_and_hms(2025, 6, 2, 0, 0, 0).unwrap();
+
+        let issue = make_issue("bd-d3", "Already deleted", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue, "tester").unwrap();
+        let first = storage
+            .delete_issue("bd-d3", "first", "first delete", Some(deleted_at))
+            .unwrap();
+        storage.clear_dirty_flags(&["bd-d3".to_string()]).unwrap();
+
+        let second = storage
+            .delete_issue("bd-d3", "second", "second delete", None)
+            .unwrap();
+
+        assert_eq!(second.status, Status::Tombstone);
+        assert_eq!(second.deleted_at, first.deleted_at);
+        assert_eq!(second.deleted_by, first.deleted_by);
+        assert_eq!(second.delete_reason, first.delete_reason);
+        assert_eq!(second.updated_at, first.updated_at);
+        assert_eq!(storage.get_dirty_issue_ids().unwrap(), Vec::<String>::new());
+        assert_eq!(
+            storage
+                .get_events("bd-d3", 10)
+                .unwrap()
+                .iter()
+                .filter(|event| event.event_type == EventType::Deleted)
+                .count(),
+            1
         );
     }
 
