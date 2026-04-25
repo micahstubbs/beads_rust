@@ -494,21 +494,25 @@ fn issue_type_is_standard(value: &str) -> bool {
         .any(|(candidate, _)| candidate.eq_ignore_ascii_case(value))
 }
 
+fn issue_type_candidates(prefix: &str) -> Vec<CompletionCandidate> {
+    let mut candidates = static_candidates(prefix, ISSUE_TYPE_CANDIDATES);
+    candidates.extend(
+        completion_index()
+            .types
+            .iter()
+            .filter(|value| !issue_type_is_standard(value))
+            .filter(|value| matches_prefix_case_insensitive(value, prefix))
+            .map(CompletionCandidate::new),
+    );
+    candidates
+}
+
 fn issue_type_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     let Some(prefix) = current.to_str() else {
         return Vec::new();
     };
 
-    let mut candidates = static_candidates(prefix, ISSUE_TYPE_CANDIDATES);
-    for value in &completion_index().types {
-        if issue_type_is_standard(value) {
-            continue;
-        }
-        if matches_prefix_case_insensitive(value, prefix) {
-            candidates.push(CompletionCandidate::new(value));
-        }
-    }
-    candidates
+    issue_type_candidates(prefix)
 }
 
 fn issue_type_completer_delimited(current: &OsStr) -> Vec<CompletionCandidate> {
@@ -516,19 +520,10 @@ fn issue_type_completer_delimited(current: &OsStr) -> Vec<CompletionCandidate> {
         return Vec::new();
     };
     let (prefix, needle) = split_delimited_prefix(current, ',');
-    let mut candidates = static_candidates(needle, ISSUE_TYPE_CANDIDATES)
+    issue_type_candidates(needle)
         .into_iter()
         .map(|candidate| candidate.add_prefix(prefix.clone()))
-        .collect::<Vec<_>>();
-    for value in &completion_index().types {
-        if issue_type_is_standard(value) {
-            continue;
-        }
-        if matches_prefix_case_insensitive(value, needle) {
-            candidates.push(CompletionCandidate::new(value).add_prefix(prefix.clone()));
-        }
-    }
-    candidates
+        .collect()
 }
 
 fn issue_type_standard_completer(current: &OsStr) -> Vec<CompletionCandidate> {
@@ -2569,11 +2564,14 @@ pub struct AgentsArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Commands, InheritedOutputMode, OutputFormat, OutputFormatBasic,
-        resolve_output_format_basic_with_outer_mode, resolve_output_format_with_outer_mode,
+        Cli, Commands, InheritedOutputMode, OutputFormat, OutputFormatBasic, issue_type_completer,
+        issue_type_completer_delimited, resolve_output_format_basic_with_outer_mode,
+        resolve_output_format_with_outer_mode,
     };
     use crate::storage::sqlite::SqliteStorage;
     use clap::{CommandFactory, Parser};
+    use clap_complete::engine::CompletionCandidate;
+    use std::ffi::OsStr;
     use tempfile::TempDir;
 
     const CLI_REFERENCE: &str = include_str!("../../docs/CLI_REFERENCE.md");
@@ -2630,6 +2628,19 @@ mod tests {
             Cli::try_parse_from(["br", "create", "positional title", "--title", "flag title"])
                 .expect_err("create should reject ambiguous title sources");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn test_issue_type_delimited_completion_preserves_plain_candidate_order() {
+        let plain = candidate_values(issue_type_completer(OsStr::new("bu")));
+        let delimited = candidate_values(issue_type_completer_delimited(OsStr::new("task, bu")));
+        let expected = plain
+            .iter()
+            .map(|value| format!("task, {value}"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(plain.first().map(String::as_str), Some("bug"));
+        assert_eq!(delimited, expected);
     }
 
     #[test]
@@ -2747,5 +2758,12 @@ mod tests {
                 "docs/CLI_REFERENCE.md is missing Clap drift sentinel: {needle}"
             );
         }
+    }
+
+    fn candidate_values(candidates: Vec<CompletionCandidate>) -> Vec<String> {
+        candidates
+            .into_iter()
+            .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+            .collect()
     }
 }
