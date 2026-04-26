@@ -6030,8 +6030,11 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("issues.jsonl");
 
-        // Create existing issue in DB with older timestamp
+        // Create existing issue in DB with older timestamp.
+        // Pin both created_at and updated_at so the validator's
+        // "updated_at >= created_at" rule holds.
         let mut existing = make_test_issue("test-001", "Old title");
+        existing.created_at = Utc::now() - chrono::Duration::hours(2);
         existing.updated_at = Utc::now() - chrono::Duration::hours(1);
         storage.create_issue(&existing, "test").unwrap();
 

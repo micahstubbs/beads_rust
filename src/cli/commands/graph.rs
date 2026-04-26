@@ -1628,8 +1628,11 @@ mod tests {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = chrono::Utc::now();
 
+        // IssueValidator requires the prefix-hash ID format, so use
+        // bd-root / bd-1 / bd-2 rather than the bare "root" the test
+        // historically used.
         let root = Issue {
-            id: "root".to_string(),
+            id: "bd-root".to_string(),
             title: "Root".to_string(),
             status: Status::Open,
             priority: crate::model::Priority::MEDIUM,
@@ -1667,7 +1670,7 @@ mod tests {
         storage
             .execute_test_sql(&format!(
                 "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
-                 VALUES ('bd-1', 'root', 'waits-for', '{created_at}', 'test');
+                 VALUES ('bd-1', 'bd-root', 'waits-for', '{created_at}', 'test');
                  INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
                  VALUES ('bd-2', 'bd-1', 'waits-for', '{created_at}', 'test');
                  INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
