@@ -319,34 +319,43 @@ fn dep_add(
     } else if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
     } else if added {
+        let issue_id_display = dep_display_text(&issue_id);
+        let depends_on_id_display = dep_display_text(&depends_on_id);
+        let dep_type_display = dep_display_text(dep_type.as_str());
         if ctx.is_rich() {
             // Rich mode: Show detailed visual feedback
             ctx.success(&format!(
                 "Added dependency: {} → {}",
-                issue_id, depends_on_id
+                issue_id_display, depends_on_id_display
             ));
             let relationship = match dep_type {
-                DependencyType::Blocks => format!("  {} now blocks {}", depends_on_id, issue_id),
+                DependencyType::Blocks => format!(
+                    "  {} now blocks {}",
+                    depends_on_id_display, issue_id_display
+                ),
                 DependencyType::ParentChild => {
-                    format!("  {} is parent of {}", depends_on_id, issue_id)
+                    format!(
+                        "  {} is parent of {}",
+                        depends_on_id_display, issue_id_display
+                    )
                 }
                 DependencyType::WaitsFor => {
-                    format!("  {} waits for {}", issue_id, depends_on_id)
+                    format!("  {} waits for {}", issue_id_display, depends_on_id_display)
                 }
-                _ => format!("  Relationship: {}", dep_type.as_str()),
+                _ => format!("  Relationship: {}", dep_type_display),
             };
             ctx.print_line(&relationship);
         } else {
             ctx.success(&format!(
                 "Added dependency: {} -> {} ({})",
-                issue_id,
-                depends_on_id,
-                dep_type.as_str()
+                issue_id_display, depends_on_id_display, dep_type_display
             ));
         }
     } else {
+        let issue_id_display = dep_display_text(&issue_id);
+        let depends_on_id_display = dep_display_text(&depends_on_id);
         ctx.info(&format!(
-            "Dependency already exists: {issue_id} → {depends_on_id}"
+            "Dependency already exists: {issue_id_display} → {depends_on_id_display}"
         ));
     }
 
@@ -408,23 +417,27 @@ fn dep_remove(
     } else if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
     } else if removed {
+        let issue_id_display = dep_display_text(&issue_id);
+        let depends_on_id_display = dep_display_text(&depends_on_id);
         if ctx.is_rich() {
             ctx.success(&format!(
                 "Removed dependency: {} → {}",
-                issue_id, depends_on_id
+                issue_id_display, depends_on_id_display
             ));
             ctx.print_line(&format!(
                 "  {} no longer depends on {}",
-                issue_id, depends_on_id
+                issue_id_display, depends_on_id_display
             ));
         } else {
             ctx.success(&format!(
-                "Removed dependency: {issue_id} -> {depends_on_id}"
+                "Removed dependency: {issue_id_display} -> {depends_on_id_display}"
             ));
         }
     } else {
+        let issue_id_display = dep_display_text(&issue_id);
+        let depends_on_id_display = dep_display_text(&depends_on_id);
         ctx.warning(&format!(
-            "Dependency not found: {issue_id} → {depends_on_id}"
+            "Dependency not found: {issue_id_display} → {depends_on_id_display}"
         ));
     }
 
@@ -441,6 +454,10 @@ fn dependency_type_for_pair(
         .into_iter()
         .find(|dep| dep.depends_on_id == depends_on_id)
         .map(|dep| dep.dep_type.as_str().to_string()))
+}
+
+fn dep_display_text(value: &str) -> String {
+    sanitize_terminal_inline(value).into_owned()
 }
 
 fn parse_dependency_type(dep_type: &str) -> Result<DependencyType> {
@@ -567,7 +584,10 @@ fn dep_list(
             DepDirection::Up => "dependents",
             DepDirection::Both => "dependencies or dependents",
         };
-        ctx.info(&format!("No {direction_str} for {issue_id}"));
+        ctx.info(&format!(
+            "No {direction_str} for {}",
+            dep_display_text(&issue_id)
+        ));
         return Ok(());
     }
 
@@ -1011,7 +1031,9 @@ fn dep_tree(
 }
 
 fn sanitize_mermaid_label(text: &str) -> String {
-    text.replace('"', "'").replace(['\n', '\r'], " ")
+    sanitize_terminal_inline(text)
+        .replace('"', "'")
+        .replace(['\n', '\r'], " ")
 }
 
 fn render_dep_tree_mermaid(nodes: &[TreeNode]) {
@@ -1711,6 +1733,17 @@ mod tests {
         assert!(rendered.contains("bd-a\\u{1b}[2J"));
         assert!(rendered.contains("bd-b\\u{7}bell"));
         assert!(rich_text.spans().len() > 1, "rich text should carry styles");
+    }
+
+    #[test]
+    fn dep_display_and_mermaid_labels_escape_terminal_controls() {
+        let display = dep_display_text("bd-a\x1b]52;c;bad\x07");
+        assert!(!display.chars().any(char::is_control));
+        assert_eq!(display, "bd-a\\u{1b}]52;c;bad\\u{7}");
+
+        let mermaid = sanitize_mermaid_label("bd-a\x1b[2J\n\"quoted\"\r\x07");
+        assert!(!mermaid.chars().any(char::is_control));
+        assert!(mermaid.contains("bd-a\\u{1b}[2J\\n'quoted'\\r\\u{7}"));
     }
 
     #[test]
