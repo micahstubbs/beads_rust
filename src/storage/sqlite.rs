@@ -6616,6 +6616,26 @@ fn finish_issue_mutation_write_probe(
     rollback_result: std::result::Result<usize, FrankenError>,
 ) -> Result<()> {
     match (probe_result, rollback_result) {
+        // A zero-row probe update means the target issue was not
+        // write-addressable through the mutation path the probe was
+        // attempting — exactly the failure mode this diagnostic was
+        // built to catch (issue #263). Returning Ok here would turn
+        // the probe into a false-negative oracle for the storage
+        // layer's visibility/write-path bug class. Surface it as the
+        // primary error even when ROLLBACK also fails: a downstream
+        // rollback hiccup is noise compared to "we couldn't update
+        // the row we just inserted".
+        (Ok(0), rollback) => {
+            if let Err(rollback_err) = rollback {
+                tracing::warn!(
+                    error = %rollback_err,
+                    "ROLLBACK failed after zero-row issue write probe"
+                );
+            }
+            Err(BeadsError::Database(FrankenError::Internal(
+                "write probe did not find issue inside mutation transaction".to_string(),
+            )))
+        }
         (Ok(_), Ok(_)) => Ok(()),
         (Ok(_), Err(rollback_err)) => Err(BeadsError::Database(rollback_err)),
         (Err(probe_err), Ok(_)) => Err(BeadsError::Database(probe_err)),
@@ -7551,8 +7571,16 @@ impl SqliteStorage {
 
     /// Upsert an issue (create or update) for import operations.
     ///
-    /// Uses explicit DELETE + INSERT to handle both cases (fsqlite does not
-    /// reliably support INSERT OR REPLACE).
+    /// For an existing row, runs an in-place UPDATE; for a new row, runs
+    /// INSERT. The previous implementation used explicit DELETE + INSERT,
+    /// which cascade-deleted child rows that reference `issues(id)` —
+    /// events, labels, dependencies, comments — every time an import
+    /// touched an existing issue (issue #263). The existence check is a
+    /// narrow `SELECT 1` rather than parsing the row through
+    /// `get_issue_from_conn`: a malformed-but-present row should be
+    /// healable by overwriting it with valid JSONL, not blocked by the
+    /// parser rejecting the bad data first.
+    ///
     /// This does NOT trigger dirty tracking or events.
     ///
     /// # Errors
@@ -7570,13 +7598,114 @@ impl SqliteStorage {
         let deleted_at_str = issue.deleted_at.map(|dt| dt.to_rfc3339());
         let compacted_at_str = issue.compacted_at.map(|dt| dt.to_rfc3339());
 
-        // Explicit DELETE + INSERT instead of INSERT OR REPLACE because
-        // fsqlite does not enforce UNIQUE constraints on non-rowid columns.
-        self.conn.execute_with_params(
-            "DELETE FROM issues WHERE id = ?",
-            &[SqliteValue::from(issue.id.as_str())],
-        )?;
+        // Closure builds the column-value vector both branches need
+        // (in column order, excluding `id` so we can append it as the
+        // WHERE-clause parameter for UPDATE or prepend it for INSERT).
+        let import_field_values = || {
+            vec![
+                issue
+                    .content_hash
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+                SqliteValue::from(issue.title.as_str()),
+                SqliteValue::from(issue.description.as_deref().unwrap_or("")),
+                SqliteValue::from(issue.design.as_deref().unwrap_or("")),
+                SqliteValue::from(issue.acceptance_criteria.as_deref().unwrap_or("")),
+                SqliteValue::from(issue.notes.as_deref().unwrap_or("")),
+                SqliteValue::from(status_str),
+                SqliteValue::from(i64::from(issue.priority.0)),
+                SqliteValue::from(issue_type_str),
+                issue
+                    .assignee
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+                SqliteValue::from(issue.owner.as_deref().unwrap_or("")),
+                issue
+                    .estimated_minutes
+                    .map_or(SqliteValue::Null, |v| SqliteValue::from(i64::from(v))),
+                SqliteValue::from(created_at_str.as_str()),
+                SqliteValue::from(issue.created_by.as_deref().unwrap_or("")),
+                SqliteValue::from(updated_at_str.as_str()),
+                closed_at_str
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+                SqliteValue::from(issue.close_reason.as_deref().unwrap_or("")),
+                SqliteValue::from(issue.closed_by_session.as_deref().unwrap_or("")),
+                due_at_str
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+                defer_until_str
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+                issue
+                    .external_ref
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+                SqliteValue::from(issue.source_system.as_deref().unwrap_or("")),
+                SqliteValue::from(issue.source_repo.as_deref().unwrap_or(".")),
+                deleted_at_str
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+                SqliteValue::from(issue.deleted_by.as_deref().unwrap_or("")),
+                SqliteValue::from(issue.delete_reason.as_deref().unwrap_or("")),
+                SqliteValue::from(issue.original_type.as_deref().unwrap_or("")),
+                SqliteValue::from(i64::from(issue.compaction_level.unwrap_or(0))),
+                compacted_at_str
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+                issue
+                    .compacted_at_commit
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+                SqliteValue::from(i64::from(issue.original_size.unwrap_or(0))),
+                SqliteValue::from(issue.sender.as_deref().unwrap_or("")),
+                SqliteValue::from(i64::from(i32::from(issue.ephemeral))),
+                SqliteValue::from(i64::from(i32::from(issue.pinned))),
+                SqliteValue::from(i64::from(i32::from(issue.is_template))),
+            ]
+        };
 
+        // Narrow existence probe: don't deserialize the row, just check
+        // if the id is present. If it's malformed we still want to
+        // overwrite it.
+        let issue_exists = match self.conn.query_row_with_params(
+            "SELECT 1 FROM issues WHERE id = ? LIMIT 1",
+            &[SqliteValue::from(issue.id.as_str())],
+        ) {
+            Ok(_) => true,
+            Err(FrankenError::QueryReturnedNoRows) => false,
+            Err(error) => return Err(error.into()),
+        };
+
+        if issue_exists {
+            let mut params = import_field_values();
+            params.push(SqliteValue::from(issue.id.as_str()));
+            let rows = self.conn.execute_with_params(
+                r"UPDATE issues SET
+                    content_hash = ?, title = ?, description = ?, design = ?,
+                    acceptance_criteria = ?, notes = ?, status = ?, priority = ?,
+                    issue_type = ?, assignee = ?, owner = ?, estimated_minutes = ?,
+                    created_at = ?, created_by = ?, updated_at = ?, closed_at = ?,
+                    close_reason = ?, closed_by_session = ?, due_at = ?, defer_until = ?,
+                    external_ref = ?, source_system = ?, source_repo = ?, deleted_at = ?,
+                    deleted_by = ?, delete_reason = ?, original_type = ?, compaction_level = ?,
+                    compacted_at = ?, compacted_at_commit = ?, original_size = ?, sender = ?,
+                    ephemeral = ?, pinned = ?, is_template = ?
+                  WHERE id = ?",
+                &params,
+            )?;
+            if rows == 0 {
+                return Err(BeadsError::Database(FrankenError::Internal(format!(
+                    "import update did not find existing issue {}",
+                    issue.id
+                ))));
+            }
+            return Ok(true);
+        }
+
+        let mut insert_params = Vec::with_capacity(36);
+        insert_params.push(SqliteValue::from(issue.id.as_str()));
+        insert_params.extend(import_field_values());
         let rows = self.conn.execute_with_params(
             r"INSERT INTO issues (
                 id, content_hash, title, description, design, acceptance_criteria, notes,
@@ -7589,44 +7718,7 @@ impl SqliteStorage {
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )",
-            &[
-                SqliteValue::from(issue.id.as_str()),
-                issue.content_hash.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                SqliteValue::from(issue.title.as_str()),
-                SqliteValue::from(issue.description.as_deref().unwrap_or("")),
-                SqliteValue::from(issue.design.as_deref().unwrap_or("")),
-                SqliteValue::from(issue.acceptance_criteria.as_deref().unwrap_or("")),
-                SqliteValue::from(issue.notes.as_deref().unwrap_or("")),
-                SqliteValue::from(status_str),
-                SqliteValue::from(i64::from(issue.priority.0)),
-                SqliteValue::from(issue_type_str),
-                issue.assignee.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                SqliteValue::from(issue.owner.as_deref().unwrap_or("")),
-                issue.estimated_minutes.map_or(SqliteValue::Null, |v| SqliteValue::from(i64::from(v))),
-                SqliteValue::from(created_at_str.as_str()),
-                SqliteValue::from(issue.created_by.as_deref().unwrap_or("")),
-                SqliteValue::from(updated_at_str.as_str()),
-                closed_at_str.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                SqliteValue::from(issue.close_reason.as_deref().unwrap_or("")),
-                SqliteValue::from(issue.closed_by_session.as_deref().unwrap_or("")),
-                due_at_str.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                defer_until_str.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                issue.external_ref.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                SqliteValue::from(issue.source_system.as_deref().unwrap_or("")),
-                SqliteValue::from(issue.source_repo.as_deref().unwrap_or(".")),
-                deleted_at_str.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                SqliteValue::from(issue.deleted_by.as_deref().unwrap_or("")),
-                SqliteValue::from(issue.delete_reason.as_deref().unwrap_or("")),
-                SqliteValue::from(issue.original_type.as_deref().unwrap_or("")),
-                SqliteValue::from(i64::from(issue.compaction_level.unwrap_or(0))),
-                compacted_at_str.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                issue.compacted_at_commit.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                SqliteValue::from(i64::from(issue.original_size.unwrap_or(0))),
-                SqliteValue::from(issue.sender.as_deref().unwrap_or("")),
-                SqliteValue::from(i64::from(i32::from(issue.ephemeral))),
-                SqliteValue::from(i64::from(i32::from(issue.pinned))),
-                SqliteValue::from(i64::from(i32::from(issue.is_template))),
-            ],
+            &insert_params,
         )?;
 
         Ok(rows > 0)
@@ -10916,6 +11008,137 @@ mod tests {
                 "column {index} should coalesce missing optional text to ''"
             );
         }
+    }
+
+    /// Regression test for issue #263 (a): import upsert must not
+    /// cascade-drop child rows. Pre-fix, `upsert_issue_for_import`
+    /// did `DELETE FROM issues WHERE id = ?` then `INSERT`, and the
+    /// child tables' `ON DELETE CASCADE` foreign keys swept events,
+    /// labels, deps, and comments out from under the issue every
+    /// time an import touched it.
+    #[test]
+    fn test_upsert_issue_for_import_preserves_child_rows() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let stamp = Utc.with_ymd_and_hms(2026, 4, 26, 12, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-import-preserve-child",
+            "Original title",
+            Status::Open,
+            2,
+            None,
+            stamp,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        let events_before = storage.get_events(&issue.id, 20).unwrap();
+        assert!(
+            !events_before.is_empty(),
+            "fixture: create_issue should produce at least one event row"
+        );
+
+        let mut imported = issue.clone();
+        imported.title = "Imported title".to_string();
+        imported.updated_at = stamp + chrono::Duration::minutes(1);
+
+        storage
+            .upsert_issue_for_import(&imported)
+            .expect("import upsert should run an in-place UPDATE for an existing id");
+
+        let updated = storage.get_issue(&issue.id).unwrap().unwrap();
+        assert_eq!(updated.title, "Imported title");
+        assert_eq!(
+            storage.get_events(&issue.id, 20).unwrap().len(),
+            events_before.len(),
+            "child events must survive an import that touches the parent row",
+        );
+        assert!(
+            !storage
+                .has_missing_issue_reference("events", "issue_id")
+                .unwrap(),
+            "import upsert must not leave dangling event rows referencing a deleted parent",
+        );
+    }
+
+    /// Regression test for issue #263 (a) — secondary contract: import
+    /// upsert must heal a malformed-but-present row by overwriting it,
+    /// not bail because the existing data fails to deserialize. The
+    /// existence probe is a narrow `SELECT 1` rather than parsing the
+    /// row through `get_issue_from_conn` for exactly this reason.
+    #[test]
+    fn test_upsert_issue_for_import_overwrites_malformed_existing_row() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let stamp = Utc.with_ymd_and_hms(2026, 4, 26, 12, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-import-heals-malformed",
+            "Original title",
+            Status::Open,
+            2,
+            None,
+            stamp,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+
+        // Stomp the persisted status with a value the Status enum
+        // doesn't accept. A subsequent import of the same id must
+        // still succeed — the existence check stops at SELECT 1.
+        storage
+            .conn
+            .execute_with_params(
+                "UPDATE issues SET status = ? WHERE id = ?",
+                &[
+                    SqliteValue::from("not-a-status"),
+                    SqliteValue::from(issue.id.as_str()),
+                ],
+            )
+            .unwrap();
+
+        let mut imported = issue.clone();
+        imported.title = "Healed title".to_string();
+        imported.updated_at = stamp + chrono::Duration::minutes(1);
+
+        storage
+            .upsert_issue_for_import(&imported)
+            .expect("import upsert should overwrite the malformed row");
+
+        let updated = storage.get_issue(&issue.id).unwrap().unwrap();
+        assert_eq!(updated.title, "Healed title");
+        assert_eq!(updated.status, Status::Open);
+    }
+
+    /// Regression test for issue #263 (b): a write-probe update that
+    /// matches zero rows must be reported as a probe failure, even
+    /// when ROLLBACK succeeds. Pre-fix, `Ok(0)` from the probe was
+    /// treated as a successful diagnostic — turning the very signal
+    /// the probe was built to surface ("the issue isn't write-
+    /// addressable through this mutation path") into a false
+    /// negative.
+    #[test]
+    fn test_finish_issue_mutation_write_probe_rejects_zero_row_update() {
+        let err = finish_issue_mutation_write_probe(Ok(0), Ok(0))
+            .expect_err("zero-row probe must surface as failure");
+        assert!(
+            err.to_string().contains("write probe did not find issue"),
+            "unexpected error: {err}",
+        );
+    }
+
+    /// Regression test for issue #263 (b): when both the probe update
+    /// matches zero rows AND the rollback returns an error, the
+    /// zero-row diagnostic remains the primary failure reported up
+    /// the stack — a downstream rollback hiccup is noise compared to
+    /// "we couldn't update the row we just inserted".
+    #[test]
+    fn test_finish_issue_mutation_write_probe_prefers_zero_row_over_rollback_error() {
+        let err = finish_issue_mutation_write_probe(
+            Ok(0),
+            Err(FrankenError::Internal("rollback failed".to_string())),
+        )
+        .expect_err("zero-row probe must outrank rollback error");
+        assert!(
+            err.to_string().contains("write probe did not find issue"),
+            "unexpected error: {err}",
+        );
     }
 
     #[test]
