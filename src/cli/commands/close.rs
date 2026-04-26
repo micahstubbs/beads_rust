@@ -8,6 +8,7 @@ use crate::cli::commands::{
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::sanitize_terminal_inline;
 use crate::model::{IssueType, Status};
 use crate::output::OutputContext;
 use crate::storage::IssueUpdate;
@@ -203,6 +204,31 @@ fn emit_close_structured_output(
         json_ctx.json_pretty(&result);
     }
     Ok(())
+}
+
+fn close_human_message(closed: &ClosedIssue) -> String {
+    let id = sanitize_terminal_inline(&closed.id);
+    let title = sanitize_terminal_inline(&closed.title);
+    let mut message = format!("Closed {}: {}", id.as_ref(), title.as_ref());
+    if let Some(reason) = &closed.close_reason {
+        let reason = sanitize_terminal_inline(reason);
+        message.push_str(" (");
+        message.push_str(reason.as_ref());
+        message.push(')');
+    }
+    message
+}
+
+fn skipped_human_message(skipped: &SkippedIssue) -> String {
+    let id = sanitize_terminal_inline(&skipped.id);
+    let reason = sanitize_terminal_inline(&skipped.reason);
+    format!("Skipped {}: {}", id.as_ref(), reason.as_ref())
+}
+
+fn unblocked_human_line(issue: &UnblockedIssue) -> String {
+    let id = sanitize_terminal_inline(&issue.id);
+    let title = sanitize_terminal_inline(&issue.title);
+    format!("  {}: {}", id.as_ref(), title.as_ref())
 }
 
 fn reorder_routed_items_by_requested_inputs<T>(
@@ -422,20 +448,16 @@ pub fn execute_with_args(
         ctx.info("No issues to close.");
     } else {
         for closed in &closed_issues {
-            let mut msg = format!("Closed {}: {}", closed.id, closed.title);
-            if let Some(reason) = &closed.close_reason {
-                msg.push_str(&format!(" ({reason})"));
-            }
-            ctx.success(&msg);
+            ctx.success(&close_human_message(closed));
         }
         for skipped in &skipped_issues {
-            ctx.warning(&format!("Skipped {}: {}", skipped.id, skipped.reason));
+            ctx.warning(&skipped_human_message(skipped));
         }
         if !unblocked_issues.is_empty() {
             ctx.newline();
             ctx.info(&format!("Unblocked {} issue(s):", unblocked_issues.len()));
             for issue in &unblocked_issues {
-                ctx.print_line(&format!("  {}: {}", issue.id, issue.title));
+                ctx.print_line(&unblocked_human_line(issue));
             }
         }
     }
@@ -547,17 +569,23 @@ fn execute_route(
         // children occur with legacy-bd migrations, bulk JSONL imports,
         // and hand-edited JSONL. Without this check, closing the parent
         // silently orphans the open children.
-        if !args.force {
+        let requested_dot_children = if args.force {
+            Vec::new()
+        } else {
             let open_dot_children = storage_ctx.storage.get_open_dot_notation_children(id)?;
-            if !open_dot_children.is_empty() {
+            let (requested_children, unrequested_children): (Vec<String>, Vec<String>) =
+                open_dot_children
+                    .into_iter()
+                    .partition(|child_id| requested_ids.contains(child_id));
+            if !unrequested_children.is_empty() {
                 let label = if issue.issue_type == IssueType::Epic {
                     "epic"
                 } else {
                     "parent issue"
                 };
-                let preview: Vec<String> = open_dot_children.iter().take(5).cloned().collect();
-                let suffix = if open_dot_children.len() > preview.len() {
-                    format!(", +{} more", open_dot_children.len() - preview.len())
+                let preview: Vec<String> = unrequested_children.iter().take(5).cloned().collect();
+                let suffix = if unrequested_children.len() > preview.len() {
+                    format!(", +{} more", unrequested_children.len() - preview.len())
                 } else {
                     String::new()
                 };
@@ -565,7 +593,7 @@ fn execute_route(
                     id: id.clone(),
                     reason: format!(
                         "{label} has {} open dot-notation child issue(s): {}{} (use --force to close anyway)",
-                        open_dot_children.len(),
+                        unrequested_children.len(),
                         preview.join(", "),
                         suffix
                     ),
@@ -574,7 +602,8 @@ fn execute_route(
                 skipped_issues.push(skipped);
                 continue;
             }
-        }
+            requested_children
+        };
 
         if args.force {
             open_issues.insert(id.clone(), issue);
@@ -598,6 +627,7 @@ fn execute_route(
         } else {
             Vec::new()
         };
+        blocker_ids.extend(requested_dot_children);
         blocker_ids.sort();
         blocker_ids.dedup();
         let (internal_blockers, external_blockers): (Vec<String>, Vec<String>) = blocker_ids
@@ -1035,6 +1065,45 @@ mod tests {
         assert!(parsed.closed_at.contains("2026-12-31"));
     }
 
+    #[test]
+    fn close_human_messages_sanitize_terminal_controls() {
+        let closed = ClosedIssue {
+            id: "bd-close\x1b[2J".to_string(),
+            title: "bad\rtitle\x08".to_string(),
+            status: "closed".to_string(),
+            closed_at: "2026-12-31T23:59:59Z".to_string(),
+            close_reason: Some("done\nnext\x07\u{9b}".to_string()),
+        };
+        let skipped = SkippedIssue {
+            id: "bd-skip\x1b[2J".to_string(),
+            reason: "blocked\rby\nterminal\x07".to_string(),
+        };
+        let unblocked = UnblockedIssue {
+            id: "bd-unblock\x1b[2J".to_string(),
+            title: "ready\nlater\x08".to_string(),
+            priority: 1,
+        };
+
+        let close_message = close_human_message(&closed);
+        let skipped_message = skipped_human_message(&skipped);
+        let unblocked_line = unblocked_human_line(&unblocked);
+
+        for text in [&close_message, &skipped_message, &unblocked_line] {
+            assert!(!text.chars().any(char::is_control));
+            assert!(text.contains("\\u{1b}[2J"));
+        }
+        assert!(close_message.contains("\\r"));
+        assert!(close_message.contains("\\u{8}"));
+        assert!(close_message.contains("\\n"));
+        assert!(close_message.contains("\\u{7}"));
+        assert!(close_message.contains("\\u{9b}"));
+        assert!(skipped_message.contains("\\r"));
+        assert!(skipped_message.contains("\\n"));
+        assert!(skipped_message.contains("\\u{7}"));
+        assert!(unblocked_line.contains("\\n"));
+        assert!(unblocked_line.contains("\\u{8}"));
+    }
+
     // =========================================================================
     // SkippedIssue serialization tests
     // =========================================================================
@@ -1251,6 +1320,91 @@ mod tests {
 
         assert_eq!(blocker.status, Status::Closed);
         assert_eq!(blocked_issue.status, Status::Closed);
+    }
+
+    #[test]
+    fn execute_with_args_closes_requested_dot_notation_child_with_parent() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        storage
+            .create_issue(&make_issue("bd-parent", "Legacy parent"), "tester")
+            .expect("create parent");
+        storage
+            .create_issue(&make_issue("bd-parent.1", "Legacy child"), "tester")
+            .expect("create dot child");
+        drop(storage);
+
+        let _guard = DirGuard::new(temp.path());
+        let args = CloseArgs {
+            ids: vec!["bd-parent".to_string(), "bd-parent.1".to_string()],
+            ..CloseArgs::default()
+        };
+        execute_with_args(&args, false, &CliOverrides::default(), &ctx)
+            .expect("close parent and dot child in one batch");
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        let parent = storage
+            .get_issue("bd-parent")
+            .expect("get parent")
+            .expect("parent exists");
+        let child = storage
+            .get_issue("bd-parent.1")
+            .expect("get child")
+            .expect("child exists");
+
+        assert_eq!(parent.status, Status::Closed);
+        assert_eq!(child.status, Status::Closed);
+    }
+
+    #[test]
+    fn execute_with_args_keeps_parent_blocked_by_unrequested_dot_notation_child() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        storage
+            .create_issue(&make_issue("bd-parent", "Legacy parent"), "tester")
+            .expect("create parent");
+        storage
+            .create_issue(&make_issue("bd-parent.1", "Legacy child"), "tester")
+            .expect("create dot child");
+        drop(storage);
+
+        let _guard = DirGuard::new(temp.path());
+        let args = CloseArgs {
+            ids: vec!["bd-parent".to_string()],
+            ..CloseArgs::default()
+        };
+        let err = execute_with_args(&args, true, &CliOverrides::default(), &ctx)
+            .expect_err("parent-only close should remain blocked by dot child");
+        assert!(matches!(err, BeadsError::NothingToDo { .. }));
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        let parent = storage
+            .get_issue("bd-parent")
+            .expect("get parent")
+            .expect("parent exists");
+        let child = storage
+            .get_issue("bd-parent.1")
+            .expect("get child")
+            .expect("child exists");
+
+        assert_eq!(parent.status, Status::Open);
+        assert_eq!(child.status, Status::Open);
     }
 
     #[test]

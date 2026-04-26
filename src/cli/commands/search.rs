@@ -336,6 +336,8 @@ fn normalize_whitespace(input: &str) -> String {
 }
 
 fn build_filters(args: &ListArgs) -> Result<ListFilters> {
+    validate_sort_key(args.sort.as_deref())?;
+
     let statuses = if args.status.is_empty() {
         None
     } else {
@@ -422,6 +424,20 @@ fn needs_client_filters(args: &ListArgs) -> bool {
 
 fn requires_post_query_ordering(_args: &ListArgs, client_filters: bool) -> bool {
     client_filters
+}
+
+fn validate_sort_key(sort: Option<&str>) -> Result<()> {
+    let Some(sort_key) = sort else {
+        return Ok(());
+    };
+
+    match sort_key {
+        "priority" | "created_at" | "created" | "updated_at" | "updated" | "title" => Ok(()),
+        _ => Err(BeadsError::Validation {
+            field: "sort".to_string(),
+            reason: format!("invalid sort field '{sort_key}'"),
+        }),
+    }
 }
 
 fn apply_client_filters(
@@ -687,6 +703,31 @@ mod tests {
             ..ListArgs::default()
         };
         assert!(requires_post_query_ordering(&args, true));
+    }
+
+    #[test]
+    fn test_search_rejects_invalid_sort_without_client_filters() {
+        let mut storage = SqliteStorage::open_memory().expect("db");
+        let timestamp = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let issue = make_issue("bd-001", "Match title", Some("match body"), timestamp);
+        storage.create_issue(&issue, "tester").expect("create");
+
+        let args = ListArgs {
+            sort: Some("bogus".to_string()),
+            ..ListArgs::default()
+        };
+
+        let err = collect_search_results(&storage, "match", &args)
+            .expect_err("invalid sort keys must be rejected before storage fallback");
+
+        assert!(
+            matches!(
+                err,
+                BeadsError::Validation { ref field, ref reason }
+                    if field == "sort" && reason.contains("bogus")
+            ),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
