@@ -1,5 +1,6 @@
 use crate::format::{
-    IssueDetails, IssueWithDependencyMetadata, sanitize_terminal_inline, sanitize_terminal_text,
+    IssueDetails, IssueWithDependencyMetadata, format_status_label, format_type_label,
+    sanitize_terminal_inline, sanitize_terminal_text,
 };
 use crate::model::{Comment, Dependency, Issue};
 use crate::output::{OutputContext, Theme};
@@ -60,19 +61,23 @@ impl<'a> IssuePanel<'a> {
 
     pub fn print(&self, ctx: &OutputContext, wrap: bool) {
         let mut content = Text::new("");
+        let issue_id = sanitize_terminal_inline(&self.issue.id);
 
         // Header: ID and Status badges
-        content.append_styled(&format!("{}  ", self.issue.id), self.theme.issue_id.clone());
+        content.append_styled(
+            &format!("{}  ", issue_id.as_ref()),
+            self.theme.issue_id.clone(),
+        );
         content.append_styled(
             &format!("[P{}]  ", self.issue.priority.0),
             self.theme.priority_style(self.issue.priority),
         );
         content.append_styled(
-            &format!("{}  ", self.issue.status),
+            &format!("{}  ", format_status_label(&self.issue.status, false)),
             self.theme.status_style(&self.issue.status),
         );
         content.append_styled(
-            &format!("{}\n\n", self.issue.issue_type),
+            &format!("{}\n\n", format_type_label(&self.issue.issue_type)),
             self.theme.type_style(&self.issue.issue_type),
         );
 
@@ -156,7 +161,10 @@ impl<'a> IssuePanel<'a> {
             content
         };
         let panel = Panel::from_rich_text(&content, panel_width)
-            .title(Text::styled(&self.issue.id, self.theme.panel_title.clone()))
+            .title(Text::styled(
+                issue_id.into_owned(),
+                self.theme.panel_title.clone(),
+            ))
             .box_style(self.theme.box_style)
             .border_style(self.theme.panel_border.clone());
 
@@ -243,10 +251,13 @@ fn render_dependency_list(
     content.append_styled(&format!("{title}:\n"), theme.emphasis.clone());
     for dep in deps {
         content.append_styled(dependency_arrow(is_dependent), theme.dimmed.clone());
-        content.append_styled(&dep.id, theme.issue_id.clone());
+        content.append_styled(
+            sanitize_terminal_inline(&dep.id).as_ref(),
+            theme.issue_id.clone(),
+        );
         content.append(" ");
         content.append_styled(
-            &format!("[{}]", dep.status.as_str()),
+            &format!("[{}]", format_status_label(&dep.status, false)),
             theme.status_style(&dep.status),
         );
         content.append(" ");
@@ -255,7 +266,10 @@ fn render_dependency_list(
             theme.issue_title.clone(),
         );
         content.append(" ");
-        content.append_styled(&format!("({})", dep.dep_type), theme.muted.clone());
+        content.append_styled(
+            &format!("({})", sanitize_terminal_inline(dep.dep_type.as_str())),
+            theme.muted.clone(),
+        );
         content.append("\n");
     }
 }
@@ -276,20 +290,77 @@ fn render_dependency_refs(deps: &[Dependency], content: &mut Text, theme: &Theme
     content.append_styled("Dependencies:\n", theme.emphasis.clone());
     for dep in deps {
         content.append_styled("  → ", theme.dimmed.clone());
-        content.append_styled(&dep.depends_on_id, theme.issue_id.clone());
+        content.append_styled(
+            sanitize_terminal_inline(&dep.depends_on_id).as_ref(),
+            theme.issue_id.clone(),
+        );
         content.append(" ");
-        content.append_styled(&format!("({})", dep.dep_type), theme.muted.clone());
+        content.append_styled(
+            &format!("({})", sanitize_terminal_inline(dep.dep_type.as_str())),
+            theme.muted.clone(),
+        );
         content.append("\n");
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::dependency_arrow;
+    use super::{dependency_arrow, render_dependency_list, render_dependency_refs};
+    use crate::format::IssueWithDependencyMetadata;
+    use crate::model::{Dependency, DependencyType, Priority, Status};
+    use crate::output::Theme;
+    use chrono::Utc;
+    use rich_rust::prelude::Text;
 
     #[test]
     fn test_dependency_arrow_tracks_direction() {
         assert_eq!(dependency_arrow(false), "  → ");
         assert_eq!(dependency_arrow(true), "  ← ");
+    }
+
+    #[test]
+    fn dependency_rendering_sanitizes_ids_and_types() {
+        let theme = Theme::default();
+        let metadata_deps = vec![IssueWithDependencyMetadata {
+            id: "bd-dep\x1b[2J".to_string(),
+            title: "Dependency title".to_string(),
+            status: Status::Open,
+            priority: Priority::MEDIUM,
+            dep_type: "blocks\x07".to_string(),
+        }];
+        let mut metadata_content = Text::new("");
+        render_dependency_list(
+            "Dependencies",
+            &metadata_deps,
+            &mut metadata_content,
+            &theme,
+            false,
+        );
+
+        let raw_deps = vec![Dependency {
+            issue_id: "bd-source".to_string(),
+            depends_on_id: "bd-target\x1b]52;c;bad\x07".to_string(),
+            dep_type: DependencyType::Custom("custom\x08type".to_string()),
+            created_at: Utc::now(),
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        }];
+        let mut raw_content = Text::new("");
+        render_dependency_refs(&raw_deps, &mut raw_content, &theme);
+
+        for rendered in [metadata_content.plain(), raw_content.plain()] {
+            assert!(!rendered.contains('\x1b'));
+            assert!(!rendered.contains('\x07'));
+            assert!(!rendered.contains('\x08'));
+        }
+        assert!(metadata_content.plain().contains("bd-dep\\u{1b}[2J"));
+        assert!(metadata_content.plain().contains("blocks\\u{7}"));
+        assert!(
+            raw_content
+                .plain()
+                .contains("bd-target\\u{1b}]52;c;bad\\u{7}")
+        );
+        assert!(raw_content.plain().contains("custom\\u{8}type"));
     }
 }

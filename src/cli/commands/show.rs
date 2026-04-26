@@ -6,7 +6,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{
     IssueDetails, IssueWithDependencyMetadata, format_priority_label, format_status_icon_colored,
-    sanitize_terminal_inline, sanitize_terminal_text,
+    format_status_label, format_type_label, sanitize_terminal_inline, sanitize_terminal_text,
 };
 use crate::model::{Dependency, Issue, Priority, Status};
 use crate::output::{IssuePanel, OutputContext, OutputMode};
@@ -695,7 +695,7 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
     let issue = &details.issue;
     let status_icon = format_status_icon_colored(&issue.status, use_color);
     let priority_label = format_priority_label(&issue.priority, use_color);
-    let status_upper = issue.status.as_str().to_uppercase();
+    let status_upper = format_status_label(&issue.status, false).to_uppercase();
     let title = sanitize_terminal_inline(&issue.title);
 
     // Match bd format: {status_icon} {id} · {title}   [● {priority} · {STATUS}]
@@ -715,7 +715,7 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
         output,
         "Owner: {} · Type: {}",
         owner,
-        issue.issue_type.as_str()
+        format_type_label(&issue.issue_type)
     );
 
     // Created/Updated line

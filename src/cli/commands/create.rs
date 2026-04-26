@@ -2,6 +2,7 @@ use super::{report_auto_flush_failure, resolve_issue_id, retry_mutation_with_jso
 use crate::cli::CreateArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::{format_type_label, sanitize_terminal_inline};
 use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
@@ -134,11 +135,19 @@ pub fn execute_with_storage(
         }
     } else if args.dry_run {
         ctx.info(&format!("Dry run: would create issue {}", issue.id));
-        ctx.print_line(&format!("Title: {}", issue.title));
-        ctx.print_line(&format!("Type: {}", issue.issue_type));
+        ctx.print_line(&format!(
+            "Title: {}",
+            sanitize_terminal_inline(&issue.title)
+        ));
+        ctx.print_line(&format!("Type: {}", format_type_label(&issue.issue_type)));
         ctx.print_line(&format!("Priority: {}", issue.priority));
         if !args.labels.is_empty() {
-            ctx.print_line(&format!("Labels: {}", args.labels.join(", ")));
+            let labels = args
+                .labels
+                .iter()
+                .map(|label| sanitize_terminal_inline(label).into_owned())
+                .collect::<Vec<_>>();
+            ctx.print_line(&format!("Labels: {}", labels.join(", ")));
         }
         if let Some(parent) = &args.parent {
             ctx.print_line(&format!("Parent: {parent}"));
@@ -147,7 +156,11 @@ pub fn execute_with_storage(
             ctx.print_line(&format!("Dependencies: {}", args.deps.join(", ")));
         }
     } else {
-        ctx.success(&format!("Created {}: {}", issue.id, issue.title));
+        ctx.success(&format!(
+            "Created {}: {}",
+            issue.id,
+            sanitize_terminal_inline(&issue.title)
+        ));
     }
     auto_flush_after_create(&mut storage_ctx, ctx);
     Ok(())

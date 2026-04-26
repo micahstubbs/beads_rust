@@ -9,6 +9,7 @@ use super::{
 use crate::cli::UpdateArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::{format_status_label, format_type_label, sanitize_terminal_inline};
 use crate::model::{Issue, IssueType, Priority, Status};
 use crate::output::OutputContext;
 use crate::storage::{IssueUpdate, SqliteStorage};
@@ -646,29 +647,45 @@ fn validate_transition_to_in_progress(
 
 /// Print a summary of what changed for the issue.
 fn print_update_summary(id: &str, title: &str, diff: &UpdateDiff) {
-    println!("Updated {id}: {title}");
+    println!("Updated {id}: {}", sanitize_terminal_inline(title));
 
     if let Some((old_status, new_status)) = &diff.status {
         println!(
             "  status: {} → {}",
-            old_status.as_str(),
-            new_status.as_str()
+            format_status_label(old_status, false),
+            format_status_label(new_status, false)
         );
     }
     if let Some((old_priority, new_priority)) = &diff.priority {
         println!("  priority: P{} → P{}", old_priority.0, new_priority.0);
     }
     if let Some((old_type, new_type)) = &diff.issue_type {
-        println!("  type: {} → {}", old_type.as_str(), new_type.as_str());
+        println!(
+            "  type: {} → {}",
+            format_type_label(old_type),
+            format_type_label(new_type)
+        );
     }
     if let Some((old_assignee, new_assignee)) = &diff.assignee {
-        let before_assignee = old_assignee.as_deref().unwrap_or("(none)");
-        let after_assignee = new_assignee.as_deref().unwrap_or("(none)");
+        let before_assignee = old_assignee.as_deref().map_or_else(
+            || "(none)".to_string(),
+            |value| sanitize_terminal_inline(value).into_owned(),
+        );
+        let after_assignee = new_assignee.as_deref().map_or_else(
+            || "(none)".to_string(),
+            |value| sanitize_terminal_inline(value).into_owned(),
+        );
         println!("  assignee: {before_assignee} → {after_assignee}");
     }
     if let Some((old_owner, new_owner)) = &diff.owner {
-        let before_owner = old_owner.as_deref().unwrap_or("(none)");
-        let after_owner = new_owner.as_deref().unwrap_or("(none)");
+        let before_owner = old_owner.as_deref().map_or_else(
+            || "(none)".to_string(),
+            |value| sanitize_terminal_inline(value).into_owned(),
+        );
+        let after_owner = new_owner.as_deref().map_or_else(
+            || "(none)".to_string(),
+            |value| sanitize_terminal_inline(value).into_owned(),
+        );
         println!("  owner: {before_owner} → {after_owner}");
     }
 }

@@ -14,7 +14,7 @@ use crate::sync::{
     METADATA_LAST_EXPORT_TIME, METADATA_LAST_IMPORT_TIME,
 };
 use crate::util::id::{normalize_prefix, parse_id};
-use crate::validation::IssueValidator;
+use crate::validation::{CommentValidator, IssueValidator};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use fsqlite::Connection;
 use fsqlite::compat::{OpenFlags, open_with_flags};
@@ -1291,6 +1291,8 @@ impl SqliteStorage {
     /// Returns an error if the issue cannot be inserted (e.g. ID collision).
     #[allow(clippy::too_many_lines)]
     pub fn create_issue(&mut self, issue: &Issue, actor: &str) -> Result<()> {
+        IssueValidator::validate(issue).map_err(BeadsError::from_validation_errors)?;
+
         self.mutate("create_issue", actor, |conn, ctx| {
             // Explicit duplicate check since fsqlite does not enforce
             // UNIQUE constraints on non-rowid columns.
@@ -1334,6 +1336,7 @@ impl SqliteStorage {
             let defer_until_str = issue.defer_until.map(|dt| dt.to_rfc3339());
             let deleted_at_str = issue.deleted_at.map(|dt| dt.to_rfc3339());
             let compacted_at_str = issue.compacted_at.map(|dt| dt.to_rfc3339());
+            let content_hash = issue.compute_content_hash();
 
             conn.execute_with_params(
                 "INSERT INTO issues (
@@ -1347,7 +1350,7 @@ impl SqliteStorage {
                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 &[
                     SqliteValue::from(issue.id.as_str()),
-                    issue.content_hash.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                    SqliteValue::from(content_hash.as_str()),
                     SqliteValue::from(issue.title.as_str()),
                     SqliteValue::from(issue.description.as_deref().unwrap_or("")),
                     SqliteValue::from(issue.design.as_deref().unwrap_or("")),
@@ -4342,14 +4345,14 @@ impl SqliteStorage {
     ///
     /// Rationale: `get_epic_counts()` covers the happy path (issues created
     /// with `br create --parent ...`, which writes a `parent-child` row in
-    /// `dependencies`). But issues migrated from legacy beads DBs, bulk
-    /// JSONL imports, or hand-authored JSONL can introduce IDs like
-    /// `epic.1`, `epic.2` that are semantically children but have no dep
-    /// row. Without this check, `br close epic` silently closes the parent
+    /// `dependencies`). But legacy beads DBs, direct database migrations, or
+    /// older storage versions can contain IDs like
+    /// `bd-epic.1`, `bd-epic.2` that are semantically children but have no dep
+    /// row. Without this check, `br close bd-epic` silently closes the parent
     /// while leaving those children orphaned.
     ///
-    /// Excludes grandchildren (e.g. `epic.1.1` is not a direct child of
-    /// `epic`). LIKE pattern specials in the parent id are escaped via
+    /// Excludes grandchildren (e.g. `bd-epic.1.1` is not a direct child of
+    /// `bd-epic`). LIKE pattern specials in the parent id are escaped via
     /// `escape_like_pattern` + `ESCAPE '\\'` so any id is safe to pass.
     ///
     /// # Errors
@@ -5313,12 +5316,8 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn add_comment(&mut self, issue_id: &str, author: &str, text: &str) -> Result<Comment> {
-        if text.trim().is_empty() {
-            return Err(crate::error::BeadsError::validation(
-                "comment",
-                "comment text cannot be empty",
-            ));
-        }
+        validate_new_comment(issue_id, author, text)?;
+
         self.mutate("add_comment", author, |conn, ctx| {
             Self::ensure_issue_mutable_in_tx(conn, issue_id, "add comment to")?;
 
@@ -7861,6 +7860,18 @@ impl crate::validation::DependencyStore for SqliteStorage {
     }
 }
 
+fn validate_new_comment(issue_id: &str, author: &str, text: &str) -> Result<()> {
+    let comment = Comment {
+        id: 1,
+        issue_id: issue_id.to_string(),
+        author: author.to_string(),
+        body: text.to_string(),
+        created_at: Utc::now(),
+    };
+
+    CommentValidator::validate(&comment).map_err(BeadsError::from_validation_errors)
+}
+
 fn insert_comment_row(conn: &Connection, issue_id: &str, author: &str, text: &str) -> Result<i64> {
     conn.execute_with_params(
         "INSERT INTO comments (issue_id, author, text, created_at)
@@ -8104,6 +8115,17 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(count, 1);
 
+        let persisted = storage
+            .get_issue("bd-1")
+            .expect("get created issue")
+            .expect("created issue exists");
+        let expected_hash = issue.compute_content_hash();
+        assert_eq!(
+            persisted.content_hash.as_deref(),
+            Some(expected_hash.as_str()),
+            "create_issue should persist the canonical content hash"
+        );
+
         // Verify event
         let event_count = storage
             .conn
@@ -8129,6 +8151,53 @@ mod tests {
             .and_then(SqliteValue::as_integer)
             .unwrap_or(0);
         assert_eq!(dirty_count, 1);
+    }
+
+    #[test]
+    fn test_create_issue_rejects_invalid_issue_without_persisting() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let invalid = Issue {
+            id: "bd-invalid-create".to_string(),
+            title: "x".repeat(501),
+            status: Status::Open,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            ..Issue::default()
+        };
+
+        let error = storage
+            .create_issue(&invalid, "tester")
+            .expect_err("invalid issues must be rejected before persistence");
+
+        assert!(
+            matches!(
+                &error,
+                BeadsError::Validation { field, reason }
+                    if field == "title" && reason.contains("exceeds 500")
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            storage
+                .get_issue("bd-invalid-create")
+                .expect("lookup invalid issue")
+                .is_none(),
+            "invalid issue must not be persisted"
+        );
+        assert!(
+            storage
+                .get_events("bd-invalid-create", 100)
+                .expect("events")
+                .is_empty(),
+            "invalid issue must not emit events"
+        );
+        let dirty_ids = storage.get_dirty_issue_ids().expect("dirty marker");
+        assert!(
+            !dirty_ids.contains(&"bd-invalid-create".to_string()),
+            "invalid issue must not be marked dirty"
+        );
     }
 
     #[test]
@@ -9456,6 +9525,53 @@ mod tests {
         let comments = storage.get_comments("bd-c2").unwrap();
         assert_eq!(comments.len(), 1);
         assert_eq!(comments[0], comment);
+    }
+
+    #[test]
+    fn test_add_comment_rejects_invalid_comment_fields_without_inserting() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-c-invalid-input",
+            "Comment validation target",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let long_text = "x".repeat(51_201);
+        let body_error = storage
+            .add_comment("bd-c-invalid-input", "alice", &long_text)
+            .unwrap_err();
+        assert!(
+            matches!(
+                &body_error,
+                BeadsError::Validation { field, reason }
+                    if field == "content" && reason.contains("exceeds 50KB")
+            ),
+            "unexpected long comment error: {body_error:?}"
+        );
+
+        let author_error = storage
+            .add_comment("bd-c-invalid-input", "", "Valid comment body")
+            .unwrap_err();
+        assert!(
+            matches!(
+                &author_error,
+                BeadsError::Validation { field, reason }
+                    if field == "author" && reason.contains("cannot be empty")
+            ),
+            "unexpected empty author error: {author_error:?}"
+        );
+
+        let comments = storage.get_comments("bd-c-invalid-input").unwrap();
+        assert!(
+            comments.is_empty(),
+            "invalid comments must not be inserted: {comments:?}"
+        );
     }
 
     #[test]
@@ -12146,12 +12262,12 @@ mod tests {
         let issue = make_issue("bd-x1", "Blocked", Status::Open, 2, None, t1, None);
         storage.create_issue(&issue, "tester").unwrap();
 
-        // Add a dependency on an ID containing a quote (e.g. from bad import)
-        // This is valid in DB but tricky for manual JSON building.
-        // Create a real issue with a tricky ID so it passes existence checks.
+        // Add a dependency on an ID containing a quote, as could exist in a
+        // legacy/corrupt database. `create_issue` now rejects invalid IDs, so
+        // seed the low-level row directly through the import upsert path.
         let tricky_id = "bd-q\"ote";
         let tricky_issue = make_issue(tricky_id, "Tricky", Status::Open, 2, None, t1, None);
-        storage.create_issue(&tricky_issue, "tester").unwrap();
+        storage.upsert_issue_for_import(&tricky_issue).unwrap();
         storage
             .add_dependency("bd-x1", tricky_id, "blocks", "tester")
             .unwrap();
@@ -13135,10 +13251,18 @@ mod tests {
     fn dot_notation_children_detects_open_direct_children() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let parent = make_issue("epic", "Epic", Status::Open, 1, None, now, None);
-        let child1 = make_issue("epic.1", "Child 1", Status::Open, 1, None, now, None);
-        let child2 = make_issue("epic.2", "Child 2", Status::InProgress, 1, None, now, None);
-        let mut child3 = make_issue("epic.3", "Child 3", Status::Closed, 1, None, now, None);
+        let parent = make_issue("bd-epic", "Epic", Status::Open, 1, None, now, None);
+        let child1 = make_issue("bd-epic.1", "Child 1", Status::Open, 1, None, now, None);
+        let child2 = make_issue(
+            "bd-epic.2",
+            "Child 2",
+            Status::InProgress,
+            1,
+            None,
+            now,
+            None,
+        );
+        let mut child3 = make_issue("bd-epic.3", "Child 3", Status::Closed, 1, None, now, None);
         // closed rows require closed_at set (DB CHECK constraint).
         child3.closed_at = Some(now);
         storage.create_issue(&parent, "t").unwrap();
@@ -13146,11 +13270,11 @@ mod tests {
         storage.create_issue(&child2, "t").unwrap();
         storage.create_issue(&child3, "t").unwrap();
 
-        let mut open_children = storage.get_open_dot_notation_children("epic").unwrap();
+        let mut open_children = storage.get_open_dot_notation_children("bd-epic").unwrap();
         open_children.sort();
         assert_eq!(
             open_children,
-            vec!["epic.1".to_string(), "epic.2".to_string()],
+            vec!["bd-epic.1".to_string(), "bd-epic.2".to_string()],
             "closed child should be excluded; open and in_progress should be returned"
         );
     }
@@ -13159,18 +13283,26 @@ mod tests {
     fn dot_notation_children_excludes_grandchildren() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let parent = make_issue("root", "Root", Status::Open, 1, None, now, None);
-        let child = make_issue("root.1", "Child", Status::Open, 1, None, now, None);
-        let grandchild = make_issue("root.1.1", "Grandchild", Status::Open, 1, None, now, None);
+        let parent = make_issue("bd-root", "Root", Status::Open, 1, None, now, None);
+        let child = make_issue("bd-root.1", "Child", Status::Open, 1, None, now, None);
+        let grandchild = make_issue(
+            "bd-root.1.1",
+            "Grandchild",
+            Status::Open,
+            1,
+            None,
+            now,
+            None,
+        );
         storage.create_issue(&parent, "t").unwrap();
         storage.create_issue(&child, "t").unwrap();
         storage.create_issue(&grandchild, "t").unwrap();
 
-        let open_children = storage.get_open_dot_notation_children("root").unwrap();
+        let open_children = storage.get_open_dot_notation_children("bd-root").unwrap();
         assert_eq!(
             open_children,
-            vec!["root.1".to_string()],
-            "grandchildren (root.1.1) must not be returned as direct children of root"
+            vec!["bd-root.1".to_string()],
+            "grandchildren (bd-root.1.1) must not be returned as direct children of bd-root"
         );
     }
 
@@ -13178,12 +13310,12 @@ mod tests {
     fn dot_notation_children_returns_empty_when_none() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let parent = make_issue("solo", "Solo", Status::Open, 1, None, now, None);
-        let unrelated = make_issue("other", "Other", Status::Open, 1, None, now, None);
+        let parent = make_issue("bd-solo", "Solo", Status::Open, 1, None, now, None);
+        let unrelated = make_issue("bd-other", "Other", Status::Open, 1, None, now, None);
         storage.create_issue(&parent, "t").unwrap();
         storage.create_issue(&unrelated, "t").unwrap();
 
-        let open_children = storage.get_open_dot_notation_children("solo").unwrap();
+        let open_children = storage.get_open_dot_notation_children("bd-solo").unwrap();
         assert!(
             open_children.is_empty(),
             "parent with no dot-notation children should return empty vec, got {open_children:?}"
@@ -13194,11 +13326,11 @@ mod tests {
     fn dot_notation_children_escapes_like_specials_in_parent_id() {
         // If escape_like_pattern were bypassed, a parent id containing `_`
         // would match any single character via LIKE. Pin the escaping behavior
-        // so `a_b.1` matches but `aXb.1` does not.
+        // so `a_b-1.1` matches but `axb-1.1` does not.
         let mut storage = SqliteStorage::open_memory().unwrap();
         let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let parent = make_issue(
-            "a_b",
+            "a_b-1",
             "Parent with underscore",
             Status::Open,
             1,
@@ -13206,17 +13338,17 @@ mod tests {
             now,
             None,
         );
-        let child = make_issue("a_b.1", "Real child", Status::Open, 1, None, now, None);
-        let decoy = make_issue("aXb.1", "Decoy", Status::Open, 1, None, now, None);
+        let child = make_issue("a_b-1.1", "Real child", Status::Open, 1, None, now, None);
+        let decoy = make_issue("axb-1.1", "Decoy", Status::Open, 1, None, now, None);
         storage.create_issue(&parent, "t").unwrap();
         storage.create_issue(&child, "t").unwrap();
         storage.create_issue(&decoy, "t").unwrap();
 
-        let open_children = storage.get_open_dot_notation_children("a_b").unwrap();
+        let open_children = storage.get_open_dot_notation_children("a_b-1").unwrap();
         assert_eq!(
             open_children,
-            vec!["a_b.1".to_string()],
-            "underscore in parent id must be escaped so `a_b.1` matches but `aXb.1` does not"
+            vec!["a_b-1.1".to_string()],
+            "underscore in parent id must be escaped so `a_b-1.1` matches but `axb-1.1` does not"
         );
     }
 

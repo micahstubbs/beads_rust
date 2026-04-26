@@ -1,4 +1,4 @@
-use crate::format::sanitize_terminal_inline;
+use crate::format::{format_status_icon, sanitize_terminal_inline};
 use crate::model::Issue;
 use crate::output::Theme;
 use rich_rust::prelude::*;
@@ -43,8 +43,8 @@ impl<'a> DependencyTree<'a> {
         // Create label with ID, status, and title
         let label = format!(
             "{} [{}] {}",
-            issue.id,
-            format!("{}", issue.status).chars().next().unwrap_or('?'),
+            sanitize_terminal_inline(&issue.id),
+            format_status_icon(&issue.status),
             truncate(&issue.title, 40)
         );
 
@@ -58,8 +58,10 @@ impl<'a> DependencyTree<'a> {
                     node = node.child(child);
                 } else {
                     // Dependency not found (external or deleted)
-                    let missing =
-                        TreeNode::new(Text::new(format!("{} [?] (not found)", dep.depends_on_id)));
+                    let missing = TreeNode::new(Text::new(format!(
+                        "{} [?] (not found)",
+                        sanitize_terminal_inline(&dep.depends_on_id)
+                    )));
                     node = node.child(missing);
                 }
             }
@@ -112,6 +114,9 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Dependency, DependencyType, Status};
+    use crate::output::Theme;
+    use chrono::Utc;
 
     #[test]
     fn test_dep_tree_truncation_safe() {
@@ -138,5 +143,34 @@ mod tests {
         let title = "Short";
         let truncated = truncate(title, 40);
         assert_eq!(truncated, "Short");
+    }
+
+    #[test]
+    fn dependency_tree_sanitizes_labels_and_uses_safe_status_icon() {
+        let mut issue = Issue {
+            id: "bd-root".to_string(),
+            title: "Root\x1b[2J".to_string(),
+            status: Status::Custom("\x1b[31mhidden".to_string()),
+            ..Issue::default()
+        };
+        issue.dependencies.push(Dependency {
+            issue_id: issue.id.clone(),
+            depends_on_id: "external:proj:\x07capability".to_string(),
+            dep_type: DependencyType::Blocks,
+            created_at: Utc::now(),
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        });
+
+        let theme = Theme::default();
+        let rendered = DependencyTree::new(&issue, &[], &theme)
+            .build()
+            .render_plain();
+
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains('\x07'));
+        assert!(rendered.contains("bd-root [?] Root\\u{1b}[2J"));
+        assert!(rendered.contains("external:proj:\\u{7}capability [?] (not found)"));
     }
 }

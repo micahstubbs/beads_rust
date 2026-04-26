@@ -8,7 +8,7 @@ use crate::config::{
     should_use_color,
 };
 use crate::error::Result;
-use crate::format::{BlockedIssue, BlockedIssueOutput};
+use crate::format::{BlockedIssue, BlockedIssueOutput, sanitize_terminal_inline};
 use crate::model::{IssueType, Priority};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
@@ -320,7 +320,7 @@ fn print_text_output(
     storage: &crate::storage::SqliteStorage,
     max_width: usize,
 ) {
-    use crate::format::{sanitize_terminal_inline, truncate_title};
+    use crate::format::{format_status_label, sanitize_terminal_inline, truncate_title};
 
     if blocked_issues.is_empty() {
         // Match bd format
@@ -333,9 +333,10 @@ fn print_text_output(
 
     for bi in blocked_issues {
         let priority = bi.issue.priority.0;
+        let issue_id = blocked_id_text(&bi.issue.id);
         // Calculate prefix length for title truncation
         // "[● P2] id: " prefix - estimate ~20 chars for priority badge and ID
-        let prefix_len = 10 + bi.issue.id.len();
+        let prefix_len = 10 + issue_id.len();
         let title = if max_width == 0 {
             // No wrap - use full title
             sanitize_terminal_inline(&bi.issue.title).into_owned()
@@ -344,7 +345,7 @@ fn print_text_output(
             truncate_title(&bi.issue.title, max_width.saturating_sub(prefix_len))
         };
         // Match bd format: [● P2] ID: Title
-        println!("[● P{}] {}: {}", priority, bi.issue.id, title);
+        println!("[● P{}] {}: {}", priority, issue_id, title);
 
         if verbose {
             println!("  Blocked by:");
@@ -359,10 +360,16 @@ fn print_text_output(
                     };
                     println!(
                         "    • {}: {} [P{}] [{}]",
-                        blocker_id, blocker_title, blocker.priority.0, blocker.status
+                        blocked_id_text(blocker_id),
+                        blocker_title,
+                        blocker.priority.0,
+                        format_status_label(&blocker.status, false)
                     );
                 } else {
-                    println!("    • {blocker_ref} (not found)");
+                    println!(
+                        "    • {} (not found)",
+                        sanitize_terminal_inline(blocker_ref)
+                    );
                 }
             }
         } else {
@@ -370,18 +377,25 @@ fn print_text_output(
             // Note: bd uses "dependencies" even for count=1 (grammatically incorrect but we match for conformance)
             let count = bi.blocked_by.len();
             // Extract just the IDs from blocker refs (strip :status suffix)
-            let ids: Vec<&str> = bi
-                .blocked_by
-                .iter()
-                .map(|r| blocker_id_from_ref(r))
-                .collect();
             println!(
                 "  Blocked by {} open dependencies: [{}]",
                 count,
-                ids.join(", ")
+                blocked_id_list_text(&bi.blocked_by)
             );
         }
     }
+}
+
+fn blocked_id_text(id: &str) -> String {
+    sanitize_terminal_inline(id).into_owned()
+}
+
+fn blocked_id_list_text(blocked_by: &[String]) -> String {
+    blocked_by
+        .iter()
+        .map(|r| blocked_id_text(blocker_id_from_ref(r)))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn blocker_id_from_ref(blocker_ref: &str) -> &str {
@@ -397,7 +411,7 @@ fn render_blocked_rich(
     storage: &crate::storage::SqliteStorage,
     max_width: usize,
 ) {
-    use crate::format::{sanitize_terminal_inline, truncate_title};
+    use crate::format::{format_status_label, sanitize_terminal_inline, truncate_title};
     use rich_rust::Text;
     use rich_rust::prelude::*;
 
@@ -429,6 +443,7 @@ fn render_blocked_rich(
     for bi in blocked_issues {
         let priority = bi.issue.priority.0;
         let blocker_count = bi.blocked_by_count;
+        let issue_id = blocked_id_text(&bi.issue.id);
 
         // Color code blocker count: yellow(1), orange(2-3), red(4+)
         let count_style = match blocker_count {
@@ -438,7 +453,7 @@ fn render_blocked_rich(
         };
 
         // Calculate title width - account for "[P2] id: " prefix and " [N blockers]" suffix
-        let prefix_len = 6 + bi.issue.id.len() + 2; // "[P2] " + id + ": "
+        let prefix_len = 6 + issue_id.len() + 2; // "[P2] " + id + ": "
         let suffix_len = 15; // " [N blockers]"
         let title = if max_width > 0 {
             let available = max_width.saturating_sub(prefix_len + suffix_len);
@@ -452,7 +467,7 @@ fn render_blocked_rich(
             &format!("[P{}] ", priority),
             Style::new().bold().color(color("magenta")),
         );
-        line.append_styled(&bi.issue.id, Style::new().bold().color(color("cyan")));
+        line.append_styled(&issue_id, Style::new().bold().color(color("cyan")));
         line.append(": ");
         line.append(&title);
         line.append_styled(&format!(" [{} blockers]", blocker_count), count_style);
@@ -467,7 +482,10 @@ fn render_blocked_rich(
                 let blocker_id = blocker_id_from_ref(blocker_ref);
                 let mut blocker_line = Text::new("");
                 blocker_line.append_styled("    \u{2022} ", Style::new().color(color("yellow")));
-                blocker_line.append_styled(blocker_id, Style::new().color(color("cyan")));
+                blocker_line.append_styled(
+                    &blocked_id_text(blocker_id),
+                    Style::new().color(color("cyan")),
+                );
 
                 if let Ok(Some(blocker)) = storage.get_issue(blocker_id) {
                     let blocker_title = if max_width > 0 {
@@ -479,23 +497,20 @@ fn render_blocked_rich(
                     blocker_line.append(&blocker_title);
                     blocker_line
                         .append_styled(&format!(" [P{}]", blocker.priority.0), Style::new().dim());
-                    blocker_line
-                        .append_styled(&format!(" [{}]", blocker.status), Style::new().dim());
+                    blocker_line.append_styled(
+                        &format!(" [{}]", format_status_label(&blocker.status, false)),
+                        Style::new().dim(),
+                    );
                 } else {
                     blocker_line.append_styled(" (not found)", Style::new().dim());
                 }
                 console.print_renderable(&blocker_line);
             }
         } else {
-            let ids: Vec<&str> = bi
-                .blocked_by
-                .iter()
-                .map(|r| blocker_id_from_ref(r))
-                .collect();
             let mut detail = Text::new("");
             detail.append_styled("  Blocked by: ", Style::new().dim());
             detail.append_styled(
-                &format!("[{}]", ids.join(", ")),
+                &format!("[{}]", blocked_id_list_text(&bi.blocked_by)),
                 Style::new().color(color("yellow")),
             );
             console.print_renderable(&detail);
@@ -582,6 +597,22 @@ mod tests {
         assert!(args.label.is_empty());
         assert!(!args.robot);
         info!("test_blocked_args_defaults: assertions passed");
+    }
+
+    #[test]
+    fn test_blocked_id_display_helpers_escape_terminal_controls() {
+        let id = blocked_id_text("bd-bad\x1b]52;c;bad\x07");
+        assert!(!id.chars().any(char::is_control));
+        assert_eq!(id, "bd-bad\\u{1b}]52;c;bad\\u{7}");
+
+        let ids = blocked_id_list_text(&[
+            "bd-one\x1b[2J:open".to_string(),
+            "external:proj:\x08cap:blocked".to_string(),
+        ]);
+
+        assert!(!ids.chars().any(char::is_control));
+        assert!(ids.contains("bd-one\\u{1b}[2J"));
+        assert!(ids.contains("external:proj:\\u{8}cap"));
     }
 
     #[test]

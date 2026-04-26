@@ -1,4 +1,7 @@
-use crate::format::{sanitize_terminal_inline, sanitize_terminal_text, truncate_title};
+use crate::format::{
+    format_status_label, format_type_label, sanitize_terminal_inline, sanitize_terminal_text,
+    truncate_title,
+};
 use crate::model::Issue;
 use crate::output::Theme;
 use regex::{Regex, RegexBuilder};
@@ -192,7 +195,10 @@ impl<'a> IssueTable<'a> {
             let mut cells: Vec<Cell> = vec![];
 
             if self.columns.id {
-                cells.push(Cell::new(Text::new(&issue.id)).style(self.theme.issue_id.clone()));
+                cells.push(
+                    Cell::new(Text::new(sanitize_terminal_inline(&issue.id).into_owned()))
+                        .style(self.theme.issue_id.clone()),
+                );
             }
             if self.columns.priority {
                 cells.push(
@@ -202,13 +208,13 @@ impl<'a> IssueTable<'a> {
             }
             if self.columns.status {
                 cells.push(
-                    Cell::new(Text::new(issue.status.to_string()))
+                    Cell::new(Text::new(format_status_label(&issue.status, false)))
                         .style(self.theme.status_style(&issue.status)),
                 );
             }
             if self.columns.issue_type {
                 cells.push(
-                    Cell::new(Text::new(issue.issue_type.to_string()))
+                    Cell::new(Text::new(format_type_label(&issue.issue_type)))
                         .style(self.theme.type_style(&issue.issue_type)),
                 );
             }
@@ -325,7 +331,10 @@ fn highlight_text(text: &str, regex: Option<&Regex>, theme: &Theme) -> Text {
 
 #[cfg(test)]
 mod tests {
+    use super::{IssueTable, IssueTableColumns};
     use crate::format::truncate_title;
+    use crate::model::{Issue, IssueType, Status};
+    use crate::output::Theme;
 
     #[test]
     fn test_table_truncation_safe() {
@@ -337,5 +346,33 @@ mod tests {
         assert!(truncated.chars().count() < 60);
         assert!(truncated.starts_with("😊"));
         assert!(truncated.ends_with("..."));
+    }
+
+    #[test]
+    fn table_sanitizes_custom_status_and_type_cells() {
+        let issue = Issue {
+            id: "bd-table\x1b]52;c;bad\x07".to_string(),
+            title: "safe title".to_string(),
+            status: Status::Custom("state\x1b[2J".to_string()),
+            issue_type: IssueType::Custom("kind\x07bell".to_string()),
+            ..Issue::default()
+        };
+        let theme = Theme::default();
+        let rendered = IssueTable::new(std::slice::from_ref(&issue), &theme)
+            .columns(IssueTableColumns {
+                id: true,
+                status: true,
+                issue_type: true,
+                title: true,
+                ..Default::default()
+            })
+            .build()
+            .render_plain(120);
+
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains('\x07'));
+        assert!(rendered.contains("bd-table\\u{1b}]52;c;bad\\u{7}"));
+        assert!(rendered.contains("\\u{1b}[2J"));
+        assert!(rendered.contains("\\u{7}bell"));
     }
 }

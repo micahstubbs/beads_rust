@@ -215,7 +215,8 @@ fn type_to_header(issue_type: &str) -> String {
         "question" => "Questions Resolved".to_string(),
         other => {
             // Capitalize first letter for custom types
-            let mut chars = other.chars();
+            let sanitized = sanitize_terminal_inline(other);
+            let mut chars = sanitized.chars();
             chars.next().map_or_else(String::new, |first| {
                 first.to_uppercase().chain(chars).collect()
             })

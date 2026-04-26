@@ -208,7 +208,11 @@ fn render_lint_rich(summary: &LintSummary, ctx: &OutputContext) {
 
         for (issue_type, results) in by_type {
             content.append_styled(
-                &format!("{issue_type} ({})\n", results.len()),
+                &format!(
+                    "{} ({})\n",
+                    sanitize_terminal_inline(issue_type),
+                    results.len()
+                ),
                 theme.section.clone(),
             );
             for result in results {
@@ -216,7 +220,7 @@ fn render_lint_rich(summary: &LintSummary, ctx: &OutputContext) {
                 content.append_styled(&result.id, theme.issue_id.clone());
                 content.append(" ");
                 content.append_styled(
-                    &format!("[{}] ", result.issue_type),
+                    &format!("[{}] ", sanitize_terminal_inline(&result.issue_type)),
                     issue_type_style(theme, &result.issue_type),
                 );
                 content.append_styled(

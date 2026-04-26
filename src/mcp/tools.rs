@@ -16,9 +16,9 @@ use fastmcp_rust::{
 use serde_json::json;
 
 use crate::error::{BeadsError, ErrorCode, StructuredError};
-use crate::model::{Issue, IssueType, Priority, Status};
+use crate::model::{Comment, Issue, IssueType, Priority, Status};
 use crate::storage::{IssueUpdate, ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
-use crate::validation::{IssueValidator, LabelValidator};
+use crate::validation::{CommentValidator, IssueValidator, LabelValidator};
 
 use super::BeadsState;
 
@@ -135,11 +135,27 @@ fn placeholder_error(s: &str) -> McpError {
     )
 }
 
-/// Check for placeholder AND validate ID exists. Returns fuzzy suggestions
-/// with `suggested_tool_calls` if not found.
+fn tombstone_issue_err(id: &str) -> McpError {
+    McpError::with_data(
+        McpErrorCode::InvalidParams,
+        format!("Issue '{id}' is tombstoned and cannot be used for this operation"),
+        json!({
+            "error_type": "TOMBSTONE_ISSUE",
+            "id": id,
+            "recoverable": false,
+            "hint": "Use list_issues to choose an active issue, or create a new issue instead"
+        }),
+    )
+}
+
+/// Check for placeholder and validate that ID exists as an active issue.
+/// Returns fuzzy suggestions with `suggested_tool_calls` if not found.
 fn require_valid_issue(storage: &SqliteStorage, id: &str) -> McpResult<()> {
     // Check DB first: if the ID exists, it's real regardless of name.
-    if storage.id_exists(id).map_err(beads_to_mcp)? {
+    if let Some(issue) = storage.get_issue(id).map_err(beads_to_mcp)? {
+        if issue.status == Status::Tombstone {
+            return Err(tombstone_issue_err(id));
+        }
         return Ok(());
     }
     // ID not found — give a more helpful placeholder error if the ID looks
@@ -741,6 +757,27 @@ fn optional_label_array_arg(args: &serde_json::Value, key: &str) -> McpResult<Ve
     Ok(labels)
 }
 
+fn validate_mcp_title(title: &str) -> McpResult<()> {
+    if title.trim().is_empty() || title.chars().count() > 500 {
+        return Err(McpError::invalid_params("Title must be 1-500 characters"));
+    }
+    Ok(())
+}
+
+fn validate_mcp_comment(issue_id: &str, author: &str, body: &str) -> McpResult<()> {
+    let comment = Comment {
+        id: 1,
+        issue_id: issue_id.to_string(),
+        author: author.to_string(),
+        body: body.to_string(),
+        created_at: chrono::Utc::now(),
+    };
+
+    CommentValidator::validate(&comment)
+        .map_err(BeadsError::from_validation_errors)
+        .map_err(beads_to_mcp)
+}
+
 /// Parse update fields from JSON args into an `IssueUpdate` + coercion warnings.
 /// Extracted to keep `UpdateIssueTool::call` under the line limit.
 #[allow(clippy::too_many_lines)]
@@ -752,9 +789,7 @@ fn parse_update_fields(
     let mut updates = IssueUpdate::default();
 
     if let Some(title) = optional_str_arg(args, "title")? {
-        if title.is_empty() || title.len() > 500 {
-            return Err(McpError::invalid_params("Title must be 1-500 characters"));
-        }
+        validate_mcp_title(&title)?;
         updates.title = Some(title);
     }
     updates.description = nullable_str(args, "description")?;
@@ -1320,9 +1355,7 @@ impl ToolHandler for CreateIssueTool {
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
         let title = required_str_arg(&args, "title")?;
 
-        if title.is_empty() || title.len() > 500 {
-            return Err(McpError::invalid_params("Title must be 1-500 characters"));
-        }
+        validate_mcp_title(&title)?;
 
         let mut coercions: Vec<String> = Vec::new();
 
@@ -1554,6 +1587,12 @@ impl ToolHandler for UpdateIssueTool {
         let labels_to_add = optional_label_array_arg(&args, "labels_add")?;
         let labels_to_remove = optional_label_array_arg(&args, "labels_remove")?;
         let comment = optional_str_arg(&args, "comment")?;
+
+        if let Some(comment) = comment.as_deref()
+            && !comment.is_empty()
+        {
+            validate_mcp_comment(&id, &self.0.actor, comment)?;
+        }
 
         let issue = self.0.with_mutation(|storage| {
             // Validate ID exists before attempting update (placeholder + existence check)
@@ -2162,14 +2201,16 @@ impl ToolHandler for ProjectOverviewTool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CreateIssueTool, build_list_filters, generate_issue_id_with_checked_lookup,
-        issue_not_found_err, next_available_child_id, optional_label_array_arg,
-        optional_string_array_arg, parse_update_fields, storage_read_warning,
+        CreateIssueTool, UpdateIssueTool, build_list_filters,
+        generate_issue_id_with_checked_lookup, issue_not_found_err, next_available_child_id,
+        optional_label_array_arg, optional_string_array_arg, parse_update_fields,
+        storage_read_warning,
     };
     use crate::error::BeadsError;
     use crate::mcp::BeadsState;
+    use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
-    use chrono::TimeZone;
+    use chrono::{TimeZone, Utc};
     use fastmcp_rust::{Cx, McpContext, McpErrorCode, ToolHandler};
     use serde_json::json;
     use std::{cell::Cell, fs, sync::Arc};
@@ -2204,6 +2245,25 @@ mod tests {
             .expect_err("array title must be rejected");
 
         assert!(err.to_string().contains("'title' must be a string"));
+    }
+
+    #[test]
+    fn parse_update_fields_accepts_500_multibyte_character_title() {
+        let title = "é".repeat(500);
+        let (updates, coercions) = parse_update_fields("beads_rust-1234", &json!({"title": title}))
+            .expect("500-character title should be valid even when UTF-8 encoded");
+
+        assert!(coercions.is_empty());
+        let expected = "é".repeat(500);
+        assert_eq!(updates.title.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn parse_update_fields_rejects_blank_title() {
+        let err = parse_update_fields("beads_rust-1234", &json!({"title": "   \t"}))
+            .expect_err("blank title must be rejected");
+
+        assert!(err.to_string().contains("Title must be 1-500 characters"));
     }
 
     #[test]
@@ -2271,6 +2331,159 @@ mod tests {
         assert!(
             storage.get_all_ids().expect("ids").is_empty(),
             "invalid MCP issue should not be persisted"
+        );
+    }
+
+    #[test]
+    fn create_issue_accepts_500_multibyte_character_title() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        let tool = CreateIssueTool::new(Arc::clone(&state));
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let title = "é".repeat(500);
+
+        tool.call(&ctx, json!({ "title": title }))
+            .expect("500-character title should pass MCP validation");
+
+        let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        let ids = storage.get_all_ids().expect("ids");
+        assert_eq!(ids.len(), 1);
+        let issue = storage
+            .get_issue(&ids[0])
+            .expect("get issue")
+            .expect("issue exists");
+        assert_eq!(issue.title, "é".repeat(500));
+    }
+
+    #[test]
+    fn create_issue_persists_canonical_content_hash() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        let tool = CreateIssueTool::new(Arc::clone(&state));
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+
+        tool.call(
+            &ctx,
+            json!({
+                "title": "MCP hash parity",
+                "description": "Created through the MCP surface"
+            }),
+        )
+        .expect("create issue");
+
+        let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        let ids = storage.get_all_ids().expect("ids");
+        assert_eq!(ids.len(), 1);
+        let issue = storage
+            .get_issue(&ids[0])
+            .expect("get issue")
+            .expect("issue exists");
+        let expected_hash = issue.compute_content_hash();
+
+        assert_eq!(
+            issue.content_hash.as_deref(),
+            Some(expected_hash.as_str()),
+            "MCP-created issues should persist the same content hash as CLI-created issues"
+        );
+    }
+
+    #[test]
+    fn create_issue_rejects_tombstone_parent_without_persisting_child() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        let tool = CreateIssueTool::new(Arc::clone(&state));
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+
+        {
+            let mut storage = SqliteStorage::open(&state.db_path).expect("open storage");
+            let now = Utc::now();
+            let parent = Issue {
+                id: "br-parent".to_string(),
+                title: "Deleted parent".to_string(),
+                status: Status::Open,
+                priority: Priority::MEDIUM,
+                issue_type: IssueType::Epic,
+                created_at: now,
+                updated_at: now,
+                ..Issue::default()
+            };
+            storage
+                .create_issue(&parent, "mcp-test")
+                .expect("create parent");
+            storage
+                .delete_issue("br-parent", "mcp-test", "delete parent", None)
+                .expect("delete parent");
+        }
+
+        let err = tool
+            .call(
+                &ctx,
+                json!({
+                    "title": "Child should not persist",
+                    "parent": "br-parent"
+                }),
+            )
+            .expect_err("MCP create must reject tombstone parents before mutating");
+
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+        assert!(
+            err.message.contains("tombstoned"),
+            "unexpected MCP error: {err:?}"
+        );
+
+        let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        assert!(
+            storage
+                .get_issue("br-parent.1")
+                .expect("lookup child")
+                .is_none(),
+            "child issue must not be persisted after tombstone parent rejection"
+        );
+    }
+
+    #[test]
+    fn update_issue_rejects_invalid_comment_before_field_mutation() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let create_tool = CreateIssueTool::new(Arc::clone(&state));
+
+        create_tool
+            .call(&ctx, json!({"title": "Original MCP title"}))
+            .expect("create issue");
+
+        let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        let ids = storage.get_all_ids().expect("ids");
+        assert_eq!(ids.len(), 1);
+        drop(storage);
+
+        let update_tool = UpdateIssueTool::new(Arc::clone(&state));
+        let err = update_tool
+            .call(
+                &ctx,
+                json!({
+                    "id": ids[0],
+                    "title": "Mutated despite comment error",
+                    "comment": "x".repeat(51_201)
+                }),
+            )
+            .expect_err("oversized comment must reject the whole MCP update");
+
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+        assert!(
+            err.message.contains("content") && err.message.contains("exceeds 50KB"),
+            "unexpected MCP error: {err:?}"
+        );
+
+        let storage = SqliteStorage::open(&state.db_path).expect("reopen storage");
+        let issue = storage
+            .get_issue(&ids[0])
+            .expect("get issue")
+            .expect("issue exists");
+        assert_eq!(issue.title, "Original MCP title");
+        assert!(
+            storage.get_comments(&ids[0]).expect("comments").is_empty(),
+            "invalid MCP comment must not be inserted"
         );
     }
 

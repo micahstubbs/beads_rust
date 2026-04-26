@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::config;
-use crate::format::truncate_title;
+use crate::format::{format_status_label, truncate_title};
 use crate::model::{IssueType, Status};
 
 pub mod commands;
@@ -462,7 +462,7 @@ fn issue_id_candidates(prefix: &str, filter: IssueCompletionFilter) -> Vec<Compl
         }
         if filter.matches(&issue.status) {
             let title = truncate_title(&issue.title, 60);
-            let help = format!("{} | {}", issue.status.as_str(), title);
+            let help = format!("{} | {}", format_status_label(&issue.status, false), title);
             candidates.push(CompletionCandidate::new(&issue.id).help(Some(StyledStr::from(help))));
         }
     }

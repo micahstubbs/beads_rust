@@ -11,7 +11,7 @@ use super::{
 use crate::cli::GraphArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::format::sanitize_terminal_inline;
+use crate::format::{format_status_label, sanitize_terminal_inline};
 use crate::model::{Issue, Priority, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
@@ -461,7 +461,7 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
                             node.id,
                             sanitize_terminal_inline(&node.title),
                             node.priority,
-                            node.status,
+                            sanitize_terminal_inline(&node.status),
                             root_marker,
                             parents
                         );
@@ -936,7 +936,7 @@ fn render_single_graph_plain(nodes: &[GraphNode], edges: &[(String, String)], ro
         root_issue.id,
         sanitize_terminal_inline(&root_issue.title),
         root_issue.priority.0,
-        root_issue.status.as_str()
+        format_status_label(&root_issue.status, false)
     );
 
     for node in nodes.iter().skip(1) {
@@ -948,7 +948,7 @@ fn render_single_graph_plain(nodes: &[GraphNode], edges: &[(String, String)], ro
             node.id,
             sanitize_terminal_inline(&node.title),
             node.priority,
-            node.status,
+            sanitize_terminal_inline(&node.status),
             parents
         );
     }
@@ -1024,7 +1024,10 @@ fn render_single_graph_rich(
 
         // Status badge
         let status_style = status_style(&node.status, theme);
-        content.append_styled(&format!("[{}]", node.status), status_style);
+        content.append_styled(
+            &format!("[{}]", sanitize_terminal_inline(&node.status)),
+            status_style,
+        );
 
         if node.id == root_issue.id {
             content.append_styled(" (root)", theme.dimmed.clone());
@@ -1143,7 +1146,10 @@ fn render_all_graph_rich(
 
             // Status badge
             let status_style = status_style(&node.status, theme);
-            content.append_styled(&format!("[{}]", node.status), status_style);
+            content.append_styled(
+                &format!("[{}]", sanitize_terminal_inline(&node.status)),
+                status_style,
+            );
 
             if component.roots.contains(&node.id) {
                 content.append_styled(" (root)", theme.dimmed.clone());

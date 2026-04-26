@@ -69,6 +69,14 @@ fn restored_status_after_undefer(issue: &Issue) -> Status {
     }
 }
 
+fn skipped_reason_text(reason: &str) -> String {
+    sanitize_terminal_inline(reason).into_owned()
+}
+
+fn issue_id_text(id: &str) -> String {
+    sanitize_terminal_inline(id).into_owned()
+}
+
 /// Execute the defer command.
 ///
 /// # Errors
@@ -169,9 +177,10 @@ fn render_defer_output(
         render_defer_rich(deferred_issues, skipped_issues, ctx);
     } else {
         for deferred in deferred_issues {
+            let id = issue_id_text(&deferred.id);
             print!(
                 "\u{23f1} Deferred {}: {}",
-                deferred.id,
+                id,
                 sanitize_terminal_inline(&deferred.title)
             );
             if let Some(ref until) = deferred.defer_until {
@@ -181,11 +190,9 @@ fn render_defer_output(
             }
         }
         for skipped in skipped_issues {
-            println!(
-                "\u{2298} Skipped {}: {}",
-                skipped.id,
-                sanitize_terminal_inline(&skipped.reason)
-            );
+            let id = issue_id_text(&skipped.id);
+            let reason = skipped_reason_text(&skipped.reason);
+            println!("\u{2298} Skipped {id}: {reason}");
         }
         if deferred_issues.is_empty() && skipped_issues.is_empty() {
             println!("No issues to defer.");
@@ -429,19 +436,18 @@ fn render_undefer_output(
         render_undefer_rich(undeferred_issues, skipped_issues, ctx);
     } else {
         for undeferred in undeferred_issues {
+            let id = issue_id_text(&undeferred.id);
             println!(
                 "\u{2713} Undeferred {}: {} (now {})",
-                undeferred.id,
+                id,
                 sanitize_terminal_inline(&undeferred.title),
                 undeferred.status
             );
         }
         for skipped in skipped_issues {
-            println!(
-                "\u{2298} Skipped {}: {}",
-                skipped.id,
-                sanitize_terminal_inline(&skipped.reason)
-            );
+            let id = issue_id_text(&skipped.id);
+            let reason = skipped_reason_text(&skipped.reason);
+            println!("\u{2298} Skipped {id}: {reason}");
         }
         if undeferred_issues.is_empty() && skipped_issues.is_empty() {
             println!("No issues to undefer.");
@@ -658,9 +664,10 @@ fn render_defer_rich(deferred: &[DeferredIssue], skipped: &[SkippedIssue], ctx: 
         content.append("No issues to defer.\n");
     } else {
         for item in deferred {
+            let id = issue_id_text(&item.id);
             content.append_styled("\u{23f1} ", theme.warning.clone());
             content.append_styled("Deferred ", theme.warning.clone());
-            content.append_styled(&item.id, theme.emphasis.clone());
+            content.append_styled(&id, theme.emphasis.clone());
             content.append(": ");
             content.append(sanitize_terminal_inline(&item.title).as_ref());
             content.append("\n");
@@ -679,11 +686,13 @@ fn render_defer_rich(deferred: &[DeferredIssue], skipped: &[SkippedIssue], ctx: 
         }
 
         for item in skipped {
+            let id = issue_id_text(&item.id);
+            let reason = skipped_reason_text(&item.reason);
             content.append_styled("\u{2298} ", theme.dimmed.clone());
             content.append_styled("Skipped ", theme.dimmed.clone());
-            content.append_styled(&item.id, theme.emphasis.clone());
+            content.append_styled(&id, theme.emphasis.clone());
             content.append(": ");
-            content.append_styled(&item.reason, theme.dimmed.clone());
+            content.append_styled(&reason, theme.dimmed.clone());
             content.append("\n");
         }
     }
@@ -717,9 +726,10 @@ fn render_undefer_rich(
         content.append("No issues to undefer.\n");
     } else {
         for item in undeferred {
+            let id = issue_id_text(&item.id);
             content.append_styled("\u{2713} ", theme.success.clone());
             content.append_styled("Undeferred ", theme.success.clone());
-            content.append_styled(&item.id, theme.emphasis.clone());
+            content.append_styled(&id, theme.emphasis.clone());
             content.append(": ");
             content.append(sanitize_terminal_inline(&item.title).as_ref());
             content.append("\n");
@@ -735,11 +745,13 @@ fn render_undefer_rich(
         }
 
         for item in skipped {
+            let id = issue_id_text(&item.id);
+            let reason = skipped_reason_text(&item.reason);
             content.append_styled("\u{2298} ", theme.dimmed.clone());
             content.append_styled("Skipped ", theme.dimmed.clone());
-            content.append_styled(&item.id, theme.emphasis.clone());
+            content.append_styled(&id, theme.emphasis.clone());
             content.append(": ");
-            content.append_styled(&item.reason, theme.dimmed.clone());
+            content.append_styled(&reason, theme.dimmed.clone());
             content.append("\n");
         }
     }
@@ -811,6 +823,32 @@ mod tests {
             dependencies: vec![],
             comments: vec![],
         }
+    }
+
+    #[test]
+    fn skipped_reason_text_sanitizes_terminal_controls() {
+        let reason = skipped_reason_text("bad\x1b[2J\rreset\x08\nnext\x07\u{9b}");
+
+        assert!(!reason.chars().any(char::is_control));
+        assert!(reason.contains("\\u{1b}[2J"));
+        assert!(reason.contains("\\r"));
+        assert!(reason.contains("\\u{8}"));
+        assert!(reason.contains("\\n"));
+        assert!(reason.contains("\\u{7}"));
+        assert!(reason.contains("\\u{9b}"));
+    }
+
+    #[test]
+    fn issue_id_text_sanitizes_terminal_controls() {
+        let id = issue_id_text("bd-bad\x1b[2J\rreset\x08\nnext\x07\u{9b}");
+
+        assert!(!id.chars().any(char::is_control));
+        assert!(id.contains("\\u{1b}[2J"));
+        assert!(id.contains("\\r"));
+        assert!(id.contains("\\u{8}"));
+        assert!(id.contains("\\n"));
+        assert!(id.contains("\\u{7}"));
+        assert!(id.contains("\\u{9b}"));
     }
 
     #[test]

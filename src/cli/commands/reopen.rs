@@ -159,21 +159,23 @@ pub fn execute(
         );
     } else {
         for reopened in &reopened_issues {
+            let id = reopen_issue_id_text(&reopened.id);
             print!(
                 "\u{2713} Reopened {}: {}",
-                reopened.id,
+                id,
                 sanitize_terminal_inline(&reopened.title)
             );
             if let Some(ref reason) = args.reason {
-                println!(" ({reason})");
+                println!("{}", reopen_reason_suffix(reason));
             } else {
                 println!();
             }
         }
         for skipped in &skipped_issues {
+            let id = reopen_issue_id_text(&skipped.id);
             println!(
                 "\u{2298} Skipped {}: {}",
-                skipped.id,
+                id,
                 sanitize_terminal_inline(&skipped.reason)
             );
         }
@@ -382,6 +384,14 @@ fn reorder_routed_items_by_requested_inputs<T>(
         .collect()
 }
 
+fn reopen_reason_suffix(reason: &str) -> String {
+    format!(" ({})", sanitize_terminal_inline(reason))
+}
+
+fn reopen_issue_id_text(id: &str) -> String {
+    sanitize_terminal_inline(id).into_owned()
+}
+
 /// Render reopen results with rich formatting.
 fn render_reopen_rich(
     reopened: &[ReopenedIssue],
@@ -399,13 +409,14 @@ fn render_reopen_rich(
         content.append("No issues to reopen.\n");
     } else {
         for item in reopened {
+            let id = reopen_issue_id_text(&item.id);
             content.append_styled("\u{2713} ", theme.success.clone());
             content.append_styled("Reopened ", theme.success.clone());
-            content.append_styled(&item.id, theme.emphasis.clone());
+            content.append_styled(&id, theme.emphasis.clone());
             content.append(": ");
             content.append(sanitize_terminal_inline(&item.title).as_ref());
             if let Some(r) = reason {
-                content.append_styled(&format!(" ({r})"), theme.dimmed.clone());
+                content.append_styled(&reopen_reason_suffix(r), theme.dimmed.clone());
             }
             content.append("\n");
             content.append_styled("  Status: ", theme.dimmed.clone());
@@ -416,11 +427,15 @@ fn render_reopen_rich(
         }
 
         for item in skipped {
+            let id = reopen_issue_id_text(&item.id);
             content.append_styled("\u{2298} ", theme.warning.clone());
             content.append_styled("Skipped ", theme.warning.clone());
-            content.append_styled(&item.id, theme.emphasis.clone());
+            content.append_styled(&id, theme.emphasis.clone());
             content.append(": ");
-            content.append_styled(&item.reason, theme.dimmed.clone());
+            content.append_styled(
+                sanitize_terminal_inline(&item.reason).as_ref(),
+                theme.dimmed.clone(),
+            );
             content.append("\n");
         }
     }
@@ -562,5 +577,33 @@ mod tests {
 
         assert_eq!(issue.status, Status::Tombstone);
         assert!(issue.deleted_at.is_some());
+    }
+
+    #[test]
+    fn reopen_reason_suffix_sanitizes_terminal_controls() {
+        let suffix = reopen_reason_suffix("bad\x1b[2J\rreset\x08\nnext\x07\u{9b}");
+
+        assert!(suffix.starts_with(" (bad"));
+        assert!(suffix.ends_with(')'));
+        assert!(!suffix.chars().any(char::is_control));
+        assert!(suffix.contains("\\u{1b}[2J"));
+        assert!(suffix.contains("\\r"));
+        assert!(suffix.contains("\\u{8}"));
+        assert!(suffix.contains("\\n"));
+        assert!(suffix.contains("\\u{7}"));
+        assert!(suffix.contains("\\u{9b}"));
+    }
+
+    #[test]
+    fn reopen_issue_id_text_sanitizes_terminal_controls() {
+        let id = reopen_issue_id_text("bd-bad\x1b[2J\rreset\x08\nnext\x07\u{9b}");
+
+        assert!(!id.chars().any(char::is_control));
+        assert!(id.contains("\\u{1b}[2J"));
+        assert!(id.contains("\\r"));
+        assert!(id.contains("\\u{8}"));
+        assert!(id.contains("\\n"));
+        assert!(id.contains("\\u{7}"));
+        assert!(id.contains("\\u{9b}"));
     }
 }

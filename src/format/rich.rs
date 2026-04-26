@@ -36,8 +36,8 @@
 //! ```
 
 use crate::format::text::{
-    format_priority, format_status_icon, sanitize_terminal_inline, sanitize_terminal_text,
-    truncate_title,
+    format_priority, format_status_icon, format_status_label, format_type_label,
+    sanitize_terminal_inline, sanitize_terminal_text, truncate_title,
 };
 use crate::model::{Issue, Status};
 use crate::output::Theme;
@@ -108,7 +108,10 @@ impl<'a> RichIssueTable<'a> {
             cells.push(Cell::new(status_icon).style(status_style.clone()));
 
             // Issue ID
-            cells.push(Cell::new(&*issue.id).style(self.theme.issue_id.clone()));
+            cells.push(
+                Cell::new(sanitize_terminal_inline(&issue.id).into_owned())
+                    .style(self.theme.issue_id.clone()),
+            );
 
             // Priority with color
             let priority_style = self.theme.priority_style(issue.priority);
@@ -116,7 +119,7 @@ impl<'a> RichIssueTable<'a> {
 
             // Type (if showing)
             if self.show_type {
-                let type_str = issue.issue_type.as_str();
+                let type_str = format_type_label(&issue.issue_type);
                 let type_style = self.theme.type_style(&issue.issue_type);
                 cells.push(Cell::new(type_str).style(type_style.clone()));
             }
@@ -171,8 +174,8 @@ impl<'a> RichIssuePanel<'a> {
 
         // Metadata line
         let priority = format_priority(&self.issue.priority);
-        let type_str = self.issue.issue_type.as_str();
-        let status_str = self.issue.status.as_str();
+        let type_str = format_type_label(&self.issue.issue_type);
+        let status_str = format_status_label(&self.issue.status, false);
         content.push_str(&format!("[{priority}] [{type_str}] {status_str}\n"));
 
         // Description if present and enabled
@@ -276,7 +279,7 @@ impl<'a> RichDependencyTree<'a> {
 #[must_use]
 pub fn format_status_badge(status: &Status, theme: &Theme) -> Text {
     let icon = format_status_icon(status);
-    let label = status.as_str().to_uppercase();
+    let label = format_status_label(status, false).to_uppercase();
     let style = theme.status_style(status);
 
     let mut text = Text::new("");
@@ -420,6 +423,28 @@ mod tests {
         assert!(rendered.contains("Test description"));
         assert!(rendered.contains("task"));
         assert!(rendered.contains("open"));
+    }
+
+    #[test]
+    fn rich_table_and_panel_sanitize_custom_status_and_type() {
+        let mut issue = make_test_issue("test-1", "Test issue");
+        issue.id = "test-1\x1b]52;c;bad\x07".to_string();
+        issue.status = Status::Custom("state\x1b[2J".to_string());
+        issue.issue_type = IssueType::Custom("kind\x07bell".to_string());
+        let theme = Theme::default();
+
+        let table = RichIssueTable::new(std::slice::from_ref(&issue), &theme);
+        let table_output = table.build_table().render_plain(120);
+        let panel_output = RichIssuePanel::new(&issue, &theme)
+            .build_panel()
+            .render_plain(80);
+
+        for rendered in [table_output, panel_output] {
+            assert!(!rendered.contains('\x1b'));
+            assert!(!rendered.contains('\x07'));
+            assert!(rendered.contains("\\u{1b}]52;c;bad\\u{7}"));
+            assert!(rendered.contains("\\u{7}bell"));
+        }
     }
 
     #[test]

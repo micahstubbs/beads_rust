@@ -576,26 +576,41 @@ fn dep_list(
         render_dep_list_rich(&ctx, &issue_id, &items, args.direction);
     } else {
         // Plain mode: Simple text output
+        let display_issue_id = sanitize_terminal_inline(&issue_id);
         let header = match args.direction {
-            DepDirection::Down => format!("Dependencies of {} ({}):", issue_id, items.len()),
-            DepDirection::Up => format!("Dependents of {} ({}):", issue_id, items.len()),
+            DepDirection::Down => {
+                format!("Dependencies of {} ({}):", display_issue_id, items.len())
+            }
+            DepDirection::Up => {
+                format!("Dependents of {} ({}):", display_issue_id, items.len())
+            }
             DepDirection::Both => format!(
                 "Dependencies and dependents of {} ({}):",
-                issue_id,
+                display_issue_id,
                 items.len()
             ),
         };
         ctx.info(&header);
 
         for item in &items {
+            let dep_type = sanitize_terminal_inline(&item.dep_type);
             let arrow = if item.issue_id == issue_id {
-                format!("  -> {} ({})", item.depends_on_id, item.dep_type)
+                format!(
+                    "  -> {} ({dep_type})",
+                    sanitize_terminal_inline(&item.depends_on_id)
+                )
             } else {
-                format!("  <- {} ({})", item.issue_id, item.dep_type)
+                format!(
+                    "  <- {} ({dep_type})",
+                    sanitize_terminal_inline(&item.issue_id)
+                )
             };
             ctx.print_line(&format!(
                 "{}: {} [P{}] [{}]",
-                arrow, item.title, item.priority, item.status
+                arrow,
+                sanitize_terminal_inline(&item.title),
+                item.priority,
+                sanitize_terminal_inline(&item.status)
             ));
         }
     }
@@ -654,6 +669,7 @@ fn render_dep_list_rich(
 }
 
 fn dep_list_panel_title(direction: DepDirection, issue_id: &str) -> String {
+    let issue_id = sanitize_terminal_inline(issue_id);
     match direction {
         DepDirection::Down => format!("Dependencies for {issue_id}"),
         DepDirection::Up => format!("Dependents for {issue_id}"),
@@ -692,23 +708,32 @@ fn append_dep_list_section(
         };
 
         content.append_styled(prefix, theme.dimmed.clone());
-        content.append_styled(target_id, theme.issue_id.clone());
+        content.append_styled(
+            sanitize_terminal_inline(target_id).as_ref(),
+            theme.issue_id.clone(),
+        );
         content.append(" ");
-        content.append_styled(&format!("({}) ", item.dep_type), theme.muted.clone());
+        content.append_styled(
+            &format!("({}) ", sanitize_terminal_inline(&item.dep_type)),
+            theme.muted.clone(),
+        );
         append_dep_list_status(content, &item.status, theme);
         content.append(" ");
-        content.append_styled(&item.title, theme.issue_title.clone());
+        content.append_styled(
+            sanitize_terminal_inline(&item.title).as_ref(),
+            theme.issue_title.clone(),
+        );
         content.append("\n");
     }
 }
 
-fn dep_list_status_label(status: &str) -> &str {
+fn dep_list_status_label(status: &str) -> String {
     match status {
-        "open" => "[open]",
-        "in_progress" => "[in-progress]",
-        "closed" => "[closed] ✓",
-        "blocked" => "[blocked]",
-        _ => status,
+        "open" => "[open]".to_string(),
+        "in_progress" => "[in-progress]".to_string(),
+        "closed" => "[closed] ✓".to_string(),
+        "blocked" => "[blocked]".to_string(),
+        _ => sanitize_terminal_inline(status).into_owned(),
     }
 }
 
@@ -720,7 +745,7 @@ fn append_dep_list_status(content: &mut Text, status: &str, theme: &Theme) {
         "blocked" => theme.status_blocked.clone(),
         _ => theme.dimmed.clone(),
     };
-    content.append_styled(dep_list_status_label(status), style);
+    content.append_styled(&dep_list_status_label(status), style);
 }
 
 fn apply_external_dep_list_metadata(
@@ -806,7 +831,7 @@ fn resolve_dep_tree_node_metadata(
 
     // Handle missing/deleted issues gracefully instead of failing the whole tree
     Ok((
-        format!("[missing issue: {node_id}]"),
+        format!("[missing issue: {}]", sanitize_terminal_inline(node_id)),
         2,
         "deleted".to_string(),
     ))
@@ -974,10 +999,10 @@ fn dep_tree(
                 "{}{}{}: {} [P{}] [{}]",
                 indent,
                 prefix,
-                node.id,
+                sanitize_terminal_inline(&node.id),
                 sanitize_terminal_inline(&node.title),
                 node.priority,
-                node.status
+                sanitize_terminal_inline(&node.status)
             ));
         }
     }
@@ -1071,7 +1096,7 @@ fn render_dep_tree_rich(ctx: &OutputContext, nodes: &[TreeNode]) {
     }
 
     // Build tree structure from flat nodes list
-    let root = build_tree_node_rich(&nodes[0], &children_map);
+    let root = build_tree_node_rich(&nodes[0], &children_map, theme);
     let tree = Tree::new(root)
         .guides(TreeGuides::Rounded)
         .guide_style(theme.dimmed.clone());
@@ -1083,56 +1108,64 @@ fn render_dep_tree_rich(ctx: &OutputContext, nodes: &[TreeNode]) {
 fn build_tree_node_rich<'a>(
     node: &'a TreeNode,
     children_map: &std::collections::HashMap<Option<&'a str>, Vec<&'a TreeNode>>,
+    theme: &Theme,
 ) -> rich_rust::renderables::TreeNode {
-    // Format the node label with status styling
-    let status_style = match node.status.as_str() {
-        "open" => "[green]",
-        "in_progress" => "[yellow]",
-        "closed" => "[dim]",
-        "blocked" => "[red]",
-        _ => "[white]",
-    };
-    let status_close = "[/]";
-
-    let status_indicator = match node.status.as_str() {
-        "closed" => " ✓",
-        "blocked" => " ⚠",
-        _ => "",
-    };
-
-    let label = if node.truncated {
-        format!(
-            "{} {}[{}]{}{} {} [dim](truncated)[/]",
-            node.id,
-            status_style,
-            node.status,
-            status_close,
-            status_indicator,
-            truncate_title(&node.title, 35)
-        )
-    } else {
-        format!(
-            "{} {}[{}]{}{} {}",
-            node.id,
-            status_style,
-            node.status,
-            status_close,
-            status_indicator,
-            truncate_title(&node.title, 40)
-        )
-    };
-
-    let mut tree_node = rich_rust::renderables::TreeNode::new(Text::new(label));
+    let mut tree_node = rich_rust::renderables::TreeNode::new(build_tree_node_label(node, theme));
 
     // Find and add children using the pre-computed map
     if let Some(children) = children_map.get(&Some(node.node_key.as_str())) {
         for child in children {
-            let child_node = build_tree_node_rich(child, children_map);
+            let child_node = build_tree_node_rich(child, children_map, theme);
             tree_node = tree_node.child(child_node);
         }
     }
 
     tree_node
+}
+
+fn build_tree_node_label(node: &TreeNode, theme: &Theme) -> Text {
+    let mut label = Text::new("");
+    label.append_styled(
+        sanitize_terminal_inline(&node.id).as_ref(),
+        theme.issue_id.clone(),
+    );
+    label.append(" [");
+    label.append_styled(
+        sanitize_terminal_inline(&node.status).as_ref(),
+        dep_tree_status_style(&node.status, theme),
+    );
+    label.append("]");
+    if let Some(indicator) = dep_tree_status_indicator(&node.status) {
+        label.append_styled(indicator, dep_tree_status_style(&node.status, theme));
+    }
+    label.append(" ");
+    label.append_styled(
+        &truncate_title(&node.title, if node.truncated { 35 } else { 40 }),
+        theme.issue_title.clone(),
+    );
+    if node.truncated {
+        label.append_styled(" (truncated)", theme.dimmed.clone());
+    }
+    label
+}
+
+fn dep_tree_status_style(status: &str, theme: &Theme) -> Style {
+    match status {
+        "open" => theme.status_open.clone(),
+        "in_progress" => theme.status_in_progress.clone(),
+        "closed" | "deleted" | "tombstone" => theme.status_closed.clone(),
+        "blocked" => theme.status_blocked.clone(),
+        "deferred" => theme.status_deferred.clone(),
+        _ => theme.muted.clone(),
+    }
+}
+
+fn dep_tree_status_indicator(status: &str) -> Option<&'static str> {
+    match status {
+        "closed" => Some(" ✓"),
+        "blocked" => Some(" ⚠"),
+        _ => None,
+    }
 }
 
 fn parse_external_dep_id(dep_id: &str) -> Option<(String, String)> {
@@ -1181,7 +1214,7 @@ fn dep_cycles(
         // Plain mode: Simple text output
         ctx.warning(&format!("Found {count} dependency cycle(s):"));
         for (i, cycle) in cycles.iter().enumerate() {
-            ctx.print_line(&format!("  {}. {}", i + 1, cycle.join(" -> ")));
+            ctx.print_line(&format!("  {}. {}", i + 1, format_cycle_plain(cycle)));
         }
     }
 
@@ -1191,35 +1224,63 @@ fn dep_cycles(
 /// Render cycles in rich mode with red highlighting
 fn render_cycles_rich(ctx: &OutputContext, cycles: &[Vec<String>], count: usize) {
     let theme = ctx.theme();
-
-    let mut content = String::new();
-    content.push_str(&format!(
-        "[bold red]⚠ {} dependency cycle(s) detected:[/]\n\n",
-        count
-    ));
-
-    for (i, cycle) in cycles.iter().enumerate() {
-        // Format cycle path with arrows
-        let cycle_path = cycle.join(" [red]→[/] ");
-        content.push_str(&format!("[bold]Cycle {}:[/]\n", i + 1));
-        content.push_str(&format!("  [red]{}[/]\n", cycle_path));
-
-        // Add underline visual
-        let path_len = cycle.iter().map(|s| s.len() + 4).sum::<usize>();
-        content.push_str(&format!("  [red]{}[/]\n", "^".repeat(path_len.min(60))));
-
-        if i < cycles.len() - 1 {
-            content.push('\n');
-        }
-    }
-
-    content.push_str("\n[dim]Suggestion: Remove one dependency from each cycle to break it.[/]");
-
-    let panel = Panel::from_text(&content)
+    let content = build_cycles_rich_text(cycles, count, theme);
+    let panel = Panel::from_rich_text(&content, ctx.width())
         .title(Text::new("Dependency Cycles"))
         .border_style(theme.error.clone());
 
     ctx.render(&panel);
+}
+
+fn build_cycles_rich_text(cycles: &[Vec<String>], count: usize, theme: &Theme) -> Text {
+    let mut content = Text::new("");
+    content.append_styled(
+        &format!("⚠ {count} dependency cycle(s) detected:\n\n"),
+        theme.error.clone().bold(),
+    );
+
+    for (i, cycle) in cycles.iter().enumerate() {
+        content.append_styled(&format!("Cycle {}:\n", i + 1), theme.emphasis.clone());
+        content.append("  ");
+        append_cycle_path_rich(&mut content, cycle, theme);
+        content.append("\n");
+
+        // Add underline visual
+        let path_len = format_cycle_plain(cycle).chars().count();
+        content.append_styled(
+            &format!("  {}\n", "^".repeat(path_len.min(60))),
+            theme.error.clone(),
+        );
+
+        if i < cycles.len() - 1 {
+            content.append("\n");
+        }
+    }
+
+    content.append("\n");
+    content.append_styled(
+        "Suggestion: Remove one dependency from each cycle to break it.",
+        theme.dimmed.clone(),
+    );
+
+    content
+}
+
+fn append_cycle_path_rich(content: &mut Text, cycle: &[String], theme: &Theme) {
+    for (index, id) in cycle.iter().enumerate() {
+        if index > 0 {
+            content.append_styled(" → ", theme.error.clone());
+        }
+        content.append_styled(sanitize_terminal_inline(id).as_ref(), theme.error.clone());
+    }
+}
+
+fn format_cycle_plain(cycle: &[String]) -> String {
+    cycle
+        .iter()
+        .map(|id| sanitize_terminal_inline(id).into_owned())
+        .collect::<Vec<_>>()
+        .join(" -> ")
 }
 
 #[cfg(test)]
@@ -1627,6 +1688,86 @@ mod tests {
         assert!(json.contains("\"count\":2"));
         assert!(json.contains("bd-001"));
         info!("test_cycles_result_json: assertions passed");
+    }
+
+    #[test]
+    fn dep_cycles_human_output_sanitizes_ids_and_omits_literal_markup() {
+        let cycles = vec![vec!["bd-a\x1b[2J".to_string(), "bd-b\x07bell".to_string()]];
+
+        let plain = format_cycle_plain(&cycles[0]);
+        assert!(!plain.contains('\x1b'));
+        assert!(!plain.contains('\x07'));
+        assert!(plain.contains("bd-a\\u{1b}[2J -> bd-b\\u{7}bell"));
+
+        let theme = Theme::default();
+        let rich_text = build_cycles_rich_text(&cycles, 1, &theme);
+        let rendered = Panel::from_rich_text(&rich_text, 100).render_plain(100);
+
+        assert!(!rendered.contains("[bold"));
+        assert!(!rendered.contains("[red"));
+        assert!(!rendered.contains("[/]"));
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains('\x07'));
+        assert!(rendered.contains("bd-a\\u{1b}[2J"));
+        assert!(rendered.contains("bd-b\\u{7}bell"));
+        assert!(rich_text.spans().len() > 1, "rich text should carry styles");
+    }
+
+    #[test]
+    fn dep_list_human_output_sanitizes_relation_ids() {
+        let item = DepListItem {
+            issue_id: "bd-parent\x1b[2J".to_string(),
+            depends_on_id: "external:proj:\x07cap".to_string(),
+            dep_type: "blocks\x1b[type".to_string(),
+            title: "Title\x1b[31m".to_string(),
+            status: "custom\x07status".to_string(),
+            priority: 1,
+        };
+        let refs = vec![&item];
+        let theme = Theme::default();
+        let mut content = Text::new("");
+
+        append_dep_list_section(&mut content, "Dependencies (1):", &refs, true, &theme);
+
+        let rendered = content.plain();
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains('\x07'));
+        assert!(rendered.contains("external:proj:\\u{7}cap"));
+        assert!(rendered.contains("blocks\\u{1b}[type"));
+        assert!(rendered.contains("Title\\u{1b}[31m"));
+        assert!(rendered.contains("custom\\u{7}status"));
+
+        let title = dep_list_panel_title(DepDirection::Down, "bd-root\x1b[2J");
+        assert!(!title.contains('\x1b'));
+        assert!(title.contains("bd-root\\u{1b}[2J"));
+    }
+
+    #[test]
+    fn dep_tree_rich_label_sanitizes_text_and_omits_literal_markup() {
+        let node = TreeNode {
+            node_key: "n1".to_string(),
+            id: "bd-node\x1b[2J".to_string(),
+            title: "Tree title\x07bell".to_string(),
+            depth: 0,
+            parent_id: None,
+            parent_key: None,
+            priority: 1,
+            status: "blocked".to_string(),
+            truncated: true,
+        };
+        let theme = Theme::default();
+        let label = build_tree_node_label(&node, &theme);
+        let rendered = label.plain();
+
+        assert!(!rendered.contains("[red]"));
+        assert!(!rendered.contains("[/]"));
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains('\x07'));
+        assert!(rendered.contains("bd-node\\u{1b}[2J"));
+        assert!(rendered.contains("Tree title\\u{7}bell"));
+        assert!(rendered.contains("[blocked] ⚠"));
+        assert!(rendered.contains("(truncated)"));
+        assert!(label.spans().len() > 1, "tree label should carry styles");
     }
 
     #[test]

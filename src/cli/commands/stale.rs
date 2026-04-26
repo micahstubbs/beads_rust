@@ -1,7 +1,7 @@
 use crate::cli::StaleArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::format::{StaleIssue, sanitize_terminal_inline};
+use crate::format::{StaleIssue, format_status_label, sanitize_terminal_inline};
 use crate::model::{Issue, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
@@ -94,7 +94,7 @@ fn execute_inner(args: &StaleArgs, ctx: &OutputContext, storage: &SqliteStorage)
         );
         for (idx, issue) in stale.iter().enumerate() {
             let days_stale = (now - issue.updated_at).num_days().max(0);
-            let status = issue.status.as_str();
+            let status = format_status_label(&issue.status, false);
             if let Some(assignee) = issue.assignee.as_deref() {
                 println!(
                     "{}. [{}] {}d {} {} ({assignee})",
@@ -102,7 +102,8 @@ fn execute_inner(args: &StaleArgs, ctx: &OutputContext, storage: &SqliteStorage)
                     status,
                     days_stale,
                     issue.id,
-                    sanitize_terminal_inline(&issue.title)
+                    sanitize_terminal_inline(&issue.title),
+                    assignee = sanitize_terminal_inline(assignee)
                 );
             } else {
                 println!(
@@ -184,7 +185,10 @@ fn render_stale_rich(
         line.append_styled(&format!("{:>3}d ", days_stale), staleness_style);
 
         // Status badge
-        line.append_styled(&format!("[{}] ", issue.status.as_str()), status_style);
+        line.append_styled(
+            &format!("[{}] ", format_status_label(&issue.status, false)),
+            status_style,
+        );
 
         // Issue ID
         line.append_styled(&issue.id, theme.issue_id.clone());

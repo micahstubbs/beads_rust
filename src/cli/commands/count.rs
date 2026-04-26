@@ -1,6 +1,7 @@
 use crate::cli::{CountArgs, CountBy};
 use crate::config;
 use crate::error::Result;
+use crate::format::sanitize_terminal_inline;
 use crate::model::Status;
 use crate::output::OutputContext;
 use crate::storage::{ListFilters, SqliteStorage};
@@ -126,7 +127,11 @@ fn execute_inner(args: &CountArgs, ctx: &OutputContext, storage: &SqliteStorage)
             } else {
                 println!("Total: {total}");
                 for group in groups {
-                    println!("{}: {}", group.group, group.count);
+                    println!(
+                        "{}: {}",
+                        sanitize_terminal_inline(&group.group),
+                        group.count
+                    );
                 }
             }
         }
@@ -174,13 +179,26 @@ fn render_count_grouped_rich(
     content.append("\n\n");
 
     // Find longest group name for alignment
-    let max_len = groups.iter().map(|g| g.group.len()).max().unwrap_or(0);
+    let sanitized_groups = groups
+        .iter()
+        .map(|group| {
+            (
+                sanitize_terminal_inline(&group.group).into_owned(),
+                group.count,
+            )
+        })
+        .collect::<Vec<_>>();
+    let max_len = sanitized_groups
+        .iter()
+        .map(|(group, _)| group.len())
+        .max()
+        .unwrap_or(0);
 
-    for group in groups {
-        let padded = format!("{:<width$}", group.group, width = max_len);
+    for (group, count) in sanitized_groups {
+        let padded = format!("{group:<width$}", width = max_len);
         content.append_styled(&padded, theme.accent.clone());
         content.append("  ");
-        content.append_styled(&group.count.to_string(), theme.emphasis.clone());
+        content.append_styled(&count.to_string(), theme.emphasis.clone());
         content.append("\n");
     }
 

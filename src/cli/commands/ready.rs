@@ -9,7 +9,9 @@ use crate::cli::{
 };
 use crate::config;
 use crate::error::Result;
-use crate::format::{ReadyIssue, format_priority_badge, terminal_width, truncate_title};
+use crate::format::{
+    ReadyIssue, format_priority_badge, format_type_badge, terminal_width, truncate_title,
+};
 use crate::model::{IssueType, Priority};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
 use crate::storage::{ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
@@ -279,7 +281,7 @@ fn format_ready_line(
 ) -> String {
     // Match bd format: {index}. [● P{n}] [{type}] {id}: {title}
     let priority_badge_plain = format!("[● {}]", crate::format::format_priority(&issue.priority));
-    let type_badge_plain = format!("[{}]", issue.issue_type.as_str());
+    let type_badge_plain = format_type_badge(&issue.issue_type);
     let prefix_plain = format!(
         "{index}. {priority_badge_plain} {type_badge_plain} {}: ",
         issue.id
