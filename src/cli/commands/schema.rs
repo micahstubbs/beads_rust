@@ -1,8 +1,16 @@
 //! Schema command implementation.
 //!
-//! Emits JSON Schema documents describing br's primary machine-readable outputs.
-//! This is intended for AI agents and tooling that want stable schemas without
-//! reading source code.
+//! Emits two complementary descriptions of br's machine-readable surface:
+//!
+//! 1. **Per-row JSON Schemas** for the data types that show up inside
+//!    command outputs (`Issue`, `IssueWithCounts`, `IssueDetails`, …).
+//! 2. **Per-command output-envelope shapes** that tell an agent how to
+//!    reach those rows from a command's `--json` payload (`.[0]` for
+//!    `show`, `.issues[]` for `list`, `.[]` for the array commands, …).
+//!
+//! Intended for AI agents and tooling that want stable schemas without
+//! reading source code. The CLI surface marks `br schema` as
+//! not-yet-stable; agents should re-call across release boundaries.
 
 use crate::cli::{
     OutputFormat, SchemaArgs, SchemaTarget, resolve_output_format_basic_with_outer_mode,
@@ -83,7 +91,11 @@ struct CommandShape {
     notes: Option<&'static str>,
 }
 
-/// Execute the schema command to generate JSON Schema documents.
+/// Execute the schema command.
+///
+/// Builds the per-row schemas and the per-command envelope map appropriate
+/// for `args.target` and prints a single bundled `SchemaOutput` payload in
+/// the resolved output format. `Quiet` mode short-circuits before any work.
 ///
 /// # Errors
 ///
@@ -186,9 +198,10 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
 /// Build the per-command output-envelope map.
 ///
 /// Empty for targets that only request a per-row schema. The `All` and
-/// `Commands` targets populate the full map. Entries are hand-curated so
-/// that drift between this map and actual command output is caught by the
-/// `commands_match_observed_output` integration test below.
+/// `Commands` targets populate the full map. Entries are hand-curated;
+/// the `command_shapes_have_consistent_invariants` test below is the
+/// regression net that catches structural drift (unknown shapes,
+/// non-jq paths, item_schema names that aren't in the schemas catalog).
 fn build_commands(target: SchemaTarget) -> BTreeMap<&'static str, CommandShape> {
     let mut commands = BTreeMap::new();
     if !matches!(target, SchemaTarget::All | SchemaTarget::Commands) {
@@ -323,7 +336,12 @@ fn insert_dependency_command_shapes(commands: &mut BTreeMap<&'static str, Comman
 }
 
 fn insert_aggregate_command_shapes(commands: &mut BTreeMap<&'static str, CommandShape>) {
-    let stats_shape = CommandShape {
+    // `br status` is documented as an alias for `br stats` and dispatches
+    // through the same handler, so the envelope is identical. We list both
+    // keys (with differentiated `notes`) so an agent looking up either name
+    // gets the right shape without an indirection step, but can still tell
+    // which name is canonical.
+    let stats_base = CommandShape {
         shape: "object",
         jq_filter: ".",
         items_at: None,
@@ -331,10 +349,10 @@ fn insert_aggregate_command_shapes(commands: &mut BTreeMap<&'static str, Command
         error_envelope_on_stderr: false,
         notes: Some("Single aggregate object."),
     };
-    commands.insert("stats", stats_shape.clone());
-    // `br status` is an alias for `br stats` and emits the same envelope.
-    // Listing both keys lets agents look up either name without indirection.
-    commands.insert("status", stats_shape);
+    let mut status_alias = stats_base.clone();
+    status_alias.notes = Some("Alias for `stats` — identical envelope.");
+    commands.insert("stats", stats_base);
+    commands.insert("status", status_alias);
 
     commands.insert(
         "count",
