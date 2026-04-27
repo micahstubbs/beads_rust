@@ -1087,7 +1087,7 @@ fn e2e_routing_defer_and_undefer_external_issue_via_main_workspace() {
     assert!(defer.status.success(), "defer failed: {}", defer.stderr);
     let deferred: Value =
         serde_json::from_str(&extract_json_payload(&defer.stdout)).expect("defer json");
-    let deferred_array = deferred.as_array().expect("deferred array");
+    let deferred_array = deferred["deferred"].as_array().expect("deferred array");
     assert_eq!(deferred_array.len(), 1);
     assert_eq!(deferred_array[0]["id"].as_str(), Some(external_id.as_str()));
     assert_eq!(deferred_array[0]["status"].as_str(), Some("deferred"));
@@ -1121,7 +1121,9 @@ fn e2e_routing_defer_and_undefer_external_issue_via_main_workspace() {
     );
     let undeferred: Value =
         serde_json::from_str(&extract_json_payload(&undefer.stdout)).expect("undefer json");
-    let undeferred_array = undeferred.as_array().expect("undeferred array");
+    let undeferred_array = undeferred["undeferred"]
+        .as_array()
+        .expect("undeferred array");
     assert_eq!(undeferred_array.len(), 1);
     assert_eq!(
         undeferred_array[0]["id"].as_str(),

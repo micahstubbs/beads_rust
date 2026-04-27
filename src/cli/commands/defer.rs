@@ -165,16 +165,12 @@ fn render_defer_output(
 ) -> Result<()> {
     let use_structured_output = json || ctx.is_json() || ctx.is_toon() || args.robot;
     if use_structured_output {
-        if skipped_issues.is_empty() {
-            emit_structured_output(&deferred_issues.to_vec(), ctx)?;
-        } else {
-            let result = DeferResult {
-                deferred: deferred_issues.to_vec(),
-                skipped: skipped_issues.to_vec(),
-                ordered_outcomes: Vec::new(),
-            };
-            emit_structured_output(&result, ctx)?;
-        }
+        let result = DeferResult {
+            deferred: deferred_issues.to_vec(),
+            skipped: skipped_issues.to_vec(),
+            ordered_outcomes: Vec::new(),
+        };
+        emit_structured_output(&result, ctx)?;
     } else if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
     } else if matches!(ctx.mode(), OutputMode::Rich) {
@@ -424,16 +420,12 @@ fn render_undefer_output(
 ) -> Result<()> {
     let use_structured_output = json || ctx.is_json() || ctx.is_toon() || args.robot;
     if use_structured_output {
-        if skipped_issues.is_empty() {
-            emit_structured_output(&undeferred_issues.to_vec(), ctx)?;
-        } else {
-            let result = UndeferResult {
-                undeferred: undeferred_issues.to_vec(),
-                skipped: skipped_issues.to_vec(),
-                ordered_outcomes: Vec::new(),
-            };
-            emit_structured_output(&result, ctx)?;
-        }
+        let result = UndeferResult {
+            undeferred: undeferred_issues.to_vec(),
+            skipped: skipped_issues.to_vec(),
+            ordered_outcomes: Vec::new(),
+        };
+        emit_structured_output(&result, ctx)?;
     } else if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
     } else if matches!(ctx.mode(), OutputMode::Rich) {
@@ -841,6 +833,16 @@ mod tests {
         }
     }
 
+    fn deferred_output_item(id: &str) -> DeferredIssue {
+        DeferredIssue {
+            id: id.to_string(),
+            title: "Deferred output".to_string(),
+            previous_status: "open".to_string(),
+            status: "deferred".to_string(),
+            defer_until: None,
+        }
+    }
+
     #[test]
     fn skipped_reason_text_sanitizes_terminal_controls() {
         let reason = skipped_reason_text("bad\x1b[2J\rreset\x08\nnext\x07\u{9b}");
@@ -878,6 +880,45 @@ mod tests {
         assert!(status.contains("\\n"));
         assert!(status.contains("\\u{7}"));
         assert!(status.contains("\\u{9b}"));
+    }
+
+    #[test]
+    fn defer_result_serializes_as_object_without_skips() {
+        let result = DeferResult {
+            deferred: vec![deferred_output_item("bd-defer-1")],
+            skipped: Vec::new(),
+            ordered_outcomes: Vec::new(),
+        };
+
+        let value = serde_json::to_value(result).expect("serialize defer result");
+
+        assert!(value.is_object(), "defer result should be an object");
+        assert_eq!(value["deferred"][0]["id"], "bd-defer-1");
+        assert!(
+            value.get("skipped").is_none(),
+            "empty skipped list should stay omitted"
+        );
+    }
+
+    #[test]
+    fn undefer_result_serializes_as_object_without_skips() {
+        let result = UndeferResult {
+            undeferred: vec![DeferredIssue {
+                status: "open".to_string(),
+                ..deferred_output_item("bd-undefer-1")
+            }],
+            skipped: Vec::new(),
+            ordered_outcomes: Vec::new(),
+        };
+
+        let value = serde_json::to_value(result).expect("serialize undefer result");
+
+        assert!(value.is_object(), "undefer result should be an object");
+        assert_eq!(value["undeferred"][0]["id"], "bd-undefer-1");
+        assert!(
+            value.get("skipped").is_none(),
+            "empty skipped list should stay omitted"
+        );
     }
 
     #[test]

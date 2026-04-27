@@ -1021,7 +1021,7 @@ fn e2e_defer_honors_toon_env_mode() {
 
     let decoded = try_decode(defer.stdout.trim(), None).expect("valid defer TOON");
     let json = Value::from(decoded);
-    let deferred = toon_array_items(&json);
+    let deferred = toon_array_items(&json["deferred"]);
     assert_eq!(deferred.len(), 1);
     assert_eq!(deferred[0]["id"], issue_id);
     assert_eq!(deferred[0]["status"], "deferred");
