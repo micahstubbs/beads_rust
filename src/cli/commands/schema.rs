@@ -43,7 +43,40 @@ struct ErrorBody {
 struct SchemaOutput {
     tool: &'static str,
     generated_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     schemas: BTreeMap<&'static str, Schema>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    commands: BTreeMap<&'static str, CommandShape>,
+}
+
+/// Per-command output-envelope description for `br schema commands`.
+///
+/// This describes the *top-level JSON shape* a command emits with `--json`,
+/// not the per-row schema (which lives in `schemas`). Agents can use the
+/// `jq_filter` to extract individual items uniformly across commands without
+/// hard-coding per-command knowledge.
+#[derive(Debug, Serialize)]
+struct CommandShape {
+    /// Top-level JSON shape: "array" | "object" | "scalar".
+    shape: &'static str,
+    /// jq filter that yields one item per output unit. For non-iterable
+    /// outputs (e.g. `stats`, `info`) this is `"."` and `items_at` is None.
+    jq_filter: &'static str,
+    /// JSON path to the iterable items. `"$"` means the top-level value
+    /// itself is the array; `".issues"` means items live at `.issues`.
+    /// None for non-iterable outputs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    items_at: Option<&'static str>,
+    /// Name of the schema each item conforms to. References a key in
+    /// the `schemas` map (e.g. `"Issue"`, `"IssueWithCounts"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    item_schema: Option<&'static str>,
+    /// On error, the same command writes an `ErrorEnvelope` to stderr.
+    /// True for commands that may fail per-call (e.g. lookups that miss).
+    error_envelope_on_stderr: bool,
+    /// Free-form notes describing quirks of the envelope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notes: Option<&'static str>,
 }
 
 /// Execute the schema command to generate JSON Schema documents.
@@ -71,10 +104,12 @@ pub fn execute(
     }
 
     let schemas = build_schemas(args.target);
+    let commands = build_commands(args.target);
     let payload = SchemaOutput {
         tool: "br",
         generated_at: Utc::now(),
         schemas,
+        commands,
     };
 
     match output_format {
@@ -136,9 +171,201 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
         SchemaTarget::Error => {
             schemas.insert("ErrorEnvelope", schema_for!(ErrorEnvelope));
         }
+        SchemaTarget::Commands => {
+            // Only the command-shape map is requested; no per-row schemas.
+        }
     }
 
     schemas
+}
+
+/// Build the per-command output-envelope map.
+///
+/// Empty for targets that only request a per-row schema. The `All` and
+/// `Commands` targets populate the full map. Entries are hand-curated so
+/// that drift between this map and actual command output is caught by the
+/// `commands_match_observed_output` integration test below.
+fn build_commands(target: SchemaTarget) -> BTreeMap<&'static str, CommandShape> {
+    let mut commands = BTreeMap::new();
+    if !matches!(target, SchemaTarget::All | SchemaTarget::Commands) {
+        return commands;
+    }
+
+    insert_issue_command_shapes(&mut commands);
+    insert_comment_command_shapes(&mut commands);
+    insert_dependency_command_shapes(&mut commands);
+    insert_aggregate_command_shapes(&mut commands);
+    insert_label_command_shapes(&mut commands);
+
+    commands
+}
+
+fn insert_issue_command_shapes(commands: &mut BTreeMap<&'static str, CommandShape>) {
+    commands.insert(
+        "show",
+        CommandShape {
+            shape: "array",
+            jq_filter: ".[0]",
+            items_at: Some("$"),
+            item_schema: Some("IssueDetails"),
+            error_envelope_on_stderr: true,
+            notes: Some(
+                "Always a single-element array on success (wrapped for shape consistency \
+                 with list-style commands). On a missing id, an ErrorEnvelope is written \
+                 to stderr and exit code is non-zero.",
+            ),
+        },
+    );
+    commands.insert(
+        "list",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".issues[]",
+            items_at: Some(".issues"),
+            item_schema: Some("IssueWithCounts"),
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "Wrapper object with pagination metadata; iterate with `.issues[]`. \
+                 The wrapper exists so totals/cursors can ride alongside the rows.",
+            ),
+        },
+    );
+    commands.insert(
+        "ready",
+        CommandShape {
+            shape: "array",
+            jq_filter: ".[]",
+            items_at: Some("$"),
+            item_schema: Some("ReadyIssue"),
+            error_envelope_on_stderr: false,
+            notes: None,
+        },
+    );
+    commands.insert(
+        "blocked",
+        CommandShape {
+            shape: "array",
+            jq_filter: ".[]",
+            items_at: Some("$"),
+            item_schema: Some("BlockedIssue"),
+            error_envelope_on_stderr: false,
+            notes: None,
+        },
+    );
+    commands.insert(
+        "stale",
+        CommandShape {
+            shape: "array",
+            jq_filter: ".[]",
+            items_at: Some("$"),
+            item_schema: Some("StaleIssue"),
+            error_envelope_on_stderr: false,
+            notes: None,
+        },
+    );
+    commands.insert(
+        "search",
+        CommandShape {
+            shape: "array",
+            jq_filter: ".[]",
+            items_at: Some("$"),
+            item_schema: Some("IssueWithCounts"),
+            error_envelope_on_stderr: false,
+            notes: None,
+        },
+    );
+}
+
+fn insert_comment_command_shapes(commands: &mut BTreeMap<&'static str, CommandShape>) {
+    commands.insert(
+        "comments list",
+        CommandShape {
+            shape: "array",
+            jq_filter: ".[]",
+            items_at: Some("$"),
+            item_schema: None,
+            error_envelope_on_stderr: true,
+            notes: Some(
+                "Empty array if no comments. ErrorEnvelope on stderr if the issue id \
+                 cannot be resolved.",
+            ),
+        },
+    );
+}
+
+fn insert_dependency_command_shapes(commands: &mut BTreeMap<&'static str, CommandShape>) {
+    commands.insert(
+        "dep tree",
+        CommandShape {
+            shape: "array",
+            jq_filter: ".[]",
+            items_at: Some("$"),
+            item_schema: Some("TreeNode"),
+            error_envelope_on_stderr: true,
+            notes: Some("Pre-order traversal; each node carries a `depth` field."),
+        },
+    );
+    commands.insert(
+        "dep list",
+        CommandShape {
+            shape: "array",
+            jq_filter: ".[]",
+            items_at: Some("$"),
+            item_schema: None,
+            error_envelope_on_stderr: true,
+            notes: None,
+        },
+    );
+}
+
+fn insert_aggregate_command_shapes(commands: &mut BTreeMap<&'static str, CommandShape>) {
+    commands.insert(
+        "stats",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".",
+            items_at: None,
+            item_schema: Some("Statistics"),
+            error_envelope_on_stderr: false,
+            notes: Some("Single aggregate object; `status` is an alias for `stats`."),
+        },
+    );
+    commands.insert(
+        "count",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".count",
+            items_at: None,
+            item_schema: None,
+            error_envelope_on_stderr: false,
+            notes: Some("Scalar count under `.count`."),
+        },
+    );
+    commands.insert(
+        "info",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".",
+            items_at: None,
+            item_schema: None,
+            error_envelope_on_stderr: false,
+            notes: Some("Workspace info object (paths, mode, config snapshot)."),
+        },
+    );
+}
+
+fn insert_label_command_shapes(commands: &mut BTreeMap<&'static str, CommandShape>) {
+    commands.insert(
+        "label list",
+        CommandShape {
+            shape: "array",
+            jq_filter: ".[]",
+            items_at: Some("$"),
+            item_schema: None,
+            error_envelope_on_stderr: false,
+            notes: None,
+        },
+    );
 }
 
 #[cfg(test)]
@@ -151,6 +378,68 @@ mod tests {
         for (name, schema) in schemas {
             let value = serde_json::to_value(&schema).expect("schema serializable");
             assert!(value.is_object(), "{name} schema should be a JSON object");
+        }
+    }
+
+    #[test]
+    fn commands_target_emits_only_command_map() {
+        let schemas = build_schemas(SchemaTarget::Commands);
+        let commands = build_commands(SchemaTarget::Commands);
+        assert!(
+            schemas.is_empty(),
+            "Commands target should not emit per-row schemas"
+        );
+        assert!(
+            !commands.is_empty(),
+            "Commands target should emit a non-empty command map"
+        );
+    }
+
+    #[test]
+    fn all_target_emits_both_schemas_and_commands() {
+        let schemas = build_schemas(SchemaTarget::All);
+        let commands = build_commands(SchemaTarget::All);
+        assert!(!schemas.is_empty(), "All target must include schemas");
+        assert!(!commands.is_empty(), "All target must include commands");
+    }
+
+    #[test]
+    fn per_row_target_does_not_emit_command_map() {
+        let commands = build_commands(SchemaTarget::Issue);
+        assert!(
+            commands.is_empty(),
+            "Per-row schema targets must not include command map"
+        );
+    }
+
+    #[test]
+    fn command_shapes_have_consistent_invariants() {
+        let commands = build_commands(SchemaTarget::Commands);
+        for (name, shape) in &commands {
+            // shape must be one of the documented values.
+            assert!(
+                matches!(shape.shape, "array" | "object" | "scalar"),
+                "{name}: shape={:?} is not one of array|object|scalar",
+                shape.shape
+            );
+            // jq_filter must be non-empty.
+            assert!(!shape.jq_filter.is_empty(), "{name}: jq_filter is empty");
+            // If shape is array, items_at must be Some("$") (the array itself is the items).
+            if shape.shape == "array" {
+                assert_eq!(
+                    shape.items_at,
+                    Some("$"),
+                    "{name}: array shapes must set items_at = \"$\""
+                );
+            }
+            // If item_schema is set, it must reference a known schema name from build_schemas(All).
+            if let Some(item_schema) = shape.item_schema {
+                let schemas = build_schemas(SchemaTarget::All);
+                assert!(
+                    schemas.contains_key(item_schema),
+                    "{name}: item_schema {item_schema:?} is not a known schema target"
+                );
+            }
         }
     }
 }

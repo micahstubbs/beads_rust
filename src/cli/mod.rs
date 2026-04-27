@@ -1233,7 +1233,7 @@ pub struct SchemaArgs {
 /// Schema targets for `br schema`.
 #[derive(ValueEnum, Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum SchemaTarget {
-    /// Emit a bundle containing all schemas
+    /// Emit a bundle containing all schemas and the per-command shape map
     #[default]
     All,
     /// Core Issue object (used by many commands)
@@ -1254,6 +1254,8 @@ pub enum SchemaTarget {
     Statistics,
     /// Structured error envelope (stderr JSON when robot mode or non-TTY)
     Error,
+    /// Per-command JSON output envelope map (top-level shape + jq filter per command)
+    Commands,
 }
 
 /// Output format for list command.
