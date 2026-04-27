@@ -873,7 +873,7 @@ fn execute_flush(
                      Database has 0 issues, JSONL has {existing_count} issues.\n\
                      This would result in data loss!\n\
                      Hint: Use --force to override this safety check."
-                )));
+            )));
         }
 
         if !jsonl_ids.is_empty() {
