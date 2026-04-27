@@ -92,7 +92,7 @@ fn execute_add(
     } else if ctx.is_rich() {
         render_comment_added_rich(&issue_id, &comment, ctx);
     } else {
-        println!("Comment added to {issue_id}");
+        println!("{}", comment_added_message(&issue_id));
     }
 
     Ok(())
@@ -193,11 +193,11 @@ fn list_comments_by_id(
     }
 
     if comments.is_empty() {
-        println!("No comments for {issue_id}.");
+        println!("{}", no_comments_message(&issue_id));
         return Ok(());
     }
 
-    println!("Comments for {issue_id}:");
+    println!("{}", comments_header(&issue_id));
     for comment in comments {
         let timestamp = comment.created_at.format("%Y-%m-%d %H:%M UTC");
         println!(
@@ -229,10 +229,7 @@ fn render_comments_list_rich(
     if comments.is_empty() {
         let mut text = Text::new("");
         text.append_styled("\u{1f4ad} ", theme.dimmed.clone());
-        text.append_styled(
-            &format!("No comments for {issue_id}."),
-            theme.dimmed.clone(),
-        );
+        text.append_styled(&no_comments_message(issue_id), theme.dimmed.clone());
         console.print_renderable(&text);
         return;
     }
@@ -267,7 +264,7 @@ fn render_comments_list_rich(
         content.append("\n\n");
     }
 
-    let title = format!("Comments: {} ({})", issue_id, comments.len());
+    let title = comments_panel_title(issue_id, comments.len());
     let content = if wrap {
         wrap_rich_text(&content, width)
     } else {
@@ -301,7 +298,10 @@ fn render_comment_added_rich(issue_id: &str, comment: &Comment, ctx: &OutputCont
     let mut text = Text::new("");
     text.append_styled("\u{2713} ", theme.success.clone());
     text.append_styled("Added comment to ", theme.success.clone());
-    text.append_styled(issue_id, theme.issue_id.clone());
+    text.append_styled(
+        sanitize_terminal_inline(issue_id).as_ref(),
+        theme.issue_id.clone(),
+    );
     console.print_renderable(&text);
 
     console.print("");
@@ -316,6 +316,22 @@ fn render_comment_added_rich(issue_id: &str, comment: &Comment, ctx: &OutputCont
     comment_text.append("\n");
     comment_text.append(sanitize_terminal_text(comment.body.trim_end_matches('\n')).as_ref());
     console.print_renderable(&comment_text);
+}
+
+fn comment_added_message(issue_id: &str) -> String {
+    format!("Comment added to {}", sanitize_terminal_inline(issue_id))
+}
+
+fn comments_header(issue_id: &str) -> String {
+    format!("Comments for {}:", sanitize_terminal_inline(issue_id))
+}
+
+fn no_comments_message(issue_id: &str) -> String {
+    format!("No comments for {}.", sanitize_terminal_inline(issue_id))
+}
+
+fn comments_panel_title(issue_id: &str, count: usize) -> String {
+    format!("Comments: {} ({count})", sanitize_terminal_inline(issue_id))
 }
 
 const MAX_STDIN_COMMENT_BYTES: usize = 10 * 1024 * 1024;
@@ -574,5 +590,26 @@ mod tests {
         let err = read_limited_string(&mut reader, 32, "text").expect_err("oversized stdin");
         assert!(matches!(err, BeadsError::Validation { .. }));
         info!("test_read_limited_string_rejects_oversized_input: assertions passed");
+    }
+
+    #[test]
+    fn comment_human_messages_sanitize_issue_id() {
+        init_test_logging();
+        info!("comment_human_messages_sanitize_issue_id: starting");
+        let issue_id = "bd-1\x1b]52;c;bad\x07\rreset";
+
+        let rendered = [
+            comment_added_message(issue_id),
+            comments_header(issue_id),
+            no_comments_message(issue_id),
+            comments_panel_title(issue_id, 2),
+        ]
+        .join("\n");
+
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains('\x07'));
+        assert!(!rendered.contains('\r'));
+        assert!(rendered.contains("bd-1\\u{1b}]52;c;bad\\u{7}\\rreset"));
+        info!("comment_human_messages_sanitize_issue_id: assertions passed");
     }
 }

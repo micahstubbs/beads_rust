@@ -166,6 +166,6 @@ mod tests {
         tracker.set(10);
 
         assert_eq!(tracker.display_counts(), (0, 0));
-        assert_eq!(tracker.progress_ratio(), 0.0);
+        assert!(tracker.progress_ratio().abs() < f64::EPSILON);
     }
 }

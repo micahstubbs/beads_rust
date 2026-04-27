@@ -134,7 +134,10 @@ pub fn execute_with_storage(
             ctx.json_pretty(&full_issue);
         }
     } else if args.dry_run {
-        ctx.info(&format!("Dry run: would create issue {}", issue.id));
+        ctx.info(&format!(
+            "Dry run: would create issue {}",
+            create_display_text(&issue.id)
+        ));
         ctx.print_line(&format!(
             "Title: {}",
             sanitize_terminal_inline(&issue.title)
@@ -150,15 +153,18 @@ pub fn execute_with_storage(
             ctx.print_line(&format!("Labels: {}", labels.join(", ")));
         }
         if let Some(parent) = &args.parent {
-            ctx.print_line(&format!("Parent: {parent}"));
+            ctx.print_line(&format!("Parent: {}", create_display_text(parent)));
         }
         if !args.deps.is_empty() {
-            ctx.print_line(&format!("Dependencies: {}", args.deps.join(", ")));
+            ctx.print_line(&format!(
+                "Dependencies: {}",
+                create_display_list(args.deps.iter().map(String::as_str))
+            ));
         }
     } else {
         ctx.success(&format!(
             "Created {}: {}",
-            issue.id,
+            create_display_text(&issue.id),
             sanitize_terminal_inline(&issue.title)
         ));
     }
@@ -175,6 +181,30 @@ fn auto_flush_after_create(storage_ctx: &mut config::OpenStorageResult, ctx: &Ou
             &error,
         );
     }
+}
+
+fn create_display_text(value: &str) -> String {
+    sanitize_terminal_inline(value).into_owned()
+}
+
+fn create_display_list<'a>(values: impl IntoIterator<Item = &'a str>) -> String {
+    values
+        .into_iter()
+        .map(create_display_text)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn create_display_path(path: &Path) -> String {
+    create_display_text(&path.display().to_string())
+}
+
+fn create_issue_summary_line(id: &str, title: &str) -> String {
+    format!(
+        "  {}: {}",
+        create_display_text(id),
+        create_display_text(title)
+    )
 }
 
 /// Core logic for creating an issue.
@@ -689,7 +719,7 @@ fn execute_import(
             let id = match generate_new_id(storage, resolved_parent.as_deref(), &id_input) {
                 Ok(id) => id,
                 Err(err) => {
-                    eprintln!("✗ Failed to create {title}: {err}");
+                    eprintln!("✗ Failed to create {}: {err}", create_display_text(&title));
                     break;
                 }
             };
@@ -698,7 +728,7 @@ fn execute_import(
                 match Priority::from_str(p) {
                     Ok(value) => value,
                     Err(err) => {
-                        eprintln!("✗ Failed to create {title}: {err}");
+                        eprintln!("✗ Failed to create {}: {err}", create_display_text(&title));
                         break;
                     }
                 }
@@ -710,7 +740,7 @@ fn execute_import(
                 match IssueType::from_str(t) {
                     Ok(value) => value,
                     Err(err) => {
-                        eprintln!("✗ Failed to create {title}: {err}");
+                        eprintln!("✗ Failed to create {}: {err}", create_display_text(&title));
                         break;
                     }
                 }
@@ -770,7 +800,7 @@ fn execute_import(
             if let Err(err) =
                 IssueValidator::validate(&issue).map_err(BeadsError::from_validation_errors)
             {
-                eprintln!("✗ Failed to create {title}: {err}");
+                eprintln!("✗ Failed to create {}: {err}", create_display_text(&title));
                 break;
             }
 
@@ -784,7 +814,9 @@ fn execute_import(
                 }
                 if let Err(err) = LabelValidator::validate(&label) {
                     eprintln!(
-                        "warning: skipping invalid label '{label}' for issue {id}: {}",
+                        "warning: skipping invalid label '{}' for issue {}: {}",
+                        create_display_text(&label),
+                        create_display_text(&id),
                         err.message
                     );
                     continue;
@@ -815,14 +847,17 @@ fn execute_import(
                 }
                 Err(BeadsError::IdCollision { .. }) => {
                     if retries >= 10 {
-                        eprintln!("✗ Failed to create {title}: ID collision after 10 retries");
+                        eprintln!(
+                            "✗ Failed to create {}: ID collision after 10 retries",
+                            create_display_text(&title)
+                        );
                         break;
                     }
                     retries += 1;
                     std::thread::sleep(std::time::Duration::from_millis(10 * retries));
                 }
                 Err(err) => {
-                    eprintln!("✗ Failed to create {title}: {err}");
+                    eprintln!("✗ Failed to create {}: {err}", create_display_text(&title));
                     break;
                 }
             }
@@ -879,7 +914,9 @@ fn execute_import(
                     let (mut t, dep_id, valid) = parse_dependency(dep_str);
                     if !valid {
                         eprintln!(
-                            "warning: skipping invalid dependency type '{t}' for issue {issue_id}"
+                            "warning: skipping invalid dependency type '{}' for issue {}",
+                            create_display_text(&t),
+                            create_display_text(issue_id)
                         );
                         continue;
                     }
@@ -898,7 +935,9 @@ fn execute_import(
                             Ok(r) => r,
                             Err(err) => {
                                 eprintln!(
-                                    "warning: unresolved dependency '{dep_id}' for issue {issue_id}: {err}"
+                                    "warning: unresolved dependency '{}' for issue {}: {err}",
+                                    create_display_text(&dep_id),
+                                    create_display_text(issue_id)
                                 );
                                 continue;
                             }
@@ -908,12 +947,17 @@ fn execute_import(
                 };
 
                 if resolved_dep_id == *issue_id {
-                    eprintln!("warning: skipping self-dependency for issue {issue_id}");
+                    eprintln!(
+                        "warning: skipping self-dependency for issue {}",
+                        create_display_text(issue_id)
+                    );
                     continue;
                 }
                 if is_marker_only_dependency(&resolved_dep_id) {
                     eprintln!(
-                        "warning: skipping invalid dependency '{resolved_dep_id}' for issue {issue_id}"
+                        "warning: skipping invalid dependency '{}' for issue {}",
+                        create_display_text(&resolved_dep_id),
+                        create_display_text(issue_id)
                     );
                     continue;
                 }
@@ -922,7 +966,9 @@ fn execute_import(
                     storage.add_dependency(issue_id, &resolved_dep_id, &type_str, &actor)
                 {
                     eprintln!(
-                        "warning: failed to add dependency {issue_id} → {resolved_dep_id}: {err}"
+                        "warning: failed to add dependency {} → {}: {err}",
+                        create_display_text(issue_id),
+                        create_display_text(&resolved_dep_id)
                     );
                 }
             }
@@ -943,7 +989,10 @@ fn execute_import(
                         if let Some(issue) = issues_by_id.remove(id) {
                             created_issues.push(issue);
                         } else {
-                            eprintln!("warning: could not load created issue {id} for JSON output");
+                            eprintln!(
+                                "warning: could not load created issue {} for JSON output",
+                                create_display_text(id)
+                            );
                         }
                     }
                 }
@@ -966,7 +1015,10 @@ fn execute_import(
 
     if created_ids.is_empty() {
         return Err(BeadsError::NothingToDo {
-            reason: format!("failed to create any issues from {}", path.display()),
+            reason: format!(
+                "failed to create any issues from {}",
+                create_display_path(path)
+            ),
         });
     }
 
@@ -983,17 +1035,17 @@ fn execute_import(
             ctx.info(&format!(
                 "Dry run: would create {} issues from {}:",
                 created_ids.len(),
-                path.display()
+                create_display_path(path)
             ));
         } else {
             ctx.success(&format!(
                 "Created {} issues from {}:",
                 created_ids.len(),
-                path.display()
+                create_display_path(path)
             ));
         }
         for (id, title) in created_ids {
-            ctx.print_line(&format!("  {id}: {title}"));
+            ctx.print_line(&create_issue_summary_line(&id, &title));
         }
     }
     auto_flush_after_create(&mut storage_ctx, ctx);
@@ -1060,6 +1112,25 @@ mod tests {
 
     fn setup_memory_storage() -> SqliteStorage {
         SqliteStorage::open_memory().expect("failed to open memory db")
+    }
+
+    #[test]
+    fn create_human_display_helpers_escape_terminal_controls() {
+        let id = create_display_text("bd-1\x1b]52;c;bad\x07");
+        let deps = create_display_list(["bd-a\x1b[2J", "external:proj:cap\x07"]);
+        let path = create_display_path(Path::new("imports\x1b[31m.md"));
+        let line = create_issue_summary_line("bd-2\x07", "Imported\nTitle");
+
+        for rendered in [&id, &deps, &path, &line] {
+            assert!(
+                !rendered.chars().any(char::is_control),
+                "display helper leaked control characters: {rendered:?}"
+            );
+        }
+        assert_eq!(id, "bd-1\\u{1b}]52;c;bad\\u{7}");
+        assert_eq!(deps, "bd-a\\u{1b}[2J, external:proj:cap\\u{7}");
+        assert_eq!(path, "imports\\u{1b}[31m.md");
+        assert_eq!(line, "  bd-2\\u{7}: Imported\\nTitle");
     }
 
     #[test]

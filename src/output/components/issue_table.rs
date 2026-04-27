@@ -151,7 +151,7 @@ impl<'a> IssueTable<'a> {
             .header_style(self.theme.table_header.clone());
 
         if let Some(ref title) = self.title {
-            table = table.title(Text::new(title));
+            table = table.title(Text::new(sanitize_terminal_inline(title).into_owned()));
         }
 
         // Add columns based on config
@@ -374,5 +374,24 @@ mod tests {
         assert!(rendered.contains("bd-table\\u{1b}]52;c;bad\\u{7}"));
         assert!(rendered.contains("\\u{1b}[2J"));
         assert!(rendered.contains("\\u{7}bell"));
+    }
+
+    #[test]
+    fn table_sanitizes_title_controls() {
+        let issue = Issue {
+            id: "bd-table".to_string(),
+            title: "safe title".to_string(),
+            ..Issue::default()
+        };
+        let theme = Theme::default();
+        let rendered = IssueTable::new(std::slice::from_ref(&issue), &theme)
+            .title("Search: \x1b]52;c;bad\x07\rreset")
+            .build()
+            .render_plain(120);
+
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains('\x07'));
+        assert!(!rendered.contains('\r'));
+        assert!(rendered.contains("Search: \\u{1b}]52;c;bad\\u{7}\\rreset"));
     }
 }

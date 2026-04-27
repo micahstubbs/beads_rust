@@ -696,13 +696,14 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
     let status_icon = format_status_icon_colored(&issue.status, use_color);
     let priority_label = format_priority_label(&issue.priority, use_color);
     let status_upper = format_status_label(&issue.status, false).to_uppercase();
+    let issue_id = sanitize_terminal_inline(&issue.id);
     let title = sanitize_terminal_inline(&issue.title);
 
     // Match bd format: {status_icon} {id} · {title}   [● {priority} · {STATUS}]
     let _ = writeln!(
         output,
         "{} {} · {}   [● {} · {}]",
-        status_icon, issue.id, title, priority_label, status_upper
+        status_icon, issue_id, title, priority_label, status_upper
     );
 
     // Owner/Type line: Owner: {owner} · Type: {type}
@@ -815,7 +816,7 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
                 output,
                 "  -> {} ({}) - {}",
                 sanitize_terminal_inline(&dep.id),
-                dep.dep_type,
+                sanitize_terminal_inline(&dep.dep_type),
                 sanitize_terminal_inline(&dep.title)
             );
         }
@@ -829,7 +830,7 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
                 output,
                 "  <- {} ({}) - {}",
                 sanitize_terminal_inline(&dep.id),
-                dep.dep_type,
+                sanitize_terminal_inline(&dep.dep_type),
                 sanitize_terminal_inline(&dep.title)
             );
         }
@@ -1110,6 +1111,46 @@ mod tests {
         assert!(output.contains("Comments:"));
         assert!(output.contains("alice: Looks good"));
         info!("test_show_text_includes_dependencies_and_comments: assertions passed");
+    }
+
+    #[test]
+    fn test_show_text_sanitizes_ids_and_dependency_types() {
+        init_logging();
+        info!("test_show_text_sanitizes_ids_and_dependency_types: starting");
+        let mut issue = make_test_issue("bd-001\x1b]52;c;bad\x07", "Test Issue");
+        issue.description = None;
+        let details = IssueDetails {
+            issue,
+            labels: Vec::new(),
+            dependencies: vec![IssueWithDependencyMetadata {
+                id: "bd-002\x1b[2J".to_string(),
+                title: "Dep\x07".to_string(),
+                status: Status::Open,
+                priority: Priority::MEDIUM,
+                dep_type: "blocks\x1b[31m".to_string(),
+            }],
+            dependents: vec![IssueWithDependencyMetadata {
+                id: "bd-003".to_string(),
+                title: "Dependent".to_string(),
+                status: Status::Open,
+                priority: Priority::MEDIUM,
+                dep_type: "waits-for\x07".to_string(),
+            }],
+            comments: Vec::new(),
+            events: Vec::new(),
+            parent: None,
+        };
+
+        let output = format_issue_details(&details, false);
+
+        assert!(!output.contains('\x1b'));
+        assert!(!output.contains('\x07'));
+        assert!(output.contains("bd-001\\u{1b}]52;c;bad\\u{7}"));
+        assert!(output.contains("bd-002\\u{1b}[2J"));
+        assert!(output.contains("(blocks\\u{1b}[31m)"));
+        assert!(output.contains("(waits-for\\u{7})"));
+        assert!(output.contains("Dep\\u{7}"));
+        info!("test_show_text_sanitizes_ids_and_dependency_types: assertions passed");
     }
 
     #[test]

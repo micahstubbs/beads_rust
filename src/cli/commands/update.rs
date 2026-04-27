@@ -647,7 +647,7 @@ fn validate_transition_to_in_progress(
 
 /// Print a summary of what changed for the issue.
 fn print_update_summary(id: &str, title: &str, diff: &UpdateDiff) {
-    println!("Updated {id}: {}", sanitize_terminal_inline(title));
+    println!("{}", updated_issue_human_line(id, title));
 
     if let Some((old_status, new_status)) = &diff.status {
         println!(
@@ -690,13 +690,25 @@ fn print_update_summary(id: &str, title: &str, diff: &UpdateDiff) {
     }
 }
 
+fn updated_issue_human_line(id: &str, title: &str) -> String {
+    format!(
+        "Updated {}: {}",
+        sanitize_terminal_inline(id),
+        sanitize_terminal_inline(title)
+    )
+}
+
+fn no_updates_human_line(id: &str) -> String {
+    format!("No updates specified for {}", sanitize_terminal_inline(id))
+}
+
 fn print_render_items(render_items: &[UpdateRenderItem]) {
     for item in render_items {
         match item {
             UpdateRenderItem::Summary { id, title, diff } => {
                 print_update_summary(id, title, diff.as_ref());
             }
-            UpdateRenderItem::NoUpdates { id } => println!("No updates specified for {id}"),
+            UpdateRenderItem::NoUpdates { id } => println!("{}", no_updates_human_line(id)),
         }
     }
 }
@@ -1166,6 +1178,21 @@ mod tests {
             assert_eq!(update_uses_machine_output(&ctx), expected_machine);
             assert_eq!(update_uses_human_output(&ctx), expected_human);
         }
+    }
+
+    #[test]
+    fn update_human_lines_sanitize_issue_ids_and_titles() {
+        let updated = updated_issue_human_line("bd-1\x1b]52;c;bad\x07", "Title\x1b[2J\nnext");
+        let no_updates = no_updates_human_line("bd-2\x07");
+
+        assert!(!updated.contains('\x1b'));
+        assert!(!updated.contains('\x07'));
+        assert!(!no_updates.contains('\x07'));
+        assert_eq!(
+            updated,
+            "Updated bd-1\\u{1b}]52;c;bad\\u{7}: Title\\u{1b}[2J\\nnext"
+        );
+        assert_eq!(no_updates, "No updates specified for bd-2\\u{7}");
     }
 
     #[test]
