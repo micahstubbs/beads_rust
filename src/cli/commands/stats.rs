@@ -112,16 +112,27 @@ fn execute_inner(
     debug!(total = all_issues.len(), "Loaded all issues for stats");
 
     // Compute summary counts
+    let now = Utc::now();
+    let has_potential_ready_candidates = all_issues
+        .iter()
+        .any(|issue| is_potential_ready_candidate(issue, &now));
     let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
-    let external_blockers = if storage.has_external_dependencies(true)? {
-        let external_statuses =
-            storage.resolve_external_dependency_statuses(&external_db_paths, true)?;
-        Some(storage.external_blockers(&external_statuses)?)
-    } else {
-        None
-    };
+    let external_blockers =
+        if has_potential_ready_candidates && storage.has_external_dependencies(true)? {
+            let external_statuses =
+                storage.resolve_external_dependency_statuses(&external_db_paths, true)?;
+            Some(storage.external_blockers(&external_statuses)?)
+        } else {
+            None
+        };
 
-    let summary = compute_summary(storage, &all_issues, external_blockers.as_ref())?;
+    let summary = compute_summary(
+        storage,
+        &all_issues,
+        external_blockers.as_ref(),
+        &now,
+        has_potential_ready_candidates,
+    )?;
 
     // Compute breakdowns if requested
     let mut breakdowns = Vec::new();
@@ -268,6 +279,8 @@ fn compute_summary(
     storage: &SqliteStorage,
     issues: &[StatsIssueRow],
     external_blockers: Option<&std::collections::HashMap<String, Vec<String>>>,
+    now: &chrono::DateTime<Utc>,
+    has_potential_ready_candidates: bool,
 ) -> Result<StatsSummary> {
     let mut open = 0;
     let mut in_progress = 0;
@@ -280,28 +293,29 @@ fn compute_summary(
     let mut epics = Vec::new();
     let mut lead_times = Vec::new();
 
+    let active_issue_ids: HashSet<&str> = issues
+        .iter()
+        .filter(|i| !matches!(i.status, Status::Closed | Status::Tombstone))
+        .map(|i| i.id.as_str())
+        .collect();
+
     // Compute blocked-by-blocks in memory to avoid an expensive double LEFT JOIN
-    // in fsqlite. We already have all issues loaded, so we build a status lookup
-    // and filter the raw dependency edges in Rust.
-    let blocked_by_blocks = {
-        let status_map: HashSet<&str> = issues
-            .iter()
-            .filter(|i| !matches!(i.status, Status::Closed | Status::Tombstone))
-            .map(|i| i.id.as_str())
-            .collect();
+    // in fsqlite. If there are no active issues, no dependency edge can affect
+    // either the blocked count or the ready count.
+    let blocked_by_blocks = if active_issue_ids.is_empty() {
+        HashSet::new()
+    } else {
         let edges = storage.get_blocks_dep_edges()?;
         let mut blocked = HashSet::new();
         for (issue_id, depends_on_id) in &edges {
-            if status_map.contains(depends_on_id.as_str()) && status_map.contains(issue_id.as_str())
+            if active_issue_ids.contains(depends_on_id.as_str())
+                && active_issue_ids.contains(issue_id.as_str())
             {
                 blocked.insert(issue_id.clone());
             }
         }
         blocked
     };
-
-    // Get full blocked cache for accurate Ready count (must match `br ready` behavior)
-    let all_blocked_ids = storage.get_blocked_ids()?;
 
     for issue in issues {
         match issue.status {
@@ -337,20 +351,19 @@ fn compute_summary(
     }
 
     // Ready count: status=open (not in_progress), no blockers (full definition).
-    let now = Utc::now();
-    let ready = issues
-        .iter()
-        .filter(|i| {
-            i.status == Status::Open
-                && !all_blocked_ids.contains(&i.id)
-                && external_blockers.is_none_or(|eb| !eb.contains_key(&i.id))
-                && !i.ephemeral
-                && !is_wisp_issue_id(&i.id)
-                && !i.pinned
-                && !i.is_template
-                && i.defer_until.is_none_or(|d| d <= now)
-        })
-        .count();
+    let ready = if has_potential_ready_candidates {
+        let all_blocked_ids = storage.get_blocked_ids()?;
+        issues
+            .iter()
+            .filter(|i| {
+                is_potential_ready_candidate(i, now)
+                    && !all_blocked_ids.contains(&i.id)
+                    && external_blockers.is_none_or(|eb| !eb.contains_key(&i.id))
+            })
+            .count()
+    } else {
+        0
+    };
 
     // Blocked count includes both dependency-blocked issues and manual
     // Status::Blocked issues, deduped by ID when both conditions apply.
@@ -392,6 +405,18 @@ fn compute_summary(
 
 fn is_wisp_issue_id(id: &str) -> bool {
     id.contains("-wisp-")
+}
+
+fn is_potential_ready_candidate(issue: &StatsIssueRow, now: &chrono::DateTime<Utc>) -> bool {
+    issue.status == Status::Open
+        && !issue.ephemeral
+        && !is_wisp_issue_id(&issue.id)
+        && !issue.pinned
+        && !issue.is_template
+        && issue
+            .defer_until
+            .as_ref()
+            .is_none_or(|defer_until| defer_until <= now)
 }
 
 /// Count epics that have all children closed.
@@ -1241,6 +1266,14 @@ mod tests {
         }
     }
 
+    fn compute_test_summary(storage: &SqliteStorage, issues: &[StatsIssueRow]) -> StatsSummary {
+        let now = Utc::now();
+        let has_potential_ready_candidates = issues
+            .iter()
+            .any(|issue| is_potential_ready_candidate(issue, &now));
+        compute_summary(storage, issues, None, &now, has_potential_ready_candidates).unwrap()
+    }
+
     #[test]
     fn test_compute_type_breakdown() {
         let test_issues = [
@@ -1330,7 +1363,7 @@ mod tests {
             .into_iter()
             .map(stats_row)
             .collect::<Vec<_>>();
-        let summary = compute_summary(&storage, &all_issues, None).unwrap();
+        let summary = compute_test_summary(&storage, &all_issues);
 
         assert_eq!(summary.total_issues, 3);
         assert_eq!(summary.open_issues, 1);
@@ -1355,7 +1388,7 @@ mod tests {
             .into_iter()
             .map(stats_row)
             .collect::<Vec<_>>();
-        let summary = compute_summary(&storage, &all_issues, None).unwrap();
+        let summary = compute_test_summary(&storage, &all_issues);
 
         assert_eq!(summary.blocked_issues, 1);
         assert_eq!(summary.ready_issues, 1); // t-1 is ready, t-2 is blocked
@@ -1372,7 +1405,7 @@ mod tests {
         let all_issues = std::iter::once(&blocked_issue)
             .map(stats_row)
             .collect::<Vec<_>>();
-        let summary = compute_summary(&storage, &all_issues, None).unwrap();
+        let summary = compute_test_summary(&storage, &all_issues);
 
         assert_eq!(summary.blocked_issues, 1);
         assert_eq!(summary.ready_issues, 0);
@@ -1393,7 +1426,7 @@ mod tests {
             .into_iter()
             .map(stats_row)
             .collect::<Vec<_>>();
-        let summary = compute_summary(&storage, &all_issues, None).unwrap();
+        let summary = compute_test_summary(&storage, &all_issues);
 
         assert_eq!(summary.ready_issues, 1);
     }
@@ -1412,7 +1445,7 @@ mod tests {
             .into_iter()
             .map(stats_row)
             .collect::<Vec<_>>();
-        let summary = compute_summary(&storage, &all_issues, None).unwrap();
+        let summary = compute_test_summary(&storage, &all_issues);
 
         assert_eq!(summary.ready_issues, 1);
     }
@@ -1437,7 +1470,7 @@ mod tests {
             .into_iter()
             .map(stats_row)
             .collect::<Vec<_>>();
-        let summary = compute_summary(&storage, &all_issues, None).unwrap();
+        let summary = compute_test_summary(&storage, &all_issues);
 
         assert_eq!(summary.epics_eligible_for_closure, 0);
     }
@@ -1460,7 +1493,7 @@ mod tests {
             .into_iter()
             .map(stats_row)
             .collect::<Vec<_>>();
-        let summary = compute_summary(&storage, &all_issues, None).unwrap();
+        let summary = compute_test_summary(&storage, &all_issues);
 
         // t-2 should NOT be blocked because t-1 is closed
         assert_eq!(summary.blocked_issues, 0);
