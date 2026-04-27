@@ -7,7 +7,7 @@ use crate::cli::OrphansArgs;
 use crate::cli::commands::auto_import_storage_ctx_if_stale;
 use crate::cli::commands::close::{self, CloseArgs};
 use crate::config;
-use crate::error::Result;
+use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
 use crate::model::{Issue, Status};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
@@ -53,6 +53,21 @@ const fn resolve_render_mode(json: bool, output_mode: OutputMode) -> OrphanRende
 
 fn orphan_display_text(value: &str) -> String {
     sanitize_terminal_inline(value).into_owned()
+}
+
+fn validate_fix_render_mode(args: &OrphansArgs, render_mode: OrphanRenderMode) -> Result<()> {
+    if args.fix
+        && !matches!(
+            render_mode,
+            OrphanRenderMode::Rich | OrphanRenderMode::Plain
+        )
+    {
+        return Err(BeadsError::validation(
+            "fix",
+            "--fix is interactive and requires human text output; omit --json/--robot/TOON/--quiet",
+        ));
+    }
+    Ok(())
 }
 
 /// Execute the orphans command.
@@ -123,6 +138,7 @@ fn execute_inner(
     let config_layer = storage_ctx.load_config(cli)?;
     let prefix = config::id_config_from_layer(&config_layer).prefix;
     let render_mode = resolve_render_mode(json, ctx.mode());
+    validate_fix_render_mode(args, render_mode)?;
     let Some(repo_root) = git_repo_root_for_path(&storage_ctx.paths.jsonl_path)
         .or_else(|| git_repo_root_for_path(beads_dir))
     else {
@@ -467,6 +483,29 @@ mod tests {
         assert!(rendered.contains("\\n"));
         assert!(rendered.contains("\\u{7}"));
         assert!(rendered.contains("\\u{9b}"));
+    }
+
+    #[test]
+    fn fix_mode_requires_human_output() {
+        let args = OrphansArgs {
+            fix: true,
+            ..Default::default()
+        };
+
+        assert!(validate_fix_render_mode(&args, OrphanRenderMode::Plain).is_ok());
+        assert!(validate_fix_render_mode(&args, OrphanRenderMode::Rich).is_ok());
+
+        for mode in [
+            OrphanRenderMode::Json,
+            OrphanRenderMode::Toon,
+            OrphanRenderMode::Quiet,
+        ] {
+            let err = validate_fix_render_mode(&args, mode).unwrap_err();
+            assert!(
+                err.to_string().contains("--fix is interactive"),
+                "unexpected error for {mode:?}: {err}"
+            );
+        }
     }
 
     #[test]
