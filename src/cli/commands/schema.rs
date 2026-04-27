@@ -55,16 +55,20 @@ struct SchemaOutput {
 /// not the per-row schema (which lives in `schemas`). Agents can use the
 /// `jq_filter` to extract individual items uniformly across commands without
 /// hard-coding per-command knowledge.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct CommandShape {
     /// Top-level JSON shape: "array" | "object" | "scalar".
     shape: &'static str,
-    /// jq filter that yields one item per output unit. For non-iterable
-    /// outputs (e.g. `stats`, `info`) this is `"."` and `items_at` is None.
+    /// jq filter that extracts the useful payload from the command's
+    /// `--json` output. For iterable commands this yields one item per
+    /// invocation (e.g. `.[]` or `.issues[]`). For aggregate commands
+    /// it extracts the value of interest — `.` for whole-object outputs
+    /// like `stats`/`info`, or a specific path like `.count` to dig out
+    /// a single scalar.
     jq_filter: &'static str,
-    /// JSON path to the iterable items. `"$"` means the top-level value
+    /// jq path to the iterable items. `"."` means the top-level value
     /// itself is the array; `".issues"` means items live at `.issues`.
-    /// None for non-iterable outputs.
+    /// `None` for non-iterable outputs.
     #[serde(skip_serializing_if = "Option::is_none")]
     items_at: Option<&'static str>,
     /// Name of the schema each item conforms to. References a key in
@@ -206,7 +210,7 @@ fn insert_issue_command_shapes(commands: &mut BTreeMap<&'static str, CommandShap
         CommandShape {
             shape: "array",
             jq_filter: ".[0]",
-            items_at: Some("$"),
+            items_at: Some("."),
             item_schema: Some("IssueDetails"),
             error_envelope_on_stderr: true,
             notes: Some(
@@ -235,7 +239,7 @@ fn insert_issue_command_shapes(commands: &mut BTreeMap<&'static str, CommandShap
         CommandShape {
             shape: "array",
             jq_filter: ".[]",
-            items_at: Some("$"),
+            items_at: Some("."),
             item_schema: Some("ReadyIssue"),
             error_envelope_on_stderr: false,
             notes: None,
@@ -246,7 +250,7 @@ fn insert_issue_command_shapes(commands: &mut BTreeMap<&'static str, CommandShap
         CommandShape {
             shape: "array",
             jq_filter: ".[]",
-            items_at: Some("$"),
+            items_at: Some("."),
             item_schema: Some("BlockedIssue"),
             error_envelope_on_stderr: false,
             notes: None,
@@ -257,7 +261,7 @@ fn insert_issue_command_shapes(commands: &mut BTreeMap<&'static str, CommandShap
         CommandShape {
             shape: "array",
             jq_filter: ".[]",
-            items_at: Some("$"),
+            items_at: Some("."),
             item_schema: Some("StaleIssue"),
             error_envelope_on_stderr: false,
             notes: None,
@@ -268,7 +272,7 @@ fn insert_issue_command_shapes(commands: &mut BTreeMap<&'static str, CommandShap
         CommandShape {
             shape: "array",
             jq_filter: ".[]",
-            items_at: Some("$"),
+            items_at: Some("."),
             item_schema: Some("IssueWithCounts"),
             error_envelope_on_stderr: false,
             notes: None,
@@ -282,7 +286,7 @@ fn insert_comment_command_shapes(commands: &mut BTreeMap<&'static str, CommandSh
         CommandShape {
             shape: "array",
             jq_filter: ".[]",
-            items_at: Some("$"),
+            items_at: Some("."),
             item_schema: None,
             error_envelope_on_stderr: true,
             notes: Some(
@@ -299,7 +303,7 @@ fn insert_dependency_command_shapes(commands: &mut BTreeMap<&'static str, Comman
         CommandShape {
             shape: "array",
             jq_filter: ".[]",
-            items_at: Some("$"),
+            items_at: Some("."),
             item_schema: Some("TreeNode"),
             error_envelope_on_stderr: true,
             notes: Some("Pre-order traversal; each node carries a `depth` field."),
@@ -310,7 +314,7 @@ fn insert_dependency_command_shapes(commands: &mut BTreeMap<&'static str, Comman
         CommandShape {
             shape: "array",
             jq_filter: ".[]",
-            items_at: Some("$"),
+            items_at: Some("."),
             item_schema: None,
             error_envelope_on_stderr: true,
             notes: None,
@@ -319,17 +323,19 @@ fn insert_dependency_command_shapes(commands: &mut BTreeMap<&'static str, Comman
 }
 
 fn insert_aggregate_command_shapes(commands: &mut BTreeMap<&'static str, CommandShape>) {
-    commands.insert(
-        "stats",
-        CommandShape {
-            shape: "object",
-            jq_filter: ".",
-            items_at: None,
-            item_schema: Some("Statistics"),
-            error_envelope_on_stderr: false,
-            notes: Some("Single aggregate object; `status` is an alias for `stats`."),
-        },
-    );
+    let stats_shape = CommandShape {
+        shape: "object",
+        jq_filter: ".",
+        items_at: None,
+        item_schema: Some("Statistics"),
+        error_envelope_on_stderr: false,
+        notes: Some("Single aggregate object."),
+    };
+    commands.insert("stats", stats_shape.clone());
+    // `br status` is an alias for `br stats` and emits the same envelope.
+    // Listing both keys lets agents look up either name without indirection.
+    commands.insert("status", stats_shape);
+
     commands.insert(
         "count",
         CommandShape {
@@ -360,7 +366,7 @@ fn insert_label_command_shapes(commands: &mut BTreeMap<&'static str, CommandShap
         CommandShape {
             shape: "array",
             jq_filter: ".[]",
-            items_at: Some("$"),
+            items_at: Some("."),
             item_schema: None,
             error_envelope_on_stderr: false,
             notes: None,
@@ -415,6 +421,8 @@ mod tests {
     #[test]
     fn command_shapes_have_consistent_invariants() {
         let commands = build_commands(SchemaTarget::Commands);
+        // Build schemas once, not per-iteration — schema_for! does real work.
+        let known_schemas = build_schemas(SchemaTarget::All);
         for (name, shape) in &commands {
             // shape must be one of the documented values.
             assert!(
@@ -424,22 +432,49 @@ mod tests {
             );
             // jq_filter must be non-empty.
             assert!(!shape.jq_filter.is_empty(), "{name}: jq_filter is empty");
-            // If shape is array, items_at must be Some("$") (the array itself is the items).
+            // If shape is array, items_at must be Some(".") (jq identity — the
+            // top-level value itself is the array we iterate).
             if shape.shape == "array" {
                 assert_eq!(
                     shape.items_at,
-                    Some("$"),
-                    "{name}: array shapes must set items_at = \"$\""
+                    Some("."),
+                    "{name}: array shapes must set items_at = \".\""
+                );
+            }
+            // If items_at is set, it must be a jq path starting with `.`
+            // (consistent with the `.issues` / `.` notation used for `list`
+            // and the array-shaped commands).
+            if let Some(path) = shape.items_at {
+                assert!(
+                    path.starts_with('.'),
+                    "{name}: items_at {path:?} must be a jq path starting with `.`"
                 );
             }
             // If item_schema is set, it must reference a known schema name from build_schemas(All).
             if let Some(item_schema) = shape.item_schema {
-                let schemas = build_schemas(SchemaTarget::All);
                 assert!(
-                    schemas.contains_key(item_schema),
+                    known_schemas.contains_key(item_schema),
                     "{name}: item_schema {item_schema:?} is not a known schema target"
                 );
             }
         }
+    }
+
+    #[test]
+    fn stats_and_status_share_the_same_envelope() {
+        // `br status` is documented as an alias for `br stats`; the schema
+        // map should describe identical shapes for both names so agents
+        // looking up either name get a consistent answer.
+        let commands = build_commands(SchemaTarget::Commands);
+        let stats = commands.get("stats").expect("stats entry must exist");
+        let status = commands.get("status").expect("status alias must exist");
+        assert_eq!(stats.shape, status.shape);
+        assert_eq!(stats.jq_filter, status.jq_filter);
+        assert_eq!(stats.items_at, status.items_at);
+        assert_eq!(stats.item_schema, status.item_schema);
+        assert_eq!(
+            stats.error_envelope_on_stderr,
+            status.error_envelope_on_stderr
+        );
     }
 }
