@@ -30,6 +30,14 @@ fn push_unique_label(labels: &mut Vec<String>, label: &str) {
     }
 }
 
+fn invalid_label_warning(label: &str, reason: &str) -> String {
+    format!(
+        "Warning: invalid label '{}': {}",
+        sanitize_terminal_inline(label),
+        sanitize_terminal_inline(reason)
+    )
+}
+
 /// Execute the quick capture command.
 ///
 /// # Errors
@@ -118,7 +126,7 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
     let labels = split_labels(&args.labels);
     for label in labels {
         if let Err(err) = LabelValidator::validate(&label) {
-            eprintln!("Warning: invalid label '{label}': {}", err.message);
+            eprintln!("{}", invalid_label_warning(&label, &err.message));
             continue;
         }
         push_unique_label(&mut valid_labels, &label);
@@ -264,5 +272,15 @@ mod tests {
         push_unique_label(&mut labels, "ops");
 
         assert_eq!(labels, vec!["backend".to_string(), "ops".to_string()]);
+    }
+
+    #[test]
+    fn invalid_label_warning_sanitizes_terminal_controls() {
+        let warning = invalid_label_warning("bad\x1b[2J\rlabel", "no bell\x07 allowed");
+
+        assert!(!warning.chars().any(char::is_control));
+        assert!(warning.contains("\\u{1b}[2J"));
+        assert!(warning.contains("\\r"));
+        assert!(warning.contains("\\u{7}"));
     }
 }

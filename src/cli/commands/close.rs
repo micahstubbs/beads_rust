@@ -231,6 +231,10 @@ fn unblocked_human_line(issue: &UnblockedIssue) -> String {
     format!("  {}: {}", id.as_ref(), title.as_ref())
 }
 
+fn issue_input_text(input: &str) -> String {
+    sanitize_terminal_inline(input).into_owned()
+}
+
 fn reorder_routed_items_by_requested_inputs<T>(
     requested_inputs: &[String],
     routed_items: Vec<(Vec<String>, Vec<T>)>,
@@ -257,11 +261,18 @@ fn reorder_routed_items_by_requested_inputs<T>(
                 .get_mut(input.as_str())
                 .and_then(VecDeque::pop_front)
             else {
+                let input = issue_input_text(&input);
                 return Err(BeadsError::internal(format!(
                     "{context} returned unexpected issue input {input}"
                 )));
             };
-            ordered_items[index] = Some(item);
+            let Some(slot) = ordered_items.get_mut(index) else {
+                let input = issue_input_text(&input);
+                return Err(BeadsError::internal(format!(
+                    "{context} returned out-of-range issue input {input}"
+                )));
+            };
+            *slot = Some(item);
         }
     }
 
@@ -270,10 +281,11 @@ fn reorder_routed_items_by_requested_inputs<T>(
         .enumerate()
         .map(|(index, item)| {
             item.ok_or_else(|| {
-                BeadsError::internal(format!(
-                    "{context} did not produce a result for {}",
-                    requested_inputs[index]
-                ))
+                let input = requested_inputs
+                    .get(index)
+                    .map(|input| issue_input_text(input))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                BeadsError::internal(format!("{context} did not produce a result for {input}"))
             })
         })
         .collect()
@@ -1102,6 +1114,46 @@ mod tests {
         assert!(skipped_message.contains("\\u{7}"));
         assert!(unblocked_line.contains("\\n"));
         assert!(unblocked_line.contains("\\u{8}"));
+    }
+
+    #[test]
+    fn reorder_routed_items_sanitizes_missing_input_error() {
+        let requested = vec!["bd-close\x1b[2J\nbad".to_string(), "bd-ok".to_string()];
+        let routed_items = vec![(vec!["bd-ok".to_string()], vec!["ok"])];
+
+        let err =
+            reorder_routed_items_by_requested_inputs(&requested, routed_items, "close routing")
+                .unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Internal { .. }),
+            "unexpected error: {err:?}"
+        );
+        if let BeadsError::Internal { message } = err {
+            assert!(!message.chars().any(char::is_control));
+            assert!(message.contains("\\u{1b}[2J"));
+            assert!(message.contains("\\n"));
+        }
+    }
+
+    #[test]
+    fn reorder_routed_items_sanitizes_unexpected_input_error() {
+        let requested = vec!["bd-ok".to_string()];
+        let routed_items = vec![(vec!["bd-close\x1b[2J\nbad".to_string()], vec!["bad"])];
+
+        let err =
+            reorder_routed_items_by_requested_inputs(&requested, routed_items, "close routing")
+                .unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Internal { .. }),
+            "unexpected error: {err:?}"
+        );
+        if let BeadsError::Internal { message } = err {
+            assert!(!message.chars().any(char::is_control));
+            assert!(message.contains("\\u{1b}[2J"));
+            assert!(message.contains("\\n"));
+        }
     }
 
     // =========================================================================

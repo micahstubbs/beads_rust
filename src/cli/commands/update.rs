@@ -702,6 +702,10 @@ fn no_updates_human_line(id: &str) -> String {
     format!("No updates specified for {}", sanitize_terminal_inline(id))
 }
 
+fn issue_input_text(input: &str) -> String {
+    sanitize_terminal_inline(input).into_owned()
+}
+
 fn print_render_items(render_items: &[UpdateRenderItem]) {
     for item in render_items {
         match item {
@@ -739,11 +743,18 @@ fn reorder_routed_items_by_requested_inputs<T>(
                 .get_mut(input.as_str())
                 .and_then(VecDeque::pop_front)
             else {
+                let input = issue_input_text(&input);
                 return Err(BeadsError::Config(format!(
                     "{context} returned unexpected issue input {input}"
                 )));
             };
-            ordered_items[index] = Some(item);
+            let Some(slot) = ordered_items.get_mut(index) else {
+                let input = issue_input_text(&input);
+                return Err(BeadsError::Config(format!(
+                    "{context} returned out-of-range issue input {input}"
+                )));
+            };
+            *slot = Some(item);
         }
     }
 
@@ -752,10 +763,11 @@ fn reorder_routed_items_by_requested_inputs<T>(
         .enumerate()
         .map(|(index, item)| {
             item.ok_or_else(|| {
-                BeadsError::Config(format!(
-                    "{context} did not produce a result for {}",
-                    requested_inputs[index]
-                ))
+                let input = requested_inputs
+                    .get(index)
+                    .map(|input| issue_input_text(input))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                BeadsError::Config(format!("{context} did not produce a result for {input}"))
             })
         })
         .collect()
@@ -1193,6 +1205,44 @@ mod tests {
             "Updated bd-1\\u{1b}]52;c;bad\\u{7}: Title\\u{1b}[2J\\nnext"
         );
         assert_eq!(no_updates, "No updates specified for bd-2\\u{7}");
+    }
+
+    #[test]
+    fn reorder_routed_items_sanitizes_missing_input_error() {
+        let requested = vec!["bd-update\x1b[2J\nbad".to_string(), "bd-ok".to_string()];
+        let routed_items = vec![(vec!["bd-ok".to_string()], vec!["ok"])];
+
+        let err =
+            reorder_routed_items_by_requested_inputs(&requested, routed_items, "update routing")
+                .unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(!message.chars().any(char::is_control));
+        assert!(message.contains("\\u{1b}[2J"));
+        assert!(message.contains("\\n"));
+    }
+
+    #[test]
+    fn reorder_routed_items_sanitizes_unexpected_input_error() {
+        let requested = vec!["bd-ok".to_string()];
+        let routed_items = vec![(vec!["bd-update\x1b[2J\nbad".to_string()], vec!["bad"])];
+
+        let err =
+            reorder_routed_items_by_requested_inputs(&requested, routed_items, "update routing")
+                .unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(!message.chars().any(char::is_control));
+        assert!(message.contains("\\u{1b}[2J"));
+        assert!(message.contains("\\n"));
     }
 
     #[test]

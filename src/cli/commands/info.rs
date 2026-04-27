@@ -3,6 +3,7 @@
 use crate::cli::InfoArgs;
 use crate::config;
 use crate::error::Result;
+use crate::format::sanitize_terminal_inline;
 use crate::output::{OutputContext, OutputMode};
 use crate::util::parse_id;
 use fsqlite::Connection;
@@ -284,25 +285,25 @@ fn actual_schema_version(conn: &Connection) -> String {
 
 fn print_human(info: &InfoOutput) {
     println!("Beads Database Information");
-    println!("Beads dir: {}", info.beads_dir);
-    println!("Database: {}", info.database_path);
+    println!("Beads dir: {}", info_display_text(&info.beads_dir));
+    println!("Database: {}", info_display_text(&info.database_path));
     if let Some(size) = info.db_size {
         println!("Database size: {}", format_bytes(size));
     }
     if let Some(jsonl_path) = &info.jsonl_path {
-        println!("JSONL: {jsonl_path}");
+        println!("JSONL: {}", info_display_text(jsonl_path));
         if let Some(size) = info.jsonl_size {
             println!("JSONL size: {}", format_bytes(size));
         }
     }
-    println!("Mode: {}", info.mode);
+    println!("Mode: {}", info_display_text(&info.mode));
 
     if info.daemon_connected {
         println!("Daemon: connected");
     } else if let Some(reason) = &info.daemon_fallback_reason {
-        println!("Daemon: not connected ({reason})");
+        println!("Daemon: not connected ({})", info_display_text(reason));
         if let Some(detail) = &info.daemon_detail {
-            println!("  {detail}");
+            println!("  {}", info_display_text(detail));
         }
     }
 
@@ -311,19 +312,25 @@ fn print_human(info: &InfoOutput) {
     }
 
     if let Some(prefix) = info.resolved_prefix.as_deref() {
-        println!("Issue prefix: {prefix}");
+        println!("Issue prefix: {}", info_display_text(prefix));
     }
 
     if let Some(schema) = &info.schema {
         println!();
         println!("Schema:");
-        println!("  Version: {}", schema.schema_version);
-        println!("  Tables: {}", schema.tables.join(", "));
+        println!("  Version: {}", info_display_text(&schema.schema_version));
+        println!(
+            "  Tables: {}",
+            info_display_list(schema.tables.iter().map(String::as_str))
+        );
         if let Some(prefix) = &schema.detected_prefix {
-            println!("  Detected prefix: {prefix}");
+            println!("  Detected prefix: {}", info_display_text(prefix));
         }
         if !schema.sample_issue_ids.is_empty() {
-            println!("  Sample IDs: {}", schema.sample_issue_ids.join(", "));
+            println!(
+                "  Sample IDs: {}",
+                info_display_list(schema.sample_issue_ids.iter().map(String::as_str))
+            );
         }
     }
 }
@@ -359,13 +366,13 @@ fn render_info_rich(info: &InfoOutput, ctx: &OutputContext) {
 
     // Location section
     content.append_styled("Location    ", theme.dimmed.clone());
-    content.append_styled(&info.beads_dir, theme.accent.clone());
+    content.append_styled(&info_display_text(&info.beads_dir), theme.accent.clone());
     content.append("\n");
 
     // Prefix (if available)
     if let Some(prefix) = info.resolved_prefix.as_deref() {
         content.append_styled("Prefix      ", theme.dimmed.clone());
-        content.append_styled(prefix, theme.issue_id.clone());
+        content.append_styled(&info_display_text(prefix), theme.issue_id.clone());
         content.append("\n");
     }
 
@@ -374,7 +381,10 @@ fn render_info_rich(info: &InfoOutput, ctx: &OutputContext) {
     // Database section
     content.append_styled("Database\n", theme.section.clone());
     content.append_styled("  Path      ", theme.dimmed.clone());
-    content.append_styled(&info.database_path, theme.accent.clone());
+    content.append_styled(
+        &info_display_text(&info.database_path),
+        theme.accent.clone(),
+    );
     content.append("\n");
 
     if let Some(size) = info.db_size {
@@ -394,7 +404,7 @@ fn render_info_rich(info: &InfoOutput, ctx: &OutputContext) {
         content.append("\n");
         content.append_styled("JSONL\n", theme.section.clone());
         content.append_styled("  Path      ", theme.dimmed.clone());
-        content.append_styled(jsonl_path, theme.accent.clone());
+        content.append_styled(&info_display_text(jsonl_path), theme.accent.clone());
         content.append("\n");
 
         if let Some(size) = info.jsonl_size {
@@ -407,7 +417,7 @@ fn render_info_rich(info: &InfoOutput, ctx: &OutputContext) {
     // Mode section
     content.append("\n");
     content.append_styled("Mode        ", theme.dimmed.clone());
-    content.append(&info.mode);
+    content.append(&info_display_text(&info.mode));
     if !info.daemon_connected {
         content.append_styled(" (no daemon)", theme.muted.clone());
     }
@@ -418,22 +428,24 @@ fn render_info_rich(info: &InfoOutput, ctx: &OutputContext) {
         content.append("\n");
         content.append_styled("Schema\n", theme.section.clone());
         content.append_styled("  Version   ", theme.dimmed.clone());
-        content.append(&schema.schema_version);
+        content.append(&info_display_text(&schema.schema_version));
         content.append("\n");
 
         content.append_styled("  Tables    ", theme.dimmed.clone());
-        content.append(&schema.tables.join(", "));
+        content.append(&info_display_list(schema.tables.iter().map(String::as_str)));
         content.append("\n");
 
         if let Some(prefix) = &schema.detected_prefix {
             content.append_styled("  Prefix    ", theme.dimmed.clone());
-            content.append_styled(prefix, theme.issue_id.clone());
+            content.append_styled(&info_display_text(prefix), theme.issue_id.clone());
             content.append("\n");
         }
 
         if !schema.sample_issue_ids.is_empty() {
             content.append_styled("  Samples   ", theme.dimmed.clone());
-            content.append(&schema.sample_issue_ids.join(", "));
+            content.append(&info_display_list(
+                schema.sample_issue_ids.iter().map(String::as_str),
+            ));
             content.append("\n");
         }
     }
@@ -467,6 +479,18 @@ fn format_bytes(bytes: u64) -> String {
 
 fn canonicalize_lossy(path: &Path) -> PathBuf {
     dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn info_display_text(value: &str) -> String {
+    sanitize_terminal_inline(value).into_owned()
+}
+
+fn info_display_list<'a>(values: impl IntoIterator<Item = &'a str>) -> String {
+    values
+        .into_iter()
+        .map(info_display_text)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
@@ -521,6 +545,23 @@ mod tests {
     #[test]
     fn test_format_bytes_gb() {
         assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GB");
+    }
+
+    #[test]
+    fn info_display_helpers_sanitize_terminal_controls() {
+        let rendered = info_display_text("/tmp/bd\x1b[2J\rreset\x08\nnext\x07\u{9b}");
+
+        assert!(!rendered.chars().any(char::is_control));
+        assert!(rendered.contains("\\u{1b}[2J"));
+        assert!(rendered.contains("\\r"));
+        assert!(rendered.contains("\\u{8}"));
+        assert!(rendered.contains("\\n"));
+        assert!(rendered.contains("\\u{7}"));
+        assert!(rendered.contains("\\u{9b}"));
+
+        let rendered_list = info_display_list(["issues", "bad\x1b[2Jtable"]);
+        assert!(!rendered_list.chars().any(char::is_control));
+        assert!(rendered_list.contains("issues, bad\\u{1b}[2Jtable"));
     }
 
     #[test]
