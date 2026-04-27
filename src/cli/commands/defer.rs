@@ -77,6 +77,10 @@ fn issue_id_text(id: &str) -> String {
     sanitize_terminal_inline(id).into_owned()
 }
 
+fn status_text(status: &str) -> String {
+    sanitize_terminal_inline(status).into_owned()
+}
+
 /// Execute the defer command.
 ///
 /// # Errors
@@ -672,7 +676,8 @@ fn render_defer_rich(deferred: &[DeferredIssue], skipped: &[SkippedIssue], ctx: 
             content.append(sanitize_terminal_inline(&item.title).as_ref());
             content.append("\n");
             content.append_styled("  Status: ", theme.dimmed.clone());
-            content.append_styled(&item.previous_status, theme.success.clone());
+            let previous_status = status_text(&item.previous_status);
+            content.append_styled(&previous_status, theme.success.clone());
             content.append(" \u{2192} ");
             content.append_styled("deferred", theme.warning.clone());
             content.append("\n");
@@ -734,12 +739,14 @@ fn render_undefer_rich(
             content.append(sanitize_terminal_inline(&item.title).as_ref());
             content.append("\n");
             content.append_styled("  Status: ", theme.dimmed.clone());
-            content.append_styled(&item.previous_status, theme.warning.clone());
+            let previous_status = status_text(&item.previous_status);
+            let status = status_text(&item.status);
+            content.append_styled(&previous_status, theme.warning.clone());
             if item.previous_status == item.status {
                 content.append_styled(" (unchanged)", theme.dimmed.clone());
             } else {
                 content.append(" \u{2192} ");
-                content.append_styled(&item.status, theme.success.clone());
+                content.append_styled(&status, theme.success.clone());
             }
             content.append("\n");
         }
@@ -849,6 +856,19 @@ mod tests {
         assert!(id.contains("\\n"));
         assert!(id.contains("\\u{7}"));
         assert!(id.contains("\\u{9b}"));
+    }
+
+    #[test]
+    fn status_text_sanitizes_terminal_controls() {
+        let status = status_text("qa\x1b[2J\rreset\x08\nnext\x07\u{9b}");
+
+        assert!(!status.chars().any(char::is_control));
+        assert!(status.contains("\\u{1b}[2J"));
+        assert!(status.contains("\\r"));
+        assert!(status.contains("\\u{8}"));
+        assert!(status.contains("\\n"));
+        assert!(status.contains("\\u{7}"));
+        assert!(status.contains("\\u{9b}"));
     }
 
     #[test]

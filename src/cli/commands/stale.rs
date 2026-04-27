@@ -95,13 +95,14 @@ fn execute_inner(args: &StaleArgs, ctx: &OutputContext, storage: &SqliteStorage)
         for (idx, issue) in stale.iter().enumerate() {
             let days_stale = (now - issue.updated_at).num_days().max(0);
             let status = format_status_label(&issue.status, false);
+            let issue_id = stale_display_text(&issue.id);
             if let Some(assignee) = issue.assignee.as_deref() {
                 println!(
                     "{}. [{}] {}d {} {} ({assignee})",
                     idx + 1,
                     status,
                     days_stale,
-                    issue.id,
+                    issue_id,
                     sanitize_terminal_inline(&issue.title),
                     assignee = sanitize_terminal_inline(assignee)
                 );
@@ -111,7 +112,7 @@ fn execute_inner(args: &StaleArgs, ctx: &OutputContext, storage: &SqliteStorage)
                     idx + 1,
                     status,
                     days_stale,
-                    issue.id,
+                    issue_id,
                     sanitize_terminal_inline(&issue.title)
                 );
             }
@@ -191,7 +192,7 @@ fn render_stale_rich(
         );
 
         // Issue ID
-        line.append_styled(&issue.id, theme.issue_id.clone());
+        line.append_styled(&stale_display_text(&issue.id), theme.issue_id.clone());
         line.append(" ");
 
         // Title
@@ -210,6 +211,10 @@ fn render_stale_rich(
 
         ctx.render(&line);
     }
+}
+
+fn stale_display_text(value: &str) -> String {
+    sanitize_terminal_inline(value).into_owned()
 }
 
 #[cfg(test)]
@@ -264,6 +269,14 @@ mod tests {
             comments: vec![],
             content_hash: None,
         }
+    }
+
+    #[test]
+    fn stale_display_text_escapes_terminal_controls() {
+        let rendered = stale_display_text("bd-1\x1b]52;c;bad\x07");
+
+        assert!(!rendered.chars().any(char::is_control));
+        assert_eq!(rendered, "bd-1\\u{1b}]52;c;bad\\u{7}");
     }
 
     /// Filter and sort stale issues for testing purposes.
