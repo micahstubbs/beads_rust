@@ -2591,13 +2591,12 @@ impl SqliteStorage {
         let mut params: Vec<SqliteValue> = Vec::new();
 
         sql.push_str(
-            " AND (title LIKE ? ESCAPE '\\' OR description LIKE ? ESCAPE '\\' OR id LIKE ? ESCAPE '\\')",
+            " AND (instr(lower(title), ?) > 0 OR instr(lower(description), ?) > 0 OR instr(lower(id), ?) > 0)",
         );
-        let escaped = escape_like_pattern(trimmed);
-        let pattern = format!("%{escaped}%");
-        params.push(SqliteValue::from(pattern.as_str()));
-        params.push(SqliteValue::from(pattern.as_str()));
-        params.push(SqliteValue::from(pattern));
+        let needle = trimmed.to_ascii_lowercase();
+        params.push(SqliteValue::from(needle.as_str()));
+        params.push(SqliteValue::from(needle.as_str()));
+        params.push(SqliteValue::from(needle));
 
         if let Some(ref labels) = filters.labels {
             for label in labels {
@@ -12206,6 +12205,47 @@ mod tests {
             "Should find one issue matching 'authentication'"
         );
         assert_eq!(results[0].id, "bd-s1");
+    }
+
+    #[test]
+    fn test_search_issues_matches_case_insensitive_literal_substrings() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 9, 1, 0, 0, 0).unwrap();
+
+        let literal_issue = make_issue(
+            "bd-s-literal",
+            "Literal %_ marker",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let mut description_issue = make_issue(
+            "bd-s-description",
+            "Description target",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        description_issue.description = Some("Uppercase AUTHENTICATION token".to_string());
+
+        storage.create_issue(&literal_issue, "tester").unwrap();
+        storage.create_issue(&description_issue, "tester").unwrap();
+
+        let filters = ListFilters::default();
+        let wildcard_results = storage.search_issues("%_", &filters).unwrap();
+        let wildcard_ids: Vec<_> = wildcard_results
+            .iter()
+            .map(|issue| issue.id.as_str())
+            .collect();
+        assert_eq!(wildcard_ids, vec!["bd-s-literal"]);
+
+        let case_results = storage.search_issues("authentication", &filters).unwrap();
+        let case_ids: Vec<_> = case_results.iter().map(|issue| issue.id.as_str()).collect();
+        assert_eq!(case_ids, vec!["bd-s-description"]);
     }
 
     #[test]
