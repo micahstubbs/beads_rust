@@ -839,7 +839,7 @@ pub enum Commands {
     /// Reopen an issue
     Reopen(ReopenArgs),
 
-    /// Emit JSON Schemas for br output types (for agent/tooling integration)
+    /// Emit JSON Schemas and per-command output envelope shapes (for agent/tooling integration)
     ///
     /// IMPORTANT: br schema is not a stable API and is subject to change.
     /// Use at your own risk.
