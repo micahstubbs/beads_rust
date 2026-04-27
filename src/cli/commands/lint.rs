@@ -345,7 +345,7 @@ fn fetch_issues_in_resolved_order(
     storage: &SqliteStorage,
     resolved_ids: &[String],
 ) -> Result<Vec<Issue>> {
-    let mut issues_by_id = storage
+    let issues_by_id = storage
         .get_issues_by_ids(resolved_ids)?
         .into_iter()
         .map(|issue| (issue.id.clone(), issue))
@@ -355,7 +355,8 @@ fn fetch_issues_in_resolved_order(
         .iter()
         .map(|id| {
             issues_by_id
-                .remove(id)
+                .get(id)
+                .cloned()
                 .ok_or_else(|| BeadsError::IssueNotFound { id: id.clone() })
         })
         .collect()
@@ -457,6 +458,7 @@ fn strip_heading_prefix(heading: &str) -> &str {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use tempfile::TempDir;
 
     fn make_issue(issue_type: IssueType, description: Option<&str>) -> Issue {
         Issue {
@@ -532,6 +534,24 @@ mod tests {
         let description = "## steps to reproduce\n- foo\n# acceptance criteria\n- bar";
         let issue = make_issue(IssueType::Bug, Some(description));
         assert!(lint_issue(&issue).is_none());
+    }
+
+    #[test]
+    fn fetch_issues_in_resolved_order_preserves_duplicate_ids() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        storage
+            .create_issue(&make_issue(IssueType::Bug, Some("Bug report")), "tester")
+            .expect("create issue");
+
+        let duplicate_ids = vec!["bd-123".to_string(), "bd-123".to_string()];
+        let issues =
+            fetch_issues_in_resolved_order(&storage, &duplicate_ids).expect("duplicate lookup");
+
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0].id, "bd-123");
+        assert_eq!(issues[1].id, "bd-123");
     }
 
     #[test]
