@@ -5770,6 +5770,53 @@ impl SqliteStorage {
         Ok((dependency_counts, dependent_counts))
     }
 
+    /// Count dependencies and dependents for every issue in the dependency table.
+    ///
+    /// This is faster than chunked `IN (...)` probes when the caller has already
+    /// selected a large result set and only needs to project counts onto those
+    /// issue IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn count_all_relation_counts(
+        &self,
+    ) -> Result<(HashMap<String, usize>, HashMap<String, usize>)> {
+        let dependency_rows = self
+            .conn
+            .query("SELECT issue_id, COUNT(*) FROM dependencies GROUP BY issue_id")?;
+        let mut dependency_counts: HashMap<String, usize> = HashMap::new();
+        for row in &dependency_rows {
+            let issue_id = row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string();
+            let count = row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0);
+            if count > 0 {
+                dependency_counts.insert(issue_id, usize::try_from(count).unwrap_or(0));
+            }
+        }
+
+        let dependent_rows = self
+            .conn
+            .query("SELECT depends_on_id, COUNT(*) FROM dependencies GROUP BY depends_on_id")?;
+        let mut dependent_counts: HashMap<String, usize> = HashMap::new();
+        for row in &dependent_rows {
+            let issue_id = row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string();
+            let count = row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0);
+            if count > 0 {
+                dependent_counts.insert(issue_id, usize::try_from(count).unwrap_or(0));
+            }
+        }
+
+        Ok((dependency_counts, dependent_counts))
+    }
+
     /// Count dependents for multiple issues efficiently.
     ///
     /// # Errors
@@ -8895,6 +8942,33 @@ mod tests {
         assert_eq!(blocked_issues.len(), 1);
         assert_eq!(blocked_issues[0].0.id, "bd-b2");
         assert_eq!(blocked_issues[0].1.len(), 1);
+    }
+
+    #[test]
+    fn test_count_all_relation_counts_matches_chunked_counts() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 4, 1, 0, 0, 0).unwrap();
+
+        for id in ["bd-a", "bd-b", "bd-c"] {
+            let issue = make_issue(id, id, Status::Open, 1, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        storage
+            .add_dependency("bd-b", "bd-a", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-c", "bd-a", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-c", "bd-b", "blocks", "tester")
+            .unwrap();
+
+        let ids = vec!["bd-a".to_string(), "bd-b".to_string(), "bd-c".to_string()];
+        let chunked_counts = storage.count_relation_counts_for_issues(&ids).unwrap();
+        let all_counts = storage.count_all_relation_counts().unwrap();
+
+        assert_eq!(all_counts, chunked_counts);
     }
 
     #[test]

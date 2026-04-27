@@ -267,7 +267,7 @@ Add to `.github/workflows/ci.yml`:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@nightly
         with:
           toolchain: nightly
 
@@ -311,7 +311,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@nightly
         with:
           toolchain: nightly
 

@@ -224,20 +224,29 @@ fn type_to_header(issue_type: &str) -> String {
     }
 }
 
+fn changelog_display_text(value: &str) -> String {
+    sanitize_terminal_inline(value).into_owned()
+}
+
+fn short_git_reference_label(reference: &str) -> String {
+    reference.chars().take(7).collect()
+}
+
 /// Print plain text output for changelog.
 fn print_text_output(output: &ChangelogOutput) {
     println!(
         "Changelog since {} ({} closed issues):",
-        output.since, output.total_closed
+        changelog_display_text(&output.since),
+        output.total_closed
     );
     for group in &output.groups {
         println!();
-        println!("{}:", group.label);
+        println!("{}:", changelog_display_text(&group.label));
         for entry in &group.issues {
             println!(
                 "- [{}] {} {}",
-                entry.priority,
-                entry.id,
+                changelog_display_text(&entry.priority),
+                changelog_display_text(&entry.id),
                 sanitize_terminal_inline(&entry.title)
             );
         }
@@ -263,13 +272,19 @@ fn render_changelog_rich(output: &ChangelogOutput, ctx: &OutputContext) {
         for group in &output.groups {
             // Group header with icon
             let icon = type_icon(&group.issue_type);
-            content.append_styled(&format!("{icon} {}\n", group.label), theme.emphasis.clone());
+            content.append_styled(
+                &format!("{icon} {}\n", changelog_display_text(&group.label)),
+                theme.emphasis.clone(),
+            );
 
             // Issue entries
             for entry in &group.issues {
                 content.append_styled("  • ", theme.dimmed.clone());
                 content.append(sanitize_terminal_inline(&entry.title).as_ref());
-                content.append_styled(&format!(" ({})", entry.id), theme.issue_id.clone());
+                content.append_styled(
+                    &format!(" ({})", changelog_display_text(&entry.id)),
+                    theme.issue_id.clone(),
+                );
                 content.append("\n");
             }
             content.append("\n");
@@ -311,7 +326,7 @@ fn format_date_brief(date_str: &str) -> String {
     if let Ok(dt) = DateTime::parse_from_rfc3339(date_str) {
         return dt.format("%Y-%m-%d").to_string();
     }
-    date_str.to_string()
+    changelog_display_text(date_str)
 }
 
 /// Get an icon for issue type.
@@ -339,12 +354,7 @@ fn resolve_since(
     if let Some(commit) = args.since_commit.as_deref() {
         let dt = git_commit_date(commit, repo_root)?;
         // Show short hash if possible
-        let label = if commit.len() > 7 {
-            &commit[..7]
-        } else {
-            commit
-        };
-        return Ok((Some(dt), label.to_string()));
+        return Ok((Some(dt), short_git_reference_label(commit)));
     }
     if let Some(since) = args.since.as_deref() {
         if let Some(dt) = parse_relative_time(since) {
@@ -363,12 +373,13 @@ fn git_commit_date(reference: &str, repo_root: Option<&Path>) -> Result<DateTime
             "cannot start with '-'",
         ));
     }
+    let display_reference = changelog_display_text(reference);
 
     let repo_root = repo_root.ok_or_else(|| {
         BeadsError::external_command(
             "git",
             format!(
-            "Cannot resolve git reference '{reference}' without a git repository for the targeted project"
+                "Cannot resolve git reference '{display_reference}' without a git repository for the targeted project"
             ),
         )
     })?;
@@ -381,7 +392,7 @@ fn git_commit_date(reference: &str, repo_root: Option<&Path>) -> Result<DateTime
     if !output.status.success() {
         return Err(BeadsError::external_command(
             "git",
-            format!("Failed to resolve git reference: {reference}"),
+            format!("Failed to resolve git reference: {display_reference}"),
         ));
     }
 
@@ -400,12 +411,13 @@ fn git_tag_date(reference: &str, repo_root: Option<&Path>) -> Result<DateTime<Ut
             "cannot start with '-'",
         ));
     }
+    let display_reference = changelog_display_text(reference);
 
     let repo_root = repo_root.ok_or_else(|| {
         BeadsError::external_command(
             "git",
             format!(
-            "Cannot resolve git tag '{reference}' without a git repository for the targeted project"
+                "Cannot resolve git tag '{display_reference}' without a git repository for the targeted project"
             ),
         )
     })?;
@@ -420,7 +432,7 @@ fn git_tag_date(reference: &str, repo_root: Option<&Path>) -> Result<DateTime<Ut
     if !verify.status.success() {
         return Err(BeadsError::external_command(
             "git",
-            format!("Failed to resolve git tag: {reference}"),
+            format!("Failed to resolve git tag: {display_reference}"),
         ));
     }
 
@@ -439,7 +451,7 @@ fn git_tag_date(reference: &str, repo_root: Option<&Path>) -> Result<DateTime<Ut
     if !output.status.success() {
         return Err(BeadsError::external_command(
             "git",
-            format!("Failed to resolve git tag: {reference}"),
+            format!("Failed to resolve git tag: {display_reference}"),
         ));
     }
 
@@ -695,6 +707,26 @@ mod tests {
     }
 
     #[test]
+    fn test_git_reference_errors_sanitize_terminal_controls() {
+        let err = git_commit_date("bad\x1b[2J\rreset", None).unwrap_err();
+        let message = err.to_string();
+
+        assert!(!message.chars().any(char::is_control));
+        assert!(message.contains("\\u{1b}[2J"));
+        assert!(message.contains("\\r"));
+    }
+
+    #[test]
+    fn test_git_tag_errors_sanitize_terminal_controls() {
+        let err = git_tag_date("bad\x1b[2J\rreset", None).unwrap_err();
+        let message = err.to_string();
+
+        assert!(!message.chars().any(char::is_control));
+        assert!(message.contains("\\u{1b}[2J"));
+        assert!(message.contains("\\r"));
+    }
+
+    #[test]
     fn test_resolve_render_mode_prefers_robot_json_over_quiet() {
         assert_eq!(
             resolve_render_mode(true, OutputMode::Quiet),
@@ -717,6 +749,15 @@ mod tests {
     }
 
     #[test]
+    fn test_type_to_header_sanitizes_custom_type() {
+        let header = type_to_header("qa\x1b[2J\rreset");
+
+        assert!(!header.chars().any(char::is_control));
+        assert!(header.contains("\\u{1b}[2J"));
+        assert!(header.contains("\\r"));
+    }
+
+    #[test]
     fn test_type_icon() {
         assert_eq!(type_icon("bug"), "\u{1f41b}");
         assert_eq!(type_icon("feature"), "\u{2728}");
@@ -736,6 +777,34 @@ mod tests {
         assert_eq!(format_date_brief("2024-01-15T10:30:00Z"), "2024-01-15");
         // Invalid format returns original
         assert_eq!(format_date_brief("invalid"), "invalid");
+    }
+
+    #[test]
+    fn test_format_date_brief_sanitizes_unparseable_label() {
+        let label = format_date_brief("release\x1b]52;c;bad\x07");
+
+        assert!(!label.chars().any(char::is_control));
+        assert!(label.contains("\\u{1b}]52;c;bad\\u{7}"));
+    }
+
+    #[test]
+    fn test_changelog_display_text_sanitizes_terminal_controls() {
+        let rendered = changelog_display_text("bd-1\x1b[2J\rreset\x08\nnext\x07\u{9b}");
+
+        assert!(!rendered.chars().any(char::is_control));
+        assert!(rendered.contains("\\u{1b}[2J"));
+        assert!(rendered.contains("\\r"));
+        assert!(rendered.contains("\\u{8}"));
+        assert!(rendered.contains("\\n"));
+        assert!(rendered.contains("\\u{7}"));
+        assert!(rendered.contains("\\u{9b}"));
+    }
+
+    #[test]
+    fn test_short_git_reference_label_is_character_boundary_safe() {
+        assert_eq!(short_git_reference_label("abcdefghi"), "abcdefg");
+        assert_eq!(short_git_reference_label("éééééééé"), "ééééééé");
+        assert_eq!(short_git_reference_label("abc"), "abc");
     }
 
     #[test]

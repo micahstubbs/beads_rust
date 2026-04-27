@@ -441,11 +441,12 @@ fn render_undefer_output(
     } else {
         for undeferred in undeferred_issues {
             let id = issue_id_text(&undeferred.id);
+            let status = status_text(&undeferred.status);
             println!(
                 "\u{2713} Undeferred {}: {} (now {})",
                 id,
                 sanitize_terminal_inline(&undeferred.title),
-                undeferred.status
+                status
             );
         }
         for skipped in skipped_issues {
@@ -630,11 +631,18 @@ fn reorder_routed_items_by_requested_inputs<T>(
                 .get_mut(input.as_str())
                 .and_then(VecDeque::pop_front)
             else {
+                let input = issue_id_text(&input);
                 return Err(BeadsError::internal(format!(
                     "{context} returned unexpected issue input {input}"
                 )));
             };
-            ordered_items[index] = Some(item);
+            let Some(slot) = ordered_items.get_mut(index) else {
+                let input = issue_id_text(&input);
+                return Err(BeadsError::internal(format!(
+                    "{context} returned out-of-range issue input {input}"
+                )));
+            };
+            *slot = Some(item);
         }
     }
 
@@ -643,10 +651,11 @@ fn reorder_routed_items_by_requested_inputs<T>(
         .enumerate()
         .map(|(index, item)| {
             item.ok_or_else(|| {
-                BeadsError::internal(format!(
-                    "{context} did not produce a result for {}",
-                    requested_inputs[index]
-                ))
+                let input = requested_inputs
+                    .get(index)
+                    .map(|input| issue_id_text(input))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                BeadsError::internal(format!("{context} did not produce a result for {input}"))
             })
         })
         .collect()
@@ -869,6 +878,69 @@ mod tests {
         assert!(status.contains("\\n"));
         assert!(status.contains("\\u{7}"));
         assert!(status.contains("\\u{9b}"));
+    }
+
+    #[test]
+    fn reorder_routed_items_preserves_duplicate_requested_inputs() -> Result<()> {
+        let requested = vec![
+            "bd-a".to_string(),
+            "bd-b".to_string(),
+            "bd-a".to_string(),
+            "bd-c".to_string(),
+        ];
+        let routed_items = vec![
+            (
+                vec!["bd-a".to_string(), "bd-a".to_string()],
+                vec!["first-a", "second-a"],
+            ),
+            (vec!["bd-b".to_string(), "bd-c".to_string()], vec!["b", "c"]),
+        ];
+
+        let ordered =
+            reorder_routed_items_by_requested_inputs(&requested, routed_items, "test routing")?;
+
+        assert_eq!(ordered, vec!["first-a", "b", "second-a", "c"]);
+        Ok(())
+    }
+
+    #[test]
+    fn reorder_routed_items_sanitizes_missing_input_error() {
+        let requested = vec!["bd-a\x1b[2J\nbad".to_string(), "bd-b".to_string()];
+        let routed_items = vec![(vec!["bd-b".to_string()], vec!["b"])];
+
+        let err =
+            reorder_routed_items_by_requested_inputs(&requested, routed_items, "test routing")
+                .unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Internal { .. }),
+            "unexpected error: {err:?}"
+        );
+        if let BeadsError::Internal { message } = err {
+            assert!(!message.chars().any(char::is_control));
+            assert!(message.contains("\\u{1b}[2J"));
+            assert!(message.contains("\\n"));
+        }
+    }
+
+    #[test]
+    fn reorder_routed_items_sanitizes_unexpected_input_error() {
+        let requested = vec!["bd-a".to_string()];
+        let routed_items = vec![(vec!["bd-b\x1b[2J\nbad".to_string()], vec!["b"])];
+
+        let err =
+            reorder_routed_items_by_requested_inputs(&requested, routed_items, "test routing")
+                .unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Internal { .. }),
+            "unexpected error: {err:?}"
+        );
+        if let BeadsError::Internal { message } = err {
+            assert!(!message.chars().any(char::is_control));
+            assert!(message.contains("\\u{1b}[2J"));
+            assert!(message.contains("\\n"));
+        }
     }
 
     #[test]

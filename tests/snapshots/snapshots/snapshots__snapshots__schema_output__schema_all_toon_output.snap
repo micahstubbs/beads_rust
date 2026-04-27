@@ -1204,3 +1204,87 @@ schemas:
             type: string
             format: date-time
         required[5]: id,issue_id,author,text,created_at
+commands:
+  blocked:
+    shape: array
+    jq_filter: ".[]"
+    items_at: .
+    item_schema: BlockedIssue
+    error_envelope_on_stderr: false
+  "comments list":
+    shape: array
+    jq_filter: ".[]"
+    items_at: .
+    error_envelope_on_stderr: true
+    notes: Empty array if no comments. ErrorEnvelope on stderr if the issue id cannot be resolved.
+  count:
+    shape: object
+    jq_filter: .count
+    error_envelope_on_stderr: false
+    notes: Scalar count under `.count`.
+  "dep list":
+    shape: array
+    jq_filter: ".[]"
+    items_at: .
+    error_envelope_on_stderr: true
+  "dep tree":
+    shape: array
+    jq_filter: ".[]"
+    items_at: .
+    item_schema: TreeNode
+    error_envelope_on_stderr: true
+    notes: Pre-order traversal; each node carries a `depth` field.
+  info:
+    shape: object
+    jq_filter: .
+    error_envelope_on_stderr: false
+    notes: "Workspace info object (paths, mode, config snapshot)."
+  "label list":
+    shape: array
+    jq_filter: ".[]"
+    items_at: .
+    error_envelope_on_stderr: false
+  list:
+    shape: object
+    jq_filter: ".issues[]"
+    items_at: .issues
+    item_schema: IssueWithCounts
+    error_envelope_on_stderr: false
+    notes: "Wrapper object with pagination metadata; iterate with `.issues[]`. The wrapper exists so totals/cursors can ride alongside the rows."
+  ready:
+    shape: array
+    jq_filter: ".[]"
+    items_at: .
+    item_schema: ReadyIssue
+    error_envelope_on_stderr: false
+  search:
+    shape: array
+    jq_filter: ".[]"
+    items_at: .
+    item_schema: IssueWithCounts
+    error_envelope_on_stderr: false
+  show:
+    shape: array
+    jq_filter: ".[0]"
+    items_at: .
+    item_schema: IssueDetails
+    error_envelope_on_stderr: true
+    notes: "Always a single-element array on success (wrapped for shape consistency with list-style commands). On a missing id, an ErrorEnvelope is written to stderr and exit code is non-zero."
+  stale:
+    shape: array
+    jq_filter: ".[]"
+    items_at: .
+    item_schema: StaleIssue
+    error_envelope_on_stderr: false
+  stats:
+    shape: object
+    jq_filter: .
+    item_schema: Statistics
+    error_envelope_on_stderr: false
+    notes: Single aggregate object.
+  status:
+    shape: object
+    jq_filter: .
+    item_schema: Statistics
+    error_envelope_on_stderr: false
+    notes: Alias for `stats` — identical envelope.

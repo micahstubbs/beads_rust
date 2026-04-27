@@ -53,8 +53,9 @@ static TS_FULL_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static DATE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\d{4}-\d{2}-\d{2}").expect("date regex"));
-static VERSION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\((main|master|HEAD)@[a-f0-9]+\)").expect("version regex"));
+static VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\((?:HEAD|[A-Za-z0-9._/-]+)@[a-f0-9]+\)").expect("version regex")
+});
 /// The build profile label embedded in `br --version` output, e.g., `(dev)`
 /// or `(release)`.  Snapshot tests may run under either profile depending on
 /// `cargo test` vs `cargo test --release`, so mask to a stable placeholder.

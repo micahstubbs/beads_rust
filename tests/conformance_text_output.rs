@@ -72,7 +72,7 @@ static TMP_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("tmp path regex")
 });
 static VERSION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\((main|master)@[a-f0-9]+\)").expect("version regex"));
+    LazyLock::new(|| Regex::new(r"\((?:[A-Za-z0-9._/-]+)@[a-f0-9]+\)").expect("version regex"));
 static SEMVER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?").expect("semver regex"));
 

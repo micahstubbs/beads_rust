@@ -57,9 +57,10 @@ fuzz/artifacts/
 perf.data
 perf.data.old
 
-# Large source images (webp versions are committed)
+# Generated screenshots and scratch images stay ignored. The curated social
+# preview image is intentionally tracked under docs/assets/.
 *.png
-!gh_og_share_image.png
+!docs/assets/gh_og_share_image.png
 
 # Claude Code temp files
 claude-upgrade-progress.json
@@ -70,6 +71,11 @@ claude-upgrade-progress.json
 # Local scratch SQLite DBs (never tracked)
 storage.sqlite3
 storage.sqlite3-*
+/*.db
+/*.db-wal
+/*.db-shm
+/*.sqlite
+/*.sqlite3
 
 # Local Cargo and Rustup caches (agent workspace artifacts)
 .cargo/
@@ -78,6 +84,9 @@ storage.sqlite3-*
 # Ephemeral/temporary files (agent workflow artifacts)
 RESEARCH_FINDINGS.md
 TOON_INTEGRATION_BRIEF.md
+/.skill-loop-progress.md
+/CLI_SCHEMA.json
+/ROBOT_MODE_EXAMPLES.jsonl
 cov_*.out
 rustc-ice-*.txt
 *.snap.new

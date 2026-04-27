@@ -1,7 +1,7 @@
 # br - Beads Rust
 
 <div align="center">
-  <img src="br_illustration.webp" alt="br - Fast, non-invasive issue tracker for git repositories" width="600">
+  <img src="../docs/assets/br_illustration.webp" alt="br - Fast, non-invasive issue tracker for git repositories" width="600">
 </div>
 
 <div align="center">
@@ -77,4 +77,3 @@ br sync --flush-only                 # Export for git commit
 | AI agent integration | **Yes** | Limited | Limited | No |
 
 ---
-

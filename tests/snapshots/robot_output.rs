@@ -16,7 +16,8 @@ use std::sync::LazyLock;
 // Review the resulting tests/snapshots/snapshots/*.snap diffs before
 // committing. The br ready fixture is fully deterministic and unmasked. The bv
 // outputs are normalized only for wall-clock metadata, elapsed timings,
-// stale-day wording, and score fields that include current-date urgency.
+// external bv version/reporting hints, stale-day wording, and score fields that
+// include current-date urgency.
 const ROBOT_JSONL_FIXTURE: &str = r#"{"id":"bd-blocker","title":"00 Blocking Root","description":"Unblocks dependent work","status":"open","priority":0,"issue_type":"task","created_at":"2026-02-01T00:00:00Z","created_by":"fixture","updated_at":"2026-02-01T00:00:00Z","source_repo":".","labels":["core"],"compaction_level":0,"original_size":0}
 {"id":"bd-ready-p0","title":"01 Ready Critical Unassigned","status":"open","priority":0,"issue_type":"bug","created_at":"2026-02-02T00:00:00Z","created_by":"fixture","updated_at":"2026-02-02T00:00:00Z","source_repo":".","labels":["ops","agent"],"compaction_level":0,"original_size":0}
 {"id":"bd-ready-p1-assigned","title":"02 Ready Assigned Feature","status":"open","priority":1,"issue_type":"feature","assignee":"alice","owner":"owner@example.com","created_at":"2026-02-03T00:00:00Z","created_by":"fixture","updated_at":"2026-02-03T00:00:00Z","source_repo":".","labels":["frontend"],"compaction_level":0,"original_size":0}
@@ -37,6 +38,24 @@ static ELAPSED_RE: LazyLock<Regex> = LazyLock::new(|| {
 static SCORE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#""(score|urgency|urgency_norm)"\s*:\s*-?[0-9]+(?:\.[0-9]+)?"#)
         .expect("score regex")
+});
+static BV_VERSION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#""version"\s*:\s*"v\d+\.\d+\.\d+""#).expect("bv version regex"));
+static GRAPH_ROOT_FIRST_USAGE_HINT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#""usage_hints"\s*:\s*\[\s*"--graph-root (?:\\u003c|<)id(?:\\u003e|>) - [^"]+",\s*"#,
+    )
+    .expect("first graph-root usage hint regex")
+});
+static GRAPH_ROOT_ONLY_USAGE_HINT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#""usage_hints"\s*:\s*\[\s*"--graph-root (?:\\u003c|<)id(?:\\u003e|>) - [^"]+"\s*\]"#,
+    )
+    .expect("only graph-root usage hint regex")
+});
+static GRAPH_ROOT_LATER_USAGE_HINT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#",\s*"--graph-root (?:\\u003c|<)id(?:\\u003e|>) - [^"]+""#)
+        .expect("later graph-root usage hint regex")
 });
 static STALE_DAYS_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"No activity in \d+ days").expect("stale days regex"));
@@ -114,6 +133,18 @@ fn assert_valid_json(raw: &str, context: &str) {
     assert_eq!(None, error);
 }
 
+fn normalize_bv_usage_hints(raw: &str) -> String {
+    let normalized = GRAPH_ROOT_ONLY_USAGE_HINT_RE
+        .replace_all(raw, r#""usage_hints":[]"#)
+        .to_string();
+    let normalized = GRAPH_ROOT_FIRST_USAGE_HINT_RE
+        .replace_all(&normalized, r#""usage_hints":["#)
+        .to_string();
+    GRAPH_ROOT_LATER_USAGE_HINT_RE
+        .replace_all(&normalized, "")
+        .to_string()
+}
+
 fn normalize_bv_robot_output(raw: &str) -> String {
     let mut normalized = raw.trim_end().to_string();
     normalized = GENERATED_AT_RE
@@ -132,12 +163,43 @@ fn normalize_bv_robot_output(raw: &str) -> String {
             format!(r#""{}": 0.0"#, &captures[1])
         })
         .to_string();
+    normalized = BV_VERSION_RE
+        .replace_all(&normalized, r#""version":"BV_VERSION""#)
+        .to_string();
+    normalized = normalize_bv_usage_hints(&normalized);
     normalized = STALE_DAYS_RE
         .replace_all(&normalized, "No activity in DAYS days")
         .to_string();
     AGING_DAYS_RE
         .replace_all(&normalized, "aging (DAYS days)")
         .to_string()
+}
+
+#[test]
+fn normalize_bv_usage_hints_removes_graph_root_hint_in_any_array_position() {
+    let graph_root = r#""--graph-root \u003cid\u003e - Scope triage""#;
+    let cases = [
+        (
+            format!(r#"{{"usage_hints":[{graph_root}]}}"#),
+            r#"{"usage_hints":[]}"#,
+        ),
+        (
+            format!(r#"{{"usage_hints":[{graph_root},"keep"]}}"#),
+            r#"{"usage_hints":["keep"]}"#,
+        ),
+        (
+            format!(r#"{{"usage_hints":["keep",{graph_root}]}}"#),
+            r#"{"usage_hints":["keep"]}"#,
+        ),
+        (
+            format!(r#"{{"usage_hints":["a",{graph_root},"b"]}}"#),
+            r#"{"usage_hints":["a","b"]}"#,
+        ),
+    ];
+
+    for (raw, expected) in cases {
+        assert_eq!(normalize_bv_usage_hints(&raw), expected);
+    }
 }
 
 #[test]

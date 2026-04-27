@@ -51,6 +51,10 @@ const fn resolve_render_mode(json: bool, output_mode: OutputMode) -> OrphanRende
     }
 }
 
+fn orphan_display_text(value: &str) -> String {
+    sanitize_terminal_inline(value).into_owned()
+}
+
 /// Execute the orphans command.
 ///
 /// Scans git log for issue ID references and returns `open/in_progress`
@@ -250,7 +254,7 @@ fn execute_inner(
                     "{}. [{}] {} {}",
                     idx + 1,
                     orphan.status,
-                    orphan.issue_id,
+                    orphan_display_text(&orphan.issue_id),
                     sanitize_terminal_inline(&orphan.title)
                 );
                 if args.details {
@@ -268,9 +272,10 @@ fn execute_inner(
         println!();
         println!("Interactive close mode:");
         for orphan in &orphans {
+            let issue_id = orphan_display_text(&orphan.issue_id);
             print!(
                 "Close {} ({})? [y/N] ",
-                orphan.issue_id,
+                issue_id,
                 sanitize_terminal_inline(&orphan.title)
             );
             io::stdout().flush()?;
@@ -289,10 +294,14 @@ fn execute_inner(
                     };
 
                     if let Err(e) = close::execute_with_args(&close_args, false, cli, ctx) {
-                        eprintln!("  Failed to close {}: {}", orphan.issue_id, e);
+                        eprintln!(
+                            "  Failed to close {}: {}",
+                            issue_id,
+                            sanitize_terminal_inline(&e.to_string())
+                        );
                     }
                 } else {
-                    println!("  Skipped {}", orphan.issue_id);
+                    println!("  Skipped {issue_id}");
                 }
             }
         }
@@ -386,13 +395,11 @@ fn parse_git_log<R: BufRead>(reader: R, prefix: &str) -> Result<Vec<(String, Str
         let line = line.map_err(crate::error::BeadsError::Io)?;
 
         // Each line is: <short_hash> <message>
-        let parts: Vec<&str> = line.splitn(2, ' ').collect();
-        if parts.len() < 2 {
+        let Some((commit_hash, commit_msg)) = line.split_once(' ') else {
             continue;
-        }
-
-        let commit_hash = parts[0].to_string();
-        let commit_msg = parts[1].to_string();
+        };
+        let commit_hash = commit_hash.to_string();
+        let commit_msg = commit_msg.to_string();
 
         // Find all issue references in this commit message
         for cap in re.captures_iter(&commit_msg) {
@@ -448,6 +455,19 @@ mod tests {
     use std::fs;
     use std::io::Cursor;
     use tempfile::TempDir;
+
+    #[test]
+    fn orphan_display_text_sanitizes_terminal_controls() {
+        let rendered = orphan_display_text("bd-1\x1b[2J\rreset\x08\nnext\x07\u{9b}");
+
+        assert!(!rendered.chars().any(char::is_control));
+        assert!(rendered.contains("\\u{1b}[2J"));
+        assert!(rendered.contains("\\r"));
+        assert!(rendered.contains("\\u{8}"));
+        assert!(rendered.contains("\\n"));
+        assert!(rendered.contains("\\u{7}"));
+        assert!(rendered.contains("\\u{9b}"));
+    }
 
     #[test]
     fn test_parse_git_log_extracts_issue_ids() {

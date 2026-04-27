@@ -13,7 +13,7 @@ Recent work (this repo):
 
 - Added agent-first doc entrypoints: `docs/agent/`
 - Captured a baseline snapshot pack: `agent_baseline/`
-- Added machine-readable artifacts: `ROBOT_MODE_EXAMPLES.jsonl`, `CLI_SCHEMA.json`
+- Added machine-readable artifacts: `agent_baseline/examples/robot_mode_examples.jsonl`, `agent_baseline/schemas/cli_schema.json`
 - Added agent smoke tests: `scripts/agent_smoke_test.sh`
 - Removed `rm -rf` usage from local scripts/tests to comply with the no-deletion policy in `AGENTS.md`
 
@@ -65,7 +65,7 @@ Rationale:
 
 ## Gaps / Next Improvements
 
-- No dynamic `--help-json` surface yet; `CLI_SCHEMA.json` is an interim static artifact.
+- No dynamic `--help-json` surface yet; `agent_baseline/schemas/cli_schema.json` is an interim static artifact.
 - Many commands return bare arrays/objects rather than a consistent `{data, metadata, errors}` envelope.
 - Schema outputs include `generated_at` (useful, but not deterministic byte-for-byte).
 

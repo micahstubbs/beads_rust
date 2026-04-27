@@ -5,6 +5,7 @@
 use crate::cli::{ListArgs, QueryCommands, QueryDeleteArgs, QueryRunArgs, QuerySaveArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::sanitize_terminal_inline;
 use crate::output::{OutputContext, OutputMode};
 use chrono::{DateTime, Utc};
 use rich_rust::prelude::*;
@@ -292,7 +293,10 @@ fn query_save(
     if storage.get_config(&key)?.is_some() {
         return Err(BeadsError::validation(
             "name",
-            format!("Query '{name}' already exists. Delete it first to replace."),
+            format!(
+                "Query '{}' already exists. Delete it first to replace.",
+                query_display_text(name)
+            ),
         ));
     }
 
@@ -331,7 +335,7 @@ fn query_save(
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_query_save_rich(name, args.description.as_deref(), ctx);
     } else {
-        println!("Saved query '{name}'");
+        println!("{}", format_query_saved_line(name));
     }
 
     Ok(())
@@ -348,7 +352,7 @@ fn query_run(
 
     let value = storage
         .get_config(&key)?
-        .ok_or_else(|| BeadsError::validation("query", format!("Query '{name}' not found")))?;
+        .ok_or_else(|| BeadsError::validation("query", format_query_not_found_message(name)))?;
 
     let saved_query: SavedQuery = serde_json::from_str(&value).map_err(|e| {
         BeadsError::validation("saved_query", format!("Invalid saved query format: {e}"))
@@ -415,12 +419,7 @@ fn query_list(storage: &crate::storage::SqliteStorage, ctx: &OutputContext) -> R
     } else {
         println!("Saved queries:");
         for q in &queries {
-            let desc = q.description.as_deref().unwrap_or("");
-            if desc.is_empty() {
-                println!("  {}", q.name);
-            } else {
-                println!("  {} - {}", q.name, desc);
-            }
+            println!("  {}", format_query_list_plain_entry(q));
         }
         println!("\n{} query(ies) total", queries.len());
     }
@@ -441,7 +440,7 @@ fn query_delete(
     if !deleted {
         return Err(BeadsError::validation(
             "query",
-            format!("Query '{name}' not found"),
+            format_query_not_found_message(name),
         ));
     }
 
@@ -468,7 +467,7 @@ fn query_delete(
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_query_delete_rich(name, ctx);
     } else {
-        println!("Deleted query '{name}'");
+        println!("{}", format_query_deleted_line(name));
     }
 
     Ok(())
@@ -477,6 +476,30 @@ fn query_delete(
 // ─────────────────────────────────────────────────────────────
 // Rich Output Rendering
 // ─────────────────────────────────────────────────────────────
+
+fn query_display_text(value: &str) -> String {
+    sanitize_terminal_inline(value).into_owned()
+}
+
+fn format_query_saved_line(name: &str) -> String {
+    format!("Saved query '{}'", query_display_text(name))
+}
+
+fn format_query_deleted_line(name: &str) -> String {
+    format!("Deleted query '{}'", query_display_text(name))
+}
+
+fn format_query_not_found_message(name: &str) -> String {
+    format!("Query '{}' not found", query_display_text(name))
+}
+
+fn format_query_list_plain_entry(query: &QueryListItem) -> String {
+    let name = query_display_text(&query.name);
+    match query.description.as_deref() {
+        Some(desc) if !desc.is_empty() => format!("{} - {}", name, query_display_text(desc)),
+        _ => name,
+    }
+}
 
 /// Render query save result with rich formatting.
 fn render_query_save_rich(name: &str, description: Option<&str>, ctx: &OutputContext) {
@@ -487,11 +510,11 @@ fn render_query_save_rich(name: &str, description: Option<&str>, ctx: &OutputCon
     let mut content = Text::new("");
     content.append_styled("\u{2713} ", theme.success.clone());
     content.append_styled("Saved query ", theme.success.clone());
-    content.append_styled(name, theme.emphasis.clone());
+    content.append_styled(&query_display_text(name), theme.emphasis.clone());
     content.append("\n");
     if let Some(desc) = description {
         content.append_styled("  ", theme.dimmed.clone());
-        content.append_styled(desc, theme.dimmed.clone());
+        content.append_styled(&query_display_text(desc), theme.dimmed.clone());
         content.append("\n");
     }
 
@@ -514,13 +537,30 @@ fn render_query_list_rich(queries: &[QueryListItem], ctx: &OutputContext) {
         content.append_styled("No saved queries\n", theme.dimmed.clone());
     } else {
         // Find longest name for alignment
-        let max_name_len = queries.iter().map(|q| q.name.len()).max().unwrap_or(0);
+        let rendered_queries: Vec<(String, Option<String>)> = queries
+            .iter()
+            .map(|query| {
+                (
+                    query_display_text(&query.name),
+                    query.description.as_deref().map(query_display_text),
+                )
+            })
+            .collect();
+        let max_name_len = rendered_queries
+            .iter()
+            .map(|(name, _)| name.len())
+            .max()
+            .unwrap_or(0);
 
-        for q in queries {
-            let padded_name = format!("{:<width$}", q.name, width = max_name_len);
-            content.append_styled(&padded_name, theme.emphasis.clone());
+        for (mut name, description) in rendered_queries {
+            let padding = max_name_len.saturating_sub(name.len());
+            name.reserve(padding);
+            for _ in 0..padding {
+                name.push(' ');
+            }
+            content.append_styled(&name, theme.emphasis.clone());
             content.append("  ");
-            if let Some(ref desc) = q.description {
+            if let Some(ref desc) = description {
                 content.append_styled(desc, theme.dimmed.clone());
             } else {
                 content.append_styled("(no description)", theme.dimmed.clone());
@@ -552,7 +592,7 @@ fn render_query_delete_rich(name: &str, ctx: &OutputContext) {
     let mut content = Text::new("");
     content.append_styled("\u{2713} ", theme.success.clone());
     content.append_styled("Deleted query ", theme.success.clone());
-    content.append_styled(name, theme.emphasis.clone());
+    content.append_styled(&query_display_text(name), theme.emphasis.clone());
     content.append("\n");
 
     let panel = Panel::from_rich_text(&content, width)
@@ -659,6 +699,33 @@ mod tests {
         assert_eq!(parsed.description, Some("All open bugs".to_string()));
         assert_eq!(parsed.filters.status, vec!["open"]);
         assert_eq!(parsed.filters.type_, vec!["bug"]);
+    }
+
+    #[test]
+    fn query_human_output_helpers_escape_terminal_controls() {
+        let item = QueryListItem {
+            name: "triage\x1b[2J".to_string(),
+            description: Some("desc\x07\rnext".to_string()),
+            created_at: Utc::now().to_rfc3339(),
+            filters: SavedFilters::default(),
+        };
+
+        let rendered_saved = format_query_saved_line(&item.name);
+        let rendered_deleted = format_query_deleted_line(&item.name);
+        let rendered_not_found = format_query_not_found_message(&item.name);
+        let rendered_entry = format_query_list_plain_entry(&item);
+        assert!(rendered_entry.contains("\\u{7}"));
+        assert!(rendered_entry.contains("\\rnext"));
+
+        for line in [
+            &rendered_saved,
+            &rendered_deleted,
+            &rendered_not_found,
+            &rendered_entry,
+        ] {
+            assert!(!line.chars().any(char::is_control));
+            assert!(line.contains("\\u{1b}[2J"));
+        }
     }
 
     // ============================================================

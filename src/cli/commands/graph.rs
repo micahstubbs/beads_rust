@@ -220,7 +220,7 @@ fn graph_single(
         if matches!(ctx.mode(), OutputMode::Rich) {
             render_no_dependents_rich(root_id, &root_issue, ctx);
         } else {
-            println!("No dependents for {root_id}");
+            println!("No dependents for {}", graph_display_text(root_id));
         }
         return Ok(());
     }
@@ -429,13 +429,13 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
             for (i, component) in components.iter().enumerate() {
                 if render_compact {
                     // Compact: one line per component
-                    let ids: Vec<&str> = component.nodes.iter().map(|n| n.id.as_str()).collect();
-                    println!("Component {}: {}", i + 1, ids.join(", "));
+                    let ids = format_id_iter(component.nodes.iter().map(|node| node.id.as_str()));
+                    println!("Component {}: {}", i + 1, ids);
                 } else {
                     let roots = if component.roots.is_empty() {
                         "none".to_string()
                     } else {
-                        component.roots.join(", ")
+                        format_id_list(&component.roots)
                     };
                     let parent_map = build_parent_map(&component.edges);
                     // Detailed view
@@ -458,7 +458,7 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
                         println!(
                             "{}{}: {} [P{}] [{}]{}{}",
                             indent,
-                            node.id,
+                            graph_display_text(&node.id),
                             sanitize_terminal_inline(&node.title),
                             node.priority,
                             sanitize_terminal_inline(&node.status),
@@ -630,7 +630,10 @@ fn build_graph_nodes(
 
 fn sort_single_graph_nodes(nodes: &mut [GraphNode], root_id: &str) {
     if let Some(root_index) = nodes.iter().position(|node| node.id == root_id) {
-        nodes[..=root_index].rotate_right(1);
+        let prefix_len = root_index.saturating_add(1);
+        if let Some(prefix) = nodes.get_mut(..prefix_len) {
+            prefix.rotate_right(1);
+        }
     }
 }
 
@@ -655,12 +658,12 @@ fn calculate_depths_from_dependency_edges(
     let mut component_indegree = vec![0usize; component_count];
 
     for (dependent, dependency) in dependency_edges {
-        let dependent_component = *node_to_component
-            .get(dependent)
-            .expect("dependent node should have a component");
-        let dependency_component = *node_to_component
-            .get(dependency)
-            .expect("dependency node should have a component");
+        let Some(&dependent_component) = node_to_component.get(dependent) else {
+            continue;
+        };
+        let Some(&dependency_component) = node_to_component.get(dependency) else {
+            continue;
+        };
 
         if dependency_component == dependent_component {
             continue;
@@ -670,8 +673,8 @@ fn calculate_depths_from_dependency_edges(
             .entry(dependency_component)
             .or_default()
             .insert(dependent_component);
-        if inserted {
-            component_indegree[dependent_component] += 1;
+        if inserted && let Some(indegree) = component_indegree.get_mut(dependent_component) {
+            *indegree += 1;
         }
     }
 
@@ -692,13 +695,17 @@ fn calculate_depths_from_dependency_edges(
             for child_component in children {
                 if reachable_components.contains(&component_id) {
                     reachable_components.insert(*child_component);
-                    component_depths[*child_component] =
-                        component_depths[*child_component].max(component_depths[component_id] + 1);
+                    let parent_depth = component_depths.get(component_id).copied().unwrap_or(0);
+                    if let Some(child_depth) = component_depths.get_mut(*child_component) {
+                        *child_depth = (*child_depth).max(parent_depth + 1);
+                    }
                 }
 
-                component_indegree[*child_component] -= 1;
-                if component_indegree[*child_component] == 0 {
-                    queue.push_back(*child_component);
+                if let Some(indegree) = component_indegree.get_mut(*child_component) {
+                    *indegree = indegree.saturating_sub(1);
+                    if *indegree == 0 {
+                        queue.push_back(*child_component);
+                    }
                 }
             }
         }
@@ -707,10 +714,12 @@ fn calculate_depths_from_dependency_edges(
     nodes
         .iter()
         .map(|node_id| {
-            let component_id = node_to_component
+            let depth = node_to_component
                 .get(node_id)
-                .expect("graph node should have a component");
-            (node_id.clone(), component_depths[*component_id])
+                .and_then(|component_id| component_depths.get(*component_id))
+                .copied()
+                .unwrap_or(0);
+            (node_id.clone(), depth)
         })
         .collect()
 }
@@ -859,16 +868,37 @@ fn build_parent_map(edges: &[(String, String)]) -> HashMap<String, Vec<String>> 
     parent_map
 }
 
+fn graph_display_text(value: &str) -> String {
+    sanitize_terminal_inline(value).into_owned()
+}
+
+fn format_id_iter<'a>(ids: impl IntoIterator<Item = &'a str>) -> String {
+    let mut rendered = String::new();
+    for id in ids {
+        if !rendered.is_empty() {
+            rendered.push_str(", ");
+        }
+        rendered.push_str(&graph_display_text(id));
+    }
+    rendered
+}
+
+fn format_id_list(ids: &[String]) -> String {
+    format_id_iter(ids.iter().map(String::as_str))
+}
+
 fn format_parent_list(parents: Option<&[String]>) -> String {
     match parents {
-        Some(parents) if !parents.is_empty() => format!(" depends on: {}", parents.join(", ")),
+        Some(parents) if !parents.is_empty() => {
+            format!(" depends on: {}", format_id_list(parents))
+        }
         _ => String::new(),
     }
 }
 
 fn format_compact_dependency_edges(root_id: &str, edges: &[(String, String)]) -> String {
     if edges.is_empty() {
-        return root_id.to_string();
+        return graph_display_text(root_id);
     }
 
     let mut grouped_dependents: HashMap<String, Vec<String>> = HashMap::new();
@@ -902,14 +932,18 @@ fn format_compact_dependency_edges(root_id: &str, edges: &[(String, String)]) ->
             let mut sorted_dependents = dependents.clone();
             sorted_dependents.sort();
             sorted_dependents.dedup();
-            format!("{dependency_id} <- {}", sorted_dependents.join(", "))
+            format!(
+                "{} <- {}",
+                graph_display_text(dependency_id),
+                format_id_list(&sorted_dependents)
+            )
         })
         .collect();
 
     if includes_root {
         parts.join("; ")
     } else {
-        format!("{root_id}; {}", parts.join("; "))
+        format!("{}; {}", graph_display_text(root_id), parts.join("; "))
     }
 }
 
@@ -927,13 +961,13 @@ fn render_single_graph_plain(nodes: &[GraphNode], edges: &[(String, String)], ro
     let parent_map = build_parent_map(edges);
     println!(
         "Dependents of {} by depth ({} total):",
-        root_issue.id,
+        graph_display_text(&root_issue.id),
         nodes.len() - 1
     );
     println!();
     println!(
         "  {}: {} [P{}] [{}] (root)",
-        root_issue.id,
+        graph_display_text(&root_issue.id),
         sanitize_terminal_inline(&root_issue.title),
         root_issue.priority.0,
         format_status_label(&root_issue.status, false)
@@ -945,7 +979,7 @@ fn render_single_graph_plain(nodes: &[GraphNode], edges: &[(String, String)], ro
         println!(
             "{}← {}: {} [P{}] [{}]{}",
             indent,
-            node.id,
+            graph_display_text(&node.id),
             sanitize_terminal_inline(&node.title),
             node.priority,
             sanitize_terminal_inline(&node.status),
@@ -974,7 +1008,7 @@ fn render_single_graph_rich(
 
     // Header with root info
     content.append_styled("Root: ", theme.dimmed.clone());
-    content.append_styled(&root_issue.id, theme.issue_id.clone());
+    content.append_styled(&graph_display_text(&root_issue.id), theme.issue_id.clone());
     content.append(" ");
     content.append_styled(
         sanitize_terminal_inline(&root_issue.title).as_ref(),
@@ -1010,7 +1044,7 @@ fn render_single_graph_rich(
         }
 
         // ID
-        content.append_styled(&node.id, theme.issue_id.clone());
+        content.append_styled(&graph_display_text(&node.id), theme.issue_id.clone());
         content.append(" ");
 
         // Title
@@ -1032,10 +1066,7 @@ fn render_single_graph_rich(
         if node.id == root_issue.id {
             content.append_styled(" (root)", theme.dimmed.clone());
         } else if let Some(parents) = parent_map.get(&node.id) {
-            content.append_styled(
-                &format!(" depends on: {}", parents.join(", ")),
-                theme.dimmed.clone(),
-            );
+            content.append_styled(&format_parent_list(Some(parents)), theme.dimmed.clone());
         }
         content.append("\n");
     }
@@ -1056,7 +1087,7 @@ fn render_no_dependents_rich(root_id: &str, root_issue: &Issue, ctx: &OutputCont
     let mut content = Text::new("");
 
     content.append_styled("● ", theme.success.clone());
-    content.append_styled(root_id, theme.issue_id.clone());
+    content.append_styled(&graph_display_text(root_id), theme.issue_id.clone());
     content.append(" ");
     content.append(sanitize_terminal_inline(&root_issue.title).as_ref());
     content.append("\n\n");
@@ -1108,7 +1139,7 @@ fn render_all_graph_rich(
         let roots = if component.roots.is_empty() {
             "none".to_string()
         } else {
-            component.roots.join(", ")
+            format_id_list(&component.roots)
         };
         content.append_styled(
             &format!(
@@ -1126,7 +1157,7 @@ fn render_all_graph_rich(
             content.append(&indent);
 
             // ID
-            content.append_styled(&node.id, theme.issue_id.clone());
+            content.append_styled(&graph_display_text(&node.id), theme.issue_id.clone());
             content.append(" ");
 
             // Title (truncate if too long for all-graph view to avoid messy panels)
@@ -1154,10 +1185,7 @@ fn render_all_graph_rich(
             if component.roots.contains(&node.id) {
                 content.append_styled(" (root)", theme.dimmed.clone());
             } else if let Some(parents) = parent_map.get(&node.id) {
-                content.append_styled(
-                    &format!(" depends on: {}", parents.join(", ")),
-                    theme.dimmed.clone(),
-                );
+                content.append_styled(&format_parent_list(Some(parents)), theme.dimmed.clone());
             }
             content.append("\n");
         }
@@ -1259,6 +1287,28 @@ mod tests {
         let json = serde_json::to_string(&output).unwrap();
         assert!(json.contains("\"root\":\"bd-001\""));
         assert!(json.contains("\"count\":3"));
+    }
+
+    #[test]
+    fn graph_human_id_helpers_escape_terminal_controls() {
+        let ids = vec![
+            "bd-root\x1b[2J".to_string(),
+            "bd-child\x07".to_string(),
+            "bd-next\rline".to_string(),
+        ];
+
+        let rendered_ids = format_id_list(&ids);
+        let rendered_parents = format_parent_list(Some(&ids));
+        let rendered_compact = format_compact_dependency_edges(
+            "bd-root\x1b[2J",
+            &[("bd-child\x07".to_string(), "bd-root\x1b[2J".to_string())],
+        );
+
+        for rendered in [rendered_ids, rendered_parents, rendered_compact] {
+            assert!(!rendered.chars().any(char::is_control));
+            assert!(rendered.contains("\\u{1b}[2J"));
+            assert!(rendered.contains("\\u{7}") || rendered.contains("\\r"));
+        }
     }
 
     #[test]
@@ -1827,6 +1877,24 @@ mod tests {
         assert_eq!(depths.get("root"), Some(&0));
         assert_eq!(depths.get("bd-a"), Some(&1));
         assert_eq!(depths.get("bd-b"), Some(&1));
+    }
+
+    #[test]
+    fn test_calculate_depths_from_dependency_edges_tolerates_external_edge_endpoint() {
+        let nodes = vec!["root".to_string(), "bd-a".to_string()];
+        let dependency_edges = vec![
+            ("bd-a".to_string(), "root".to_string()),
+            ("bd-a".to_string(), "bd-missing".to_string()),
+            ("bd-unknown".to_string(), "root".to_string()),
+        ];
+        let root_nodes = ["root".to_string()];
+
+        let depths = calculate_depths_from_dependency_edges(&nodes, &dependency_edges, &root_nodes);
+
+        assert_eq!(depths.get("root"), Some(&0));
+        assert_eq!(depths.get("bd-a"), Some(&1));
+        assert!(!depths.contains_key("bd-missing"));
+        assert!(!depths.contains_key("bd-unknown"));
     }
 
     #[test]

@@ -4,6 +4,7 @@ use crate::config;
 use crate::config::routing::follow_redirects;
 use crate::error::BeadsError;
 use crate::error::Result;
+use crate::format::sanitize_terminal_inline;
 use crate::output::OutputContext;
 use crate::util::parse_id;
 use fsqlite::Connection;
@@ -228,19 +229,23 @@ fn inspect_jsonl_prefix(path: &Path) -> JsonlPrefixState {
 }
 
 fn print_human(output: &WhereOutput) {
-    println!("{}", output.path);
+    println!("{}", where_display_text(&output.path));
     if let Some(origin) = &output.redirected_from {
-        println!("  (via redirect from {origin})");
+        println!("  (via redirect from {})", where_display_text(origin));
     }
     if let Some(prefix) = &output.prefix {
-        println!("  prefix: {prefix}");
+        println!("  prefix: {}", where_display_text(prefix));
     }
     if let Some(db_path) = &output.database_path {
-        println!("  database: {db_path}");
+        println!("  database: {}", where_display_text(db_path));
     }
     if let Some(jsonl_path) = &output.jsonl_path {
-        println!("  jsonl: {jsonl_path}");
+        println!("  jsonl: {}", where_display_text(jsonl_path));
     }
+}
+
+fn where_display_text(value: &str) -> String {
+    sanitize_terminal_inline(value).into_owned()
 }
 
 /// Render location info as a rich panel.
@@ -253,42 +258,42 @@ fn render_where_rich(output: &WhereOutput, ctx: &OutputContext) {
 
     // Main path
     content.append_styled("Directory   ", theme.dimmed.clone());
-    content.append_styled(&output.path, theme.accent.clone());
+    content.append_styled(&where_display_text(&output.path), theme.accent.clone());
     content.append("\n");
 
     // Redirect info
     if let Some(origin) = &output.redirected_from {
         content.append_styled("            ", theme.dimmed.clone());
         content.append_styled("(via redirect from ", theme.muted.clone());
-        content.append_styled(origin, theme.accent.clone());
+        content.append_styled(&where_display_text(origin), theme.accent.clone());
         content.append_styled(")\n", theme.muted.clone());
     }
 
     // Prefix
     if let Some(prefix) = &output.prefix {
         content.append_styled("Prefix      ", theme.dimmed.clone());
-        content.append_styled(prefix, theme.issue_id.clone());
+        content.append_styled(&where_display_text(prefix), theme.issue_id.clone());
         content.append("\n");
     }
 
     // Database path
     if let Some(db_path) = &output.database_path {
         content.append_styled("Database    ", theme.dimmed.clone());
-        content.append_styled(db_path, theme.accent.clone());
+        content.append_styled(&where_display_text(db_path), theme.accent.clone());
         content.append("\n");
     }
 
     // JSONL path
     if let Some(jsonl_path) = &output.jsonl_path {
         content.append_styled("JSONL       ", theme.dimmed.clone());
-        content.append_styled(jsonl_path, theme.accent.clone());
+        content.append_styled(&where_display_text(jsonl_path), theme.accent.clone());
         content.append("\n");
     }
 
-    let title = output
-        .prefix
-        .as_ref()
-        .map_or_else(|| "Beads Location".to_string(), |p| format!("{p} Location"));
+    let title = output.prefix.as_ref().map_or_else(
+        || "Beads Location".to_string(),
+        |p| format!("{} Location", where_display_text(p)),
+    );
 
     let panel = Panel::from_rich_text(&content, width)
         .title(Text::styled(&title, theme.panel_title.clone()))
@@ -328,6 +333,19 @@ mod tests {
         fn drop(&mut self) {
             let _ = env::set_current_dir(&self.previous);
         }
+    }
+
+    #[test]
+    fn where_display_text_sanitizes_terminal_controls() {
+        let rendered = where_display_text("/tmp/ws\x1b[2J/.beads\rhidden\x08\nnext\x07\u{9b}");
+
+        assert!(!rendered.chars().any(char::is_control));
+        assert!(rendered.contains("\\u{1b}[2J"));
+        assert!(rendered.contains("\\r"));
+        assert!(rendered.contains("\\u{8}"));
+        assert!(rendered.contains("\\n"));
+        assert!(rendered.contains("\\u{7}"));
+        assert!(rendered.contains("\\u{9b}"));
     }
 
     #[test]

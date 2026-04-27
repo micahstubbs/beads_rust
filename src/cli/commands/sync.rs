@@ -11,8 +11,8 @@ use crate::sync::history::HistoryConfig;
 use crate::sync::{
     ConflictResolution, ExportConfig, ExportEntityType, ExportError, ExportErrorPolicy,
     ImportConfig, METADATA_JSONL_CONTENT_HASH, METADATA_LAST_EXPORT_TIME,
-    METADATA_LAST_IMPORT_TIME, MergeContext, OrphanMode, compute_jsonl_hash, compute_staleness,
-    count_issues_in_jsonl, export_temp_path, export_to_jsonl_with_policy, finalize_export,
+    METADATA_LAST_IMPORT_TIME, MergeContext, OrphanMode, analyze_jsonl, compute_jsonl_hash,
+    compute_staleness, export_temp_path, export_to_jsonl_with_policy, finalize_export,
     get_issue_ids_from_jsonl, import_from_jsonl, load_base_snapshot, read_issues_from_jsonl,
     require_safe_sync_overwrite_path, restore_tombstones_after_rebuild,
     save_base_snapshot_from_jsonl, scan_jsonl_for_tombstone_filter, snapshot_tombstones,
@@ -857,11 +857,12 @@ fn execute_flush(
     // If no dirty issues and no force, report nothing to do
     if dirty_ids.is_empty() && !needs_flush && jsonl_exists && !args.force {
         // `ensure_no_conflict_markers` ran above before we got here, so
-        // `count_issues_in_jsonl` / `get_issue_ids_from_jsonl` below won't
-        // trip over unresolved `<<<<<<<` / `=======` / `>>>>>>>` lines.
+        // `analyze_jsonl` below won't trip over unresolved `<<<<<<<` /
+        // `=======` / `>>>>>>>` lines.
 
-        // Guard against empty DB overwriting a non-empty JSONL.
-        let existing_count = count_issues_in_jsonl(jsonl_path)?;
+        // Guard against stale DB state without parsing the JSONL twice for count
+        // and IDs.
+        let (existing_count, jsonl_ids) = analyze_jsonl(jsonl_path)?;
         if existing_count > 0 && db_issue_count == 0 {
             warn!(
                 jsonl_count = existing_count,
@@ -872,10 +873,9 @@ fn execute_flush(
                      Database has 0 issues, JSONL has {existing_count} issues.\n\
                      This would result in data loss!\n\
                      Hint: Use --force to override this safety check."
-            )));
+                )));
         }
 
-        let jsonl_ids = get_issue_ids_from_jsonl(jsonl_path)?;
         if !jsonl_ids.is_empty() {
             let db_ids: HashSet<String> = storage.get_all_ids()?.into_iter().collect();
             let mut missing_list = jsonl_ids.difference(&db_ids).cloned().collect::<Vec<_>>();

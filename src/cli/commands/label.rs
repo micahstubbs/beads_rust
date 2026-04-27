@@ -90,6 +90,50 @@ fn validate_label(label: &str) -> Result<()> {
     LabelValidator::validate(label).map_err(|error| BeadsError::validation("label", error.message))
 }
 
+fn label_display_text(value: &str) -> String {
+    sanitize_terminal_inline(value).into_owned()
+}
+
+fn format_label_action_plain_line(result: &LabelActionResult, action: &str) -> Option<String> {
+    let label = label_display_text(&result.label);
+    let issue_id = label_display_text(&result.issue_id);
+    match (action, result.status.as_str()) {
+        ("add", "added") => Some(format!("\u{2713} Added label {label} to {issue_id}")),
+        ("add", _) => Some(format!(
+            "\u{2713} Label {label} already exists on {issue_id}"
+        )),
+        ("remove", "removed") => Some(format!("\u{2713} Removed label {label} from {issue_id}")),
+        ("remove", _) => Some(format!(
+            "\u{2713} Label {label} not found on {issue_id} (no-op)"
+        )),
+        _ => None,
+    }
+}
+
+fn format_rename_noop_plain_line(label: &str) -> String {
+    format!(
+        "Label '{}' already has that name; no changes made.",
+        label_display_text(label)
+    )
+}
+
+fn format_rename_not_found_plain_line(label: &str) -> String {
+    format!(
+        "Label '{}' not found on any issues.",
+        label_display_text(label)
+    )
+}
+
+fn format_rename_result_plain_line(old_name: &str, new_name: &str, count: usize) -> String {
+    format!(
+        "\u{2713} Renamed label '{}' to '{}' on {} issue{}",
+        label_display_text(old_name),
+        label_display_text(new_name),
+        count,
+        if count == 1 { "" } else { "s" }
+    )
+}
+
 /// Parse issues and label from positional args.
 ///
 /// The last argument is the label, all preceding arguments are issue IDs.
@@ -116,10 +160,14 @@ fn parse_issues_and_label(
         ));
     }
 
-    let (issue_ids, label_args) = issues.split_at(issues.len() - 1);
-    let label = label_args[0].clone();
+    let Some((label, issue_ids)) = issues.split_last() else {
+        return Err(BeadsError::validation(
+            "arguments",
+            "usage: label add <issue...> <label> or label add <issue...> -l <label>",
+        ));
+    };
 
-    Ok((issue_ids.to_vec(), label))
+    Ok((issue_ids.to_vec(), label.clone()))
 }
 
 fn execute_routed_label_add(
@@ -356,36 +404,8 @@ fn render_label_action_results(
         render_label_action_results_rich(results, action, ctx);
     } else {
         for result in results {
-            match (action, result.status.as_str()) {
-                ("add", "added") => {
-                    println!(
-                        "\u{2713} Added label {} to {}",
-                        sanitize_terminal_inline(&result.label),
-                        result.issue_id
-                    );
-                }
-                ("add", _) => {
-                    println!(
-                        "\u{2713} Label {} already exists on {}",
-                        sanitize_terminal_inline(&result.label),
-                        result.issue_id
-                    );
-                }
-                ("remove", "removed") => {
-                    println!(
-                        "\u{2713} Removed label {} from {}",
-                        sanitize_terminal_inline(&result.label),
-                        result.issue_id
-                    );
-                }
-                ("remove", _) => {
-                    println!(
-                        "\u{2713} Label {} not found on {} (no-op)",
-                        sanitize_terminal_inline(&result.label),
-                        result.issue_id
-                    );
-                }
-                _ => {}
+            if let Some(line) = format_label_action_plain_line(result, action) {
+                println!("{line}");
             }
         }
     }
@@ -412,11 +432,11 @@ fn label_list(
         } else if matches!(ctx.mode(), OutputMode::Rich) {
             render_labels_for_issue_rich(&issue_id, &labels, ctx);
         } else if labels.is_empty() {
-            println!("No labels for {issue_id}.");
+            println!("No labels for {}.", label_display_text(&issue_id));
         } else {
-            println!("Labels for {issue_id}:");
+            println!("Labels for {}:", label_display_text(&issue_id));
             for label in &labels {
-                println!("  {}", sanitize_terminal_inline(label));
+                println!("  {}", label_display_text(label));
             }
         }
     } else {
@@ -437,7 +457,7 @@ fn label_list(
         } else {
             println!("Labels ({} total):", unique_labels.len());
             for label in &unique_labels {
-                println!("  {}", sanitize_terminal_inline(label));
+                println!("  {}", label_display_text(label));
             }
         }
     }
@@ -471,7 +491,7 @@ fn label_list_all(storage: &SqliteStorage, _json: bool, ctx: &OutputContext) -> 
         for lc in &label_counts {
             println!(
                 "  {} ({} issue{})",
-                sanitize_terminal_inline(&lc.label),
+                label_display_text(&lc.label),
                 lc.count,
                 if lc.count == 1 { "" } else { "s" }
             );
@@ -511,10 +531,8 @@ fn label_rename(
         } else if matches!(ctx.mode(), OutputMode::Rich) {
             render_rename_noop_rich(&args.old_name, ctx);
         } else {
-            println!(
-                "Label '{}' already has that name; no changes made.",
-                sanitize_terminal_inline(&args.old_name)
-            );
+            let line = format_rename_noop_plain_line(&args.old_name);
+            println!("{line}");
         }
         return Ok(());
     }
@@ -547,7 +565,8 @@ fn label_rename(
         } else if matches!(ctx.mode(), OutputMode::Rich) {
             render_rename_not_found_rich(&args.old_name, ctx);
         } else {
-            println!("Label '{}' not found on any issues.", args.old_name);
+            let line = format_rename_not_found_plain_line(&args.old_name);
+            println!("{line}");
         }
         return Ok(());
     }
@@ -573,13 +592,8 @@ fn label_rename(
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_rename_result_rich(&args.old_name, &args.new_name, count, ctx);
     } else {
-        println!(
-            "\u{2713} Renamed label '{}' to '{}' on {} issue{}",
-            args.old_name,
-            args.new_name,
-            count,
-            if count == 1 { "" } else { "s" }
-        );
+        let line = format_rename_result_plain_line(&args.old_name, &args.new_name, count);
+        println!("{line}");
     }
 
     Ok(())
@@ -612,10 +626,19 @@ fn reorder_routed_items_by_requested_inputs<T>(
                 .and_then(VecDeque::pop_front)
             else {
                 return Err(BeadsError::internal(format!(
-                    "{context} returned unexpected issue input {input}"
+                    "{} returned unexpected issue input {}",
+                    label_display_text(context),
+                    label_display_text(&input)
                 )));
             };
-            ordered_items[index] = Some(item);
+            let Some(slot) = ordered_items.get_mut(index) else {
+                return Err(BeadsError::internal(format!(
+                    "{} returned out-of-range issue input position {}",
+                    label_display_text(context),
+                    index
+                )));
+            };
+            *slot = Some(item);
         }
     }
 
@@ -624,9 +647,13 @@ fn reorder_routed_items_by_requested_inputs<T>(
         .enumerate()
         .map(|(index, item)| {
             item.ok_or_else(|| {
+                let requested_input = requested_inputs
+                    .get(index)
+                    .map_or("<unknown>", String::as_str);
                 BeadsError::internal(format!(
-                    "{context} did not produce a result for {}",
-                    requested_inputs[index]
+                    "{} did not produce a result for {}",
+                    label_display_text(context),
+                    label_display_text(requested_input)
                 ))
             })
         })
@@ -654,7 +681,10 @@ fn label_color(label: &str) -> Color {
     ];
 
     let hash = label.bytes().fold(0u8, u8::wrapping_add);
-    let color_name = LABEL_PALETTE[hash as usize % LABEL_PALETTE.len()];
+    let color_name = LABEL_PALETTE
+        .get(usize::from(hash) % LABEL_PALETTE.len())
+        .copied()
+        .unwrap_or("cyan");
     Color::parse(color_name).unwrap_or_default()
 }
 
@@ -691,7 +721,10 @@ fn render_label_action_results_rich(
             Style::new().color(label_color(&result.label)),
         );
         text.append(if action == "add" { " on " } else { " from " });
-        text.append_styled(&result.issue_id, theme.issue_id.clone());
+        text.append_styled(
+            &label_display_text(&result.issue_id),
+            theme.issue_id.clone(),
+        );
 
         console.print_renderable(&text);
     }
@@ -705,14 +738,14 @@ fn render_labels_for_issue_rich(issue_id: &str, labels: &[String], ctx: &OutputC
     if labels.is_empty() {
         let mut text = Text::new("");
         text.append_styled("No labels for ", theme.dimmed.clone());
-        text.append_styled(issue_id, theme.issue_id.clone());
+        text.append_styled(&label_display_text(issue_id), theme.issue_id.clone());
         console.print_renderable(&text);
         return;
     }
 
     let mut text = Text::new("");
     text.append("Labels for ");
-    text.append_styled(issue_id, theme.issue_id.clone());
+    text.append_styled(&label_display_text(issue_id), theme.issue_id.clone());
     text.append(":");
     console.print_renderable(&text);
 
@@ -723,7 +756,7 @@ fn render_labels_for_issue_rich(issue_id: &str, labels: &[String], ctx: &OutputC
             label_line.append("  ");
         }
         label_line.append_styled(
-            sanitize_terminal_inline(label).as_ref(),
+            &label_display_text(label),
             Style::new().color(label_color(label)),
         );
     }
@@ -753,7 +786,7 @@ fn render_unique_labels_rich(labels: &[String], ctx: &OutputContext) {
             label_line.append("  ");
         }
         label_line.append_styled(
-            sanitize_terminal_inline(label).as_ref(),
+            &label_display_text(label),
             Style::new().color(label_color(label)),
         );
     }
@@ -781,7 +814,7 @@ fn render_label_counts_rich(label_counts: &[LabelCount], ctx: &OutputContext) {
             content.append("\n");
         }
         content.append_styled(
-            &format!("{:<20}", sanitize_terminal_inline(&lc.label)),
+            &format!("{:<20}", label_display_text(&lc.label)),
             Style::new().color(label_color(&lc.label)),
         );
         content.append_styled(
@@ -878,6 +911,39 @@ fn render_rename_result_rich(old_name: &str, new_name: &str, count: usize, ctx: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn label_display_text_sanitizes_terminal_controls() {
+        let rendered = label_display_text("urgent\x1b[2J\rreset\x08\nnext\x07\u{9b}");
+
+        assert!(!rendered.chars().any(char::is_control));
+        assert!(rendered.contains("\\u{1b}[2J"));
+        assert!(rendered.contains("\\r"));
+        assert!(rendered.contains("\\u{8}"));
+        assert!(rendered.contains("\\n"));
+        assert!(rendered.contains("\\u{7}"));
+        assert!(rendered.contains("\\u{9b}"));
+    }
+
+    #[test]
+    fn label_plain_output_helpers_escape_terminal_controls() {
+        let result = LabelActionResult {
+            status: "added".to_string(),
+            issue_id: "bd-1\x1b[2J".to_string(),
+            label: "urgent\x07".to_string(),
+        };
+
+        let lines = [
+            format_label_action_plain_line(&result, "add").expect("add line"),
+            format_rename_noop_plain_line("old\x1b[2J"),
+            format_rename_not_found_plain_line("missing\rlabel"),
+            format_rename_result_plain_line("old\x08", "new\nlabel", 2),
+        ];
+
+        for line in lines {
+            assert!(!line.chars().any(char::is_control));
+        }
+    }
 
     #[test]
     fn test_validate_label_valid() {

@@ -4,10 +4,11 @@ use crate::format::{sanitize_terminal_inline, sanitize_terminal_text};
 use rich_rust::prelude::*;
 use rich_rust::renderables::Renderable;
 use serde::Serialize;
+use std::borrow::Cow;
 use std::io::{self, IsTerminal, Write};
 use std::sync::OnceLock;
 use toon_rust::options::KeyFoldingMode;
-use toon_rust::{EncodeOptions, JsonValue, encode};
+use toon_rust::{EncodeOptions, JsonValue, StringOrNumberOrBoolOrNull, encode};
 
 /// Central output coordinator that respects robot/json/quiet modes.
 ///
@@ -58,6 +59,68 @@ impl Write for CountingWriter {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+#[must_use]
+fn toon_encode_options() -> EncodeOptions {
+    EncodeOptions {
+        indent: Some(2),
+        delimiter: None,
+        key_folding: Some(KeyFoldingMode::Safe),
+        flatten_depth: None,
+        replacer: None,
+    }
+}
+
+fn sanitize_toon_value(value: &mut JsonValue) {
+    match value {
+        JsonValue::Primitive(StringOrNumberOrBoolOrNull::String(value)) => {
+            if let Cow::Owned(safe_value) = sanitize_toon_string(value) {
+                *value = safe_value;
+            }
+        }
+        JsonValue::Primitive(
+            StringOrNumberOrBoolOrNull::Null
+            | StringOrNumberOrBoolOrNull::Bool(_)
+            | StringOrNumberOrBoolOrNull::Number(_),
+        ) => {}
+        JsonValue::Array(values) => {
+            for value in values {
+                sanitize_toon_value(value);
+            }
+        }
+        JsonValue::Object(values) => {
+            for (key, value) in values {
+                if let Cow::Owned(safe_key) = sanitize_toon_string(key) {
+                    *key = safe_key;
+                }
+                sanitize_toon_value(value);
+            }
+        }
+    }
+}
+
+fn sanitize_toon_string(value: &str) -> Cow<'_, str> {
+    if value
+        .chars()
+        .all(|ch| matches!(ch, '\n' | '\t') || !ch.is_control())
+    {
+        return Cow::Borrowed(value);
+    }
+
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\n' | '\t') || !ch.is_control() {
+            escaped.push(ch);
+            continue;
+        }
+
+        for escaped_char in ch.escape_default() {
+            escaped.push(escaped_char);
+        }
+    }
+
+    Cow::Owned(escaped)
 }
 
 impl OutputContext {
@@ -321,14 +384,9 @@ impl OutputContext {
             let Some(json_value) = self.json_value(value, "TOON") else {
                 return;
             };
-            let toon_value: JsonValue = json_value.into();
-            let options = Some(EncodeOptions {
-                indent: Some(2),
-                delimiter: None,
-                key_folding: Some(KeyFoldingMode::Safe),
-                flatten_depth: None,
-                replacer: None,
-            });
+            let mut toon_value: JsonValue = json_value.into();
+            sanitize_toon_value(&mut toon_value);
+            let options = Some(toon_encode_options());
             let toon_output = encode(toon_value, options);
             println!("{toon_output}");
         }
@@ -351,21 +409,17 @@ impl OutputContext {
             let Some(json_value) = self.json_value(value, "TOON") else {
                 return;
             };
+            let mut toon_value: JsonValue = json_value.into();
+            sanitize_toon_value(&mut toon_value);
             let emit_stats =
                 Self::should_emit_toon_stats(show_stats, std::env::var("TOON_STATS").is_ok());
             let json_chars = if emit_stats {
-                Self::pretty_json_len(&json_value)
+                let sanitized_json_value: serde_json::Value = toon_value.clone().into();
+                Self::pretty_json_len(&sanitized_json_value)
             } else {
                 None
             };
-            let toon_value: JsonValue = json_value.into();
-            let options = Some(EncodeOptions {
-                indent: Some(2),
-                delimiter: None,
-                key_folding: Some(KeyFoldingMode::Safe),
-                flatten_depth: None,
-                replacer: None,
-            });
+            let options = Some(toon_encode_options());
             let toon_output = encode(toon_value, options);
 
             if let Some(json_chars) = json_chars {
@@ -477,7 +531,10 @@ impl OutputContext {
                 let mut text = Text::from(description.as_ref());
                 text.append("\n\nSuggestions:\n");
                 for suggestion in suggestions {
-                    text.append(&format!("• {}\n", sanitize_terminal_inline(suggestion)));
+                    let suggestion = sanitize_terminal_inline(suggestion);
+                    text.append("• ");
+                    text.append(suggestion.as_ref());
+                    text.append("\n");
                 }
 
                 let panel = Panel::from_rich_text(&text, self.width())
@@ -656,6 +713,70 @@ mod tests {
                     .expect("JSON serialization failed")
                     .len()
             )
+        );
+    }
+
+    #[test]
+    fn sanitize_toon_string_keeps_newline_and_tab_but_escapes_carriage_return() {
+        assert_eq!(sanitize_toon_string("line\n\t\rnext"), "line\n\t\\rnext");
+    }
+
+    #[test]
+    fn sanitize_toon_value_escapes_controls_the_encoder_would_emit_raw() {
+        let value = json!({
+            "plain": "ok",
+            "bad\u{1b}key": "title\u{1b}[2J\u{7}\u{9b}\u{8}\n\t\rend",
+            "nested": [
+                { "body": "bell\u{7}" }
+            ]
+        });
+
+        let mut toon_value = JsonValue::from(value);
+        sanitize_toon_value(&mut toon_value);
+        let toon_output = encode(toon_value, Some(toon_encode_options()));
+
+        for forbidden in ['\u{1b}', '\u{7}', '\u{8}', '\u{9b}', '\r'] {
+            assert!(
+                !toon_output.contains(forbidden),
+                "TOON output contained raw control {forbidden:?}: {toon_output:?}"
+            );
+        }
+
+        assert!(toon_output.contains("\\u{1b}[2J"));
+        assert!(toon_output.contains("\\u{7}"));
+        assert!(toon_output.contains("\\u{8}"));
+        assert!(toon_output.contains("\\u{9b}"));
+        assert!(toon_output.contains("\\n"));
+        assert!(toon_output.contains("\\t"));
+        assert!(toon_output.contains("\\r"));
+    }
+
+    #[test]
+    fn sanitize_toon_value_keeps_entries_when_sanitized_keys_collide() {
+        let mut toon_value = JsonValue::Object(vec![
+            (
+                "bad\u{1b}".to_string(),
+                JsonValue::Primitive(StringOrNumberOrBoolOrNull::String("first".to_string())),
+            ),
+            (
+                "bad\\u{1b}".to_string(),
+                JsonValue::Primitive(StringOrNumberOrBoolOrNull::String("second".to_string())),
+            ),
+        ]);
+
+        sanitize_toon_value(&mut toon_value);
+
+        let entries = match toon_value {
+            JsonValue::Object(entries) => entries,
+            JsonValue::Primitive(_) | JsonValue::Array(_) => Vec::new(),
+        };
+        let keys = entries
+            .into_iter()
+            .map(|(key, _value)| key)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec!["bad\\u{1b}".to_string(), "bad\\u{1b}".to_string()]
         );
     }
 

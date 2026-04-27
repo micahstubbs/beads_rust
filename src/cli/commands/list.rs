@@ -75,10 +75,13 @@ fn execute_inner(
     let user_limit = args.limit.unwrap_or(50);
     let user_offset = args.offset.unwrap_or(0);
 
-    // For JSON output with SQL-path queries, run a COUNT(*) query using the same
-    // filters (without LIMIT/OFFSET) so we can include pagination metadata.
+    // For paginated structured SQL-path queries, run a COUNT(*) query using the
+    // same filters (without LIMIT/OFFSET) so we can include pagination metadata.
+    // Unlimited output already materializes the full matching set, so its exact
+    // total is the issue vector length after the list query.
     // For client-filter path, the total count is determined after filtering in Rust.
-    let sql_total: Option<usize> = if is_json_output && !client_filters {
+    let needs_sql_total = is_json_output && !client_filters && user_limit != 0;
+    let sql_total: Option<usize> = if needs_sql_total {
         Some(storage.count_issues_with_filters(&filters)?)
     } else {
         None
@@ -175,13 +178,19 @@ fn execute_inner(
     match output_format {
         OutputFormat::Json | OutputFormat::Toon => {
             let ctx = OutputContext::from_output_format(output_format, quiet, true);
-            // Fetch relations for all issues
-            let issue_ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
-            let mut labels_map = storage.get_labels_for_issues(&issue_ids)?;
-
-            // Use batch counting
-            let (dependency_counts, dependent_counts) =
-                storage.count_relation_counts_for_issues(&issue_ids)?;
+            let use_full_relation_scan =
+                should_use_full_relation_scan(args, client_filters, user_limit, user_offset);
+            let (mut labels_map, dependency_counts, dependent_counts) = if use_full_relation_scan {
+                let labels_map = storage.get_all_labels()?;
+                let (dependency_counts, dependent_counts) = storage.count_all_relation_counts()?;
+                (labels_map, dependency_counts, dependent_counts)
+            } else {
+                let issue_ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
+                let labels_map = storage.get_labels_for_issues(&issue_ids)?;
+                let (dependency_counts, dependent_counts) =
+                    storage.count_relation_counts_for_issues(&issue_ids)?;
+                (labels_map, dependency_counts, dependent_counts)
+            };
 
             // Convert to IssueWithCounts
             let issues_with_counts: Vec<IssueWithCounts> = issues
@@ -387,6 +396,26 @@ fn needs_client_filters(args: &ListArgs) -> bool {
         || args.notes_contains.is_some()
         || args.deferred
         || args.overdue
+}
+
+fn should_use_full_relation_scan(
+    args: &ListArgs,
+    client_filters: bool,
+    user_limit: usize,
+    user_offset: usize,
+) -> bool {
+    !client_filters
+        && user_limit == 0
+        && user_offset == 0
+        && args.all
+        && args.status.is_empty()
+        && args.type_.is_empty()
+        && args.priority.is_empty()
+        && args.assignee.is_none()
+        && !args.unassigned
+        && args.title_contains.is_none()
+        && args.label.is_empty()
+        && args.label_any.is_empty()
 }
 
 fn apply_client_filters(

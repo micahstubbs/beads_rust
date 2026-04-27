@@ -13,6 +13,7 @@ readme = "README.md"
 exclude = [
     "sample_beads_db_files/",
     ".beads/",
+    ".agent-mail.yaml",
     ".github/",
     ".claude/",
     ".ntm/",
@@ -22,18 +23,12 @@ exclude = [
     "skills/",
     "temp_test/",
     "temp_test_2/",
+    "refactor/",
     "*.webp",
     "*.png",
     "*.db",
     "*.db-wal",
     "*.db-shm",
-    "EXISTING_BEADS_STRUCTURE_AND_ARCHITECTURE.md",
-    "PLAN_TO_PORT_BEADS_WITH_SQLITE_AND_ISSUES_JSONL_TO_RUST.md",
-    "PROPOSED_ARCHITECTURE_FOR_BR_USING_RUST_BEST_PRACTICES.md",
-    "RICH_INTEGRATION_PLAN.md",
-    "AGENT_FRIENDLINESS_REPORT.md",
-    "ROBOT_MODE_EXAMPLES.jsonl",
-    "CLI_SCHEMA.json",
 ]
 
 [[bin]]
@@ -136,6 +131,13 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[profile.release-perf]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+debug = "line-tables-only"
+strip = false
 
 [profile.dev]
 opt-level = 1

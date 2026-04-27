@@ -1,7 +1,7 @@
 # br - Beads Rust
 
 <div align="center">
-  <img src="br_illustration.webp" alt="br - Fast, non-invasive issue tracker for git repositories" width="600">
+  <img src="docs/assets/br_illustration.webp" alt="br - Fast, non-invasive issue tracker for git repositories" width="600">
 </div>
 
 <div align="center">
@@ -910,7 +910,7 @@ br schema issue-details --format toon
 
 ## VCS Integration
 
-Using non-git version control? See [VCS_INTEGRATION.md](VCS_INTEGRATION.md) for
+Using non-git version control? See [VCS_INTEGRATION.md](docs/VCS_INTEGRATION.md) for
 equivalent commands and workflows.
 
 Quick example:
