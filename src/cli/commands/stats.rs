@@ -18,8 +18,10 @@ use rich_rust::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use tracing::{debug, info};
 
 /// Execute the stats command.
@@ -619,7 +621,7 @@ fn git_recent_activity(
     use std::io::{BufReader, Read};
     use std::process::Stdio;
 
-    let mut child = Command::new("git")
+    let mut child = git_command()
         .args([
             "log",
             "--format=__BR_ACTIVITY_COMMIT__:%H\t%ct",
@@ -797,7 +799,122 @@ fn parse_activity_commit_marker(line: &str) -> Option<i64> {
 }
 
 fn git_repo_context(start: &Path) -> Option<GitRepoContext> {
-    let output = Command::new("git")
+    git_repo_context_from_filesystem(start).or_else(|| git_repo_context_from_command(start))
+}
+
+fn git_repo_context_from_filesystem(start: &Path) -> Option<GitRepoContext> {
+    let mut repo_root = dunce::canonicalize(start).ok()?;
+
+    loop {
+        let git_entry = repo_root.join(".git");
+        if git_entry.is_dir() {
+            let head = read_git_head(&git_entry)?;
+            return Some(GitRepoContext { repo_root, head });
+        }
+
+        if git_entry.is_file() {
+            let git_dir = read_gitdir_file(&git_entry, &repo_root)?;
+            let head = read_git_head(&git_dir)?;
+            return Some(GitRepoContext { repo_root, head });
+        }
+
+        if !repo_root.pop() {
+            return None;
+        }
+    }
+}
+
+fn read_gitdir_file(git_file: &Path, repo_root: &Path) -> Option<PathBuf> {
+    let raw = fs::read_to_string(git_file).ok()?;
+    let gitdir = raw.trim().strip_prefix("gitdir:")?.trim();
+    if gitdir.is_empty() {
+        return None;
+    }
+
+    let path = PathBuf::from(gitdir);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        repo_root.join(path)
+    };
+    dunce::canonicalize(path).ok()
+}
+
+fn read_git_head(git_dir: &Path) -> Option<String> {
+    let raw = fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = raw.trim();
+    let Some(reference) = head.strip_prefix("ref:") else {
+        return non_empty_string(head);
+    };
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return None;
+    }
+
+    let common_dir = git_common_dir(git_dir);
+    read_git_ref(git_dir, reference)
+        .or_else(|| read_git_ref(&common_dir, reference))
+        .or_else(|| read_packed_git_ref(&common_dir, reference))
+}
+
+fn git_common_dir(git_dir: &Path) -> PathBuf {
+    let Ok(raw) = fs::read_to_string(git_dir.join("commondir")) else {
+        return git_dir.to_path_buf();
+    };
+    let common_dir = raw.trim();
+    if common_dir.is_empty() {
+        return git_dir.to_path_buf();
+    }
+
+    let path = PathBuf::from(common_dir);
+    if path.is_absolute() {
+        path
+    } else {
+        git_dir.join(path)
+    }
+}
+
+fn read_git_ref(git_dir: &Path, reference: &str) -> Option<String> {
+    let ref_path = safe_git_ref_path(git_dir, reference)?;
+    let raw = fs::read_to_string(ref_path).ok()?;
+    non_empty_string(raw.trim())
+}
+
+fn read_packed_git_ref(git_dir: &Path, reference: &str) -> Option<String> {
+    let raw = fs::read_to_string(git_dir.join("packed-refs")).ok()?;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+            continue;
+        }
+
+        let mut parts = line.split_whitespace();
+        let Some(hash) = parts.next() else { continue };
+        if parts.next() == Some(reference) {
+            return non_empty_string(hash);
+        }
+    }
+    None
+}
+
+fn safe_git_ref_path(git_dir: &Path, reference: &str) -> Option<PathBuf> {
+    let ref_path = Path::new(reference);
+    if ref_path.is_absolute()
+        || ref_path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(git_dir.join(ref_path))
+}
+
+fn non_empty_string(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn git_repo_context_from_command(start: &Path) -> Option<GitRepoContext> {
+    let output = git_command()
         .args(["rev-parse", "--show-toplevel", "HEAD"])
         .current_dir(start)
         .output()
@@ -819,6 +936,48 @@ fn git_repo_context(start: &Path) -> Option<GitRepoContext> {
         repo_root: PathBuf::from(repo_root),
         head: head.to_string(),
     })
+}
+
+fn git_command() -> Command {
+    Command::new(git_executable())
+}
+
+fn git_executable() -> &'static Path {
+    static GIT_EXECUTABLE: OnceLock<PathBuf> = OnceLock::new();
+    GIT_EXECUTABLE.get_or_init(resolve_git_executable)
+}
+
+fn resolve_git_executable() -> PathBuf {
+    let binary_name = if cfg!(windows) { "git.exe" } else { "git" };
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return PathBuf::from(binary_name);
+    };
+
+    for dir in std::env::split_paths(&path_var) {
+        if dir.as_os_str().is_empty() || !dir.is_absolute() {
+            continue;
+        }
+
+        let candidate = dir.join(binary_name);
+        if is_executable_file(&candidate) {
+            return candidate;
+        }
+    }
+
+    PathBuf::from(binary_name)
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
 }
 
 fn repo_relative_git_path(path: &Path, repo_root: &Path) -> Option<PathBuf> {
@@ -1902,6 +2061,48 @@ mod tests {
             git_pathspec_string(&PathBuf::from(".beads/issues.jsonl")),
             ".beads/issues.jsonl"
         );
+    }
+
+    #[test]
+    fn test_git_repo_context_from_filesystem_reads_loose_head() {
+        let temp = TempDir::new().expect("tempdir");
+        let git_dir = temp.path().join(".git");
+        let refs_dir = git_dir.join("refs").join("heads");
+        fs::create_dir_all(&refs_dir).expect("create refs");
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").expect("write head");
+        fs::write(
+            refs_dir.join("main"),
+            "0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .expect("write ref");
+
+        let repo_ctx = git_repo_context_from_filesystem(temp.path()).expect("repo context");
+        assert_eq!(repo_ctx.repo_root, temp.path());
+        assert_eq!(repo_ctx.head, "0123456789abcdef0123456789abcdef01234567");
+    }
+
+    #[test]
+    fn test_git_repo_context_from_filesystem_reads_gitdir_file() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_root = temp.path().join("worktree");
+        let git_dir = temp.path().join("actual.git");
+        fs::create_dir_all(&repo_root).expect("create worktree");
+        fs::create_dir_all(git_dir.join("refs").join("heads")).expect("create refs");
+        fs::write(
+            repo_root.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .expect("write gitdir");
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").expect("write head");
+        fs::write(
+            git_dir.join("refs").join("heads").join("main"),
+            "fedcba9876543210fedcba9876543210fedcba98\n",
+        )
+        .expect("write ref");
+
+        let repo_ctx = git_repo_context_from_filesystem(&repo_root).expect("repo context");
+        assert_eq!(repo_ctx.repo_root, repo_root);
+        assert_eq!(repo_ctx.head, "fedcba9876543210fedcba9876543210fedcba98");
     }
 
     #[test]
