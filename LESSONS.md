@@ -45,9 +45,44 @@ storage.commit_import_batch(true)?;
 - The failure point is deterministic (same issue count regardless of cache settings), which is a strong signal of a fixed internal limit rather than a system resource issue
 - Add debug tracing (eprintln!) early in investigation to narrow the failure to a specific phase/loop iteration before diving into library source code
 
+## 2026-04-28T03:00 - Rebase Conflicts Where HEAD Already Has the Fix Are "Obsolete Commits"
+
+**Problem**: A 18-commit rebase onto an updated base produced conflicts on 6 commits — each one a small bug fix (cycle-detection filter, transaction wrapping, BEGIN IMMEDIATE, HashSet visited-set, batch import OOM). For each conflict, the incoming change was a localized patch, while HEAD had a much broader refactor that already contained the fix in a more thorough form (e.g., `with_write_transaction` helper replacing 5 manually-written BEGIN IMMEDIATE/COMMIT/ROLLBACK blocks; streaming `stream_import_actions_in_tx` replacing batch-and-reopen).
+
+**Root Cause**: When two branches independently fix the same bug — one with a minimal patch, the other inside a broader refactor — `git` cannot merge them because they touch the same lines with structurally different code. But the fix's *intent* exists on both sides.
+
+**Lesson**: After resolving a conflict by taking HEAD's version, run `git diff --cached HEAD` on the staged result. If the diff is empty, the commit is fully obsolete — its goal is already satisfied — and `git rebase --skip` is the correct resolution. This is much safer than `git rebase --continue` with a hand-edited commit, because skip preserves history integrity (no empty commits, no misleading "applied" status).
+
+**Pattern**:
+```bash
+# After resolving a conflict block:
+git checkout --ours -- <file>     # take HEAD's version
+git add <file>
+git diff --cached HEAD --stat     # measure residual delta
+
+# If empty → commit is obsolete:
+git rebase --skip
+
+# If non-empty but expected → keep going:
+git rebase --continue
+```
+
+**Solution**: Worked through each conflict by:
+1. Reading both sides of the conflict + git show of the incoming commit
+2. Confirming HEAD's broader refactor already contained the fix's intent
+3. Taking HEAD wholesale (`git checkout --ours -- <file>`)
+4. Verifying with empty `git diff --cached HEAD`
+5. `git rebase --skip` — six times, one for each obsolete commit
+
+**Prevention**:
+- Before resolving conflicts manually line-by-line, check if HEAD's broader version already addresses the incoming commit's intent (read its commit message, then grep HEAD for the same fix)
+- When the answer is "yes, already fixed," `--ours` + `--skip` is faster, safer, and more accurate than hand-merging
+- The smoke test for "obsolete commit" is the empty `git diff --cached HEAD` after taking HEAD — no need to read the full file diff
+
 ## Meta-Lessons
 
 - **Library OOM != System OOM**: Always check if the "out of memory" error is from an internal resource pool before assuming system memory exhaustion
 - **Shared resource pools are dangerous**: When a pool serves both cache and active operations, the cache can starve the operations. The only safe fix is periodic pool release (connection reopen)
 - **Debug tracing narrows scope fast**: Adding eprintln! to phase boundaries and loop iterations pinpointed the failure from "somewhere in import" to "Phase 3 at issue ~1479" in one run, saving hours of guesswork
 - **Batch size bisection**: When a batch size works or fails deterministically, binary search for the threshold (500→100→50→25) is the fastest path to a working configuration
+- **Empty diff = obsolete commit**: During rebase, after resolving conflicts in favor of HEAD, an empty `git diff --cached HEAD` is the unambiguous signal to `--skip` rather than `--continue`. Saves dozens of bad merges across long rebases.
