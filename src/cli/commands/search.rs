@@ -152,6 +152,26 @@ fn render_search_results(
         return Ok(());
     }
 
+    match output_format {
+        OutputFormat::Json => {
+            let issues_with_counts = attach_counts(storage, issues)?;
+            early_ctx.json_pretty(&issues_with_counts);
+            return Ok(());
+        }
+        OutputFormat::Toon => {
+            let issues_with_counts = attach_counts(storage, issues)?;
+            early_ctx.toon_with_stats(&issues_with_counts, list_args.stats);
+            return Ok(());
+        }
+        OutputFormat::Csv => {
+            let fields = csv::parse_fields(list_args.fields.as_deref());
+            let csv_output = csv::format_csv(&issues, &fields);
+            print!("{csv_output}");
+            return Ok(());
+        }
+        OutputFormat::Text => {}
+    }
+
     let config_layer = storage_ctx.load_config(cli)?;
     let use_color = config::should_use_color(&config_layer);
     let max_width = if std::io::stdout().is_terminal() {
@@ -165,26 +185,6 @@ fn render_search_results(
         wrap: list_args.wrap,
     };
     let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
-
-    match output_format {
-        OutputFormat::Json => {
-            let issues_with_counts = attach_counts(storage, issues)?;
-            ctx.json_pretty(&issues_with_counts);
-            return Ok(());
-        }
-        OutputFormat::Toon => {
-            let issues_with_counts = attach_counts(storage, issues)?;
-            ctx.toon_with_stats(&issues_with_counts, list_args.stats);
-            return Ok(());
-        }
-        OutputFormat::Csv => {
-            let fields = csv::parse_fields(list_args.fields.as_deref());
-            let csv_output = csv::format_csv(&issues, &fields);
-            print!("{csv_output}");
-            return Ok(());
-        }
-        OutputFormat::Text => {}
-    }
 
     if matches!(ctx.mode(), OutputMode::Rich) {
         let context_snippets = build_context_snippets(&issues, query);
