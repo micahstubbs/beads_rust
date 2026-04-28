@@ -79,6 +79,38 @@ git rebase --continue
 - When the answer is "yes, already fixed," `--ours` + `--skip` is faster, safer, and more accurate than hand-merging
 - The smoke test for "obsolete commit" is the empty `git diff --cached HEAD` after taking HEAD — no need to read the full file diff
 
+## 2026-04-28T03:30 - SQL `INSERT...SELECT` Does Not Apply DEFAULT for Legacy NULLs
+
+**Problem**: After upgrading br 0.1.44 → 0.2.1, every command (`list`, `ready`, `doctor`, …) failed against the project's own DB with `NOT NULL constraint failed: issues_rebuild_tmp.design`. Only `bv` (the JSONL sidecar reader) survived. `apply_schema` calls `rebuild_issues_table` whenever column order is non-canonical — this fires for any user upgrading from any older schema.
+
+**Root Cause**: `rebuild_issues_table_inner` did `INSERT INTO issues_rebuild_tmp (cols) SELECT cols FROM issues` to copy data into the new strict schema. The new temp table declared `description`/`design`/`acceptance_criteria`/`notes`/`source_repo` as `TEXT NOT NULL DEFAULT ''`. Legacy rows held NULL in those columns (introduced when an older br version added them via ALTER TABLE without a backfill). The DEFAULT clause **does NOT** substitute for explicit `INSERT...SELECT` of a NULL value — DEFAULT only applies to (a) `INSERT` statements that omit the column entirely, or (b) `ALTER TABLE ADD COLUMN` backfilling existing rows. So the SELECT pushed the NULL through and it tripped the `NOT NULL` constraint, aborting the whole rebuild and leaving br broken.
+
+**Lesson**: Whenever you tighten a SQL schema (nullable → `NOT NULL DEFAULT 'x'`), the rebuild/migration path **must** explicitly COALESCE the SELECT side. The CREATE TABLE side's DEFAULT clause is a phantom safety net here — it doesn't fire for `INSERT...SELECT`.
+
+**Code Issue**:
+```rust
+// Before (broken)
+let copy_out_sql = format!(
+    "INSERT INTO issues_rebuild_tmp ({cols}) SELECT {cols} FROM issues",
+    cols = projected_columns.join(", ")
+);
+
+// After (fixed)
+// For each NOT NULL DEFAULT <literal> column, wrap in COALESCE(col, <literal>):
+let copy_out_sql = format!(
+    "INSERT INTO issues_rebuild_tmp ({cols}) SELECT {exprs} FROM issues",
+    cols = projected_columns.join(", "),
+    exprs = projected_select_exprs.join(", ")  // e.g. COALESCE(design, '')
+);
+```
+
+**Solution**: Added `rebuild_select_expr(col_name, col_def)` + `parse_not_null_default_literal(col_def)` helpers in `src/storage/schema.rs`. The parser recognises `TEXT NOT NULL DEFAULT 'X'` (string literals: `''`, `'open'`, `'.'`) and `INTEGER NOT NULL DEFAULT N` (numeric literals: `0`, `2`). Non-literal defaults (`CURRENT_TIMESTAMP`) and nullable columns pass through unchanged — legacy NULLs in `created_at` would still fail loudly, which is correct (those represent corruption, not legacy data).
+
+**Prevention**:
+- Whenever `ISSUE_COLUMNS` (or any equivalent strict-schema declaration) gains a `NOT NULL DEFAULT` constraint that didn't exist before, audit every `INSERT...SELECT` path that copies data INTO that schema. Each one needs COALESCE for the new constraints.
+- Write a regression test the moment you add a `NOT NULL DEFAULT` to an existing column. Test the path: legacy schema (column nullable) → row with NULL → rebuild → success with default substituted.
+- For schema rebuilds that must be tolerant of legacy data (the common case during upgrades), prefer "tolerant SELECT, strict CREATE" over "strict SELECT". The SELECT is the data-cleanup hatch.
+
 ## Meta-Lessons
 
 - **Library OOM != System OOM**: Always check if the "out of memory" error is from an internal resource pool before assuming system memory exhaustion
@@ -86,3 +118,5 @@ git rebase --continue
 - **Debug tracing narrows scope fast**: Adding eprintln! to phase boundaries and loop iterations pinpointed the failure from "somewhere in import" to "Phase 3 at issue ~1479" in one run, saving hours of guesswork
 - **Batch size bisection**: When a batch size works or fails deterministically, binary search for the threshold (500→100→50→25) is the fastest path to a working configuration
 - **Empty diff = obsolete commit**: During rebase, after resolving conflicts in favor of HEAD, an empty `git diff --cached HEAD` is the unambiguous signal to `--skip` rather than `--continue`. Saves dozens of bad merges across long rebases.
+- **DEFAULT is for omission, not NULL**: SQL DEFAULT clauses fire on column omission or ALTER TABLE ADD backfills. They do NOT fire when an explicit `INSERT...SELECT` pushes a literal NULL into a `NOT NULL DEFAULT 'x'` column. Schema-tightening migrations must COALESCE on the SELECT side.
+- **Sidecar surviving = data path bug, not data loss**: When a read-only sidecar (bv) shows correct data but the writer (br) crashes on open, the bug is in the writer's startup/migration path. Don't panic-restore; the data is fine.
