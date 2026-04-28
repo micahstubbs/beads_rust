@@ -45,6 +45,39 @@ pub(crate) struct ListRelationMetadata {
     pub(crate) dependency_count: usize,
     pub(crate) dependent_count: usize,
 }
+
+fn append_label_membership_filters(
+    sql: &mut String,
+    params: &mut Vec<SqliteValue>,
+    labels_and: &[String],
+    labels_or: &[String],
+) {
+    match labels_and {
+        [] => {}
+        [label] => {
+            sql.push_str(" AND issues.id IN (SELECT issue_id FROM labels WHERE label = ?)");
+            params.push(SqliteValue::from(label.as_str()));
+        }
+        _ => {
+            for label in labels_and {
+                sql.push_str(" AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label = ?)");
+                params.push(SqliteValue::from(label.as_str()));
+            }
+        }
+    }
+
+    if !labels_or.is_empty() {
+        let placeholders: Vec<String> = labels_or.iter().map(|_| "?".to_string()).collect();
+        let _ = write!(
+            sql,
+            " AND issues.id IN (SELECT issue_id FROM labels WHERE label IN ({}))",
+            placeholders.join(",")
+        );
+        for label in labels_or {
+            params.push(SqliteValue::from(label.as_str()));
+        }
+    }
+}
 // `fsqlite` starts returning false PRIMARY KEY conflicts when we rewrite
 // existing `export_hashes` rows with a single multi-values INSERT. Batch the
 // DELETE side for efficiency, but re-insert one row at a time for correctness.
@@ -2324,26 +2357,12 @@ impl SqliteStorage {
 
         let mut params: Vec<SqliteValue> = Vec::new();
 
-        if let Some(ref labels) = filters.labels {
-            for label in labels {
-                sql.push_str(" AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label = ?)");
-                params.push(SqliteValue::from(label.as_str()));
-            }
-        }
-
-        if let Some(ref labels_or) = filters.labels_or
-            && !labels_or.is_empty()
-        {
-            let placeholders: Vec<String> = labels_or.iter().map(|_| "?".to_string()).collect();
-            let _ = write!(
-                sql,
-                " AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label IN ({}))",
-                placeholders.join(",")
-            );
-            for label in labels_or {
-                params.push(SqliteValue::from(label.as_str()));
-            }
-        }
+        append_label_membership_filters(
+            &mut sql,
+            &mut params,
+            filters.labels.as_deref().unwrap_or(&[]),
+            filters.labels_or.as_deref().unwrap_or(&[]),
+        );
 
         if let Some(ref statuses) = filters.statuses
             && !statuses.is_empty()
@@ -2508,26 +2527,12 @@ impl SqliteStorage {
 
         let mut params: Vec<SqliteValue> = Vec::new();
 
-        if let Some(ref labels) = filters.labels {
-            for label in labels {
-                sql.push_str(" AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label = ?)");
-                params.push(SqliteValue::from(label.as_str()));
-            }
-        }
-
-        if let Some(ref labels_or) = filters.labels_or
-            && !labels_or.is_empty()
-        {
-            let placeholders: Vec<String> = labels_or.iter().map(|_| "?".to_string()).collect();
-            let _ = write!(
-                sql,
-                " AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label IN ({}))",
-                placeholders.join(",")
-            );
-            for label in labels_or {
-                params.push(SqliteValue::from(label.as_str()));
-            }
-        }
+        append_label_membership_filters(
+            &mut sql,
+            &mut params,
+            filters.labels.as_deref().unwrap_or(&[]),
+            filters.labels_or.as_deref().unwrap_or(&[]),
+        );
 
         if let Some(ref statuses) = filters.statuses
             && !statuses.is_empty()
@@ -2876,25 +2881,12 @@ impl SqliteStorage {
         sql.push_str(" FROM issues WHERE 1=1");
         let mut params: Vec<SqliteValue> = Vec::new();
 
-        if !filters.labels_and.is_empty() {
-            for label in &filters.labels_and {
-                sql.push_str(" AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label = ?)");
-                params.push(SqliteValue::from(label.as_str()));
-            }
-        }
-
-        if !filters.labels_or.is_empty() {
-            let placeholders: Vec<String> =
-                filters.labels_or.iter().map(|_| "?".to_string()).collect();
-            let _ = write!(
-                sql,
-                " AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label IN ({}))",
-                placeholders.join(",")
-            );
-            for label in &filters.labels_or {
-                params.push(SqliteValue::from(label.as_str()));
-            }
-        }
+        append_label_membership_filters(
+            &mut sql,
+            &mut params,
+            &filters.labels_and,
+            &filters.labels_or,
+        );
 
         // Ready condition 1: only `open` issues are "ready" (in_progress means
         // already claimed). Optionally include deferred issues when requested.
