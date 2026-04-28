@@ -180,36 +180,45 @@ fn execute_inner(
             let ctx = OutputContext::from_output_format(output_format, quiet, true);
             let use_full_relation_scan =
                 should_use_full_relation_scan(args, client_filters, user_limit, user_offset);
-            let (mut labels_map, dependency_counts, dependent_counts) = if use_full_relation_scan {
-                let labels_map = storage.get_all_labels()?;
-                let (dependency_counts, dependent_counts) = storage.count_all_relation_counts()?;
-                (labels_map, dependency_counts, dependent_counts)
+            let issues_with_counts: Vec<IssueWithCounts> = if use_full_relation_scan {
+                let mut relation_metadata = storage.get_all_list_relation_metadata()?;
+                issues
+                    .into_iter()
+                    .map(|mut issue| {
+                        let metadata = relation_metadata.remove(&issue.id).unwrap_or_default();
+                        issue.labels = metadata.labels;
+
+                        IssueWithCounts {
+                            issue,
+                            dependency_count: metadata.dependency_count,
+                            dependent_count: metadata.dependent_count,
+                        }
+                    })
+                    .collect()
             } else {
                 let issue_ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
-                let labels_map = storage.get_labels_for_issues(&issue_ids)?;
+                let mut labels_map = storage.get_labels_for_issues(&issue_ids)?;
                 let (dependency_counts, dependent_counts) =
                     storage.count_relation_counts_for_issues(&issue_ids)?;
-                (labels_map, dependency_counts, dependent_counts)
+
+                issues
+                    .into_iter()
+                    .map(|mut issue| {
+                        if let Some(labels) = labels_map.remove(&issue.id) {
+                            issue.labels = labels;
+                        }
+
+                        let dependency_count = *dependency_counts.get(&issue.id).unwrap_or(&0);
+                        let dependent_count = *dependent_counts.get(&issue.id).unwrap_or(&0);
+
+                        IssueWithCounts {
+                            issue,
+                            dependency_count,
+                            dependent_count,
+                        }
+                    })
+                    .collect()
             };
-
-            // Convert to IssueWithCounts
-            let issues_with_counts: Vec<IssueWithCounts> = issues
-                .into_iter()
-                .map(|mut issue| {
-                    if let Some(labels) = labels_map.remove(&issue.id) {
-                        issue.labels = labels;
-                    }
-
-                    let dependency_count = *dependency_counts.get(&issue.id).unwrap_or(&0);
-                    let dependent_count = *dependent_counts.get(&issue.id).unwrap_or(&0);
-
-                    IssueWithCounts {
-                        issue,
-                        dependency_count,
-                        dependent_count,
-                    }
-                })
-                .collect();
 
             let has_more = if user_limit == 0 {
                 false

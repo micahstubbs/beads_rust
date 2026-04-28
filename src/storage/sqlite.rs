@@ -38,6 +38,13 @@ const WAL_CHECKPOINT_INTERVAL: u32 = 50;
 /// jittered exponential backoff via thread::sleep) to provide proper
 /// desynchronization. This is critical for multi-agent concurrent access.
 const DEFAULT_BUSY_TIMEOUT_MS: u64 = 0;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ListRelationMetadata {
+    pub(crate) labels: Vec<String>,
+    pub(crate) dependency_count: usize,
+    pub(crate) dependent_count: usize,
+}
 // `fsqlite` starts returning false PRIMARY KEY conflicts when we rewrite
 // existing `export_hashes` rows with a single multi-values INSERT. Batch the
 // DELETE side for efficiency, but re-insert one row at a time for correctness.
@@ -5163,6 +5170,78 @@ impl SqliteStorage {
         Ok(map)
     }
 
+    /// Get labels plus dependency/dependent counts for every issue that has any
+    /// list relation metadata.
+    ///
+    /// This is tuned for full structured list output: it keeps the same SQL
+    /// scans as the separate helpers but stores everything in a single map so
+    /// callers do one lookup per issue instead of three.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any database query fails.
+    pub(crate) fn get_all_list_relation_metadata(
+        &self,
+    ) -> Result<HashMap<String, ListRelationMetadata>> {
+        let label_rows = self
+            .conn
+            .query("SELECT issue_id, label FROM labels ORDER BY issue_id, label")?;
+        let dependency_rows = self
+            .conn
+            .query("SELECT issue_id, COUNT(*) FROM dependencies GROUP BY issue_id")?;
+        let dependent_rows = self
+            .conn
+            .query("SELECT depends_on_id, COUNT(*) FROM dependencies GROUP BY depends_on_id")?;
+
+        let capacity = label_rows
+            .len()
+            .saturating_add(dependency_rows.len())
+            .saturating_add(dependent_rows.len());
+        let mut map: HashMap<String, ListRelationMetadata> = HashMap::with_capacity(capacity);
+
+        for row in &label_rows {
+            let issue_id = row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string();
+            let label = row
+                .get(1)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string();
+            map.entry(issue_id).or_default().labels.push(label);
+        }
+
+        for row in &dependency_rows {
+            let issue_id = row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string();
+            let count = row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0);
+            if count > 0 {
+                map.entry(issue_id).or_default().dependency_count =
+                    usize::try_from(count).unwrap_or(0);
+            }
+        }
+
+        for row in &dependent_rows {
+            let issue_id = row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string();
+            let count = row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0);
+            if count > 0 {
+                map.entry(issue_id).or_default().dependent_count =
+                    usize::try_from(count).unwrap_or(0);
+            }
+        }
+
+        Ok(map)
+    }
+
     /// Get all labels attached to exportable issues.
     ///
     /// This mirrors the JSONL export issue filter so relation hydration does
@@ -9206,6 +9285,51 @@ mod tests {
         let all_counts = storage.count_all_relation_counts().unwrap();
 
         assert_eq!(all_counts, chunked_counts);
+    }
+
+    #[test]
+    fn test_all_list_relation_metadata_matches_separate_helpers() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 4, 1, 0, 0, 0).unwrap();
+
+        for id in ["bd-a", "bd-b", "bd-c"] {
+            let issue = make_issue(id, id, Status::Open, 1, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage.add_label("bd-a", "backend", "tester").unwrap();
+        storage.add_label("bd-a", "urgent", "tester").unwrap();
+        storage.add_label("bd-b", "backend", "tester").unwrap();
+        storage
+            .add_dependency("bd-b", "bd-a", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-c", "bd-a", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-c", "bd-b", "blocks", "tester")
+            .unwrap();
+
+        let labels = storage.get_all_labels().unwrap();
+        let (dependency_counts, dependent_counts) = storage.count_all_relation_counts().unwrap();
+        let metadata = storage.get_all_list_relation_metadata().unwrap();
+
+        for id in ["bd-a", "bd-b", "bd-c"] {
+            let entry = metadata.get(id);
+            assert_eq!(
+                entry
+                    .map(|metadata| metadata.labels.as_slice())
+                    .unwrap_or(&[]),
+                labels.get(id).map(Vec::as_slice).unwrap_or(&[])
+            );
+            assert_eq!(
+                entry.map_or(0, |metadata| metadata.dependency_count),
+                *dependency_counts.get(id).unwrap_or(&0)
+            );
+            assert_eq!(
+                entry.map_or(0, |metadata| metadata.dependent_count),
+                *dependent_counts.get(id).unwrap_or(&0)
+            );
+        }
     }
 
     #[test]
