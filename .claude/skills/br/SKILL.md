@@ -344,6 +344,8 @@ which br                     # Verify br is installed
 
 **"Database locked"**: Check for other `br` processes with `pgrep -f "br "`.
 
+**`NOT NULL constraint failed: issues_rebuild_tmp.<col>`** (post-upgrade): The schema rebuild path failed copying legacy NULL values into a stricter `NOT NULL DEFAULT ''` column. Diagnostic confirmation: `bv --robot-triage` still works against the same `.beads/` (it reads JSONL), only `br` itself crashes. Fixed in the COALESCE rebuild path (commit `0b0b233`). If you hit this on an older br binary, upgrade — don't try to manually patch the DB; the fix is in the writer's startup migration, the data is fine.
+
 **Worktree error** (`'main' is already checked out`):
 ```bash
 git branch beads-sync main
