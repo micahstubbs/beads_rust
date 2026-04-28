@@ -861,10 +861,18 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
 
     // Copy only columns that exist in the source table so SQLite can apply
     // declared defaults for newer columns that are absent in legacy schemas.
+    //
+    // For columns the canonical schema declares `NOT NULL DEFAULT <literal>`,
+    // wrap the SELECT reference in COALESCE so legacy rows holding NULL (e.g.
+    // columns added by an older br via ALTER TABLE without a backfill) get
+    // substituted with the canonical default rather than tripping the new
+    // table's NOT NULL constraint during the temp-table INSERT.
     let mut projected_columns = Vec::new();
-    for (col_name, _) in &all_expected {
+    let mut projected_select_exprs = Vec::new();
+    for (col_name, col_def) in &all_expected {
         if existing_columns.iter().any(|c| c == col_name) {
             projected_columns.push((*col_name).to_string());
+            projected_select_exprs.push(rebuild_select_expr(col_name, col_def));
         }
     }
 
@@ -876,8 +884,9 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
 
     // Copy data out to the temp table.
     let copy_out_sql = format!(
-        "INSERT INTO issues_rebuild_tmp ({cols}) SELECT {cols} FROM issues",
-        cols = projected_columns.join(", ")
+        "INSERT INTO issues_rebuild_tmp ({cols}) SELECT {exprs} FROM issues",
+        cols = projected_columns.join(", "),
+        exprs = projected_select_exprs.join(", ")
     );
     conn.execute(&copy_out_sql)?;
 
@@ -898,6 +907,51 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
     conn.execute("DROP TABLE issues_rebuild_tmp")?;
 
     Ok(())
+}
+
+/// Build the SELECT expression for one column during the issues-table
+/// rebuild copy. For columns whose canonical definition is
+/// `NOT NULL DEFAULT <literal>`, returns `COALESCE("col", <literal>)` so
+/// legacy NULL data does not trip the new strict schema. Returns the bare
+/// column name for nullable columns or columns whose default is a non-literal
+/// expression (e.g. CURRENT_TIMESTAMP) — those pass through unchanged.
+fn rebuild_select_expr(col_name: &str, col_def: &str) -> String {
+    match parse_not_null_default_literal(col_def) {
+        Some(default) => format!("COALESCE({col_name}, {default})"),
+        None => col_name.to_string(),
+    }
+}
+
+/// Extract the literal default value from a `NOT NULL DEFAULT <literal>`
+/// column definition. Returns `None` for nullable columns or for non-literal
+/// defaults (CURRENT_TIMESTAMP, expressions). Recognised literals: single-quoted
+/// strings (`'open'`, `''`, `'.'`) and signed integers (`0`, `-1`, `2`).
+fn parse_not_null_default_literal(col_def: &str) -> Option<String> {
+    let upper = col_def.to_uppercase();
+    if !upper.contains("NOT NULL") {
+        return None;
+    }
+    let default_idx = upper.find("DEFAULT")?;
+    let after = col_def[default_idx + "DEFAULT".len()..].trim_start();
+
+    if let Some(rest) = after.strip_prefix('\'') {
+        // String literal terminated by the next single quote. Our column defs
+        // do not embed escaped quotes, so a simple find suffices.
+        let end = rest.find('\'')?;
+        return Some(format!("'{}'", &rest[..end]));
+    }
+
+    if after.starts_with(|c: char| c.is_ascii_digit() || c == '-') {
+        let end = after
+            .find(|c: char| !c.is_ascii_digit() && c != '-')
+            .unwrap_or(after.len());
+        let value = &after[..end];
+        if !value.is_empty() && value != "-" {
+            return Some(value.to_string());
+        }
+    }
+
+    None
 }
 
 fn kv_table_uses_primary_key(conn: &Connection, table: &str) -> bool {
@@ -2278,6 +2332,121 @@ mod tests {
                 "missing column {column}"
             );
         }
+    }
+
+    #[test]
+    fn test_parse_not_null_default_literal_recognises_canonical_defs() {
+        // Strings
+        assert_eq!(
+            parse_not_null_default_literal("TEXT NOT NULL DEFAULT ''"),
+            Some("''".to_string())
+        );
+        assert_eq!(
+            parse_not_null_default_literal("TEXT NOT NULL DEFAULT 'open'"),
+            Some("'open'".to_string())
+        );
+        assert_eq!(
+            parse_not_null_default_literal("TEXT NOT NULL DEFAULT '.'"),
+            Some("'.'".to_string())
+        );
+        // Integers (with and without trailing CHECK)
+        assert_eq!(
+            parse_not_null_default_literal("INTEGER NOT NULL DEFAULT 0"),
+            Some("0".to_string())
+        );
+        assert_eq!(
+            parse_not_null_default_literal(
+                "INTEGER NOT NULL DEFAULT 2 CHECK(priority >= 0 AND priority <= 4)"
+            ),
+            Some("2".to_string())
+        );
+        // Nullable columns: skipped
+        assert_eq!(parse_not_null_default_literal("TEXT"), None);
+        assert_eq!(parse_not_null_default_literal("TEXT DEFAULT ''"), None);
+        // Non-literal defaults: skipped (legacy NULLs there will still fail loudly,
+        // which is fine — created_at/updated_at NULLs are corruption, not legacy data)
+        assert_eq!(
+            parse_not_null_default_literal("DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+            None
+        );
+        // PRIMARY KEY (implicit NOT NULL but no DEFAULT clause): skipped
+        assert_eq!(parse_not_null_default_literal("TEXT PRIMARY KEY"), None);
+        // NOT NULL without DEFAULT (e.g., title): skipped
+        assert_eq!(
+            parse_not_null_default_literal("TEXT NOT NULL CHECK(length(title) <= 500)"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_rebuild_issues_table_coalesces_null_text_defaults() {
+        // Regression for the upgrade path where legacy databases hold NULL
+        // values in columns that the canonical schema declares
+        // `TEXT NOT NULL DEFAULT ''`. Without COALESCE in the rebuild copy,
+        // the temp-table INSERT fails with `NOT NULL constraint failed:
+        // issues_rebuild_tmp.design`.
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("legacy-nulls.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+
+        // Legacy schema: canonical column names but NO `NOT NULL` on the
+        // text fields, so NULLs are allowed.
+        execute_batch(
+            &conn,
+            r"
+            CREATE TABLE issues (
+                id TEXT PRIMARY KEY,
+                content_hash TEXT,
+                title TEXT NOT NULL,
+                description TEXT,
+                design TEXT,
+                acceptance_criteria TEXT,
+                notes TEXT,
+                status TEXT DEFAULT 'open',
+                priority INTEGER DEFAULT 2,
+                issue_type TEXT DEFAULT 'task',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                source_repo TEXT
+            );
+            INSERT INTO issues (id, title) VALUES ('bd-1', 'has nulls');
+            ",
+        )
+        .unwrap();
+
+        rebuild_issues_table(&conn).expect("rebuild must succeed despite NULL legacy data");
+
+        let row = conn
+            .query_row(
+                "SELECT description, design, acceptance_criteria, notes, source_repo \
+                 FROM issues WHERE id = 'bd-1'",
+            )
+            .unwrap();
+        assert_eq!(
+            row.get(0).and_then(SqliteValue::as_text),
+            Some(""),
+            "description NULL should be coalesced to ''"
+        );
+        assert_eq!(
+            row.get(1).and_then(SqliteValue::as_text),
+            Some(""),
+            "design NULL should be coalesced to ''"
+        );
+        assert_eq!(
+            row.get(2).and_then(SqliteValue::as_text),
+            Some(""),
+            "acceptance_criteria NULL should be coalesced to ''"
+        );
+        assert_eq!(
+            row.get(3).and_then(SqliteValue::as_text),
+            Some(""),
+            "notes NULL should be coalesced to ''"
+        );
+        assert_eq!(
+            row.get(4).and_then(SqliteValue::as_text),
+            Some("."),
+            "source_repo NULL should be coalesced to '.'"
+        );
     }
 
     #[test]
