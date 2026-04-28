@@ -1,4 +1,4 @@
-Emit JSON Schemas for br output types (for agent/tooling integration)
+Emit JSON Schemas and per-command output envelope shapes (for agent/tooling integration)
 
 IMPORTANT: br schema is not a stable API and is subject to change. Use at your own risk.
 
@@ -9,7 +9,7 @@ Arguments:
           Which schema to emit
 
           Possible values:
-          - all:               Emit a bundle containing all schemas
+          - all:               Emit a bundle containing all schemas and the per-command shape map
           - issue:             Core Issue object (used by many commands)
           - issue-with-counts: List/search row: Issue + dependency/dependent counts
           - issue-details:     Show view: Issue + relations/comments/events
@@ -19,6 +19,7 @@ Arguments:
           - tree-node:         Dependency tree node
           - statistics:        Stats output
           - error:             Structured error envelope (stderr JSON when robot mode or non-TTY)
+          - commands:          Per-command JSON output envelope map (top-level shape + jq filter per command)
 
           [default: all]
 

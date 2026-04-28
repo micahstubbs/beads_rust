@@ -30,7 +30,7 @@ Commands:
   query        Manage saved queries
   ready        List ready issues (open, unblocked, not deferred)
   reopen       Reopen an issue
-  schema       Emit JSON Schemas for br output types (for agent/tooling integration)
+  schema       Emit JSON Schemas and per-command output envelope shapes (for agent/tooling integration)
   search       Search issues
   show         Show issue details
   stale        List stale issues
