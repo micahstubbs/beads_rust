@@ -52,18 +52,16 @@ fn append_label_membership_filters(
     labels_and: &[String],
     labels_or: &[String],
 ) {
-    match labels_and {
-        [] => {}
-        [label] => {
-            sql.push_str(" AND issues.id IN (SELECT issue_id FROM labels WHERE label = ?)");
-            params.push(SqliteValue::from(label.as_str()));
-        }
-        _ => {
-            for label in labels_and {
-                sql.push_str(" AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label = ?)");
-                params.push(SqliteValue::from(label.as_str()));
-            }
-        }
+    // Use EXISTS uniformly for both single- and multi-label cases. The IN
+    // (SELECT ...) form returns empty when combined with another IN (?)
+    // predicate (e.g. issue_type IN (?)) under fsqlite's query planner — the
+    // EXISTS form sidesteps the planner bug. See test
+    // test_list_issues_combined_type_and_label_filters for the regression.
+    for label in labels_and {
+        sql.push_str(
+            " AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label = ?)",
+        );
+        params.push(SqliteValue::from(label.as_str()));
     }
 
     if !labels_or.is_empty() {
