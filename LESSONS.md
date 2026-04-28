@@ -120,3 +120,72 @@ let copy_out_sql = format!(
 - **Empty diff = obsolete commit**: During rebase, after resolving conflicts in favor of HEAD, an empty `git diff --cached HEAD` is the unambiguous signal to `--skip` rather than `--continue`. Saves dozens of bad merges across long rebases.
 - **DEFAULT is for omission, not NULL**: SQL DEFAULT clauses fire on column omission or ALTER TABLE ADD backfills. They do NOT fire when an explicit `INSERT...SELECT` pushes a literal NULL into a `NOT NULL DEFAULT 'x'` column. Schema-tightening migrations must COALESCE on the SELECT side.
 - **Sidecar surviving = data path bug, not data loss**: When a read-only sidecar (bv) shows correct data but the writer (br) crashes on open, the bug is in the writer's startup/migration path. Don't panic-restore; the data is fine.
+
+## 2026-04-28T11:10 - Same-Issue Self-Collision After AUTOINCREMENT Re-allocation
+
+**Problem**: `br doctor --repair` and `br sync --import-only --force` both crashed with `internal error: VDBE halted with code 19: PRIMARY KEY constraint failed` while rebuilding the SQLite DB from a healthy 776-record JSONL. Validation passed (`OK jsonl.parse: Parsed 775 records`), the DB was freshly created, and the source JSONL had no top-level duplicate keys — yet the rebuild crashed every time.
+
+**Root Cause**: `sync_comments_for_import` had a defensive check at `src/storage/sqlite.rs:8255` that routed colliding-id inserts through AUTOINCREMENT — but ONLY when the existing row was on a *different* issue (`existing_issue_id != issue_id`). With a corrupt JSONL where two issues claim the same `comment.id`, the first claimant gets its id AUTO-reallocated. The AUTO-allocated id is `max(seq, max(id)) + 1`, which can land in the range of *future* JSONL-provided ids. When a later issue's comments array contains that allocated id as its own JSONL id, the check sees a colliding row owned by the same issue, falls through to the WITH-id INSERT branch, and crashes on the row that was just AUTO-allocated.
+
+**Lesson**: Defensive collision routing must consider self-induced collisions, not just collisions with pre-existing data. The instinct to write `existing_issue_id != issue_id` is "another issue owns it; sidestep" — but the same logic skipped over "I just took that slot myself with an auto-allocated id." When a function loops over inputs and may mutate state that future iterations read, treat the function's own intermediate writes as part of the conflict surface.
+
+**Code Issue**:
+```rust
+// Before (broken): "different issue" check is too narrow
+if colliding_issue_id
+    .as_deref()
+    .is_some_and(|existing_issue_id| existing_issue_id != issue_id)
+    || comment.id <= 0
+{
+    // AUTOINCREMENT path
+} else {
+    // WITH-id INSERT — fails when "issue_id" is THIS call's own
+    // earlier AUTO-allocated row that happens to occupy comment.id.
+}
+
+// After (fixed): if any row owns the slot, route through AUTO
+if colliding_issue_id.is_some() || comment.id <= 0 {
+    // AUTOINCREMENT path
+}
+```
+
+**Solution**: Drop the narrow `existing != issue_id` predicate. The `DELETE FROM comments WHERE issue_id = ?` at the top of the function clears any prior rows for THIS issue from the *previous* call; any remaining colliding row inside the loop is either another issue's row or this issue's just-auto-allocated row — AUTO is the correct path in both cases. See commit 4651396.
+
+**Prevention**:
+- When a defensive check sidesteps "rows owned by someone else", explicitly think about self-induced collisions: rows this call has written that future iterations of the same call will encounter.
+- A regression test that exercises self-collision is hard to build without deliberately pinning the AUTOINCREMENT counter (see `test_sync_comments_for_import_handles_same_issue_self_collision_after_auto_realloc` in src/storage/sqlite.rs). Pre-seed via `add_comment` to advance `sqlite_sequence`, then call the function with comment ids that intersect the auto-allocation range.
+
+## 2026-04-28T12:00 - Library Bug That Only Fires With Bound Parameters, Not Inlined SQL
+
+**Problem**: `list_issues(types=[Task], labels=[core])` returned `[]` against fsqlite, even though both filter clauses individually returned the matching row. The downstream test `test_list_issues_combined_type_and_label_filters` had been failing on `main` for some time; my first instinct was a beads_rust SQL-construction bug, but per-clause bisect showed the SQL was correct and the planner was returning empty. Filed it upstream as fsqlite#76 with an inlined-string repro, then tried to reproduce it in fsqlite's own test harness — and the inlined-string repro **passed**. The bug seemed to evaporate.
+
+**Root Cause**: The bug only fires when both `IN (?)` literals are bound parameters via `query_with_params`. With inlined string literals (`label = 'core'` and `IN ('task')`), the planner chooses a different path that doesn't trigger the bug. beads_rust uses `query_with_params` exclusively for safety; fsqlite's own internal tests use inlined strings; that's why upstream's test suite never caught it.
+
+**Lesson**: When a SQL bug "doesn't reproduce" against a library's own test harness, check whether the harness uses the *same calling shape* as the failing call. Inlined SQL and parameterized SQL go through different planner paths — same logical query, different IR. A test that exercises the bug shape via inlined strings is a *different test* from one that exercises it via bind parameters, even if the SQL text matches after substitution.
+
+**Code Issue**:
+```rust
+// Inlined — works on fsqlite 0.1.2 (planner picks safe path)
+conn.query("SELECT id FROM t WHERE id IN (SELECT issue_id FROM labels WHERE label = 'core') AND issue_type IN ('task')")
+
+// Parameterized — returns [] on fsqlite 0.1.2 (planner bug)
+conn.query_with_params(
+    "SELECT id FROM t WHERE id IN (SELECT issue_id FROM labels WHERE label = ?) AND issue_type IN (?)",
+    &[SqliteValue::from("core"), SqliteValue::from("task")],
+)
+```
+
+**Solution**: Two parts:
+1. Workaround in beads_rust: switch `append_label_membership_filters` to use `EXISTS (...)` uniformly, dodging the planner's troubled path entirely (commit a0b45bd).
+2. Filed upstream — and discovered the bug is *already fixed on fsqlite main* (HEAD `e5c83f11`), just not yet released as 0.1.3. Opened upstream PR #77 with a regression test covering both inlined AND parameterized variants so the fix doesn't silently regress.
+
+**Prevention**:
+- When writing regression tests for SQL bugs, cover BOTH inlined and parameterized variants. They exercise different planner code.
+- When investigating a downstream library bug, before diving into the library source: rebuild against the library's `main` branch (or git HEAD) to see if the bug is already fixed. fsqlite's published 0.1.2 was 5+ weeks behind main; my workaround was real but the upstream fix had already shipped.
+- A library can have the same `version =` field on crates.io and on `main` while the code differs significantly. "Same version" is necessary but not sufficient evidence that you're testing the same code.
+
+## More Meta-Lessons
+
+- **Loops mutate the conflict surface they iterate over**: When a function loops over inputs and writes to a table that future iterations read, the function's own intermediate writes are part of the conflict surface. "Owner != me" checks must include "owner == me from earlier in this same call."
+- **Inlined vs parameterized SQL = different code paths**: A SQL bug that doesn't reproduce against a library's tests may be hiding behind the calling shape. Inlined string literals and bind parameters go through different planner phases, even when the resulting query is logically identical. Always test both shapes for SQL bugs.
+- **Check `main`, not just the published version**: Before fixing an upstream library bug, build against the upstream `main` branch — not just the latest published version. A library can have the same `version =` field on crates.io and in its repo while the code differs significantly. The fix you're about to write may already be one merged-but-unreleased commit away.
