@@ -126,6 +126,18 @@ enum ReadyIssueProjection {
     Command,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ReadyFlagPredicate {
+    ExactFalse,
+    LegacyNullAsFalse,
+}
+
+#[derive(Clone, Copy)]
+enum ReadyPriorityBucket {
+    High,
+    Low,
+}
+
 struct IssueDetailRelationPresence {
     has_labels: bool,
     has_dependencies: bool,
@@ -2801,6 +2813,12 @@ impl SqliteStorage {
         sort: ReadySortPolicy,
         projection: ReadyIssueProjection,
     ) -> Result<Vec<Issue>> {
+        let flag_predicate = if self.ready_filter_columns_are_not_null() {
+            ReadyFlagPredicate::ExactFalse
+        } else {
+            ReadyFlagPredicate::LegacyNullAsFalse
+        };
+
         // Read-only path: if the cache is stale, compute blocked IDs in memory
         // instead of persisting (issue #216 — read ops must not write).
         if self.blocked_cache_marked_stale()? {
@@ -2813,12 +2831,18 @@ impl SqliteStorage {
                 sort,
                 &blocked_ids,
                 projection,
+                flag_predicate,
             );
         }
 
-        match self
-            .query_ready_issue_candidates_with_projection(filters, sort, true, true, projection)
-        {
+        match self.query_ready_issue_candidates_dispatch(
+            filters,
+            sort,
+            true,
+            true,
+            projection,
+            flag_predicate,
+        ) {
             Ok(issues) => Ok(issues),
             Err(error) => {
                 let blocked_ids = self.recover_blocked_ids("ready_issues_query", &error)?;
@@ -2827,9 +2851,102 @@ impl SqliteStorage {
                     sort,
                     &blocked_ids,
                     projection,
+                    flag_predicate,
                 )
             }
         }
+    }
+
+    fn ready_filter_columns_are_not_null(&self) -> bool {
+        let Ok(rows) = self.conn.query("PRAGMA table_info(issues)") else {
+            return false;
+        };
+
+        ["ephemeral", "pinned", "is_template"]
+            .into_iter()
+            .all(|column| {
+                rows.iter().any(|row| {
+                    row.get(1).and_then(SqliteValue::as_text) == Some(column)
+                        && row.get(3).and_then(SqliteValue::as_integer).unwrap_or(0) != 0
+                })
+            })
+    }
+
+    fn query_ready_issue_candidates_dispatch(
+        &self,
+        filters: &ReadyFilters,
+        sort: ReadySortPolicy,
+        exclude_blocked_in_sql: bool,
+        apply_limit: bool,
+        projection: ReadyIssueProjection,
+        flag_predicate: ReadyFlagPredicate,
+    ) -> Result<Vec<Issue>> {
+        if sort == ReadySortPolicy::Hybrid && flag_predicate == ReadyFlagPredicate::ExactFalse {
+            return self.query_ready_hybrid_issue_candidates_with_projection(
+                filters,
+                exclude_blocked_in_sql,
+                apply_limit,
+                projection,
+                flag_predicate,
+            );
+        }
+
+        self.query_ready_issue_candidates_with_projection(
+            filters,
+            sort,
+            exclude_blocked_in_sql,
+            apply_limit,
+            projection,
+            flag_predicate,
+            None,
+        )
+    }
+
+    fn query_ready_hybrid_issue_candidates_with_projection(
+        &self,
+        filters: &ReadyFilters,
+        exclude_blocked_in_sql: bool,
+        apply_limit: bool,
+        projection: ReadyIssueProjection,
+        flag_predicate: ReadyFlagPredicate,
+    ) -> Result<Vec<Issue>> {
+        let sql_limit = filters.limit.filter(|limit| apply_limit && *limit > 0);
+        let mut high_filters = filters.clone();
+        high_filters.limit = sql_limit;
+
+        let mut issues = self.query_ready_issue_candidates_with_projection(
+            &high_filters,
+            ReadySortPolicy::Hybrid,
+            exclude_blocked_in_sql,
+            apply_limit,
+            projection,
+            flag_predicate,
+            Some(ReadyPriorityBucket::High),
+        )?;
+
+        if let Some(limit) = sql_limit {
+            if issues.len() >= limit {
+                issues.truncate(limit);
+                return Ok(issues);
+            }
+        }
+
+        let mut low_filters = filters.clone();
+        if let Some(limit) = sql_limit {
+            low_filters.limit = Some(limit - issues.len());
+        }
+
+        let mut low_issues = self.query_ready_issue_candidates_with_projection(
+            &low_filters,
+            ReadySortPolicy::Hybrid,
+            exclude_blocked_in_sql,
+            apply_limit,
+            projection,
+            flag_predicate,
+            Some(ReadyPriorityBucket::Low),
+        )?;
+        issues.append(&mut low_issues);
+        Ok(issues)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2839,6 +2956,8 @@ impl SqliteStorage {
         exclude_blocked_in_sql: bool,
         apply_limit: bool,
         projection: ReadyIssueProjection,
+        flag_predicate: ReadyFlagPredicate,
+        priority_bucket: Option<ReadyPriorityBucket>,
     ) -> (String, Vec<SqliteValue>) {
         let mut sql = String::from(projection.select_clause());
         sql.push_str(" FROM issues WHERE 1=1");
@@ -2884,17 +3003,21 @@ impl SqliteStorage {
             sql.push_str(" AND (defer_until IS NULL OR datetime(defer_until) <= datetime('now'))");
         }
 
-        // Ready condition 4: not pinned. Legacy rows may still store NULL,
-        // which the rest of the storage layer treats as false.
-        sql.push_str(" AND (pinned = 0 OR pinned IS NULL)");
-
-        // Ready condition 5: not ephemeral and not wisp. Legacy rows may
-        // still store NULL, which should behave the same as false.
-        sql.push_str(" AND (ephemeral = 0 OR ephemeral IS NULL)");
+        match flag_predicate {
+            ReadyFlagPredicate::ExactFalse => {
+                sql.push_str(" AND pinned = 0");
+                sql.push_str(" AND ephemeral = 0");
+                sql.push_str(" AND is_template = 0");
+            }
+            ReadyFlagPredicate::LegacyNullAsFalse => {
+                // Legacy rows may still store NULL, which the rest of the
+                // storage layer treats as false.
+                sql.push_str(" AND (pinned = 0 OR pinned IS NULL)");
+                sql.push_str(" AND (ephemeral = 0 OR ephemeral IS NULL)");
+                sql.push_str(" AND (is_template = 0 OR is_template IS NULL)");
+            }
+        }
         sql.push_str(" AND id NOT LIKE '%-wisp-%'");
-
-        // Exclude templates
-        sql.push_str(" AND (is_template = 0 OR is_template IS NULL)");
 
         // Filter by types
         if let Some(ref types) = filters.types
@@ -2915,6 +3038,13 @@ impl SqliteStorage {
             let _ = write!(sql, " AND priority IN ({})", placeholders.join(","));
             for p in priorities {
                 params.push(SqliteValue::from(i64::from(p.0)));
+            }
+        }
+
+        if let Some(bucket) = priority_bucket {
+            match bucket {
+                ReadyPriorityBucket::High => sql.push_str(" AND priority <= 1"),
+                ReadyPriorityBucket::Low => sql.push_str(" AND priority > 1"),
             }
         }
 
@@ -2958,15 +3088,21 @@ impl SqliteStorage {
         }
 
         // Sorting
-        match sort {
-            ReadySortPolicy::Hybrid => {
-                sql.push_str(" ORDER BY CASE WHEN priority <= 1 THEN 0 ELSE 1 END, created_at ASC");
-            }
-            ReadySortPolicy::Priority => {
-                sql.push_str(" ORDER BY priority ASC, created_at ASC");
-            }
-            ReadySortPolicy::Oldest => {
-                sql.push_str(" ORDER BY created_at ASC");
+        if priority_bucket.is_some() {
+            sql.push_str(" ORDER BY created_at ASC");
+        } else {
+            match sort {
+                ReadySortPolicy::Hybrid => {
+                    sql.push_str(
+                        " ORDER BY CASE WHEN priority <= 1 THEN 0 ELSE 1 END, created_at ASC",
+                    );
+                }
+                ReadySortPolicy::Priority => {
+                    sql.push_str(" ORDER BY priority ASC, created_at ASC");
+                }
+                ReadySortPolicy::Oldest => {
+                    sql.push_str(" ORDER BY created_at ASC");
+                }
             }
         }
 
@@ -2993,6 +3129,8 @@ impl SqliteStorage {
         exclude_blocked_in_sql: bool,
         apply_limit: bool,
         projection: ReadyIssueProjection,
+        flag_predicate: ReadyFlagPredicate,
+        priority_bucket: Option<ReadyPriorityBucket>,
     ) -> Result<Vec<Issue>> {
         let (sql, params) = Self::build_ready_issue_candidates_query(
             filters,
@@ -3000,6 +3138,8 @@ impl SqliteStorage {
             exclude_blocked_in_sql,
             apply_limit,
             projection,
+            flag_predicate,
+            priority_bucket,
         );
         let rows = self.conn.query_with_params(&sql, &params)?;
         let mut issues = Vec::with_capacity(rows.len());
@@ -3016,9 +3156,15 @@ impl SqliteStorage {
         sort: ReadySortPolicy,
         blocked_ids: &HashSet<String>,
         projection: ReadyIssueProjection,
+        flag_predicate: ReadyFlagPredicate,
     ) -> Result<Vec<Issue>> {
-        let mut issues = self.query_ready_issue_candidates_with_projection(
-            filters, sort, false, false, projection,
+        let mut issues = self.query_ready_issue_candidates_dispatch(
+            filters,
+            sort,
+            false,
+            false,
+            projection,
+            flag_predicate,
         )?;
         issues.retain(|issue| !blocked_ids.contains(issue.id.as_str()));
         if let Some(limit) = filters.limit

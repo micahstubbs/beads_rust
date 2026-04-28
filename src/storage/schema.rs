@@ -90,6 +90,15 @@ pub const SCHEMA_SQL: &str = r"
         AND pinned = 0
         AND is_template = 0;
 
+    -- Hybrid ready order split path: P0/P1 by created_at, then all others
+    -- by created_at.  Keeps both bucket scans ordered without a temp sort.
+    CREATE INDEX IF NOT EXISTS idx_issues_ready_created
+        ON issues(status, created_at)
+        WHERE status = 'open'
+        AND ephemeral = 0
+        AND pinned = 0
+        AND is_template = 0;
+
     -- Common active list path: non-terminal issues sorted by priority/created_at.
     -- Uses ASC on created_at (not DESC) to avoid frankensqlite B-tree ordering
     -- divergence with C sqlite3 integrity_check.  SQLite reverse-scans the ASC
@@ -1270,6 +1279,13 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
             AND pinned = 0
             AND is_template = 0;
 
+        CREATE INDEX IF NOT EXISTS idx_issues_ready_created
+            ON issues(status, created_at)
+            WHERE status = 'open'
+            AND ephemeral = 0
+            AND pinned = 0
+            AND is_template = 0;
+
         -- Common active list path: non-terminal issues sorted by priority/created_at
         CREATE INDEX IF NOT EXISTS idx_issues_list_active_order
             ON issues(priority, created_at)
@@ -1905,6 +1921,10 @@ mod tests {
         assert!(
             indexes.contains("idx_issues_ready"),
             "missing idx_issues_ready composite index"
+        );
+        assert!(
+            indexes.contains("idx_issues_ready_created"),
+            "missing idx_issues_ready_created hybrid index"
         );
         assert!(
             indexes.contains("idx_issues_list_active_order"),
