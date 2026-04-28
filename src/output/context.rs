@@ -39,6 +39,8 @@ pub enum OutputMode {
     Quiet,
 }
 
+const JSON_OUTPUT_BUFFER_CAPACITY: usize = 128 * 1024;
+
 #[derive(Default)]
 struct CountingWriter {
     bytes: usize,
@@ -350,7 +352,7 @@ impl OutputContext {
         if self.is_json() {
             // Stream to stdout to avoid allocating large JSON strings.
             let stdout = io::stdout();
-            let mut out = io::BufWriter::new(stdout.lock());
+            let mut out = io::BufWriter::with_capacity(JSON_OUTPUT_BUFFER_CAPACITY, stdout.lock());
             if let Err(err) = serde_json::to_writer(&mut out, value) {
                 self.report_serialization_error("JSON", &err);
                 return;
@@ -369,7 +371,7 @@ impl OutputContext {
         } else if self.is_json() {
             // Stream to stdout to avoid allocating large JSON strings.
             let stdout = io::stdout();
-            let mut out = io::BufWriter::new(stdout.lock());
+            let mut out = io::BufWriter::with_capacity(JSON_OUTPUT_BUFFER_CAPACITY, stdout.lock());
             if let Err(err) = serde_json::to_writer_pretty(&mut out, value) {
                 self.report_serialization_error("JSON", &err);
                 return;
