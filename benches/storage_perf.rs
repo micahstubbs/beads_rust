@@ -199,6 +199,27 @@ fn configure_group<M: criterion::measurement::Measurement>(
     }
 }
 
+fn should_skip_group(group_name: &str) -> bool {
+    std::env::var("BENCH_ONLY_GROUP").is_ok_and(|only| group_name != only)
+}
+
+fn configured_sizes(defaults: &[usize], env_var: &str) -> Vec<usize> {
+    let Ok(raw) = std::env::var(env_var) else {
+        return defaults.to_vec();
+    };
+    let sizes: Vec<usize> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter_map(|value| value.parse().ok())
+        .collect();
+    if sizes.is_empty() {
+        defaults.to_vec()
+    } else {
+        sizes
+    }
+}
+
 // =============================================================================
 // Storage Operation Benchmarks
 // =============================================================================
@@ -207,6 +228,9 @@ fn configure_group<M: criterion::measurement::Measurement>(
 fn bench_create_single(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "storage/create";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -237,6 +261,9 @@ fn bench_create_single(c: &mut Criterion) {
 fn bench_create_batch(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "storage/create_batch";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -274,6 +301,9 @@ fn bench_create_batch(c: &mut Criterion) {
 fn bench_update_issue(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "storage/update";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -335,6 +365,9 @@ fn bench_update_issue(c: &mut Criterion) {
 fn bench_close_issue_with_reason(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "storage/close";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -376,6 +409,9 @@ fn bench_close_issue_with_reason(c: &mut Criterion) {
 fn bench_delete_issue(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "storage/delete";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -416,6 +452,9 @@ fn bench_delete_issue(c: &mut Criterion) {
 fn bench_list_issues(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "storage/list";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -444,6 +483,9 @@ fn bench_list_issues(c: &mut Criterion) {
 fn bench_list_issues_filtered(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "storage/list_filtered";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -475,6 +517,9 @@ fn bench_list_issues_filtered(c: &mut Criterion) {
 fn bench_ready_query(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "storage/ready";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -509,6 +554,9 @@ fn bench_ready_query(c: &mut Criterion) {
 fn bench_blocked_query(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "storage/blocked";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -544,11 +592,14 @@ fn bench_blocked_query(c: &mut Criterion) {
 fn bench_export(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "sync/export";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
 
-    for size in [100, 500, 1000, 2000, 5000, 10000] {
+    for size in configured_sizes(&[100, 500, 1000, 2000, 5000, 10000], "BENCH_SYNC_SIZES") {
         let (_dir, storage) = setup_db_with_issues(size);
 
         group.throughput(Throughput::Elements(size as u64));
@@ -572,11 +623,14 @@ fn bench_export(c: &mut Criterion) {
 fn bench_import(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "sync/import";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
 
-    for size in [100, 500, 1000, 2000, 5000, 10000] {
+    for size in configured_sizes(&[100, 500, 1000, 2000, 5000, 10000], "BENCH_SYNC_SIZES") {
         // Create source data
         let (_src_dir, src_storage) = setup_db_with_issues(size);
         let mut buffer = Cursor::new(Vec::new());
@@ -617,6 +671,9 @@ fn bench_import(c: &mut Criterion) {
 fn bench_dirty_tracking_mark(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "sync/dirty_mark";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -655,6 +712,9 @@ fn bench_dirty_tracking_mark(c: &mut Criterion) {
 fn bench_dirty_tracking_query(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "sync/dirty_query";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -700,6 +760,9 @@ fn bench_dirty_tracking_query(c: &mut Criterion) {
 fn bench_add_dependency(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "storage/add_dep";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -744,6 +807,9 @@ fn bench_add_dependency(c: &mut Criterion) {
 fn bench_cycle_detection(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "storage/cycle_detection";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -814,6 +880,9 @@ fn bench_generate_id(c: &mut Criterion) {
 
     init_bench_logging();
     let group_name = "id/generate";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -866,6 +935,9 @@ fn bench_resolve_id_prefix(c: &mut Criterion) {
 
     init_bench_logging();
     let group_name = "id/resolve_prefix";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -904,6 +976,9 @@ fn bench_id_hash(c: &mut Criterion) {
 
     init_bench_logging();
     let group_name = "id/hash";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -931,6 +1006,9 @@ fn bench_content_hash(c: &mut Criterion) {
 
     init_bench_logging();
     let group_name = "id/content_hash";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -974,6 +1052,9 @@ fn bench_content_hash(c: &mut Criterion) {
 fn bench_search(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "storage/search";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
