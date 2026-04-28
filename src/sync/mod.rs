@@ -2118,110 +2118,145 @@ pub fn compute_staleness_refreshing_witnesses(
     Ok(staleness)
 }
 
+/// Check whether auto-import needs to inspect the JSONL contents.
+///
+/// This is the read-command startup fast path: when JSONL is not newer, callers
+/// do not need dirty-count or pending-flush state because no import can happen.
+/// If JSONL may be newer, `auto_import_if_stale` recomputes the full staleness
+/// record before deciding whether a local dirty DB should block import.
+///
+/// # Errors
+///
+/// Returns an error if reading JSONL metadata, stored witnesses, or hashing
+/// fails. Opportunistic witness refresh failures are logged and ignored.
+pub fn auto_import_probe_refreshing_witnesses(
+    storage: &mut SqliteStorage,
+    jsonl_path: &Path,
+) -> Result<bool> {
+    let probe = compute_jsonl_newer_impl(storage, jsonl_path)?;
+    if let Some(observed) = probe.refresh_witness {
+        refresh_jsonl_witness_best_effort(storage, jsonl_path, &observed);
+    }
+    Ok(probe.jsonl_newer)
+}
+
 fn compute_staleness_impl(
     storage: &SqliteStorage,
     jsonl_path: &Path,
 ) -> Result<(StalenessCheck, Option<JsonlWitness>)> {
     let jsonl_exists = jsonl_path.exists();
     let (dirty_count, _needs_flush, db_newer) = pending_export_state(storage, jsonl_exists)?;
-    let mut refresh_witness = None;
-
-    let (jsonl_mtime, jsonl_newer) = if jsonl_exists {
-        let observed = observed_jsonl_witness(jsonl_path)?;
-        let stored_mtime = storage.get_metadata(METADATA_JSONL_MTIME)?;
-        let stored_size = storage.get_metadata(METADATA_JSONL_SIZE)?;
-        let stored_hash = storage.get_metadata(METADATA_JSONL_CONTENT_HASH)?;
-
-        if stored_mtime.as_deref() == Some(observed.mtime_witness.as_str()) {
-            let stored_size_matches =
-                stored_size.as_deref().and_then(parse_jsonl_size_witness) == Some(observed.size);
-            let jsonl_newer = if stored_size_matches {
-                stored_hash.is_none()
-            } else {
-                stored_hash.as_ref().is_none_or(|hash| {
-                    compute_jsonl_hash(jsonl_path)
-                        .map_or(true, |current_hash| &current_hash != hash)
-                })
-            };
-
-            if !jsonl_newer && stored_hash.is_some() && !stored_size_matches {
-                refresh_witness = Some(observed.clone());
-            }
-
-            return Ok((
-                StalenessCheck {
-                    dirty_count,
-                    jsonl_exists: true,
-                    jsonl_mtime: Some(observed.mtime),
-                    jsonl_newer,
-                    db_newer,
-                },
-                refresh_witness,
-            ));
-        }
-
-        let last_import_time = storage.get_metadata(METADATA_LAST_IMPORT_TIME)?;
-        let last_export_time = storage.get_metadata(METADATA_LAST_EXPORT_TIME)?;
-
-        // Get the latest known sync time (either import or export)
-        let mut latest_sync_ts: Option<chrono::DateTime<Utc>> = None;
-
-        if let Some(import_time) = &last_import_time
-            && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(import_time)
-        {
-            latest_sync_ts = Some(ts.with_timezone(&Utc));
-        }
-
-        if let Some(export_time) = &last_export_time
-            && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(export_time)
-        {
-            let ts_utc = ts.with_timezone(&Utc);
-            if latest_sync_ts.is_none_or(|latest| ts_utc > latest) {
-                latest_sync_ts = Some(ts_utc);
-            }
-        }
-
-        // JSONL is newer if it was modified after the latest sync
-        // If metadata is missing or invalid, assume JSONL is newer (safe default)
-        let mtime_newer = latest_sync_ts.is_none_or(|sync_ts| {
-            let sync_sys_time = std::time::SystemTime::from(sync_ts);
-            observed.mtime > sync_sys_time
-        });
-
-        let jsonl_newer = if mtime_newer {
-            stored_hash.as_ref().is_none_or(|stored_hash| {
-                compute_jsonl_hash(jsonl_path)
-                    .map_or(true, |current_hash| &current_hash != stored_hash)
-            })
-        } else {
-            false
-        };
-
-        if !jsonl_newer && stored_hash.is_some() {
-            let stored_size_matches =
-                stored_size.as_deref().and_then(parse_jsonl_size_witness) == Some(observed.size);
-            if stored_mtime.as_deref() != Some(observed.mtime_witness.as_str())
-                || !stored_size_matches
-            {
-                refresh_witness = Some(observed.clone());
-            }
-        }
-
-        (Some(observed.mtime), jsonl_newer)
-    } else {
-        (None, false)
-    };
+    let probe = compute_jsonl_newer_impl(storage, jsonl_path)?;
 
     Ok((
         StalenessCheck {
             dirty_count,
-            jsonl_exists,
-            jsonl_mtime,
-            jsonl_newer,
+            jsonl_exists: probe.jsonl_exists,
+            jsonl_mtime: probe.jsonl_mtime,
+            jsonl_newer: probe.jsonl_newer,
             db_newer,
         },
-        refresh_witness,
+        probe.refresh_witness,
     ))
+}
+
+struct JsonlNewerProbe {
+    jsonl_exists: bool,
+    jsonl_mtime: Option<std::time::SystemTime>,
+    jsonl_newer: bool,
+    refresh_witness: Option<JsonlWitness>,
+}
+
+fn compute_jsonl_newer_impl(storage: &SqliteStorage, jsonl_path: &Path) -> Result<JsonlNewerProbe> {
+    if !jsonl_path.exists() {
+        return Ok(JsonlNewerProbe {
+            jsonl_exists: false,
+            jsonl_mtime: None,
+            jsonl_newer: false,
+            refresh_witness: None,
+        });
+    }
+
+    let observed = observed_jsonl_witness(jsonl_path)?;
+    let stored_mtime = storage.get_metadata(METADATA_JSONL_MTIME)?;
+    let stored_size = storage.get_metadata(METADATA_JSONL_SIZE)?;
+    let stored_hash = storage.get_metadata(METADATA_JSONL_CONTENT_HASH)?;
+    let mut refresh_witness = None;
+
+    if stored_mtime.as_deref() == Some(observed.mtime_witness.as_str()) {
+        let stored_size_matches =
+            stored_size.as_deref().and_then(parse_jsonl_size_witness) == Some(observed.size);
+        let jsonl_newer = if stored_size_matches {
+            stored_hash.is_none()
+        } else {
+            stored_hash.as_ref().is_none_or(|hash| {
+                compute_jsonl_hash(jsonl_path).map_or(true, |current_hash| &current_hash != hash)
+            })
+        };
+
+        if !jsonl_newer && stored_hash.is_some() && !stored_size_matches {
+            refresh_witness = Some(observed.clone());
+        }
+
+        return Ok(JsonlNewerProbe {
+            jsonl_exists: true,
+            jsonl_mtime: Some(observed.mtime),
+            jsonl_newer,
+            refresh_witness,
+        });
+    }
+
+    let last_import_time = storage.get_metadata(METADATA_LAST_IMPORT_TIME)?;
+    let last_export_time = storage.get_metadata(METADATA_LAST_EXPORT_TIME)?;
+
+    // Get the latest known sync time (either import or export)
+    let mut latest_sync_ts: Option<chrono::DateTime<Utc>> = None;
+
+    if let Some(import_time) = &last_import_time
+        && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(import_time)
+    {
+        latest_sync_ts = Some(ts.with_timezone(&Utc));
+    }
+
+    if let Some(export_time) = &last_export_time
+        && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(export_time)
+    {
+        let ts_utc = ts.with_timezone(&Utc);
+        if latest_sync_ts.is_none_or(|latest| ts_utc > latest) {
+            latest_sync_ts = Some(ts_utc);
+        }
+    }
+
+    // JSONL is newer if it was modified after the latest sync.
+    // If metadata is missing or invalid, assume JSONL is newer (safe default).
+    let mtime_newer = latest_sync_ts.is_none_or(|sync_ts| {
+        let sync_sys_time = std::time::SystemTime::from(sync_ts);
+        observed.mtime > sync_sys_time
+    });
+
+    let jsonl_newer = if mtime_newer {
+        stored_hash.as_ref().is_none_or(|stored_hash| {
+            compute_jsonl_hash(jsonl_path).map_or(true, |current_hash| &current_hash != stored_hash)
+        })
+    } else {
+        false
+    };
+
+    if !jsonl_newer && stored_hash.is_some() {
+        let stored_size_matches =
+            stored_size.as_deref().and_then(parse_jsonl_size_witness) == Some(observed.size);
+        if stored_mtime.as_deref() != Some(observed.mtime_witness.as_str()) || !stored_size_matches
+        {
+            refresh_witness = Some(observed.clone());
+        }
+    }
+
+    Ok(JsonlNewerProbe {
+        jsonl_exists: true,
+        jsonl_mtime: Some(observed.mtime),
+        jsonl_newer,
+        refresh_witness,
+    })
 }
 
 #[cfg(test)]
