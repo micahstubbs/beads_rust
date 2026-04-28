@@ -13066,6 +13066,70 @@ mod tests {
     }
 
     #[test]
+    fn test_get_ready_issues_hybrid_sort_and_limit() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let base = Utc.with_ymd_and_hms(2026, 3, 12, 0, 0, 0).unwrap();
+
+        for issue in [
+            make_issue("bd-low-old", "Low old", Status::Open, 4, None, base, None),
+            make_issue(
+                "bd-high-old",
+                "High old",
+                Status::Open,
+                1,
+                None,
+                base + chrono::Duration::seconds(1),
+                None,
+            ),
+            make_issue(
+                "bd-critical-new",
+                "Critical new",
+                Status::Open,
+                0,
+                None,
+                base + chrono::Duration::seconds(2),
+                None,
+            ),
+            make_issue(
+                "bd-low-new",
+                "Low new",
+                Status::Open,
+                2,
+                None,
+                base + chrono::Duration::seconds(3),
+                None,
+            ),
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        let ids: Vec<String> = storage
+            .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Hybrid)
+            .unwrap()
+            .into_iter()
+            .map(|issue| issue.id)
+            .collect();
+        assert_eq!(
+            ids,
+            ["bd-high-old", "bd-critical-new", "bd-low-old", "bd-low-new"]
+        );
+
+        let limited_ids: Vec<String> = storage
+            .get_ready_issues(
+                &ReadyFilters {
+                    limit: Some(2),
+                    ..ReadyFilters::default()
+                },
+                ReadySortPolicy::Hybrid,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|issue| issue.id)
+            .collect();
+        assert_eq!(limited_ids, ["bd-high-old", "bd-critical-new"]);
+    }
+
+    #[test]
     fn test_get_ready_issues_excludes_in_progress() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc::now();
