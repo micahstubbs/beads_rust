@@ -68,28 +68,28 @@ fn test_rebuild_blocked_cache_crash_with_multiple_parents() {
 
     // Create blockers D and E (open status)
     storage
-        .create_issue(&make_issue("bd-D", "Blocker D"), "test")
+        .create_issue(&make_issue("bd-d", "Blocker D"), "test")
         .unwrap();
     storage
-        .create_issue(&make_issue("bd-E", "Blocker E"), "test")
+        .create_issue(&make_issue("bd-e", "Blocker E"), "test")
         .unwrap();
 
     // Create parents B and C
     storage
-        .create_issue(&make_issue("bd-B", "Parent B"), "test")
+        .create_issue(&make_issue("bd-b", "Parent B"), "test")
         .unwrap();
     storage
-        .create_issue(&make_issue("bd-C", "Parent C"), "test")
+        .create_issue(&make_issue("bd-c", "Parent C"), "test")
         .unwrap();
 
     // Create child A
     storage
-        .create_issue(&make_issue("bd-A", "Child A"), "test")
+        .create_issue(&make_issue("bd-a", "Child A"), "test")
         .unwrap();
 
     // Make B blocked by D
     storage
-        .add_dependency("bd-B", "bd-D", "blocks", "test")
+        .add_dependency("bd-b", "bd-d", "blocks", "test")
         .unwrap();
     storage
         .rebuild_blocked_cache(true)
@@ -97,7 +97,7 @@ fn test_rebuild_blocked_cache_crash_with_multiple_parents() {
 
     // Make C blocked by E
     storage
-        .add_dependency("bd-C", "bd-E", "blocks", "test")
+        .add_dependency("bd-c", "bd-e", "blocks", "test")
         .unwrap();
     storage
         .rebuild_blocked_cache(true)
@@ -108,20 +108,20 @@ fn test_rebuild_blocked_cache_crash_with_multiple_parents() {
     // around the same mutations that `br dep add` triggers through storage-owned
     // cache invalidation.
     storage
-        .add_dependency("bd-A", "bd-B", "parent-child", "test")
+        .add_dependency("bd-a", "bd-b", "parent-child", "test")
         .unwrap();
     storage
         .rebuild_blocked_cache(true)
         .expect("incremental rebuild after A -> B should not crash");
     storage
-        .add_dependency("bd-A", "bd-C", "parent-child", "test")
+        .add_dependency("bd-a", "bd-c", "parent-child", "test")
         .unwrap();
 
     storage
         .rebuild_blocked_cache(true)
         .expect("incremental rebuild after A -> C should not crash");
 
-    assert!(storage.is_blocked("bd-A").unwrap(), "A should be blocked");
+    assert!(storage.is_blocked("bd-a").unwrap(), "A should be blocked");
     println!("Test finished successfully");
 }
 

@@ -54,21 +54,21 @@ fn test_pinned_status_blocks_dependents() {
     let mut storage = SqliteStorage::open_memory().unwrap();
 
     // 1. Create Pinned Issue A
-    let issue_a = make_issue("bd-A", "Pinned Blocker", Status::Pinned);
+    let issue_a = make_issue("bd-a", "Pinned Blocker", Status::Pinned);
     storage.create_issue(&issue_a, "setup").unwrap();
 
     // 2. Create Issue B that depends on A
-    let issue_b = make_issue("bd-B", "Blocked Task", Status::Open);
+    let issue_b = make_issue("bd-b", "Blocked Task", Status::Open);
     storage.create_issue(&issue_b, "setup").unwrap();
     storage
-        .add_dependency("bd-B", "bd-A", "blocks", "setup")
+        .add_dependency("bd-b", "bd-a", "blocks", "setup")
         .unwrap();
 
     // 3. Rebuild cache (add_dependency does this, but let's be explicit)
     storage.rebuild_blocked_cache(true).unwrap();
 
     // 4. Verify B is blocked
-    let is_blocked = storage.is_blocked("bd-B").unwrap();
+    let is_blocked = storage.is_blocked("bd-b").unwrap();
 
     // Debug info
     if !is_blocked {
@@ -79,7 +79,7 @@ fn test_pinned_status_blocks_dependents() {
         }
     }
 
-    assert!(is_blocked, "bd-B should be blocked by pinned bd-A");
+    assert!(is_blocked, "bd-b should be blocked by pinned bd-a");
 }
 
 #[test]
@@ -88,20 +88,20 @@ fn test_custom_status_blocks_dependents() {
     let mut storage = SqliteStorage::open_memory().unwrap();
 
     let issue_a = make_issue(
-        "bd-A",
+        "bd-a",
         "Custom Blocker",
         Status::Custom("review".to_string()),
     );
     storage.create_issue(&issue_a, "setup").unwrap();
 
-    let issue_b = make_issue("bd-B", "Blocked Task", Status::Open);
+    let issue_b = make_issue("bd-b", "Blocked Task", Status::Open);
     storage.create_issue(&issue_b, "setup").unwrap();
     storage
-        .add_dependency("bd-B", "bd-A", "blocks", "setup")
+        .add_dependency("bd-b", "bd-a", "blocks", "setup")
         .unwrap();
 
     storage.rebuild_blocked_cache(true).unwrap();
 
-    let is_blocked = storage.is_blocked("bd-B").unwrap();
-    assert!(is_blocked, "bd-B should be blocked by custom status bd-A");
+    let is_blocked = storage.is_blocked("bd-b").unwrap();
+    assert!(is_blocked, "bd-b should be blocked by custom status bd-a");
 }
