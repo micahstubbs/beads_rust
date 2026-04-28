@@ -126,6 +126,14 @@ enum ReadyIssueProjection {
     Command,
 }
 
+struct IssueDetailRelationPresence {
+    has_labels: bool,
+    has_dependencies: bool,
+    has_dependents: bool,
+    has_comments: bool,
+    parent: Option<String>,
+}
+
 impl ReadyIssueProjection {
     const fn select_clause(self) -> &'static str {
         match self {
@@ -6395,10 +6403,23 @@ impl SqliteStorage {
             return Ok(None);
         };
 
-        let labels = self.get_labels(id)?;
-        let dependencies = self.get_dependencies_with_metadata(id)?;
-        let dependents = self.get_dependents_with_metadata(id)?;
-        let comments = if include_comments {
+        let relation_presence = self.issue_detail_relation_presence(id)?;
+        let labels = if relation_presence.has_labels {
+            self.get_labels(id)?
+        } else {
+            vec![]
+        };
+        let dependencies = if relation_presence.has_dependencies {
+            self.get_dependencies_with_metadata(id)?
+        } else {
+            vec![]
+        };
+        let dependents = if relation_presence.has_dependents {
+            self.get_dependents_with_metadata(id)?
+        } else {
+            vec![]
+        };
+        let comments = if include_comments && relation_presence.has_comments {
             self.get_comments(id)?
         } else {
             vec![]
@@ -6408,7 +6429,7 @@ impl SqliteStorage {
         } else {
             vec![]
         };
-        let parent = self.get_parent_id(id)?;
+        let parent = relation_presence.parent;
 
         Ok(Some(IssueDetails {
             issue,
@@ -6419,6 +6440,34 @@ impl SqliteStorage {
             events,
             parent,
         }))
+    }
+
+    fn issue_detail_relation_presence(&self, id: &str) -> Result<IssueDetailRelationPresence> {
+        let row = self.conn.query_row_with_params(
+            "SELECT
+                 EXISTS(SELECT 1 FROM labels WHERE issue_id = ?),
+                 EXISTS(SELECT 1 FROM dependencies WHERE issue_id = ?),
+                 EXISTS(SELECT 1 FROM dependencies WHERE depends_on_id = ?),
+                 EXISTS(SELECT 1 FROM comments WHERE issue_id = ?),
+                 (SELECT depends_on_id FROM dependencies
+                  WHERE issue_id = ? AND type = 'parent-child'
+                  ORDER BY rowid DESC LIMIT 1)",
+            &[
+                SqliteValue::from(id),
+                SqliteValue::from(id),
+                SqliteValue::from(id),
+                SqliteValue::from(id),
+                SqliteValue::from(id),
+            ],
+        )?;
+
+        Ok(IssueDetailRelationPresence {
+            has_labels: row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0) != 0,
+            has_dependencies: row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0) != 0,
+            has_dependents: row.get(2).and_then(SqliteValue::as_integer).unwrap_or(0) != 0,
+            has_comments: row.get(3).and_then(SqliteValue::as_integer).unwrap_or(0) != 0,
+            parent: row.get(4).and_then(SqliteValue::as_text).map(String::from),
+        })
     }
 
     fn issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
