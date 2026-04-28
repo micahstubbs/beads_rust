@@ -126,24 +126,36 @@ enum ReadyIssueProjection {
     Command,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum ReadyFlagPredicate {
-    ExactFalse,
-    LegacyNullAsFalse,
-}
-
-#[derive(Clone, Copy)]
-enum ReadyPriorityBucket {
-    High,
-    Low,
-}
-
 struct IssueDetailRelationPresence {
     has_labels: bool,
     has_dependencies: bool,
     has_dependents: bool,
     has_comments: bool,
     parent: Option<String>,
+}
+
+struct ImportIssueTimestampStrings {
+    created_at: String,
+    updated_at: String,
+    closed_at: Option<String>,
+    due_at: Option<String>,
+    defer_until: Option<String>,
+    deleted_at: Option<String>,
+    compacted_at: Option<String>,
+}
+
+impl ImportIssueTimestampStrings {
+    fn from_issue(issue: &Issue) -> Self {
+        Self {
+            created_at: issue.created_at.to_rfc3339(),
+            updated_at: issue.updated_at.to_rfc3339(),
+            closed_at: issue.closed_at.map(|dt| dt.to_rfc3339()),
+            due_at: issue.due_at.map(|dt| dt.to_rfc3339()),
+            defer_until: issue.defer_until.map(|dt| dt.to_rfc3339()),
+            deleted_at: issue.deleted_at.map(|dt| dt.to_rfc3339()),
+            compacted_at: issue.compacted_at.map(|dt| dt.to_rfc3339()),
+        }
+    }
 }
 
 impl ReadyIssueProjection {
@@ -2813,12 +2825,6 @@ impl SqliteStorage {
         sort: ReadySortPolicy,
         projection: ReadyIssueProjection,
     ) -> Result<Vec<Issue>> {
-        let flag_predicate = if self.ready_filter_columns_are_not_null() {
-            ReadyFlagPredicate::ExactFalse
-        } else {
-            ReadyFlagPredicate::LegacyNullAsFalse
-        };
-
         // Read-only path: if the cache is stale, compute blocked IDs in memory
         // instead of persisting (issue #216 — read ops must not write).
         if self.blocked_cache_marked_stale()? {
@@ -2831,18 +2837,12 @@ impl SqliteStorage {
                 sort,
                 &blocked_ids,
                 projection,
-                flag_predicate,
             );
         }
 
-        match self.query_ready_issue_candidates_dispatch(
-            filters,
-            sort,
-            true,
-            true,
-            projection,
-            flag_predicate,
-        ) {
+        match self
+            .query_ready_issue_candidates_with_projection(filters, sort, true, true, projection)
+        {
             Ok(issues) => Ok(issues),
             Err(error) => {
                 let blocked_ids = self.recover_blocked_ids("ready_issues_query", &error)?;
@@ -2851,102 +2851,9 @@ impl SqliteStorage {
                     sort,
                     &blocked_ids,
                     projection,
-                    flag_predicate,
                 )
             }
         }
-    }
-
-    fn ready_filter_columns_are_not_null(&self) -> bool {
-        let Ok(rows) = self.conn.query("PRAGMA table_info(issues)") else {
-            return false;
-        };
-
-        ["ephemeral", "pinned", "is_template"]
-            .into_iter()
-            .all(|column| {
-                rows.iter().any(|row| {
-                    row.get(1).and_then(SqliteValue::as_text) == Some(column)
-                        && row.get(3).and_then(SqliteValue::as_integer).unwrap_or(0) != 0
-                })
-            })
-    }
-
-    fn query_ready_issue_candidates_dispatch(
-        &self,
-        filters: &ReadyFilters,
-        sort: ReadySortPolicy,
-        exclude_blocked_in_sql: bool,
-        apply_limit: bool,
-        projection: ReadyIssueProjection,
-        flag_predicate: ReadyFlagPredicate,
-    ) -> Result<Vec<Issue>> {
-        if sort == ReadySortPolicy::Hybrid && flag_predicate == ReadyFlagPredicate::ExactFalse {
-            return self.query_ready_hybrid_issue_candidates_with_projection(
-                filters,
-                exclude_blocked_in_sql,
-                apply_limit,
-                projection,
-                flag_predicate,
-            );
-        }
-
-        self.query_ready_issue_candidates_with_projection(
-            filters,
-            sort,
-            exclude_blocked_in_sql,
-            apply_limit,
-            projection,
-            flag_predicate,
-            None,
-        )
-    }
-
-    fn query_ready_hybrid_issue_candidates_with_projection(
-        &self,
-        filters: &ReadyFilters,
-        exclude_blocked_in_sql: bool,
-        apply_limit: bool,
-        projection: ReadyIssueProjection,
-        flag_predicate: ReadyFlagPredicate,
-    ) -> Result<Vec<Issue>> {
-        let sql_limit = filters.limit.filter(|limit| apply_limit && *limit > 0);
-        let mut high_filters = filters.clone();
-        high_filters.limit = sql_limit;
-
-        let mut issues = self.query_ready_issue_candidates_with_projection(
-            &high_filters,
-            ReadySortPolicy::Hybrid,
-            exclude_blocked_in_sql,
-            apply_limit,
-            projection,
-            flag_predicate,
-            Some(ReadyPriorityBucket::High),
-        )?;
-
-        if let Some(limit) = sql_limit {
-            if issues.len() >= limit {
-                issues.truncate(limit);
-                return Ok(issues);
-            }
-        }
-
-        let mut low_filters = filters.clone();
-        if let Some(limit) = sql_limit {
-            low_filters.limit = Some(limit - issues.len());
-        }
-
-        let mut low_issues = self.query_ready_issue_candidates_with_projection(
-            &low_filters,
-            ReadySortPolicy::Hybrid,
-            exclude_blocked_in_sql,
-            apply_limit,
-            projection,
-            flag_predicate,
-            Some(ReadyPriorityBucket::Low),
-        )?;
-        issues.append(&mut low_issues);
-        Ok(issues)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2956,8 +2863,7 @@ impl SqliteStorage {
         exclude_blocked_in_sql: bool,
         apply_limit: bool,
         projection: ReadyIssueProjection,
-        flag_predicate: ReadyFlagPredicate,
-        priority_bucket: Option<ReadyPriorityBucket>,
+        apply_ordering: bool,
     ) -> (String, Vec<SqliteValue>) {
         let mut sql = String::from(projection.select_clause());
         sql.push_str(" FROM issues WHERE 1=1");
@@ -3003,21 +2909,17 @@ impl SqliteStorage {
             sql.push_str(" AND (defer_until IS NULL OR datetime(defer_until) <= datetime('now'))");
         }
 
-        match flag_predicate {
-            ReadyFlagPredicate::ExactFalse => {
-                sql.push_str(" AND pinned = 0");
-                sql.push_str(" AND ephemeral = 0");
-                sql.push_str(" AND is_template = 0");
-            }
-            ReadyFlagPredicate::LegacyNullAsFalse => {
-                // Legacy rows may still store NULL, which the rest of the
-                // storage layer treats as false.
-                sql.push_str(" AND (pinned = 0 OR pinned IS NULL)");
-                sql.push_str(" AND (ephemeral = 0 OR ephemeral IS NULL)");
-                sql.push_str(" AND (is_template = 0 OR is_template IS NULL)");
-            }
-        }
+        // Ready condition 4: not pinned. Legacy rows may still store NULL,
+        // which the rest of the storage layer treats as false.
+        sql.push_str(" AND (pinned = 0 OR pinned IS NULL)");
+
+        // Ready condition 5: not ephemeral and not wisp. Legacy rows may
+        // still store NULL, which should behave the same as false.
+        sql.push_str(" AND (ephemeral = 0 OR ephemeral IS NULL)");
         sql.push_str(" AND id NOT LIKE '%-wisp-%'");
+
+        // Exclude templates
+        sql.push_str(" AND (is_template = 0 OR is_template IS NULL)");
 
         // Filter by types
         if let Some(ref types) = filters.types
@@ -3038,13 +2940,6 @@ impl SqliteStorage {
             let _ = write!(sql, " AND priority IN ({})", placeholders.join(","));
             for p in priorities {
                 params.push(SqliteValue::from(i64::from(p.0)));
-            }
-        }
-
-        if let Some(bucket) = priority_bucket {
-            match bucket {
-                ReadyPriorityBucket::High => sql.push_str(" AND priority <= 1"),
-                ReadyPriorityBucket::Low => sql.push_str(" AND priority > 1"),
             }
         }
 
@@ -3087,10 +2982,7 @@ impl SqliteStorage {
             }
         }
 
-        // Sorting
-        if priority_bucket.is_some() {
-            sql.push_str(" ORDER BY created_at ASC");
-        } else {
+        if apply_ordering {
             match sort {
                 ReadySortPolicy::Hybrid => {
                     sql.push_str(
@@ -3129,22 +3021,23 @@ impl SqliteStorage {
         exclude_blocked_in_sql: bool,
         apply_limit: bool,
         projection: ReadyIssueProjection,
-        flag_predicate: ReadyFlagPredicate,
-        priority_bucket: Option<ReadyPriorityBucket>,
     ) -> Result<Vec<Issue>> {
+        let sort_hybrid_in_rust = sort == ReadySortPolicy::Hybrid && filters.limit.is_none();
         let (sql, params) = Self::build_ready_issue_candidates_query(
             filters,
             sort,
             exclude_blocked_in_sql,
             apply_limit,
             projection,
-            flag_predicate,
-            priority_bucket,
+            !sort_hybrid_in_rust,
         );
         let rows = self.conn.query_with_params(&sql, &params)?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
             issues.push(projection.parse_row(row)?);
+        }
+        if sort_hybrid_in_rust {
+            sort_ready_hybrid(&mut issues);
         }
 
         Ok(issues)
@@ -3156,15 +3049,9 @@ impl SqliteStorage {
         sort: ReadySortPolicy,
         blocked_ids: &HashSet<String>,
         projection: ReadyIssueProjection,
-        flag_predicate: ReadyFlagPredicate,
     ) -> Result<Vec<Issue>> {
-        let mut issues = self.query_ready_issue_candidates_dispatch(
-            filters,
-            sort,
-            false,
-            false,
-            projection,
-            flag_predicate,
+        let mut issues = self.query_ready_issue_candidates_with_projection(
+            filters, sort, false, false, projection,
         )?;
         issues.retain(|issue| !blocked_ids.contains(issue.id.as_str()));
         if let Some(limit) = filters.limit
@@ -5276,6 +5163,41 @@ impl SqliteStorage {
         Ok(map)
     }
 
+    /// Get all labels attached to exportable issues.
+    ///
+    /// This mirrors the JSONL export issue filter so relation hydration does
+    /// not observe rows for excluded ephemerals or wisps.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_labels_for_export(&self) -> Result<HashMap<String, Vec<String>>> {
+        let rows = self.conn.query(
+            "SELECT labels.issue_id, labels.label
+             FROM labels
+             INNER JOIN issues ON issues.id = labels.issue_id
+             WHERE (issues.ephemeral = 0 OR issues.ephemeral IS NULL)
+               AND issues.id NOT LIKE '%-wisp-%'
+             ORDER BY labels.issue_id, labels.label",
+        )?;
+
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for row in &rows {
+            let issue_id = row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string();
+            let label = row
+                .get(1)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string();
+            map.entry(issue_id).or_default().push(label);
+        }
+        Ok(map)
+    }
+
     /// Get all unique labels with their issue counts.
     ///
     /// Returns a vector of (label, count) pairs sorted alphabetically by label.
@@ -6179,6 +6101,59 @@ impl SqliteStorage {
         Ok(map)
     }
 
+    /// Get all dependency records whose source issue is exportable.
+    ///
+    /// This keeps full-scan export hydration semantically equivalent to the
+    /// previous ID-filtered batch queries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_dependency_records_for_export(
+        &self,
+    ) -> Result<HashMap<String, Vec<crate::model::Dependency>>> {
+        use crate::model::{Dependency, DependencyType};
+
+        let rows = self.conn.query(
+            "SELECT dependencies.issue_id, dependencies.depends_on_id, dependencies.type,
+                    dependencies.created_at, dependencies.created_by, dependencies.metadata,
+                    dependencies.thread_id
+             FROM dependencies
+             INNER JOIN issues ON issues.id = dependencies.issue_id
+             WHERE (issues.ephemeral = 0 OR issues.ephemeral IS NULL)
+               AND issues.id NOT LIKE '%-wisp-%'
+             ORDER BY dependencies.issue_id, dependencies.depends_on_id",
+        )?;
+
+        let mut map: HashMap<String, Vec<Dependency>> = HashMap::new();
+        for row in &rows {
+            let issue_id = row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string();
+            let dep = Dependency {
+                issue_id: issue_id.clone(),
+                depends_on_id: row
+                    .get(1)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or("")
+                    .to_string(),
+                dep_type: row
+                    .get(2)
+                    .and_then(SqliteValue::as_text)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(DependencyType::Blocks),
+                created_at: parse_datetime_value(row.get(3))?,
+                created_by: row.get(4).and_then(SqliteValue::as_text).map(String::from),
+                metadata: row.get(5).and_then(SqliteValue::as_text).map(String::from),
+                thread_id: row.get(6).and_then(SqliteValue::as_text).map(String::from),
+            };
+            map.entry(issue_id).or_default().push(dep);
+        }
+        Ok(map)
+    }
+
     /// Get all comments for all issues.
     ///
     /// Returns a map from `issue_id` to its list of comments.
@@ -6192,6 +6167,32 @@ impl SqliteStorage {
             "SELECT id, issue_id, author, text, created_at
              FROM comments
              ORDER BY issue_id ASC, created_at ASC, id ASC",
+        )?;
+
+        let mut map: HashMap<String, Vec<Comment>> = HashMap::new();
+        for row in &rows {
+            let comment = comment_from_row(row)?;
+            map.entry(comment.issue_id.clone())
+                .or_default()
+                .push(comment);
+        }
+        Ok(map)
+    }
+
+    /// Get all comments attached to exportable issues.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_comments_for_export(&self) -> Result<HashMap<String, Vec<Comment>>> {
+        let rows = self.conn.query(
+            "SELECT comments.id, comments.issue_id, comments.author, comments.text,
+                    comments.created_at
+             FROM comments
+             INNER JOIN issues ON issues.id = comments.issue_id
+             WHERE (issues.ephemeral = 0 OR issues.ephemeral IS NULL)
+               AND issues.id NOT LIKE '%-wisp-%'
+             ORDER BY comments.issue_id ASC, comments.created_at ASC, comments.id ASC",
         )?;
 
         let mut map: HashMap<String, Vec<Comment>> = HashMap::new();
@@ -7054,6 +7055,18 @@ pub enum ReadySortPolicy {
     Oldest,
 }
 
+fn sort_ready_hybrid(issues: &mut [Issue]) {
+    issues.sort_by(|left, right| {
+        ready_hybrid_bucket(left.priority)
+            .cmp(&ready_hybrid_bucket(right.priority))
+            .then_with(|| left.created_at.cmp(&right.created_at))
+    });
+}
+
+const fn ready_hybrid_bucket(priority: Priority) -> i32 {
+    if priority.0 <= 1 { 0 } else { 1 }
+}
+
 fn parse_status(s: Option<&str>) -> Status {
     s.map_or_else(Status::default, |val| {
         val.parse()
@@ -7810,6 +7823,145 @@ impl SqliteStorage {
         ))
     }
 
+    fn import_issue_field_values(
+        issue: &Issue,
+        timestamps: &ImportIssueTimestampStrings,
+    ) -> Vec<SqliteValue> {
+        let status_str = issue.status.as_str();
+        let issue_type_str = issue.issue_type.as_str();
+
+        vec![
+            issue
+                .content_hash
+                .as_deref()
+                .map_or(SqliteValue::Null, SqliteValue::from),
+            SqliteValue::from(issue.title.as_str()),
+            SqliteValue::from(issue.description.as_deref().unwrap_or("")),
+            SqliteValue::from(issue.design.as_deref().unwrap_or("")),
+            SqliteValue::from(issue.acceptance_criteria.as_deref().unwrap_or("")),
+            SqliteValue::from(issue.notes.as_deref().unwrap_or("")),
+            SqliteValue::from(status_str),
+            SqliteValue::from(i64::from(issue.priority.0)),
+            SqliteValue::from(issue_type_str),
+            issue
+                .assignee
+                .as_deref()
+                .map_or(SqliteValue::Null, SqliteValue::from),
+            SqliteValue::from(issue.owner.as_deref().unwrap_or("")),
+            issue
+                .estimated_minutes
+                .map_or(SqliteValue::Null, |v| SqliteValue::from(i64::from(v))),
+            SqliteValue::from(timestamps.created_at.as_str()),
+            SqliteValue::from(issue.created_by.as_deref().unwrap_or("")),
+            SqliteValue::from(timestamps.updated_at.as_str()),
+            timestamps
+                .closed_at
+                .as_deref()
+                .map_or(SqliteValue::Null, SqliteValue::from),
+            SqliteValue::from(issue.close_reason.as_deref().unwrap_or("")),
+            SqliteValue::from(issue.closed_by_session.as_deref().unwrap_or("")),
+            timestamps
+                .due_at
+                .as_deref()
+                .map_or(SqliteValue::Null, SqliteValue::from),
+            timestamps
+                .defer_until
+                .as_deref()
+                .map_or(SqliteValue::Null, SqliteValue::from),
+            issue
+                .external_ref
+                .as_deref()
+                .map_or(SqliteValue::Null, SqliteValue::from),
+            SqliteValue::from(issue.source_system.as_deref().unwrap_or("")),
+            SqliteValue::from(issue.source_repo.as_deref().unwrap_or(".")),
+            timestamps
+                .deleted_at
+                .as_deref()
+                .map_or(SqliteValue::Null, SqliteValue::from),
+            SqliteValue::from(issue.deleted_by.as_deref().unwrap_or("")),
+            SqliteValue::from(issue.delete_reason.as_deref().unwrap_or("")),
+            SqliteValue::from(issue.original_type.as_deref().unwrap_or("")),
+            SqliteValue::from(i64::from(issue.compaction_level.unwrap_or(0))),
+            timestamps
+                .compacted_at
+                .as_deref()
+                .map_or(SqliteValue::Null, SqliteValue::from),
+            issue
+                .compacted_at_commit
+                .as_deref()
+                .map_or(SqliteValue::Null, SqliteValue::from),
+            SqliteValue::from(i64::from(issue.original_size.unwrap_or(0))),
+            SqliteValue::from(issue.sender.as_deref().unwrap_or("")),
+            SqliteValue::from(i64::from(i32::from(issue.ephemeral))),
+            SqliteValue::from(i64::from(i32::from(issue.pinned))),
+            SqliteValue::from(i64::from(i32::from(issue.is_template))),
+        ]
+    }
+
+    fn insert_issue_row_for_import(
+        &self,
+        issue: &Issue,
+        timestamps: &ImportIssueTimestampStrings,
+    ) -> Result<usize> {
+        let mut insert_params = Vec::with_capacity(36);
+        insert_params.push(SqliteValue::from(issue.id.as_str()));
+        insert_params.extend(Self::import_issue_field_values(issue, timestamps));
+
+        let rows = self.conn.execute_with_params(
+            r"INSERT INTO issues (
+                id, content_hash, title, description, design, acceptance_criteria, notes,
+                status, priority, issue_type, assignee, owner, estimated_minutes,
+                created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
+                due_at, defer_until, external_ref, source_system, source_repo,
+                deleted_at, deleted_by, delete_reason, original_type, compaction_level,
+                compacted_at, compacted_at_commit, original_size, sender, ephemeral,
+                pinned, is_template
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )",
+            &insert_params,
+        )?;
+
+        Ok(rows)
+    }
+
+    fn update_issue_row_for_import(
+        &self,
+        issue: &Issue,
+        timestamps: &ImportIssueTimestampStrings,
+    ) -> Result<usize> {
+        let mut params = Self::import_issue_field_values(issue, timestamps);
+        params.push(SqliteValue::from(issue.id.as_str()));
+        let rows = self.conn.execute_with_params(
+            r"UPDATE issues SET
+                content_hash = ?, title = ?, description = ?, design = ?,
+                acceptance_criteria = ?, notes = ?, status = ?, priority = ?,
+                issue_type = ?, assignee = ?, owner = ?, estimated_minutes = ?,
+                created_at = ?, created_by = ?, updated_at = ?, closed_at = ?,
+                close_reason = ?, closed_by_session = ?, due_at = ?, defer_until = ?,
+                external_ref = ?, source_system = ?, source_repo = ?, deleted_at = ?,
+                deleted_by = ?, delete_reason = ?, original_type = ?, compaction_level = ?,
+                compacted_at = ?, compacted_at_commit = ?, original_size = ?, sender = ?,
+                ephemeral = ?, pinned = ?, is_template = ?
+              WHERE id = ?",
+            &params,
+        )?;
+
+        Ok(rows)
+    }
+
+    /// Insert a new issue during JSONL import without first probing for existence.
+    ///
+    /// This does NOT trigger dirty tracking or events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub(crate) fn insert_new_issue_for_import(&self, issue: &Issue) -> Result<bool> {
+        let timestamps = ImportIssueTimestampStrings::from_issue(issue);
+        Ok(self.insert_issue_row_for_import(issue, &timestamps)? > 0)
+    }
+
     /// Upsert an issue (create or update) for import operations.
     ///
     /// For an existing row, runs an in-place UPDATE; for a new row, runs
@@ -7827,84 +7979,8 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    #[allow(clippy::too_many_lines)]
     pub fn upsert_issue_for_import(&self, issue: &Issue) -> Result<bool> {
-        let status_str = issue.status.as_str();
-        let issue_type_str = issue.issue_type.as_str();
-        let created_at_str = issue.created_at.to_rfc3339();
-        let updated_at_str = issue.updated_at.to_rfc3339();
-        let closed_at_str = issue.closed_at.map(|dt| dt.to_rfc3339());
-        let due_at_str = issue.due_at.map(|dt| dt.to_rfc3339());
-        let defer_until_str = issue.defer_until.map(|dt| dt.to_rfc3339());
-        let deleted_at_str = issue.deleted_at.map(|dt| dt.to_rfc3339());
-        let compacted_at_str = issue.compacted_at.map(|dt| dt.to_rfc3339());
-
-        // Closure builds the column-value vector both branches need
-        // (in column order, excluding `id` so we can append it as the
-        // WHERE-clause parameter for UPDATE or prepend it for INSERT).
-        let import_field_values = || {
-            vec![
-                issue
-                    .content_hash
-                    .as_deref()
-                    .map_or(SqliteValue::Null, SqliteValue::from),
-                SqliteValue::from(issue.title.as_str()),
-                SqliteValue::from(issue.description.as_deref().unwrap_or("")),
-                SqliteValue::from(issue.design.as_deref().unwrap_or("")),
-                SqliteValue::from(issue.acceptance_criteria.as_deref().unwrap_or("")),
-                SqliteValue::from(issue.notes.as_deref().unwrap_or("")),
-                SqliteValue::from(status_str),
-                SqliteValue::from(i64::from(issue.priority.0)),
-                SqliteValue::from(issue_type_str),
-                issue
-                    .assignee
-                    .as_deref()
-                    .map_or(SqliteValue::Null, SqliteValue::from),
-                SqliteValue::from(issue.owner.as_deref().unwrap_or("")),
-                issue
-                    .estimated_minutes
-                    .map_or(SqliteValue::Null, |v| SqliteValue::from(i64::from(v))),
-                SqliteValue::from(created_at_str.as_str()),
-                SqliteValue::from(issue.created_by.as_deref().unwrap_or("")),
-                SqliteValue::from(updated_at_str.as_str()),
-                closed_at_str
-                    .as_deref()
-                    .map_or(SqliteValue::Null, SqliteValue::from),
-                SqliteValue::from(issue.close_reason.as_deref().unwrap_or("")),
-                SqliteValue::from(issue.closed_by_session.as_deref().unwrap_or("")),
-                due_at_str
-                    .as_deref()
-                    .map_or(SqliteValue::Null, SqliteValue::from),
-                defer_until_str
-                    .as_deref()
-                    .map_or(SqliteValue::Null, SqliteValue::from),
-                issue
-                    .external_ref
-                    .as_deref()
-                    .map_or(SqliteValue::Null, SqliteValue::from),
-                SqliteValue::from(issue.source_system.as_deref().unwrap_or("")),
-                SqliteValue::from(issue.source_repo.as_deref().unwrap_or(".")),
-                deleted_at_str
-                    .as_deref()
-                    .map_or(SqliteValue::Null, SqliteValue::from),
-                SqliteValue::from(issue.deleted_by.as_deref().unwrap_or("")),
-                SqliteValue::from(issue.delete_reason.as_deref().unwrap_or("")),
-                SqliteValue::from(issue.original_type.as_deref().unwrap_or("")),
-                SqliteValue::from(i64::from(issue.compaction_level.unwrap_or(0))),
-                compacted_at_str
-                    .as_deref()
-                    .map_or(SqliteValue::Null, SqliteValue::from),
-                issue
-                    .compacted_at_commit
-                    .as_deref()
-                    .map_or(SqliteValue::Null, SqliteValue::from),
-                SqliteValue::from(i64::from(issue.original_size.unwrap_or(0))),
-                SqliteValue::from(issue.sender.as_deref().unwrap_or("")),
-                SqliteValue::from(i64::from(i32::from(issue.ephemeral))),
-                SqliteValue::from(i64::from(i32::from(issue.pinned))),
-                SqliteValue::from(i64::from(i32::from(issue.is_template))),
-            ]
-        };
+        let timestamps = ImportIssueTimestampStrings::from_issue(issue);
 
         // Narrow existence probe: don't deserialize the row, just check
         // if the id is present. If it's malformed we still want to
@@ -7919,22 +7995,7 @@ impl SqliteStorage {
         };
 
         if issue_exists {
-            let mut params = import_field_values();
-            params.push(SqliteValue::from(issue.id.as_str()));
-            let rows = self.conn.execute_with_params(
-                r"UPDATE issues SET
-                    content_hash = ?, title = ?, description = ?, design = ?,
-                    acceptance_criteria = ?, notes = ?, status = ?, priority = ?,
-                    issue_type = ?, assignee = ?, owner = ?, estimated_minutes = ?,
-                    created_at = ?, created_by = ?, updated_at = ?, closed_at = ?,
-                    close_reason = ?, closed_by_session = ?, due_at = ?, defer_until = ?,
-                    external_ref = ?, source_system = ?, source_repo = ?, deleted_at = ?,
-                    deleted_by = ?, delete_reason = ?, original_type = ?, compaction_level = ?,
-                    compacted_at = ?, compacted_at_commit = ?, original_size = ?, sender = ?,
-                    ephemeral = ?, pinned = ?, is_template = ?
-                  WHERE id = ?",
-                &params,
-            )?;
+            let rows = self.update_issue_row_for_import(issue, &timestamps)?;
             if rows == 0 {
                 return Err(BeadsError::Database(FrankenError::Internal(format!(
                     "import update did not find existing issue {}",
@@ -7944,25 +8005,7 @@ impl SqliteStorage {
             return Ok(true);
         }
 
-        let mut insert_params = Vec::with_capacity(36);
-        insert_params.push(SqliteValue::from(issue.id.as_str()));
-        insert_params.extend(import_field_values());
-        let rows = self.conn.execute_with_params(
-            r"INSERT INTO issues (
-                id, content_hash, title, description, design, acceptance_criteria, notes,
-                status, priority, issue_type, assignee, owner, estimated_minutes,
-                created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
-                due_at, defer_until, external_ref, source_system, source_repo,
-                deleted_at, deleted_by, delete_reason, original_type, compaction_level,
-                compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                pinned, is_template
-            ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-            )",
-            &insert_params,
-        )?;
-
-        Ok(rows > 0)
+        Ok(self.insert_issue_row_for_import(issue, &timestamps)? > 0)
     }
 
     /// Replace an issue's dirty marker inside the current write transaction.
