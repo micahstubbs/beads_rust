@@ -6,8 +6,8 @@ use crate::model::{Comment, DependencyType, Event, EventType, Issue, IssueType, 
 use crate::storage::events::get_events;
 use crate::storage::schema::CURRENT_SCHEMA_VERSION;
 use crate::storage::schema::{
-    apply_runtime_compatible_schema, apply_schema, execute_batch, runtime_schema_compatible,
-    table_exists,
+    apply_runtime_compatible_schema, apply_schema, execute_batch,
+    issues_table_create_sql_preserves_if_not_exists, runtime_schema_compatible, table_exists,
 };
 use crate::sync::{
     METADATA_JSONL_CONTENT_HASH, METADATA_JSONL_MTIME, METADATA_JSONL_SIZE,
@@ -603,7 +603,11 @@ impl SqliteStorage {
         if database_header_user_version(path)
             .is_some_and(|version| version >= u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0))
         {
-            crate::storage::schema::apply_runtime_pragmas(&conn)?;
+            if issues_table_create_sql_preserves_if_not_exists(&conn) {
+                apply_runtime_compatible_schema(&conn)?;
+            } else {
+                crate::storage::schema::apply_runtime_pragmas(&conn)?;
+            }
         } else if runtime_schema_compatible(&conn) {
             apply_runtime_compatible_schema(&conn)?;
         } else {
@@ -10279,14 +10283,14 @@ mod tests {
 
         // First insert is fine (table empty).
         storage
-            .sync_comments_for_import("br-cc-a", &[comment_a.clone()])
+            .sync_comments_for_import("br-cc-a", std::slice::from_ref(&comment_a))
             .expect("first sync should succeed");
 
         // Second insert should NOT fail — the JSONL-provided id collides with
         // an existing row on a different issue, so the importer must allocate
         // a new id rather than re-using comment_b.id.
         storage
-            .sync_comments_for_import("br-cc-b", &[comment_b.clone()])
+            .sync_comments_for_import("br-cc-b", std::slice::from_ref(&comment_b))
             .expect("cross-issue colliding id must not violate PK");
 
         let comments_a = storage.get_comments("br-cc-a").unwrap();
@@ -11258,6 +11262,43 @@ mod tests {
         );
 
         lock_conn.execute("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn test_open_repairs_current_version_issues_create_sql_if_not_exists() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("current_bad_issues_sql.db");
+
+        {
+            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            execute_batch(&conn, crate::storage::schema::SCHEMA_SQL).unwrap();
+            conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
+                .unwrap();
+
+            let row = conn
+                .query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='issues'")
+                .unwrap();
+            let issues_sql = row.get(0).and_then(SqliteValue::as_text).unwrap();
+            assert!(
+                issues_sql.contains("CREATE TABLE IF NOT EXISTS issues"),
+                "test setup should reproduce legacy br sqlite_master SQL, got: {issues_sql}"
+            );
+        }
+
+        let reopened = SqliteStorage::open(&db_path).unwrap();
+        let row = reopened
+            .conn
+            .query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='issues'")
+            .unwrap();
+        let issues_sql = row.get(0).and_then(SqliteValue::as_text).unwrap();
+        assert!(
+            issues_sql.starts_with("CREATE TABLE issues"),
+            "current-version open should canonicalize issues table SQL, got: {issues_sql}"
+        );
+        assert!(
+            !issues_sql.contains("CREATE TABLE IF NOT EXISTS issues"),
+            "current-version open must repair IF NOT EXISTS before bd runs ALTER TABLE, got: {issues_sql}"
+        );
     }
 
     #[test]

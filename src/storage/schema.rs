@@ -394,6 +394,9 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
 
     execute_batch(conn, SCHEMA_SQL)?;
 
+    let issues_rebuilt_for_canonical_sql = canonicalize_issues_table_create_sql(conn)?;
+    let issues_rebuilt = issues_rebuilt || issues_rebuilt_for_canonical_sql;
+
     if is_fresh {
         // Fresh database: SCHEMA_SQL already created everything at the
         // current version. Skip migrations and stamp user_version directly.
@@ -451,7 +454,8 @@ pub(crate) fn apply_runtime_compatible_schema(conn: &Connection) -> Result<()> {
     // The table layouts are already safe to operate on, so we can skip the
     // heavier pre-schema rebuilds and just restore any missing canonical DDL.
     execute_batch(conn, SCHEMA_SQL)?;
-    run_migrations(conn, false)?;
+    let issues_rebuilt = canonicalize_issues_table_create_sql(conn)?;
+    run_migrations(conn, issues_rebuilt)?;
     conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
         .map_err(BeadsError::Database)?;
     apply_runtime_pragmas(conn)?;
@@ -507,6 +511,31 @@ fn index_exists(conn: &Connection, index: &str) -> bool {
     let escaped_index = index.replace('\'', "''");
     let sql = format!("SELECT 1 FROM sqlite_master WHERE type='index' AND name='{escaped_index}'");
     conn.query(&sql).is_ok_and(|rows| !rows.is_empty())
+}
+
+fn canonicalize_issues_table_create_sql(conn: &Connection) -> Result<bool> {
+    if !issues_table_create_sql_preserves_if_not_exists(conn) {
+        return Ok(false);
+    }
+
+    rebuild_issues_table(conn)?;
+    execute_batch(conn, SCHEMA_SQL)?;
+    Ok(true)
+}
+
+pub(crate) fn issues_table_create_sql_preserves_if_not_exists(conn: &Connection) -> bool {
+    let Ok(row) =
+        conn.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='issues'")
+    else {
+        return false;
+    };
+
+    row.get(0)
+        .and_then(SqliteValue::as_text)
+        .is_some_and(|sql| {
+            sql.trim_start()
+                .starts_with("CREATE TABLE IF NOT EXISTS issues")
+        })
 }
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
@@ -1798,6 +1827,14 @@ mod tests {
             .and_then(SqliteValue::as_text)
             .expect("issues table SQL should be present");
 
+        assert!(
+            issues_sql.starts_with("CREATE TABLE issues"),
+            "issues table SQL should be stored in canonical SQLite form for bd ALTER TABLE compatibility, got: {issues_sql}"
+        );
+        assert!(
+            !issues_sql.contains("CREATE TABLE IF NOT EXISTS issues"),
+            "issues table SQL must not preserve IF NOT EXISTS because bd ALTER TABLE reparses sqlite_master SQL, got: {issues_sql}"
+        );
         assert_eq!(
             issues_sql.matches("source_repo").count(),
             1,
