@@ -10,7 +10,6 @@ target*/
 # for end users (paths point at /data/projects/frankensqlite on the author's
 # workstation). Keep Cargo.lock untracked — crates.io publishes regenerate
 # the lockfile from Cargo.toml on install.
-Cargo.lock
 
 # IDE
 .idea/
