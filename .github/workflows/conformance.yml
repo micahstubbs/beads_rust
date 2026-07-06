@@ -31,10 +31,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
         with:
           toolchain: nightly
 
@@ -42,7 +42,7 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2.9.1
 
       - name: Install Go
-        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v5
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v5
         with:
           go-version: '1.23'
           cache: false
@@ -57,7 +57,7 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/beads.git ../beads-go
           cd ../beads-go
           go build -o bd ./cmd/beads
-          echo "BD_BINARY=$(pwd)/bd" >> $GITHUB_ENV
+          echo "BD_BINARY=$(pwd)/bd" >> "$GITHUB_ENV"
 
       - name: Verify binaries
         if: steps.build_bd.outcome == 'success'
@@ -71,11 +71,11 @@ jobs:
       - name: Run conformance tests
         if: steps.build_bd.outcome == 'success'
         run: |
-          VERBOSE_FLAG=""
+          ARGS=()
           if [ "${{ inputs.verbose }}" = "true" ]; then
-            VERBOSE_FLAG="--verbose"
+            ARGS+=(--verbose)
           fi
-          scripts/conformance.sh $VERBOSE_FLAG
+          scripts/conformance.sh "${ARGS[@]}"
         env:
           BD_BINARY: ${{ env.BD_BINARY }}
           CONFORMANCE_STRICT: ${{ inputs.strict_mode && '1' || '0' }}

@@ -25,7 +25,7 @@ use shell_words::split as split_shell_words;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, info, trace};
@@ -134,9 +134,14 @@ fn create_temp_config_file(config_path: &Path) -> Result<(PathBuf, File)> {
 }
 
 fn write_config_atomically(config_path: &Path, yaml: &str) -> Result<()> {
-    let existing_permissions = fs::metadata(config_path)
-        .ok()
-        .map(|metadata| metadata.permissions());
+    let existing_permissions = match fs::symlink_metadata(config_path) {
+        Ok(metadata) => {
+            validate_edit_config_target(config_path, &metadata)?;
+            Some(metadata.permissions())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
     let (temp_path, mut temp_file) = create_temp_config_file(config_path)?;
     let mut guard = TempConfigFileGuard::new(temp_path.clone());
     if let Some(permissions) = existing_permissions
@@ -153,6 +158,48 @@ fn write_config_atomically(config_path: &Path, yaml: &str) -> Result<()> {
     drop(temp_file);
     crate::util::durable_rename(&temp_path, config_path)?;
     guard.persist();
+    Ok(())
+}
+
+fn validate_edit_config_target(config_path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    if metadata.file_type().is_symlink() {
+        return Err(BeadsError::Config(format!(
+            "Refusing to edit config through symbolic link: {}",
+            config_path.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(BeadsError::Config(format!(
+            "Config path is not a regular file: {}",
+            config_path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn create_default_config_if_missing(config_path: &Path, default_content: &str) -> Result<()> {
+    match fs::symlink_metadata(config_path) {
+        Ok(metadata) => return validate_edit_config_target(config_path, &metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let mut file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(config_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(config_path)?;
+            return validate_edit_config_target(config_path, &metadata);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    file.write_all(default_content.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    crate::util::sync_parent_directory(config_path)?;
     Ok(())
 }
 
@@ -290,6 +337,7 @@ fn load_db_layer_without_recovery(paths: &ConfigPaths) -> ConfigLayer {
             layer.runtime.insert(key.to_string(), value.to_string());
         }
 
+        conn.close()?;
         Ok(layer)
     }) {
         Ok(layer) => layer,
@@ -314,6 +362,25 @@ fn merge_layers(layers: &[LayerWithSource]) -> ConfigLayer {
 
 fn canonical_config_key(key: &str) -> String {
     key.trim().to_lowercase().replace('-', "_")
+}
+
+fn push_unique_config_alias(aliases: &mut Vec<String>, alias: String) {
+    if !alias.is_empty() && !aliases.contains(&alias) {
+        aliases.push(alias);
+    }
+}
+
+fn config_key_aliases(key: &str) -> Vec<String> {
+    let trimmed = key.trim();
+    let mut aliases = Vec::new();
+    push_unique_config_alias(&mut aliases, trimmed.to_string());
+
+    let lower = trimmed.to_lowercase();
+    push_unique_config_alias(&mut aliases, lower.clone());
+    push_unique_config_alias(&mut aliases, lower.replace('-', "_"));
+    push_unique_config_alias(&mut aliases, lower.replace('_', "-"));
+
+    aliases
 }
 
 fn resolve_source(key: &str, layers: &[LayerWithSource]) -> ConfigSource {
@@ -457,9 +524,9 @@ fn edit_config() -> Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    // Create file if it doesn't exist
-    if !config_path.exists() {
-        let default_content = r"# br configuration
+    // Create the default file if needed, and reject symlinked or non-file paths
+    // before passing the config path to an editor.
+    let default_content = r"# br configuration
 # See `br config list` for available options
 
 # Issue ID prefix
@@ -471,8 +538,7 @@ fn edit_config() -> Result<()> {
 # Default issue type
 # default_type: task
 ";
-        fs::write(&config_path, default_content)?;
-    }
+    create_default_config_if_missing(&config_path, default_content)?;
 
     // Get editor
     let editor = env::var("EDITOR")
@@ -480,11 +546,11 @@ fn edit_config() -> Result<()> {
         .unwrap_or_else(|_| "vi".to_string());
     let (program, editor_args) = parse_editor_command(&editor)?;
 
-    // Open editor
-    let status = Command::new(&program)
-        .args(&editor_args)
-        .arg(&config_path)
-        .status()?;
+    // Open an allowlisted editor. EDITOR/VISUAL may carry flags, but the
+    // executable itself is constrained so a poisoned environment cannot turn
+    // `br config edit` into a generic process launcher.
+    let mut command = AllowedEditor::from_program(&program)?.command();
+    let status = command.args(&editor_args).arg(&config_path).status()?;
 
     if !status.success() {
         eprintln!("Editor exited with status: {status}");
@@ -504,6 +570,168 @@ fn parse_editor_command(editor: &str) -> Result<(String, Vec<String>)> {
     Ok((program.clone(), args.to_vec()))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AllowedEditor {
+    Code,
+    CodeInsiders,
+    Codium,
+    Cursor,
+    CursorInsiders,
+    Emacs,
+    EmacsClient,
+    Helix,
+    Hx,
+    Neovim,
+    Neovide,
+    NotepadPlusPlus,
+    Mate,
+    Micro,
+    Nano,
+    Pico,
+    Notepad,
+    Subl,
+    True,
+    Vi,
+    Vim,
+    Vscodium,
+    Zed,
+}
+
+impl AllowedEditor {
+    fn from_program(program: &str) -> Result<Self> {
+        let normalized = strip_windows_exe_suffix(editor_program_name(program));
+
+        match normalized {
+            "code" => Ok(Self::Code),
+            "code-insiders" => Ok(Self::CodeInsiders),
+            "codium" => Ok(Self::Codium),
+            "cursor" => Ok(Self::Cursor),
+            "cursor-insiders" => Ok(Self::CursorInsiders),
+            "emacs" => Ok(Self::Emacs),
+            "emacsclient" => Ok(Self::EmacsClient),
+            "helix" => Ok(Self::Helix),
+            "hx" => Ok(Self::Hx),
+            "nvim" => Ok(Self::Neovim),
+            "neovide" => Ok(Self::Neovide),
+            "mate" => Ok(Self::Mate),
+            "micro" => Ok(Self::Micro),
+            "nano" => Ok(Self::Nano),
+            "notepad" => Ok(Self::Notepad),
+            "notepad++" => Ok(Self::NotepadPlusPlus),
+            "pico" => Ok(Self::Pico),
+            "subl" => Ok(Self::Subl),
+            "true" => Ok(Self::True),
+            "vi" => Ok(Self::Vi),
+            "vim" => Ok(Self::Vim),
+            "vscodium" => Ok(Self::Vscodium),
+            "zed" => Ok(Self::Zed),
+            _ => Err(BeadsError::Config(format!(
+                "Unsupported editor '{program}'. Set EDITOR or VISUAL to one of: {}",
+                ALLOWED_EDITORS.join(", ")
+            ))),
+        }
+    }
+
+    fn command(self) -> Command {
+        match self {
+            Self::Code => Command::new("code"),
+            Self::CodeInsiders => Command::new("code-insiders"),
+            Self::Codium => Command::new("codium"),
+            Self::Cursor => Command::new("cursor"),
+            Self::CursorInsiders => Command::new("cursor-insiders"),
+            Self::Emacs => Command::new("emacs"),
+            Self::EmacsClient => Command::new("emacsclient"),
+            Self::Helix => Command::new("helix"),
+            Self::Hx => Command::new("hx"),
+            Self::Neovim => Command::new("nvim"),
+            Self::Neovide => Command::new("neovide"),
+            Self::Mate => Command::new("mate"),
+            Self::Micro => Command::new("micro"),
+            Self::Nano => Command::new("nano"),
+            Self::Notepad => Command::new("notepad"),
+            Self::NotepadPlusPlus => Command::new("notepad++"),
+            Self::Pico => Command::new("pico"),
+            Self::Subl => Command::new("subl"),
+            Self::True => Command::new("true"),
+            Self::Vi => Command::new("vi"),
+            Self::Vim => Command::new("vim"),
+            Self::Vscodium => Command::new("vscodium"),
+            Self::Zed => Command::new("zed"),
+        }
+    }
+}
+
+fn editor_program_name(program: &str) -> &str {
+    let name = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program)
+        .trim();
+    name.rsplit(['/', '\\']).next().unwrap_or(name).trim()
+}
+
+fn strip_windows_exe_suffix(name: &str) -> &str {
+    let suffix_start = name.len().saturating_sub(4);
+    let Some(suffix) = name.get(suffix_start..) else {
+        return name;
+    };
+    if suffix.eq_ignore_ascii_case(".exe") {
+        name.get(..suffix_start).unwrap_or(name)
+    } else {
+        name
+    }
+}
+
+const ALLOWED_EDITORS: &[&str] = &[
+    "code",
+    "code-insiders",
+    "codium",
+    "cursor",
+    "cursor-insiders",
+    "emacs",
+    "emacsclient",
+    "helix",
+    "hx",
+    "neovide",
+    "nvim",
+    "mate",
+    "micro",
+    "nano",
+    "notepad",
+    "notepad++",
+    "pico",
+    "subl",
+    "true",
+    "vi",
+    "vim",
+    "vscodium",
+    "zed",
+];
+
+/// Resolve the effective DB path `br` would use at runtime for the current
+/// workspace, independent of any explicit `db` config override.
+///
+/// Uses the same path-resolution logic (`config::resolve_paths`, honoring the
+/// `--db` / `BEADS_DB` override and `.beads/metadata.json`) that the storage
+/// layer uses to locate the database. Returns the canonical path (when a
+/// `.beads` directory was discovered) and whether that file exists on disk.
+/// Returns `(None, false)` when no workspace is discovered. #339
+fn resolve_effective_db_path(
+    beads_dir: Option<&PathBuf>,
+    overrides: &CliOverrides,
+) -> (Option<PathBuf>, bool) {
+    let Some(dir) = beads_dir else {
+        return (None, false);
+    };
+    match config::resolve_paths(dir, overrides.db.as_ref()) {
+        Ok(paths) => {
+            let exists = paths.db_path.exists();
+            (Some(paths.db_path), exists)
+        }
+        Err(_) => (None, false),
+    }
+}
+
 /// Get a specific config value.
 fn get_config_value(
     key: &str,
@@ -520,10 +748,27 @@ fn get_config_value(
     let value = layer.get(&canonical_key).map(str::to_owned);
 
     if ctx.is_json() {
-        let output = json!({
+        let mut output = json!({
             "key": key,
             "value": value,
         });
+        // For the `db` key, surface the RESOLVED canonical DB path that `br`
+        // actually uses at runtime (the discovered `.beads/beads.db`), even
+        // when there is no explicit override (`value` is null). Robot callers
+        // querying `config get db --json` need the effective path, not just
+        // the raw override, plus whether that file currently exists. #339
+        if canonical_key == "db" {
+            let (effective_path, exists) = resolve_effective_db_path(beads_dir, overrides);
+            if let Some(obj) = output.as_object_mut() {
+                obj.insert(
+                    "effective_path".to_string(),
+                    effective_path
+                        .as_ref()
+                        .map_or(serde_json::Value::Null, |p| json!(p.display().to_string())),
+                );
+                obj.insert("exists".to_string(), json!(exists));
+            }
+        }
         ctx.json_pretty(&output);
     } else if let Some(v) = value {
         if ctx.is_quiet() {
@@ -560,14 +805,14 @@ fn set_config_value(
     overrides: &CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let (key, value) = match args.len() {
-        1 => args[0]
+    let (key, value) = match args {
+        [arg] => arg
             .split_once('=')
             .ok_or_else(|| crate::error::BeadsError::Validation {
                 field: "config".to_string(),
                 reason: "Invalid format. Use: --set key=value or --set key value".to_string(),
             })?,
-        2 => (args[0].as_str(), args[1].as_str()),
+        [key, value] => (key.as_str(), value.as_str()),
         _ => {
             return Err(crate::error::BeadsError::Validation {
                 field: "config".to_string(),
@@ -680,23 +925,23 @@ fn parse_scalar_config_value(value: &str) -> serde_yml::Value {
 }
 
 fn set_yaml_value(config: &mut serde_yml::Value, parts: &[&str], value: serde_yml::Value) {
-    if parts.is_empty() {
+    let Some((part, remaining_parts)) = parts.split_first() else {
         return;
-    }
+    };
 
     if !matches!(config, serde_yml::Value::Mapping(_)) {
         *config = serde_yml::Value::Mapping(serde_yml::Mapping::default());
     }
 
-    if parts.len() == 1 {
+    if remaining_parts.is_empty() {
         if let serde_yml::Value::Mapping(map) = config {
-            map.insert(serde_yml::Value::String(parts[0].to_string()), value);
+            map.insert(serde_yml::Value::String((*part).to_string()), value);
         }
         return;
     }
 
     if let serde_yml::Value::Mapping(map) = config {
-        let key = serde_yml::Value::String(parts[0].to_string());
+        let key = serde_yml::Value::String((*part).to_string());
         let entry = map
             .entry(key)
             .or_insert_with(|| serde_yml::Value::Mapping(serde_yml::Mapping::default()));
@@ -705,22 +950,20 @@ fn set_yaml_value(config: &mut serde_yml::Value, parts: &[&str], value: serde_ym
             *entry = serde_yml::Value::Mapping(serde_yml::Mapping::default());
         }
 
-        set_yaml_value(entry, &parts[1..], value);
+        set_yaml_value(entry, remaining_parts, value);
     }
 }
 
 fn get_yaml_value(value: &serde_yml::Value, parts: &[&str]) -> Option<String> {
-    if parts.is_empty() {
-        return None;
-    }
+    let (part, remaining_parts) = parts.split_first()?;
 
     if let serde_yml::Value::Mapping(map) = value {
-        let key = serde_yml::Value::String(parts[0].to_string());
+        let key = serde_yml::Value::String((*part).to_string());
         let child = map.get(&key)?;
-        if parts.len() == 1 {
+        if remaining_parts.is_empty() {
             return yaml_value_to_string(child);
         }
-        return get_yaml_value(child, &parts[1..]);
+        return get_yaml_value(child, remaining_parts);
     }
 
     None
@@ -739,9 +982,14 @@ fn yaml_value_to_string(value: &serde_yml::Value) -> Option<String> {
 }
 
 fn load_mutable_yaml_config(config_path: &Path) -> Result<serde_yml::Value> {
-    if !config_path.exists() {
-        return Ok(serde_yml::Value::Mapping(serde_yml::Mapping::default()));
-    }
+    let metadata = match fs::symlink_metadata(config_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(serde_yml::Value::Mapping(serde_yml::Mapping::default()));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    validate_edit_config_target(config_path, &metadata)?;
 
     let contents = fs::read_to_string(config_path)?;
     match serde_yml::from_str(&contents) {
@@ -785,7 +1033,9 @@ fn delete_config_value(
         && !matches!(overrides.no_db, Some(true))
     {
         let mut storage_ctx = config::open_storage_with_cli(dir, overrides)?;
-        db_deleted = storage_ctx.storage.delete_config(key)?;
+        for alias in config_key_aliases(key) {
+            db_deleted |= storage_ctx.storage.delete_config(&alias)?;
+        }
         storage_ctx.flush_no_db_if_dirty()?;
     }
 
@@ -891,20 +1141,28 @@ fn delete_from_yaml(value: &mut serde_yml::Value, key: &str) -> bool {
 }
 
 fn delete_nested(value: &mut serde_yml::Value, path: &[&str]) -> bool {
-    if path.is_empty() {
+    let Some((part, remaining_path)) = path.split_first() else {
         return false;
-    }
+    };
 
     if let serde_yml::Value::Mapping(map) = value {
-        let key = serde_yml::Value::String(path[0].to_string());
-
-        if path.len() == 1 {
-            return map.remove(&key).is_some();
+        if remaining_path.is_empty() {
+            let mut deleted = false;
+            for alias in config_key_aliases(part) {
+                let key = serde_yml::Value::String(alias);
+                deleted |= map.remove(&key).is_some();
+            }
+            return deleted;
         }
 
-        if let Some(child) = map.get_mut(&key) {
-            return delete_nested(child, &path[1..]);
+        let mut deleted = false;
+        for alias in config_key_aliases(part) {
+            let key = serde_yml::Value::String(alias);
+            if let Some(child) = map.get_mut(&key) {
+                deleted |= delete_nested(child, remaining_path);
+            }
         }
+        return deleted;
     }
     false
 }
@@ -1106,8 +1364,9 @@ fn output_layer(layer: &ConfigLayer, source: ConfigSource, _json_mode: bool, ctx
             println!("  (empty)");
         } else {
             for key in all_keys {
-                let value = layer.get(key).unwrap();
-                println!("  {key}: {value}");
+                if let Some(value) = layer.get(key) {
+                    println!("  {key}: {value}");
+                }
             }
         }
     }
@@ -1165,9 +1424,7 @@ mod tests {
     fn test_nested_key_parsing() {
         // Test the key parsing logic - "display.color" should have 2 parts
         let parts: Vec<&str> = "display.color".split('.').collect();
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0], "display");
-        assert_eq!(parts[1], "color");
+        assert_eq!(parts.as_slice(), ["display", "color"]);
     }
 
     #[test]
@@ -1185,6 +1442,48 @@ mod tests {
     }
 
     #[test]
+    fn test_allowed_editor_accepts_absolute_common_editor_path() {
+        assert_eq!(
+            AllowedEditor::from_program("/usr/bin/vim").unwrap(),
+            AllowedEditor::Vim
+        );
+    }
+
+    #[test]
+    fn test_allowed_editor_accepts_common_visual_editor_aliases() {
+        assert_eq!(
+            AllowedEditor::from_program("/opt/homebrew/bin/nvim").unwrap(),
+            AllowedEditor::Neovim
+        );
+        assert_eq!(
+            AllowedEditor::from_program("emacsclient").unwrap(),
+            AllowedEditor::EmacsClient
+        );
+        assert_eq!(
+            AllowedEditor::from_program("cursor").unwrap(),
+            AllowedEditor::Cursor
+        );
+    }
+
+    #[test]
+    fn test_allowed_editor_accepts_windows_exe_suffix() {
+        assert_eq!(
+            AllowedEditor::from_program("notepad.EXE").unwrap(),
+            AllowedEditor::Notepad
+        );
+        assert_eq!(
+            AllowedEditor::from_program(r"C:\Windows\System32\notepad.ExE").unwrap(),
+            AllowedEditor::Notepad
+        );
+    }
+
+    #[test]
+    fn test_allowed_editor_rejects_unknown_program() {
+        let err = AllowedEditor::from_program("custom-editor").unwrap_err();
+        assert!(err.to_string().contains("Unsupported editor"));
+    }
+
+    #[test]
     fn test_delete_config_key_from_yaml_file_removes_value() {
         let dir = tempfile::TempDir::new().unwrap();
         let config_path = dir.path().join("config.yaml");
@@ -1197,6 +1496,32 @@ mod tests {
 
         let contents = fs::read_to_string(&config_path).unwrap();
         assert!(!contents.contains("color"));
+    }
+
+    #[test]
+    fn test_delete_config_key_removes_hyphen_underscore_aliases() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        fs::write(
+            &config_path,
+            "issue-prefix: bd\nsync:\n  auto-flush: false\n",
+        )
+        .unwrap();
+
+        let deleted_prefix =
+            apply_prepared_yaml_delete(prepare_yaml_delete(&config_path, "issue_prefix").unwrap())
+                .unwrap();
+        assert!(deleted_prefix);
+
+        let deleted_sync = apply_prepared_yaml_delete(
+            prepare_yaml_delete(&config_path, "sync.auto_flush").unwrap(),
+        )
+        .unwrap();
+        assert!(deleted_sync);
+
+        let contents = fs::read_to_string(&config_path).unwrap();
+        assert!(!contents.contains("issue-prefix"));
+        assert!(!contents.contains("auto-flush"));
     }
 
     #[test]
@@ -1239,6 +1564,101 @@ mod tests {
         assert_eq!(mode, 0o600, "atomic rewrite should preserve file mode");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_mutable_config_helpers_refuse_existing_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let target_path = dir.path().join("outside-target.yaml");
+        fs::write(&target_path, "display:\n  color: true\n").unwrap();
+        symlink(&target_path, &config_path).unwrap();
+
+        let load_err = load_mutable_yaml_config(&config_path).unwrap_err();
+        assert!(load_err.to_string().contains("symbolic link"));
+
+        let write_err =
+            write_config_atomically(&config_path, "display:\n  color: false\n").unwrap_err();
+        assert!(write_err.to_string().contains("symbolic link"));
+        assert_eq!(
+            fs::read_to_string(&target_path).unwrap(),
+            "display:\n  color: true\n",
+            "mutable config helpers must not read-edit-write a symlink target"
+        );
+        assert!(
+            fs::symlink_metadata(&config_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "rejected config symlink should be left untouched"
+        );
+    }
+
+    #[test]
+    fn test_create_default_config_if_missing_creates_regular_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let default_content = "display:\n  color: true\n";
+
+        create_default_config_if_missing(&config_path, default_content).unwrap();
+
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), default_content);
+        assert!(fs::symlink_metadata(&config_path).unwrap().is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_create_default_config_if_missing_refuses_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let target_path = dir.path().join("outside-target.yaml");
+        symlink(&target_path, &config_path).unwrap();
+
+        let err = create_default_config_if_missing(&config_path, "display:\n  color: true\n")
+            .unwrap_err();
+
+        assert!(err.to_string().contains("symbolic link"));
+        assert!(
+            !target_path.exists(),
+            "dangling symlink target must remain absent"
+        );
+        assert!(
+            fs::symlink_metadata(&config_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "config path should not be replaced after refusal"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_create_default_config_if_missing_refuses_existing_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let target_path = dir.path().join("outside-target.yaml");
+        fs::write(&target_path, "existing-target").unwrap();
+        symlink(&target_path, &config_path).unwrap();
+
+        let err = create_default_config_if_missing(&config_path, "display:\n  color: true\n")
+            .unwrap_err();
+
+        assert!(err.to_string().contains("symbolic link"));
+        assert_eq!(fs::read_to_string(&target_path).unwrap(), "existing-target");
+        assert!(
+            fs::symlink_metadata(&config_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "config path should not be replaced after refusal"
+        );
+    }
+
     #[test]
     fn test_build_layers_does_not_create_missing_db_for_read_only_access() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1252,6 +1672,39 @@ mod tests {
             "config read paths must not create a database as a side effect"
         );
         assert!(!layers.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_effective_db_path_reports_discovered_path_and_existence() {
+        // #339: `config get db --json` must expose the RESOLVED canonical DB
+        // path even with no explicit override, plus whether it exists.
+        let dir = tempfile::TempDir::new().unwrap();
+        let beads_dir = dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        // No override, no DB file yet: effective path points at the discovered
+        // `.beads` DB location, and `exists` is false.
+        let (path, exists) = resolve_effective_db_path(Some(&beads_dir), &CliOverrides::default());
+        let path = path.expect("effective DB path resolved for discovered workspace");
+        assert!(
+            path.starts_with(crate::util::resolve_cache_dir(&beads_dir))
+                || path.starts_with(&beads_dir),
+            "effective path must resolve under the discovered .beads workspace: {}",
+            path.display()
+        );
+        assert!(!exists, "DB does not exist yet");
+
+        // Create the DB at the resolved path; `exists` flips to true.
+        crate::storage::SqliteStorage::open(&path).unwrap();
+        let (path2, exists2) =
+            resolve_effective_db_path(Some(&beads_dir), &CliOverrides::default());
+        assert_eq!(path2.as_ref(), Some(&path));
+        assert!(exists2, "DB now exists at the resolved effective path");
+
+        // No discovered workspace: returns (None, false).
+        let (none_path, none_exists) = resolve_effective_db_path(None, &CliOverrides::default());
+        assert!(none_path.is_none());
+        assert!(!none_exists);
     }
 
     #[test]

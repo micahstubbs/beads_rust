@@ -19,6 +19,238 @@ fn parse_created_id(stdout: &str) -> String {
 }
 
 #[test]
+fn e2e_dep_cycles_default_hides_closed_archive_and_include_closed_exposes_it() {
+    common::init_test_logging();
+    info!("e2e_dep_cycles_default_hides_closed_archive_and_include_closed_exposes_it: starting");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_closed_archive_cycles");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let issue_a = run_br(&workspace, ["create", "Archived cycle A"], "create_a");
+    assert!(
+        issue_a.status.success(),
+        "create A failed: {}",
+        issue_a.stderr
+    );
+    let issue_a_id = parse_created_id(&issue_a.stdout);
+
+    let issue_b = run_br(&workspace, ["create", "Archived cycle B"], "create_b");
+    assert!(
+        issue_b.status.success(),
+        "create B failed: {}",
+        issue_b.stderr
+    );
+    let issue_b_id = parse_created_id(&issue_b.stdout);
+
+    let add_a_b = run_br(
+        &workspace,
+        ["dep", "add", &issue_a_id, &issue_b_id, "-t", "related"],
+        "add_a_b_related",
+    );
+    assert!(
+        add_a_b.status.success(),
+        "add A->B failed: {}",
+        add_a_b.stderr
+    );
+    let add_b_a = run_br(
+        &workspace,
+        ["dep", "add", &issue_b_id, &issue_a_id, "-t", "related"],
+        "add_b_a_related",
+    );
+    assert!(
+        add_b_a.status.success(),
+        "add B->A failed: {}",
+        add_b_a.stderr
+    );
+
+    let close_a = run_br(&workspace, ["close", &issue_a_id], "close_a");
+    assert!(
+        close_a.status.success(),
+        "close A failed: {}",
+        close_a.stderr
+    );
+    let close_b = run_br(&workspace, ["close", &issue_b_id], "close_b");
+    assert!(
+        close_b.status.success(),
+        "close B failed: {}",
+        close_b.stderr
+    );
+
+    let active_only = run_br(
+        &workspace,
+        ["dep", "cycles", "--json"],
+        "cycles_active_only",
+    );
+    assert!(
+        active_only.status.success(),
+        "dep cycles active-only failed: {}",
+        active_only.stderr
+    );
+    let active_payload: Value = serde_json::from_str(&extract_json_payload(&active_only.stdout))
+        .expect("active cycles json");
+    assert_eq!(active_payload["scope"], "active");
+    assert_eq!(active_payload["include_closed"], false);
+    assert_eq!(active_payload["count"], 0);
+    assert_eq!(active_payload["active_count"], 0);
+    assert_eq!(active_payload["archived_closed_count"], 1);
+    assert_eq!(active_payload["total_count"], 1);
+    assert_eq!(active_payload["cycles"].as_array().unwrap().len(), 0);
+    assert!(active_payload.get("archived_closed_cycles").is_none());
+
+    let with_archive = run_br(
+        &workspace,
+        ["dep", "cycles", "--json", "--include-closed"],
+        "cycles_include_closed",
+    );
+    assert!(
+        with_archive.status.success(),
+        "dep cycles --include-closed failed: {}",
+        with_archive.stderr
+    );
+    let archive_payload: Value = serde_json::from_str(&extract_json_payload(&with_archive.stdout))
+        .expect("include-closed cycles json");
+    assert_eq!(archive_payload["scope"], "active_and_archived");
+    assert_eq!(archive_payload["include_closed"], true);
+    assert_eq!(archive_payload["count"], 1);
+    assert_eq!(archive_payload["active_count"], 0);
+    assert_eq!(archive_payload["archived_closed_count"], 1);
+    assert_eq!(archive_payload["total_count"], 1);
+    assert_eq!(archive_payload["cycles"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        archive_payload["archived_closed_cycles"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    info!(
+        "e2e_dep_cycles_default_hides_closed_archive_and_include_closed_exposes_it: assertions passed"
+    );
+}
+
+/// #368: an active dependency cycle must surface to scripted/robot callers via
+/// a non-zero exit code (5 = CycleDetected) on both the text and JSON surfaces,
+/// while the cycle data itself is still emitted on stdout.
+#[test]
+fn e2e_dep_cycles_active_cycle_exits_nonzero() {
+    common::init_test_logging();
+    info!("e2e_dep_cycles_active_cycle_exits_nonzero: starting");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_active_cycle");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let issue_a = run_br(&workspace, ["create", "Active cycle A"], "create_a");
+    assert!(
+        issue_a.status.success(),
+        "create A failed: {}",
+        issue_a.stderr
+    );
+    let issue_a_id = parse_created_id(&issue_a.stdout);
+
+    let issue_b = run_br(&workspace, ["create", "Active cycle B"], "create_b");
+    assert!(
+        issue_b.status.success(),
+        "create B failed: {}",
+        issue_b.stderr
+    );
+    let issue_b_id = parse_created_id(&issue_b.stdout);
+
+    // `related` edges can close a cycle without br refusing the edge (only
+    // `blocks` cycles are rejected at insert time), leaving an active cycle the
+    // detector reports.
+    let add_a_b = run_br(
+        &workspace,
+        ["dep", "add", &issue_a_id, &issue_b_id, "-t", "related"],
+        "add_a_b_related",
+    );
+    assert!(
+        add_a_b.status.success(),
+        "add A->B failed: {}",
+        add_a_b.stderr
+    );
+    let add_b_a = run_br(
+        &workspace,
+        ["dep", "add", &issue_b_id, &issue_a_id, "-t", "related"],
+        "add_b_a_related",
+    );
+    assert!(
+        add_b_a.status.success(),
+        "add B->A failed: {}",
+        add_b_a.stderr
+    );
+
+    // JSON surface: cycle data preserved AND non-zero exit.
+    let json = run_br(&workspace, ["dep", "cycles", "--json"], "cycles_json");
+    assert_eq!(
+        json.status.code(),
+        Some(5),
+        "dep cycles --json should exit 5 with an active cycle; stderr: {}",
+        json.stderr
+    );
+    let payload: Value =
+        serde_json::from_str(&extract_json_payload(&json.stdout)).expect("cycles json");
+    assert_eq!(payload["count"], 1, "expected one reported cycle");
+    assert_eq!(payload["active_count"], 1, "expected one active cycle");
+
+    // Text surface: same non-zero exit.
+    let text = run_br(&workspace, ["dep", "cycles"], "cycles_text");
+    assert_eq!(
+        text.status.code(),
+        Some(5),
+        "dep cycles should exit 5 with an active cycle; stderr: {}",
+        text.stderr
+    );
+
+    info!("e2e_dep_cycles_active_cycle_exits_nonzero: assertions passed");
+}
+
+/// #368: when a bulk import's per-edge fallback drops a cycle-closing edge, the
+/// issues are still created but the command exits non-zero so scripted callers
+/// learn the imported graph differs from the declared spec.
+#[test]
+fn e2e_create_bulk_dropped_cycle_edge_exits_nonzero() {
+    common::init_test_logging();
+    info!("e2e_create_bulk_dropped_cycle_edge_exits_nonzero: starting");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_bulk_cycle");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let bulk = "## Task A\n\n### ID\na1\n\n### Type\ntask\n\n### Description\nFirst task.\n\n\
+                ### Dependencies\nblocks: b1\n\n\
+                ## Task B\n\n### ID\nb1\n\n### Type\ntask\n\n### Description\nSecond task.\n\n\
+                ### Dependencies\nblocks: a1\n";
+    let bulk_path = workspace.root.join("bulk.md");
+    fs::write(&bulk_path, bulk).expect("write bulk.md");
+
+    let created = run_br(
+        &workspace,
+        ["create", "-f", bulk_path.to_str().unwrap()],
+        "bulk_create_cycle",
+    );
+    assert_eq!(
+        created.status.code(),
+        Some(5),
+        "bulk create that dropped a cycle edge should exit 5; stderr: {}",
+        created.stderr
+    );
+
+    // The issues themselves are still created despite the dropped edge.
+    let list = run_br(&workspace, ["list", "--json"], "list_after_bulk");
+    assert!(list.status.success(), "list failed: {}", list.stderr);
+    let issues = extract_issues_array(&list.stdout);
+    assert_eq!(
+        issues.len(),
+        2,
+        "both issues should be created from the bulk file"
+    );
+
+    info!("e2e_create_bulk_dropped_cycle_edge_exits_nonzero: assertions passed");
+}
+
+#[test]
 fn e2e_relations_labels_comments() {
     common::init_test_logging();
     info!("e2e_relations_labels_comments: starting");

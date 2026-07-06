@@ -4,8 +4,8 @@
 
 use super::{
     RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
-    auto_import_storage_ctx_if_stale, report_auto_flush_failure, resolve_issue_id,
-    retry_mutation_with_jsonl_recovery,
+    auto_import_storage_ctx_if_stale, cli_for_routed_workspace, report_auto_flush_failure,
+    resolve_issue_id, retry_mutation_with_jsonl_recovery,
 };
 use crate::cli::{LabelAddArgs, LabelCommands, LabelListArgs, LabelRemoveArgs, LabelRenameArgs};
 use crate::config;
@@ -51,6 +51,35 @@ pub fn execute(
     }
 }
 
+/// Execute read-only label subcommands when the caller already has open storage.
+///
+/// Returns `Ok(false)` for commands that need the normal routing path.
+///
+/// # Errors
+///
+/// Returns an error if the label query fails.
+pub fn execute_with_storage(
+    command: &LabelCommands,
+    json: bool,
+    ctx: &OutputContext,
+    storage: &SqliteStorage,
+) -> Result<bool> {
+    match command {
+        LabelCommands::ListAll => {
+            label_list_all(storage, json, ctx)?;
+            Ok(true)
+        }
+        LabelCommands::List(args) if args.issue.is_none() => {
+            label_list_unique(storage, ctx)?;
+            Ok(true)
+        }
+        LabelCommands::Add(_)
+        | LabelCommands::Remove(_)
+        | LabelCommands::List(_)
+        | LabelCommands::Rename(_) => Ok(false),
+    }
+}
+
 /// JSON output for label add/remove operations.
 #[derive(Serialize)]
 struct LabelActionResult {
@@ -85,9 +114,14 @@ struct RenameResult {
 
 /// Validate a label name.
 ///
-/// Labels must be alphanumeric with dashes and underscores allowed.
+/// Labels may contain ASCII alphanumeric characters, hyphens, underscores, and colons.
 fn validate_label(label: &str) -> Result<()> {
     LabelValidator::validate(label).map_err(|error| BeadsError::validation("label", error.message))
+}
+
+fn validate_rename_labels(args: &LabelRenameArgs) -> Result<()> {
+    validate_label(&args.old_name)?;
+    validate_label(&args.new_name)
 }
 
 fn label_display_text(value: &str) -> String {
@@ -254,6 +288,7 @@ fn execute_routed_label_remove(
     beads_dir: &Path,
 ) -> Result<()> {
     let (issue_inputs, label) = parse_issues_and_label(&args.issues, args.label.as_ref())?;
+    validate_label(&label)?;
     let prepared_routes = prepare_label_routes(&issue_inputs, cli, beads_dir)?;
     let mut routed_results = Vec::new();
 
@@ -328,9 +363,13 @@ fn execute_label_list_command(
 ) -> Result<()> {
     if let Some(input) = &args.issue {
         let route = config::routing::resolve_route(input, beads_dir)?;
-        let route_cli = routed_cli_for_batch(cli, route.is_external);
-        let _routed_write_lock =
-            acquire_routed_workspace_write_lock(&route.beads_dir, route.is_external)?;
+        let mut route_cli = routed_cli_for_batch(cli, route.is_external);
+        let routed_write_lock = acquire_routed_workspace_write_lock(
+            &route.beads_dir,
+            route.is_external,
+            route_cli.lock_timeout,
+        )?;
+        routed_write_lock.mark_cli_write_lock_held(&mut route_cli);
         let mut storage_ctx = config::open_storage_with_cli(&route.beads_dir, &route_cli)?;
         auto_import_storage_ctx_if_stale(&mut storage_ctx, &route_cli)?;
         let config_layer = storage_ctx.load_config(&route_cli)?;
@@ -355,9 +394,13 @@ fn prepare_label_routes(
     let mut prepared_routes = Vec::new();
 
     for batch in routed_batches {
-        let batch_cli = routed_cli_for_batch(cli, batch.is_external);
-        let routed_write_lock =
-            acquire_routed_workspace_write_lock(&batch.beads_dir, batch.is_external)?;
+        let mut batch_cli = routed_cli_for_batch(cli, batch.is_external);
+        let routed_write_lock = acquire_routed_workspace_write_lock(
+            &batch.beads_dir,
+            batch.is_external,
+            batch_cli.lock_timeout,
+        )?;
+        routed_write_lock.mark_cli_write_lock_held(&mut batch_cli);
         let mut storage_ctx = config::open_storage_with_cli(&batch.beads_dir, &batch_cli)?;
         auto_import_storage_ctx_if_stale(&mut storage_ctx, &batch_cli)?;
         let config_layer = storage_ctx.load_config(&batch_cli)?;
@@ -383,11 +426,7 @@ fn prepare_label_routes(
 }
 
 fn routed_cli_for_batch(cli: &config::CliOverrides, is_external: bool) -> config::CliOverrides {
-    let mut route_cli = cli.clone();
-    if is_external {
-        route_cli.db = None;
-    }
-    route_cli
+    cli_for_routed_workspace(cli, is_external)
 }
 
 fn render_label_action_results(
@@ -440,25 +479,31 @@ fn label_list(
             }
         }
     } else {
-        // List all unique labels (without counts - use list-all for counts)
-        let labels_with_counts = storage.get_unique_labels_with_counts()?;
-        let unique_labels: Vec<String> = labels_with_counts.into_iter().map(|(l, _)| l).collect();
+        label_list_unique(storage, ctx)?;
+    }
 
-        if ctx.is_json() {
-            ctx.json_pretty(&unique_labels);
-        } else if ctx.is_toon() {
-            ctx.toon(&unique_labels);
-        } else if ctx.is_quiet() {
-            return Ok(());
-        } else if matches!(ctx.mode(), OutputMode::Rich) {
-            render_unique_labels_rich(&unique_labels, ctx);
-        } else if unique_labels.is_empty() {
-            println!("No labels in project.");
-        } else {
-            println!("Labels ({} total):", unique_labels.len());
-            for label in &unique_labels {
-                println!("  {}", label_display_text(label));
-            }
+    Ok(())
+}
+
+fn label_list_unique(storage: &SqliteStorage, ctx: &OutputContext) -> Result<()> {
+    // List all unique labels (without counts - use list-all for counts)
+    let labels_with_counts = storage.get_unique_labels_with_counts()?;
+    let unique_labels: Vec<String> = labels_with_counts.into_iter().map(|(l, _)| l).collect();
+
+    if ctx.is_json() {
+        ctx.json_pretty(&unique_labels);
+    } else if ctx.is_toon() {
+        ctx.toon(&unique_labels);
+    } else if ctx.is_quiet() {
+        return Ok(());
+    } else if matches!(ctx.mode(), OutputMode::Rich) {
+        render_unique_labels_rich(&unique_labels, ctx);
+    } else if unique_labels.is_empty() {
+        println!("No labels in project.");
+    } else {
+        println!("Labels ({} total):", unique_labels.len());
+        for label in &unique_labels {
+            println!("  {}", label_display_text(label));
         }
     }
 
@@ -509,7 +554,7 @@ fn label_rename(
     ctx: &OutputContext,
 ) -> Result<()> {
     let storage = &mut storage_ctx.storage;
-    validate_label(&args.new_name)?;
+    validate_rename_labels(args)?;
 
     if args.old_name == args.new_name {
         if ctx.is_json() {
@@ -700,19 +745,11 @@ fn render_label_action_results_rich(
     for result in results {
         let mut text = Text::new("");
 
-        let (icon, verb, style) = if action == "add" {
-            if result.status == "added" {
-                ("\u{2713}", "Added", theme.success.clone())
-            } else {
-                ("\u{2022}", "Exists", theme.dimmed.clone())
-            }
-        } else {
-            // remove
-            if result.status == "removed" {
-                ("\u{2713}", "Removed", theme.success.clone())
-            } else {
-                ("\u{2022}", "Not found", theme.dimmed.clone())
-            }
+        let (icon, verb, style) = match (action, result.status.as_str()) {
+            ("add", "added") => ("\u{2713}", "Added", theme.success.clone()),
+            ("add", _) => ("\u{2022}", "Exists", theme.dimmed.clone()),
+            (_, "removed") => ("\u{2713}", "Removed", theme.success.clone()),
+            _ => ("\u{2022}", "Not found", theme.dimmed.clone()),
         };
 
         text.append_styled(&format!("{icon} {verb} label "), style);
@@ -959,9 +996,50 @@ mod tests {
     fn test_validate_label_invalid() {
         assert!(validate_label("").is_err());
         assert!(validate_label("has space").is_err());
+        assert!(validate_label("has/slash").is_err());
         assert!(validate_label("special@char").is_err());
         assert!(validate_label("dot.not.allowed").is_err());
         assert!(validate_label(&"a".repeat(51)).is_err());
+    }
+
+    #[test]
+    fn test_validate_rename_labels_rejects_invalid_old_name() {
+        let args = LabelRenameArgs {
+            old_name: "bad label".to_string(),
+            new_name: "backend".to_string(),
+        };
+        let err = validate_rename_labels(&args).unwrap_err();
+
+        assert!(err.to_string().contains("invalid characters"));
+    }
+
+    #[test]
+    fn test_validate_rename_labels_rejects_invalid_new_name() {
+        let args = LabelRenameArgs {
+            old_name: "backend".to_string(),
+            new_name: "bad label".to_string(),
+        };
+        let err = validate_rename_labels(&args).unwrap_err();
+
+        assert!(err.to_string().contains("invalid characters"));
+    }
+
+    #[test]
+    fn test_label_remove_rejects_invalid_label_before_route_preparation() {
+        let args = LabelRemoveArgs {
+            issues: vec!["bd-abc".to_string(), "has space".to_string()],
+            label: None,
+        };
+        let ctx = OutputContext::from_flags(false, false, true);
+        let err = execute_routed_label_remove(
+            &args,
+            &config::CliOverrides::default(),
+            &ctx,
+            std::path::Path::new("/missing/.beads"),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("invalid characters"));
     }
 
     #[test]

@@ -21,9 +21,12 @@
 use crate::error::{BeadsError, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use tracing::{debug, trace, warn};
+
+const MAX_REDIRECT_BYTES: usize = 4096;
+const MAX_REDIRECT_BYTES_U64: u64 = 4096;
 
 /// A route entry from routes.jsonl.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -117,7 +120,9 @@ pub fn find_town_root(start: &Path) -> Option<PathBuf> {
 
 /// Load route entries from a routes.jsonl file.
 ///
-/// Returns an empty vector if the file doesn't exist.
+/// Returns an empty vector if the file doesn't exist. Blank lines and
+/// whole-line `#` comments are ignored for parity with classic beads route
+/// files.
 ///
 /// # Errors
 ///
@@ -133,7 +138,7 @@ pub fn load_routes(routes_path: &Path) -> Result<Vec<RouteEntry>> {
 
     for (line_num, line_result) in reader.lines().enumerate() {
         let line = line_result?;
-        if line.trim().is_empty() {
+        if is_ignorable_route_jsonl_line(&line) {
             continue;
         }
 
@@ -158,6 +163,13 @@ pub fn load_routes(routes_path: &Path) -> Result<Vec<RouteEntry>> {
     Ok(routes)
 }
 
+/// Return true for route-file lines that carry no route entry.
+#[must_use]
+pub(crate) fn is_ignorable_route_jsonl_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.is_empty() || trimmed.starts_with('#')
+}
+
 /// Find a route entry matching the given prefix.
 #[must_use]
 pub fn find_route<'a>(routes: &'a [RouteEntry], prefix: &str) -> Option<&'a RouteEntry> {
@@ -180,7 +192,8 @@ pub fn read_redirect(beads_dir: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
 
-    let content = fs::read_to_string(&redirect_path)?;
+    let metadata = fs::metadata(&redirect_path)?;
+    let content = read_redirect_file_limited(&redirect_path, &metadata)?;
     let target = content.trim();
 
     if target.is_empty() {
@@ -204,6 +217,33 @@ pub fn read_redirect(beads_dir: &Path) -> Result<Option<PathBuf>> {
     );
 
     Ok(Some(resolved))
+}
+
+fn read_redirect_file_limited(redirect_path: &Path, metadata: &fs::Metadata) -> Result<String> {
+    if metadata.len() > MAX_REDIRECT_BYTES_U64 {
+        return Err(BeadsError::Config(format!(
+            "Redirect file exceeds maximum size of {MAX_REDIRECT_BYTES} bytes: {}",
+            redirect_path.display()
+        )));
+    }
+
+    let file = File::open(redirect_path)?;
+    let mut reader = file.take(MAX_REDIRECT_BYTES_U64.saturating_add(1));
+    let mut content = Vec::new();
+    reader.read_to_end(&mut content)?;
+    if content.len() > MAX_REDIRECT_BYTES {
+        return Err(BeadsError::Config(format!(
+            "Redirect file exceeds maximum size of {MAX_REDIRECT_BYTES} bytes: {}",
+            redirect_path.display()
+        )));
+    }
+
+    String::from_utf8(content).map_err(|e| {
+        BeadsError::Config(format!(
+            "Redirect file must be valid UTF-8: {}: {e}",
+            redirect_path.display()
+        ))
+    })
 }
 
 /// Follow redirects until we reach a terminal beads directory.
@@ -455,6 +495,24 @@ mod tests {
     }
 
     #[test]
+    fn load_routes_skips_comments() {
+        let dir = TempDir::new().unwrap();
+        let routes_path = dir.path().join("routes.jsonl");
+
+        let content = r#"# Local route table
+        {"prefix":"bd-","path":"."}
+        # Keep this in sync with the town map.
+        {"prefix":"fe-","path":"../frontend"}
+        "#;
+        fs::write(&routes_path, content).unwrap();
+
+        let routes = load_routes(&routes_path).unwrap();
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].prefix, "bd-");
+        assert_eq!(routes[1].prefix, "fe-");
+    }
+
+    #[test]
     fn find_route_match() {
         let routes = vec![
             RouteEntry {
@@ -516,6 +574,58 @@ mod tests {
 
         let result = read_redirect(&beads_dir).unwrap().unwrap();
         assert_eq!(result, beads_dir);
+    }
+
+    #[test]
+    fn read_redirect_rejects_oversized_file() {
+        let dir = TempDir::new().unwrap();
+        let beads_dir = dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let redirect_path = beads_dir.join("redirect");
+        fs::write(&redirect_path, ".").unwrap();
+        File::options()
+            .write(true)
+            .open(&redirect_path)
+            .unwrap()
+            .set_len(MAX_REDIRECT_BYTES_U64 + 1)
+            .unwrap();
+
+        let err = read_redirect(&beads_dir).unwrap_err();
+        assert!(
+            matches!(&err, BeadsError::Config(msg) if msg.contains("maximum size")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn read_redirect_file_limited_checks_size_before_utf8_decode() {
+        let dir = TempDir::new().unwrap();
+        let redirect_path = dir.path().join("redirect");
+        fs::write(&redirect_path, ".").unwrap();
+        let metadata = fs::metadata(&redirect_path).unwrap();
+        let mut payload = vec![b'a'; MAX_REDIRECT_BYTES];
+        payload.push(0xc3);
+        fs::write(&redirect_path, payload).unwrap();
+
+        let err = read_redirect_file_limited(&redirect_path, &metadata).unwrap_err();
+        assert!(
+            matches!(&err, BeadsError::Config(msg) if msg.contains("maximum size")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn read_redirect_rejects_invalid_utf8() {
+        let dir = TempDir::new().unwrap();
+        let beads_dir = dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(beads_dir.join("redirect"), [0xff]).unwrap();
+
+        let err = read_redirect(&beads_dir).unwrap_err();
+        assert!(
+            matches!(&err, BeadsError::Config(msg) if msg.contains("valid UTF-8")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]

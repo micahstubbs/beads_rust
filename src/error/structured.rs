@@ -121,9 +121,15 @@ pub enum ErrorCode {
     /// YAML parsing error
     YamlError,
 
-    // === Operational Errors (exit code 3) ===
+    // === Operational Errors ===
+    /// Cooperative shutdown is already in progress
+    ShuttingDown,
     /// All requested items were skipped; nothing to do
     NothingToDo,
+
+    // === Policy Errors (exit code 4) ===
+    /// Closure-time policy gate fired (issue #274)
+    PolicyViolation,
 
     // === Internal Errors (exit code 1) ===
     /// Unexpected internal error
@@ -175,7 +181,10 @@ impl ErrorCode {
             Self::JsonError => "JSON_ERROR",
             Self::YamlError => "YAML_ERROR",
             // Operational
+            Self::ShuttingDown => "SHUTTING_DOWN",
             Self::NothingToDo => "NOTHING_TO_DO",
+            // Policy
+            Self::PolicyViolation => "POLICY_VIOLATION",
             // Internal
             Self::InternalError => "INTERNAL_ERROR",
         }
@@ -197,6 +206,7 @@ impl ErrorCode {
                 | Self::InvalidPriority
                 | Self::RequiredField
                 | Self::AmbiguousId
+                | Self::ShuttingDown
         )
     }
 
@@ -211,6 +221,7 @@ impl ErrorCode {
     /// - 6: Sync/JSONL errors
     /// - 7: Config errors
     /// - 8: I/O errors
+    /// - 130: Cooperative shutdown after SIGINT
     #[must_use]
     pub const fn exit_code(&self) -> i32 {
         match self {
@@ -227,12 +238,14 @@ impl ErrorCode {
             | Self::IdCollision
             | Self::InvalidId
             | Self::NothingToDo => 3,
+            Self::ShuttingDown => 130,
             // Validation (4)
             Self::ValidationFailed
             | Self::InvalidStatus
             | Self::InvalidType
             | Self::InvalidPriority
-            | Self::RequiredField => 4,
+            | Self::RequiredField
+            | Self::PolicyViolation => 4,
             // Dependency (5)
             Self::CycleDetected
             | Self::DependencyNotFound
@@ -637,9 +650,25 @@ impl StructuredError {
                 ErrorCode::DuplicateDependency,
                 Some(json!({"from": from, "to": to})),
             ),
+            BeadsError::ShuttingDown => (
+                ErrorCode::ShuttingDown,
+                Some(json!({"shutdown_requested": true})),
+            ),
             BeadsError::NothingToDo { reason } => {
                 (ErrorCode::NothingToDo, Some(json!({"reason": reason})))
             }
+            BeadsError::PolicyViolation {
+                issue_id,
+                summary,
+                violations,
+            } => (
+                ErrorCode::PolicyViolation,
+                Some(json!({
+                    "issue_id": issue_id,
+                    "summary": summary,
+                    "violations": violations,
+                })),
+            ),
             BeadsError::Config(_) => (ErrorCode::ConfigError, None),
             BeadsError::ExternalCommand { command, reason } => (
                 ErrorCode::IoError,
@@ -723,6 +752,9 @@ impl StructuredError {
             }
             BeadsError::NothingToDo { .. } => {
                 Some("All specified issues were already closed or not found.".to_string())
+            }
+            BeadsError::ShuttingDown => {
+                Some("Retry after starting a fresh br process.".to_string())
             }
             BeadsError::JsonlParse { line, .. } => Some(format!(
                 "Check line {line} of the JSONL file for syntax errors."
@@ -997,6 +1029,7 @@ mod tests {
         assert_eq!(ErrorCode::IssueNotFound.as_str(), "ISSUE_NOT_FOUND");
         assert_eq!(ErrorCode::CycleDetected.as_str(), "CYCLE_DETECTED");
         assert_eq!(ErrorCode::NotInitialized.as_str(), "NOT_INITIALIZED");
+        assert_eq!(ErrorCode::ShuttingDown.as_str(), "SHUTTING_DOWN");
     }
 
     #[test]
@@ -1006,6 +1039,7 @@ mod tests {
         assert!(ErrorCode::DatabaseLocked.is_retryable());
         assert!(ErrorCode::ValidationFailed.is_retryable());
         assert!(ErrorCode::InvalidPriority.is_retryable());
+        assert!(ErrorCode::ShuttingDown.is_retryable());
     }
 
     #[test]
@@ -1017,6 +1051,7 @@ mod tests {
         assert_eq!(ErrorCode::JsonlParseError.exit_code(), 6);
         assert_eq!(ErrorCode::ConfigError.exit_code(), 7);
         assert_eq!(ErrorCode::IoError.exit_code(), 8);
+        assert_eq!(ErrorCode::ShuttingDown.exit_code(), 130);
         assert_eq!(ErrorCode::InternalError.exit_code(), 1);
     }
 

@@ -97,6 +97,21 @@ fn run_installer_function(temp_dir: &TempDir, _function_name: &str, function_cal
         .expect("Failed to run installer function")
 }
 
+fn install_script_contents() -> String {
+    let install_script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("install.sh");
+    fs::read_to_string(install_script).expect("read install.sh")
+}
+
+fn shell_function_section<'a>(script: &'a str, function_name: &str) -> &'a str {
+    let marker = format!("{function_name}() {{");
+    let start = script.find(&marker).expect("function marker") + marker.len();
+    let tail = &script[start..];
+    let end = tail
+        .find("\n# ============================================================================")
+        .unwrap_or(tail.len());
+    &tail[..end]
+}
+
 // ============================================================================
 // Platform Detection Tests
 // ============================================================================
@@ -117,16 +132,22 @@ fn e2e_installer_platform_detection_linux_x64() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let platform = stdout.trim();
 
-        // Verify platform format: os_arch
+        // Verify platform format: os_arch or os_libc_arch (the libc segment
+        // is only emitted on Linux when a non-glibc libc is detected — see
+        // detect_platform in install.sh and #284).
         assert!(
             platform.contains('_'),
-            "Platform should be os_arch format, got: {platform}"
+            "Platform should be os[_libc]_arch format, got: {platform}"
         );
 
         let parts: Vec<&str> = platform.split('_').collect();
-        assert_eq!(parts.len(), 2, "Platform should have exactly 2 parts");
+        assert!(
+            parts.len() == 2 || parts.len() == 3,
+            "Platform should have 2 or 3 parts, got {parts:?}"
+        );
 
         let valid_os = ["linux", "darwin", "windows"];
+        let valid_libc = ["musl"];
         let valid_arch = ["amd64", "arm64", "armv7"];
 
         assert!(
@@ -135,12 +156,29 @@ fn e2e_installer_platform_detection_linux_x64() {
             parts[0],
             valid_os
         );
-        assert!(
-            valid_arch.contains(&parts[1]),
-            "Invalid arch: {}, expected one of {:?}",
-            parts[1],
-            valid_arch
-        );
+
+        if parts.len() == 3 {
+            assert_eq!(parts[0], "linux", "libc segment is only valid on Linux");
+            assert!(
+                valid_libc.contains(&parts[1]),
+                "Invalid libc: {}, expected one of {:?}",
+                parts[1],
+                valid_libc
+            );
+            assert!(
+                valid_arch.contains(&parts[2]),
+                "Invalid arch: {}, expected one of {:?}",
+                parts[2],
+                valid_arch
+            );
+        } else {
+            assert!(
+                valid_arch.contains(&parts[1]),
+                "Invalid arch: {}, expected one of {:?}",
+                parts[1],
+                valid_arch
+            );
+        }
     }
     // Note: Function might fail if sourcing install.sh has issues, that's OK for this test
 }
@@ -183,11 +221,15 @@ fn e2e_installer_detects_system_platform() {
     let output = run_installer_function(&temp, "detect_platform", "detect_platform");
     if output.status.success() {
         let detected = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let expected = format!("{expected_os}_{expected_arch}");
+        // Accept either the 2-part (glibc / non-Linux) or 3-part (musl) form.
+        // The exact libc segment depends on the host's libc — we don't try to
+        // probe it here, only verify that the os/arch alignment is correct.
+        let two_part = format!("{expected_os}_{expected_arch}");
+        let three_part_musl = format!("{expected_os}_musl_{expected_arch}");
 
-        assert_eq!(
-            detected, expected,
-            "Platform detection mismatch: got {detected}, expected {expected}"
+        assert!(
+            detected == two_part || detected == three_part_musl,
+            "Platform detection mismatch: got {detected}, expected {two_part} or {three_part_musl}"
         );
     }
 }
@@ -217,6 +259,50 @@ fn e2e_installer_version_resolution_explicit() {
         stdout.contains("br installer") || stdout.contains("install") || stderr.contains("br"),
         "Help output should mention br installer"
     );
+}
+
+#[test]
+fn e2e_installer_uses_tagless_release_asset_names() {
+    if !has_bash() {
+        eprintln!("Skipping test: bash not available");
+        return;
+    }
+
+    let temp = TempDir::new().expect("temp dir");
+    let output = run_installer_function(
+        &temp,
+        "release_asset_version",
+        r#"
+        printf 'asset_from_tag=%s\n' "$(release_asset_version "v0.2.10")"
+        printf 'asset_from_plain=%s\n' "$(release_asset_version "0.2.10")"
+        printf 'tag_from_tag=%s\n' "$(release_download_tag "v0.2.10")"
+        printf 'tag_from_plain=%s\n' "$(release_download_tag "0.2.10")"
+        trap - EXIT
+        exit 0
+        "#,
+    );
+
+    assert!(
+        output.status.success(),
+        "version helper probe failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("asset_from_tag=0.2.10"));
+    assert!(stdout.contains("asset_from_plain=0.2.10"));
+    assert!(stdout.contains("tag_from_tag=v0.2.10"));
+    assert!(stdout.contains("tag_from_plain=v0.2.10"));
+
+    let script = install_script_contents();
+    let download_release = shell_function_section(&script, "download_release");
+    assert!(
+        download_release
+            .contains(r#"archive_name="br-${asset_version}-${platform}.${archive_ext}""#)
+    );
+    assert!(download_release.contains(r"/releases/download/${release_tag}/${archive_name}"));
+    assert!(!download_release.contains(r#"archive_name="br-${VERSION}-${platform}"#));
 }
 
 #[test]
@@ -334,35 +420,49 @@ fn e2e_installer_checksum_mismatch_fails() {
     }
 
     let temp = TempDir::new().expect("temp dir");
+    let archive = temp.path().join("br-0.0.0-linux_amd64.tar.gz");
+    fs::write(&archive, b"not a release archive").expect("write fake archive");
 
     // Provide a bad checksum - installer should fail
     let bad_checksum = "0000000000000000000000000000000000000000000000000000000000000000";
+    let artifact_url = format!("file://{}", archive.display());
 
     let output = run_installer(
         &temp,
-        &["--checksum", bad_checksum, "--quiet"],
+        &[
+            "--version",
+            "v0.0.0",
+            "--artifact-url",
+            &artifact_url,
+            "--checksum",
+            bad_checksum,
+            "--quiet",
+            "--skip-skills",
+        ],
         HashMap::new(),
     );
 
-    // With a bad checksum, the installer should fail during verification
-    // unless it can't download the file at all (which is also a failure mode)
-    // Either way, the install should NOT succeed silently
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // The installer might fail at download stage (no version) or checksum stage
-    // Both are acceptable - we just don't want silent success with bad checksum
-    if output.status.success() {
-        // If it somehow succeeded, verify the binary wasn't installed
-        let binary_path = temp.path().join("bin").join("br");
-        if binary_path.exists() {
-            // If binary exists, it should be because checksum was skipped (no release found)
-            // In production with --checksum flag, this would be a test failure
-            eprintln!(
-                "Note: Install succeeded but checksum flag was provided. stdout={stdout}, stderr={stderr}"
-            );
-        }
-    }
+    assert!(
+        !output.status.success(),
+        "installer must fail closed on checksum mismatch; stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("Checksum mismatch"),
+        "stderr should explain the checksum mismatch; stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("Release artifact verification failed"),
+        "stderr should not fall back to source build after verification failure; stdout={stdout}, stderr={stderr}"
+    );
+
+    let binary_path = temp.path().join("bin").join("br");
+    assert!(
+        !binary_path.exists(),
+        "checksum mismatch must not install a binary"
+    );
 }
 
 // ============================================================================
@@ -578,6 +678,28 @@ fn e2e_installer_from_source_flag_accepted() {
         stdout.contains("br installer") || stdout.contains("--from-source"),
         "Should accept --from-source flag"
     );
+}
+
+#[test]
+fn e2e_installer_source_build_preflight_does_not_touch_shared_cargo_state() {
+    let script = install_script_contents();
+    let prepare_for_build = shell_function_section(&script, "prepare_for_build");
+
+    assert!(
+        !prepare_for_build.contains("pkill"),
+        "source-build preflight must not kill unrelated cargo processes"
+    );
+    for forbidden_path in [
+        "~/.cargo/.package-cache",
+        "~/.cargo/registry/.crate-cache.lock",
+        "~/.cargo/registry/cache",
+        "/tmp/cargo-target",
+    ] {
+        assert!(
+            !prepare_for_build.contains(forbidden_path),
+            "source-build preflight must not delete shared Cargo state: {forbidden_path}"
+        );
+    }
 }
 
 // ============================================================================

@@ -7,9 +7,8 @@ use crate::cli::ChangelogArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
-use crate::model::{Issue, Status};
 use crate::output::{OutputContext, OutputMode};
-use crate::storage::ListFilters;
+use crate::storage::ChangelogIssueRow;
 use crate::util::time::{parse_flexible_timestamp, parse_relative_time};
 use chrono::{DateTime, Utc};
 use rich_rust::prelude::*;
@@ -66,11 +65,8 @@ enum ChangelogRenderMode {
 ///
 /// # Errors
 ///
-/// Returns an error if config loading, git lookup, or storage access fails.
-///
-/// # Panics
-///
-/// Panics if JSON serialization of the output fails (should never happen with valid data).
+/// Returns an error if config loading, git lookup, storage access, or output
+/// serialization fails.
 pub fn execute(
     args: &ChangelogArgs,
     json: bool,
@@ -86,11 +82,8 @@ pub fn execute(
 ///
 /// # Errors
 ///
-/// Returns an error if git lookup or storage access fails.
-///
-/// # Panics
-///
-/// Panics if JSON serialization of the output fails (should never happen with valid data).
+/// Returns an error if git lookup, storage access, or output serialization
+/// fails.
 pub fn execute_with_storage_ctx(
     args: &ChangelogArgs,
     json: bool,
@@ -107,14 +100,9 @@ pub fn execute_with_storage_ctx(
 
     debug!(since = %since_label, "Filtering closed issues for changelog");
 
-    let filters = ListFilters {
-        statuses: Some(vec![Status::Closed]),
-        include_closed: true,
-        ..Default::default()
-    };
-    let issues = storage.list_issues(&filters)?;
+    let issues = storage.list_changelog_issues()?;
 
-    let mut grouped: BTreeMap<String, Vec<Issue>> = BTreeMap::new();
+    let mut grouped: BTreeMap<String, Vec<ChangelogIssueRow>> = BTreeMap::new();
     for issue in issues {
         if let Some(since_dt) = since_dt {
             let Some(closed_at) = issue.closed_at else {
@@ -173,10 +161,7 @@ pub fn execute_with_storage_ctx(
             } else {
                 // Robot mode requests JSON even though the shared output context only
                 // sees global flags.
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&output).expect("Failed to serialize JSON output")
-                );
+                println!("{}", serde_json::to_string_pretty(&output)?);
             }
         }
         ChangelogRenderMode::Toon => {

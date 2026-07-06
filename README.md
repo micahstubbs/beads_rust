@@ -59,6 +59,7 @@ You need to track issues for your project, but:
 br init                              # Initialize in your repo
 br create "Fix login timeout" -p 1   # Create high-priority issue
 br ready                             # See what's actionable
+br coordination status --json        # Inspect hidden in-progress claims
 br close br-abc123                   # Close when done; JSONL auto-flushes by default
 br sync --flush-only                 # Optional final export check before git commit
 ```
@@ -189,6 +190,9 @@ Every command supports `--json` for AI coding agents:
 br list --json | jq '.issues[] | select(.priority <= 1)'
 br ready --json  # Structured output for agents
 br show br-abc123 --json
+br capabilities --format json
+br capabilities --format json --command "create"
+br robot-docs guide
 ```
 
 For routine operator or agent use, prefer `RUST_LOG=error br ...` to suppress internal Rust dependency logs while preserving normal stdout/JSON output:
@@ -226,6 +230,18 @@ br has grown into a full CLI surface for local issue tracking: routing, recovery
 TOON/JSON schemas, MCP support, conformance checks, and sync safety tools are
 all part of the current scope. The focus is still local-first operation, explicit
 git/VCS handoff, and no background services installed behind your back.
+
+Agent-facing output contracts have a focused verifier:
+
+```bash
+BR_AGENT_CONTRACT_USE_RCH=1 ./scripts/verify-agent-contracts.sh
+```
+
+Run it before changing schema command metadata, CLI JSON/TOON output, MCP
+resources/tools/prompts, README/docs examples, or `agent_baseline/` artifacts.
+With `BR_AGENT_CONTRACT_USE_RCH=1`, the script delegates each Cargo target to
+`rch exec --`. The contract tests do not run git, project network calls, live
+Agent Mail, MCP clients, or fixture update modes.
 
 ---
 
@@ -332,7 +348,19 @@ on a network port, and uses the same SQLite database, JSONL export path, write
 locks, audit events, and sync safety model as the normal CLI. It does not run
 git. Use shell/JSON
 commands for simple scripts; use MCP when an agent benefits from discoverable
-tools, resources, prompts, and structured recovery hints.
+tools, resources, prompts, and structured recovery hints. MCP clients can read
+`beads://coordination/status` for the same `br.coordination.v1` stale-claim
+evidence shape as `br coordination status --json`; use the CLI snapshot flags
+when Agent Mail reservation or liveness evidence is required.
+
+The MCP tool surface is `list_issues`, `show_issue`, `create_issue`,
+`update_issue`, `close_issue`, `manage_dependencies`, and `project_overview`.
+The resource surface is `beads://project/info`, `beads://issues/{id}`,
+`beads://schema`, `beads://labels`, `beads://issues/ready`,
+`beads://issues/blocked`, `beads://issues/in_progress`,
+`beads://coordination/status`, `beads://issues/deferred`,
+`beads://issues/bottlenecks`, `beads://graph/health`, and
+`beads://events/recent`.
 
 ### Verify Installation
 
@@ -424,6 +452,7 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | `blocked` | Blocked issues | `br blocked` |
 | `search` | Full-text search | `br search "authentication"` |
 | `stale` | Stale issues | `br stale --days 30` |
+| `coordination status` | Hidden in-progress claim diagnosis | `br coordination status --json` |
 | `count` | Count with grouping | `br count --by status` |
 | `query` | Manage saved queries | `br query save mine --status open --assignee alice` |
 
@@ -432,6 +461,7 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | Command | Description | Example |
 |---------|-------------|---------|
 | `dep add` | Add dependency | `br dep add br-child br-parent` |
+| `dep import` | Bulk import dependency JSONL | `br dep import edges.jsonl --robot` |
 | `dep remove` | Remove dependency | `br dep remove br-child br-parent` |
 | `dep list` | List dependencies | `br dep list br-abc123` |
 | `dep tree` | Dependency tree | `br dep tree br-abc123` |
@@ -471,8 +501,10 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 |---------|-------------|---------|
 | `agents` | Manage AGENTS.md workflow instructions | `br agents --add --force` |
 | `audit` | Record and label agent interactions | `br audit record --kind note` |
+| `capabilities` | Describe machine-readable contracts and safety guarantees | `br capabilities --format json` |
 | `completions` | Generate shell completions | `br completions zsh` |
 | `info` | Show workspace diagnostics | `br info` |
+| `robot-docs` | Print concise docs for automation agents | `br robot-docs guide` |
 | `schema` | Emit JSON Schemas for outputs | `br schema all --format json` |
 | `where` | Show active `.beads` directory | `br where` |
 
@@ -551,6 +583,33 @@ br config set defaults.priority=1
 br config edit
 ```
 
+### Workflow Policy (`.beads/policy.yaml`)
+
+Workflow behavior is configured separately in `.beads/policy.yaml`. One use is
+defining a **configurable ready status group**: which statuses `br ready` treats
+as actionable work. By default only `open` is ready, but projects with a review
+workflow can widen it so review-returned work (e.g. `rework`) resurfaces through
+the same `br ready --json` entrypoint:
+
+```yaml
+# .beads/policy.yaml
+workflow:
+  status_groups:
+    ready:
+      - open
+      - rework
+```
+
+- Default (when unset): `[open]` — no change for existing repos.
+- Returned issues keep their real status (`{"status":"rework"}` in `--json`).
+- The `defer_until` time-gate still applies to non-`deferred` members;
+  `--include-deferred` additionally surfaces `deferred` work and drops the gate.
+- Under `workflow.strict: true`, the ready group must be a subset of
+  `workflow.statuses` or `br ready` rejects it with a clear error.
+- `br ready` (text/json/toon/robot) and `br scheduler` all honor the group.
+
+See `docs/CLI_REFERENCE.md` (the `ready` command) for full details.
+
 ### Environment Variables
 
 | Variable | Description |
@@ -607,13 +666,16 @@ Update issue        ──►      br update        ──►    SQLite UPDATE
 
 Query issues        ──►      br list          ──►    SQLite SELECT
 
-Export to git       ──►      br sync          ──►    Write JSONL
-                             --flush-only     ──►    Clear dirty flags
+Export to git       ──►      br sync --flush-only
+                                              ──►    Write JSONL + clear dirty flags
 
 Pull from git       ──►      git pull         ──►    JSONL updated
-                    ──►      br sync          ──►    Merge to SQLite
-                             --import-only
+                    ──►      br sync --import-only
+                                              ──►    Merge to SQLite
 ```
+
+Bare `br sync` is intentionally refused; choose `--flush-only`, `--import-only`,
+`--merge`, `--status`, or `--witness` so the data direction is explicit.
 
 ### Safety Model
 
@@ -684,9 +746,9 @@ br sync --import-only --force
 br sync --import-only --rebuild
 ```
 
-`--rebuild` is an import-mode operation. It is not valid with `--flush-only` or
-`--merge`; after import it removes database entries that are absent from JSONL,
-while preserving deletion tombstones used by sync.
+`--rebuild` is an explicit import-mode operation. It is valid only with
+`--import-only`; after import it removes database entries that are absent from
+JSONL, while preserving deletion tombstones used by sync.
 
 ### Sync Issues After Git Merge
 
@@ -761,10 +823,19 @@ Yes! br is designed for AI agent integration:
 br list --json
 br ready --json
 br show br-abc123 --json
+br coordination status --json
+br capabilities --format json
+br capabilities --format json --command "comments add"
+br robot-docs guide
 
 # Create issues programmatically
 br create "Title" --json  # Returns created issue as JSON
 ```
+
+When `br ready --json` is empty but `bv --robot-next` or a human operator
+suspects work is hidden behind old claims, use `br coordination status --json`
+alongside Agent Mail reservations. The command is read-only: it does not call
+Agent Mail, does not run git, and never auto-reclaims a bead.
 
 See [AGENTS.md](AGENTS.md) for the complete agent integration guide.
 
@@ -898,6 +969,11 @@ br is designed for AI coding agents. See [AGENTS.md](AGENTS.md) for:
 - Degraded coordination when Agent Mail is unavailable
 - Robot mode flags
 - Best practices
+
+For CI and release workflow edits, use
+[CI_SUPPLY_CHAIN.md](docs/CI_SUPPLY_CHAIN.md) as the canonical maintenance
+policy for immutable GitHub Action pins, workflow fragment harnesses, update
+audits, and required proof commands.
 
 You can also emit machine-readable JSON Schema documents directly:
 

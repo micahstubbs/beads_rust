@@ -3,7 +3,7 @@
 //! Shows issues ready to work on next: open, unblocked, not deferred, not pinned,
 //! not ephemeral.
 
-use super::resolve_issue_id;
+use super::{auto_import_external_projects_if_stale, resolve_issue_id};
 use crate::cli::{
     OutputFormat, ReadyArgs, SortPolicy, resolve_output_format_basic_with_outer_mode,
 };
@@ -14,7 +14,7 @@ use crate::format::{
 };
 use crate::model::{IssueType, Priority};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
-use crate::storage::{ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
+use crate::storage::{ReadyFilters, ReadySortPolicy, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use std::io::IsTerminal;
 use std::path::Path;
@@ -114,9 +114,10 @@ fn execute_inner(
         None => None,
     };
 
-    let resolved_parent = args
-        .parent
-        .as_deref()
+    // `--epic <id>` is sugar for `--parent <id> --recursive` (they conflict at
+    // the clap layer, so at most one of these is set).
+    let parent_spec = args.epic.as_deref().or(args.parent.as_deref());
+    let resolved_parent = parent_spec
         .map(|parent| {
             let config_layer = load_config_layer()?;
             let id_config = config::id_config_from_layer(&config_layer);
@@ -124,6 +125,14 @@ fn execute_inner(
             resolve_issue_id(storage, &resolver, parent)
         })
         .transpose()?;
+
+    // Resolve the configured "ready" status group (#354). Defaults to `[open]`
+    // when `.beads/policy.yaml` has no `workflow.status_groups.ready`, which is
+    // a zero-behavior-change for existing repos. Strict-mode validation rejects
+    // an out-of-vocabulary group before we ever query.
+    let workflow = crate::close_policy::load_for_beads_dir(beads_dir)?.workflow;
+    workflow.validate_ready_status_group()?;
+    let ready_statuses = workflow.ready_status_group();
 
     let filters = ReadyFilters {
         assignee,
@@ -133,10 +142,13 @@ fn execute_inner(
         types: parse_types(&args.type_)?,
         priorities: parse_priorities(&args.priority)?,
         include_deferred: args.include_deferred,
+        ready_statuses,
         // Fetch all candidates to allow post-filtering of external blockers
         limit: None,
         parent: resolved_parent,
-        recursive: args.recursive,
+        // --epic implies descent through the whole subtree.
+        recursive: args.recursive || args.epic.is_some(),
+        parent_member_ids: None,
     };
 
     let sort_policy = match args.sort {
@@ -147,43 +159,37 @@ fn execute_inner(
 
     info!("Fetching ready issues");
 
-    // Optimization: if there are no external dependencies, we can apply the limit
-    // directly in the SQL query to avoid loading all candidate issues into memory.
-    let has_external = storage.has_external_dependencies(true)?;
-    let external_db_paths = if has_external {
-        Some(config::external_project_db_paths(
-            &load_config_layer()?,
-            beads_dir,
-        ))
-    } else {
-        None
-    };
+    // Fetch the full ready set (no SQL LIMIT) so we always know the exact total
+    // before truncation — this lets us emit an accurate "showing N of M" note
+    // when `--limit` actually truncates, consistent with `br list` and the MCP
+    // ready surface (which prints "N total, showing top M"). See issue #91:
+    // results must never be *silently* truncated.
     let mut filters = filters;
-    if !has_external && args.limit > 0 {
-        filters.limit = Some(args.limit);
-    }
+    filters.limit = None;
 
     debug!(filters = ?filters, sort = ?sort_policy, "Applied ready filters");
 
-    // Get ready issues from storage (blocked cache only) while avoiding
-    // heavyweight issue columns that never reach ready output.
-    let mut ready_issues = storage.get_ready_issues_for_command_output(&filters, sort_policy)?;
+    let mut ready_issues =
+        get_ready_issues_for_output(storage, &filters, sort_policy, output_format)?;
 
-    if has_external {
-        let external_statuses = storage.resolve_external_dependency_statuses(
-            external_db_paths
-                .as_ref()
-                .expect("external dependency paths should be loaded"),
-            true,
-        )?;
+    if !ready_issues.is_empty() && storage.has_external_dependencies(true)? {
+        let config_layer = load_config_layer()?;
+        auto_import_external_projects_if_stale(&config_layer, beads_dir, cli);
+        let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
+        let external_statuses =
+            storage.resolve_external_dependency_statuses(&external_db_paths, true)?;
         let external_blockers = storage.external_blockers(&external_statuses)?;
         if !external_blockers.is_empty() {
             ready_issues.retain(|issue| !external_blockers.contains_key(&issue.id));
         }
+    }
 
-        if args.limit > 0 && ready_issues.len() > args.limit {
-            ready_issues.truncate(args.limit);
-        }
+    // Apply the user-visible limit in Rust (after external-blocker filtering),
+    // recording the true pre-truncation total so the text surface can report it.
+    let total_before_truncation = ready_issues.len();
+    let truncated = args.limit > 0 && ready_issues.len() > args.limit;
+    if truncated {
+        ready_issues.truncate(args.limit);
     }
 
     info!(count = ready_issues.len(), "Found ready issues");
@@ -197,11 +203,11 @@ fn execute_inner(
     }
     match output_format {
         OutputFormat::Json => {
-            let ready_output: Vec<ReadyIssue> =
-                ready_issues.into_iter().map(ReadyIssue::from).collect();
-            early_ctx.json_pretty(&ready_output);
+            hydrate_ready_labels(storage, &mut ready_issues)?;
+            early_ctx.json_array(ready_issues.into_iter().map(ReadyIssue::from));
         }
         OutputFormat::Toon => {
+            hydrate_ready_labels(storage, &mut ready_issues)?;
             let ready_output: Vec<ReadyIssue> =
                 ready_issues.into_iter().map(ReadyIssue::from).collect();
             early_ctx.toon_with_stats(&ready_output, args.stats);
@@ -251,25 +257,65 @@ fn execute_inner(
                     println!("{line}");
                 }
             }
+
+            // Surface truncation explicitly so the top-priority rows filling the
+            // limit never read as "queue drained" (#91, #356). Mirrors the
+            // `br list` note and the MCP ready surface's "N total, showing top M".
+            if truncated && !quiet {
+                eprintln!(
+                    "[note] Showing {} of {} ready issues. Use --limit 0 for all results.",
+                    ready_issues.len(),
+                    total_before_truncation,
+                );
+            }
         }
     }
 
     Ok(())
 }
 
+/// Populate `labels` on ready issues for structured output (#309).
+///
+/// The ready candidate query hydrates only the columns stored directly on the
+/// `issues` row; labels live in a separate table, so JSON/TOON consumers need a
+/// single extra batched lookup to get full parity with `br list --json`.
+fn hydrate_ready_labels(storage: &SqliteStorage, issues: &mut [crate::model::Issue]) -> Result<()> {
+    if issues.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<String> = issues.iter().map(|issue| issue.id.clone()).collect();
+    let mut labels_by_id = storage.get_labels_for_issues(&ids)?;
+    for issue in issues.iter_mut() {
+        if let Some(labels) = labels_by_id.remove(&issue.id) {
+            issue.labels = labels;
+        }
+    }
+    Ok(())
+}
+
 fn empty_ready_message(storage: &SqliteStorage) -> Result<&'static str> {
-    let has_non_closed_issues = !storage
-        .list_issues(&ListFilters {
-            include_deferred: true,
-            limit: Some(1),
-            ..Default::default()
-        })?
-        .is_empty();
+    let has_non_closed_issues = storage.has_active_issues()?;
     Ok(if has_non_closed_issues {
         "✨ No ready issues — all remaining work is blocked, deferred, or in progress"
     } else {
         "✨ All work complete — no issues to work on"
     })
+}
+
+fn get_ready_issues_for_output(
+    storage: &SqliteStorage,
+    filters: &ReadyFilters,
+    sort_policy: ReadySortPolicy,
+    output_format: OutputFormat,
+) -> Result<Vec<crate::model::Issue>> {
+    match output_format {
+        OutputFormat::Text | OutputFormat::Csv => {
+            storage.get_ready_summary_issues_for_command_output(filters, sort_policy)
+        }
+        OutputFormat::Json | OutputFormat::Toon => {
+            storage.get_ready_issues_for_command_output(filters, sort_policy)
+        }
+    }
 }
 
 fn format_ready_line(

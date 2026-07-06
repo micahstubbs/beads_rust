@@ -52,5 +52,9 @@ pub mod context;
 pub mod theme;
 
 pub use components::*;
-pub use context::{OutputContext, OutputMode};
+pub(crate) use context::JsonArrayPageMeta;
+pub use context::{
+    OutputContext, OutputMode, record_pending_exit_code, take_output_serialization_failure,
+    take_pending_exit_code,
+};
 pub use theme::Theme;

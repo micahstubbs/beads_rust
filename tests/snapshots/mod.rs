@@ -54,7 +54,7 @@ static TS_FULL_RE: LazyLock<Regex> = LazyLock::new(|| {
 static DATE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\d{4}-\d{2}-\d{2}").expect("date regex"));
 static VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\((?:HEAD|[A-Za-z0-9._/-]+)@[a-f0-9]+\)").expect("version regex")
+    Regex::new(r"\s+\((?:HEAD|[A-Za-z0-9._/-]+)@[a-f0-9]+\)").expect("version regex")
 });
 /// The build profile label embedded in `br --version` output, e.g., `(dev)`
 /// or `(release)`.  Snapshot tests may run under either profile depending on
@@ -445,9 +445,7 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
 
     // 9. Mask git hashes and build-profile labels (dev / release)
     if config.mask_git_hashes && VERSION_RE.is_match(&normalized) {
-        normalized = VERSION_RE
-            .replace_all(&normalized, "(BRANCH@GIT_HASH)")
-            .to_string();
+        normalized = VERSION_RE.replace_all(&normalized, "").to_string();
         log.push("git_hashes".to_string());
     }
     if config.mask_git_hashes && BUILD_PROFILE_RE.is_match(&normalized) {
@@ -545,6 +543,7 @@ fn normalize_id_string(s: &str) -> String {
     id_re.replace_all(s, "ISSUE_ID").to_string()
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn normalize_json(json: &Value) -> Value {
     match json {
         Value::Object(map) => {
@@ -560,6 +559,19 @@ pub fn normalize_json(json: &Value) -> Value {
                         Value::String("TIMESTAMP".to_string())
                     }
                     "content_hash" => Value::String("HASH".to_string()),
+                    // Normalize source_repo/source_repo_path: br resolves "." to the absolute
+                    // path of the workspace; under tempdir-based tests this is
+                    // a randomly-named ".tmpXXXXXX" path, so the snapshot must
+                    // collapse it back to a stable token. (Issue surfaced by
+                    // beads_rust-l6xl audit; PC-RECOVERY-adjacent: not a
+                    // safety problem, just a snapshot determinism gap.)
+                    "source_repo" | "source_repo_path" => {
+                        if let Value::String(_) = value {
+                            Value::String("SOURCE_REPO".to_string())
+                        } else {
+                            normalize_json(value)
+                        }
+                    }
                     // Normalize actor/user fields that vary by system
                     "created_by" | "assignee" | "owner" | "author" | "deleted_by"
                     | "closed_by_session" | "actor" => {
@@ -734,9 +746,9 @@ mod golden_snapshot_tests {
 
     #[test]
     fn test_mask_git_hash() {
-        let input = "Version 0.1.0 (main@abc1234)";
+        let input = "br version 0.1.0 (dev) (main@abc1234)";
         let snapshot = TextSnapshot::golden(input);
-        assert!(snapshot.normalized.contains("(BRANCH@GIT_HASH)"));
+        assert_eq!(snapshot.normalized, "br version X.Y.Z (BUILD)");
         assert!(!snapshot.normalized.contains("abc1234"));
     }
 

@@ -12,7 +12,7 @@ use crate::error::{BeadsError, Result};
 use crate::format::{format_status_label, format_type_label, sanitize_terminal_inline};
 use crate::model::{Issue, IssueType, Priority, Status};
 use crate::output::OutputContext;
-use crate::storage::{IssueUpdate, SqliteStorage};
+use crate::storage::{EventAttribution, IssueUpdate, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use crate::util::time::parse_flexible_timestamp;
 use crate::validation::LabelValidator;
@@ -143,6 +143,9 @@ struct PreparedUpdateRoute {
     valid_set_labels: Vec<String>,
     resolved_parent: ParentUpdatePlan,
     auto_flush_external: bool,
+    /// Tier 1 attribution (issue #312, Layer 3 capture-only) staged onto each
+    /// mutation's audit events. Recorded only — never gated or enforced on.
+    attribution: EventAttribution,
     _routed_write_lock: RoutedWorkspaceWriteLock,
 }
 
@@ -151,7 +154,14 @@ struct PreparedUpdateRoute {
 /// # Errors
 ///
 /// Returns an error if database operations fail or validation errors occur.
+#[allow(clippy::too_many_lines)]
 pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
+    // Refuse terminal-state transitions before doing any I/O. `br update`
+    // is a data-only field mutator; terminal-state transitions
+    // (closed, tombstone) must go through their dedicated commands so the
+    // close-policy / delete pipelines are applied (see beads_rust#301).
+    reject_terminal_status_transition(args.status.as_deref())?;
+
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut target_inputs = args.ids.clone();
     if target_inputs.is_empty() {
@@ -262,9 +272,58 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         ctx.json_pretty(&updated_issues);
     } else if !ctx.is_quiet() {
         print_render_items(&render_items);
+        // beads_rust#297: emit inherited governing context for any
+        // bead that just transitioned into in_progress (via --claim or
+        // --status in_progress). Done after the update summary so the
+        // child's status change is visible first, then the inherited
+        // context the agent should be operating under.
+        emit_inherited_context_for_in_progress_transitions(&beads_dir, cli, &render_items);
     }
 
     Ok(())
+}
+
+fn emit_inherited_context_for_in_progress_transitions(
+    beads_dir: &Path,
+    cli: &config::CliOverrides,
+    render_items: &[UpdateRenderItem],
+) {
+    if !crate::inheritance::is_enabled(beads_dir) {
+        return;
+    }
+    let claimed_ids: Vec<&str> = render_items
+        .iter()
+        .filter_map(|item| match item {
+            UpdateRenderItem::Summary { id, diff, .. }
+                if diff
+                    .status
+                    .as_ref()
+                    .is_some_and(|(_, new)| matches!(new, Status::InProgress)) =>
+            {
+                Some(id.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    if claimed_ids.is_empty() {
+        return;
+    }
+    // Open a transient read-only storage to walk ancestry. Failure
+    // here is non-fatal — the update has already succeeded and the
+    // child's status change is already printed.
+    let Ok(storage_ctx) = config::open_storage_with_cli(beads_dir, cli) else {
+        return;
+    };
+    let storage = &storage_ctx.storage;
+    for id in claimed_ids {
+        let blocks = match crate::inheritance::collect_inherited_blocks(storage, id) {
+            Ok(blocks) if !blocks.is_empty() => blocks,
+            _ => continue,
+        };
+        let rendered = crate::inheritance::render_text(&blocks);
+        println!();
+        print!("{rendered}");
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -274,7 +333,8 @@ fn prepare_single_route(
     beads_dir: &Path,
     auto_flush_external: bool,
 ) -> Result<PreparedUpdateRoute> {
-    let routed_write_lock = acquire_routed_workspace_write_lock(beads_dir, auto_flush_external)?;
+    let routed_write_lock =
+        acquire_routed_workspace_write_lock(beads_dir, auto_flush_external, cli.lock_timeout)?;
     let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
     auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
 
@@ -285,6 +345,50 @@ fn prepare_single_route(
 
     let claim_exclusive = config::claim_exclusive_from_layer(&config_layer);
     let update = build_update(args, &actor, claim_exclusive)?;
+
+    // Strict status-workflow enforcement (issue #311) + transition rules
+    // (issue #312, layer 1). When the project's `.beads/policy.yaml` configures
+    // `workflow.strict: true` with a non-empty `workflow.statuses` set, a target
+    // status outside that set is rejected. When `workflow.strict: true` with a
+    // non-empty `workflow.transitions` map, a `from -> to` status change that is
+    // not an allowed transition is rejected. Absent/non-strict workflow config
+    // is a no-op, so existing repos are unaffected.
+    if let Some(new_status) = update.status.as_ref() {
+        let policy = crate::close_policy::load_for_beads_dir(beads_dir)?;
+        policy.workflow.validate_status(new_status.as_str())?;
+        let transitions_enforced = policy.workflow.transitions_enforced();
+        let gates_enforced = policy.workflow.gates_enforced();
+        if transitions_enforced || gates_enforced {
+            for id in &resolved_ids {
+                // The current status is the `from` state for the transition
+                // check. An issue that cannot be read (missing/unresolved)
+                // validates against the `initial` key (from = None), mirroring
+                // a create.
+                let current = storage_ctx
+                    .storage
+                    .get_issue(id)?
+                    .map(|issue| issue.status.as_str().to_string());
+                if transitions_enforced {
+                    policy
+                        .workflow
+                        .validate_transition(current.as_deref(), new_status.as_str())?;
+                }
+                // Workflow gate enforcement (issue #312, layer 2). A move into a
+                // gated state is rejected until every required gate passes.
+                // Only consulted when there is a `from` state (gates guard a
+                // `from -> to` transition; a create has no `from` to gate).
+                if gates_enforced && let Some(from) = current.as_deref() {
+                    enforce_gates(
+                        &storage_ctx.storage,
+                        &policy.workflow,
+                        id,
+                        from,
+                        new_status.as_str(),
+                    )?;
+                }
+            }
+        }
+    }
     let has_updates = !update.is_empty()
         || !args.add_label.is_empty()
         || !args.remove_label.is_empty()
@@ -295,6 +399,9 @@ fn prepare_single_route(
 
     // Validate labels before making any database changes
     for label in &args.add_label {
+        LabelValidator::validate(label).map_err(|e| BeadsError::validation("label", e.message))?;
+    }
+    for label in &args.remove_label {
         LabelValidator::validate(label).map_err(|e| BeadsError::validation("label", e.message))?;
     }
 
@@ -330,6 +437,11 @@ fn prepare_single_route(
         valid_set_labels,
         resolved_parent,
         auto_flush_external,
+        attribution: EventAttribution::new(
+            args.agent_name.as_deref(),
+            args.harness.as_deref(),
+            args.model.as_deref(),
+        ),
         _routed_write_lock: routed_write_lock,
     })
 }
@@ -339,6 +451,10 @@ fn execute_prepared_route(
     mut prepared: PreparedUpdateRoute,
     ctx: &OutputContext,
 ) -> Result<UpdateRouteOutput> {
+    if can_use_bulk_label_only_route(&prepared) {
+        return execute_bulk_label_only_route(prepared, ctx);
+    }
+
     let mut updated_issues: Vec<UpdatedIssueOutput> = Vec::new();
     let mut render_items = Vec::new();
     let resolved_ids = prepared.resolved_ids.clone();
@@ -364,6 +480,13 @@ fn execute_prepared_route(
         if !prepared.update.is_empty() {
             let mut issue_update = prepared.update.clone();
             issue_update.skip_cache_rebuild = defer_blocked_cache_rebuild;
+            // Stage Tier 1 attribution (issue #312, Layer 3 capture-only) so the
+            // update / status-change audit events record the self-reported agent
+            // identity. Recorded ONLY — never gates or alters the transition.
+            prepared
+                .storage_ctx
+                .storage
+                .set_pending_event_attribution(prepared.attribution.clone());
             let update_result = update_issue_with_recovery(
                 &mut prepared.storage_ctx,
                 !route_has_mutated,
@@ -529,6 +652,110 @@ fn execute_prepared_route(
     })
 }
 
+fn can_use_bulk_label_only_route(prepared: &PreparedUpdateRoute) -> bool {
+    let add_only = !prepared.add_labels.is_empty() && prepared.remove_labels.is_empty();
+    let remove_only = prepared.add_labels.is_empty() && !prepared.remove_labels.is_empty();
+
+    (add_only || remove_only)
+        && prepared.update.is_empty()
+        && !prepared.set_labels
+        && matches!(prepared.resolved_parent, ParentUpdatePlan::Unchanged)
+}
+
+fn execute_bulk_label_only_route(
+    mut prepared: PreparedUpdateRoute,
+    ctx: &OutputContext,
+) -> Result<UpdateRouteOutput> {
+    let resolved_ids = prepared.resolved_ids.clone();
+    let actor = prepared.actor.clone();
+    let add_labels = prepared.add_labels.clone();
+    let remove_labels = prepared.remove_labels.clone();
+    let mut route_has_mutated = false;
+
+    for label in add_labels {
+        let add_label_result = retry_mutation_with_jsonl_recovery(
+            &mut prepared.storage_ctx,
+            !route_has_mutated,
+            "bulk update label add",
+            None,
+            |storage| storage.add_label_to_issues_bulk(&resolved_ids, &label, &actor),
+        );
+        let _changed_ids = preserve_blocked_cache_on_error(
+            &mut prepared.storage_ctx.storage,
+            false,
+            "update",
+            add_label_result,
+        )?;
+        route_has_mutated = true;
+    }
+
+    for label in remove_labels {
+        let remove_label_result = retry_mutation_with_jsonl_recovery(
+            &mut prepared.storage_ctx,
+            !route_has_mutated,
+            "bulk update label remove",
+            None,
+            |storage| storage.remove_label_from_issues_bulk(&resolved_ids, &label, &actor),
+        );
+        let _changed_ids = preserve_blocked_cache_on_error(
+            &mut prepared.storage_ctx.storage,
+            false,
+            "update",
+            remove_label_result,
+        )?;
+        route_has_mutated = true;
+    }
+
+    let issues = prepared
+        .storage_ctx
+        .storage
+        .get_issues_by_ids(&resolved_ids)?;
+    let issues_by_id = issues
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect::<HashMap<_, _>>();
+
+    let use_machine_output = update_uses_machine_output(ctx);
+    let use_human_output = update_uses_human_output(ctx);
+    let mut updated_issues = Vec::new();
+    let mut render_items = Vec::new();
+
+    for id in &resolved_ids {
+        let issue = issues_by_id.get(id);
+        if use_machine_output {
+            if let Some(issue) = issue {
+                updated_issues.push(UpdatedIssueOutput::from(issue));
+            }
+        } else if use_human_output && prepared.has_updates {
+            render_items.push(UpdateRenderItem::Summary {
+                id: id.clone(),
+                title: issue.map_or_else(String::new, |issue| issue.title.clone()),
+                diff: Box::new(UpdateDiff::default()),
+            });
+        } else if use_human_output {
+            render_items.push(UpdateRenderItem::NoUpdates { id: id.clone() });
+        }
+    }
+
+    prepared.storage_ctx.flush_no_db_if_dirty()?;
+    if prepared.auto_flush_external
+        && let Err(error) = prepared.storage_ctx.auto_flush_if_enabled()
+    {
+        report_auto_flush_failure(
+            ctx,
+            &prepared.storage_ctx.paths.beads_dir,
+            &prepared.storage_ctx.paths.jsonl_path,
+            &error,
+        );
+    }
+
+    Ok(UpdateRouteOutput {
+        updated_issues,
+        render_items,
+        resolved_ids,
+    })
+}
+
 fn update_uses_machine_output(ctx: &OutputContext) -> bool {
     ctx.is_json() || ctx.is_toon()
 }
@@ -559,6 +786,50 @@ fn validate_multi_issue_external_ref_update(
     }
 
     Ok(())
+}
+
+/// Enforce workflow gates (issue #312, layer 2) for a single `from -> to`
+/// status change on `id`. Loads the issue's labels + priority, the recorded
+/// gate results, and rejects the move with a [`BeadsError::PolicyViolation`]
+/// when any required gate is unsatisfied. A no-op when the transition is not
+/// gated.
+fn enforce_gates(
+    storage: &SqliteStorage,
+    workflow: &crate::close_policy::Workflow,
+    id: &str,
+    from: &str,
+    to: &str,
+) -> Result<()> {
+    let required = workflow.required_gates_for(from, to, &[], 0);
+    // Cheap pre-check: skip the labels/priority/results queries entirely when
+    // the bare transition has no gate rule. (required_gates_for ignores
+    // conditional gates with empty labels; we re-check below with real data.)
+    let rule = workflow.gate_rule_for(from, to);
+    if rule.is_none() && required.is_empty() {
+        return Ok(());
+    }
+    let labels = storage.get_labels(id)?;
+    let priority = storage.get_issue(id)?.map_or(0, |issue| issue.priority.0);
+    let results = storage.get_gate_results(id)?;
+    let violations =
+        crate::close_policy::evaluate_gates(workflow, id, from, to, &labels, priority, &results);
+    if violations.is_empty() {
+        return Ok(());
+    }
+    let summary = if let [single] = violations.as_slice() {
+        single.message.clone()
+    } else {
+        let lines: Vec<String> = violations
+            .iter()
+            .map(|v| format!("- {}", v.message))
+            .collect();
+        format!("{} gate(s) failed:\n{}", violations.len(), lines.join("\n"))
+    };
+    Err(BeadsError::PolicyViolation {
+        issue_id: id.to_string(),
+        summary,
+        violations,
+    })
 }
 
 fn validate_route_runtime_guards(
@@ -628,16 +899,14 @@ fn validate_transition_to_in_progress(
     }
 
     for id in ids {
-        if storage.is_blocked(id)? {
-            let blockers = storage.get_blockers(id)?;
-            let blocker_list = if blockers.is_empty() {
-                "blocking dependencies".to_string()
-            } else {
-                blockers.join(", ")
-            };
+        // Use start-blockers (not `is_blocked`), so an epic that is only
+        // "blocked" by its own still-open children — a close-ordering rollup,
+        // not a real dependency — can still be claimed and worked on (#315).
+        let blockers = storage.get_start_blockers(id)?;
+        if !blockers.is_empty() {
             return Err(BeadsError::validation(
                 "claim",
-                format!("cannot claim blocked issue: {blocker_list}"),
+                format!("cannot claim blocked issue: {}", blockers.join(", ")),
             ));
         }
     }
@@ -824,6 +1093,48 @@ fn validate_mutable_target_issues(
     Ok(())
 }
 
+/// Reject `br update --status <terminal>` and direct the user at the
+/// dedicated command for that transition.
+///
+/// `br update` is a data-only field mutator. Terminal-state transitions
+/// (`closed`, `tombstone`) own their own audit / policy pipelines:
+///
+/// * `closed`    → `br close`  (close-policy gates: close-reason, AC, attribution, ...)
+/// * `tombstone` → `br delete` (tombstone metadata, dependency rewiring)
+///
+/// Allowing both paths to reach the same terminal state would give the
+/// project two different audit contracts depending on which command the
+/// operator reached for — see beads_rust#301 for the regression that
+/// motivated this gate.
+///
+/// This deliberately runs *before* any I/O (route discovery, locking,
+/// SQLite open) so a misuse fails instantly rather than after acquiring
+/// the workspace write lock.
+fn reject_terminal_status_transition(raw_status: Option<&str>) -> Result<()> {
+    let Some(raw) = raw_status else {
+        return Ok(());
+    };
+    let parsed: Status = raw.parse()?;
+    match parsed {
+        Status::Closed => Err(BeadsError::validation(
+            "status",
+            "refusing to close via `br update --status closed`: \
+             terminal-state transitions must go through `br close` so close-policy \
+             (close-reason / AC / attribution) is enforced. \
+             Use `br close <id> --reason \"...\"` instead, or `br close <id> \
+             --bypass-policy --bypass-reason \"...\"` to opt out explicitly. \
+             See https://github.com/Dicklesworthstone/beads_rust/issues/301.",
+        )),
+        Status::Tombstone => Err(BeadsError::validation(
+            "status",
+            "refusing to tombstone via `br update --status tombstone`: \
+             use `br delete <id>` instead so dependency rewiring and tombstone \
+             metadata are applied correctly.",
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result<IssueUpdate> {
     let status = if args.claim {
         Some(Status::InProgress)
@@ -845,10 +1156,16 @@ fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result
     let due_at = optional_date_field(args.due.as_deref())?;
     let defer_until = optional_date_field(args.defer.as_deref())?;
 
-    let closed_at = match &status {
-        Some(Status::Closed) => Some(Some(Utc::now())),
-        Some(_) => Some(None),
-        None => None,
+    if args.session.is_some() && !matches!(status, Some(Status::Closed)) {
+        return Err(BeadsError::validation(
+            "session",
+            "--session can only be used when closing with --status closed",
+        ));
+    }
+    let (closed_at, close_reason, closed_by_session) = match &status {
+        Some(Status::Closed) => (Some(Some(Utc::now())), None, args.session.clone().map(Some)),
+        Some(_) => (Some(None), Some(None), Some(None)),
+        None => (None, None, None),
     };
 
     // Build update struct
@@ -867,9 +1184,12 @@ fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result
         due_at,
         defer_until,
         external_ref: optional_string_field(args.external_ref.as_deref()),
+        source_repo: optional_string_field(args.source_repo.as_deref()),
+        source_repo_path: optional_string_field(args.source_repo_path.as_deref()),
+        agent_context: agent_context_update_from_arg(args.agent_context.as_deref())?,
         closed_at,
-        close_reason: None,
-        closed_by_session: args.session.clone().map(Some),
+        close_reason,
+        closed_by_session,
         deleted_at: None,
         deleted_by: None,
         delete_reason: None,
@@ -893,6 +1213,91 @@ fn optional_string_field(value: Option<&str>) -> Option<Option<String>> {
             Some(v.to_string())
         }
     })
+}
+
+/// Parse the `--agent-context` argument into an `IssueUpdate::agent_context`
+/// payload. Accepts:
+///
+/// - `None` → don't touch the field (`Option<Option<String>>::None`).
+/// - `Some("")` → clear the field back to NULL (`Some(None)`).
+/// - `Some("@path")` → read the file at `path`; parse as YAML when the
+///   extension is `.yaml`/`.yml`, otherwise as JSON. Normalize to JSON
+///   so storage is opaque TEXT but always canonical-JSON-shaped.
+/// - `Some("{...}")` → parse as JSON inline.
+///
+/// Validation happens here because the storage column is opaque TEXT —
+/// without this guard we'd happily round-trip syntactically invalid
+/// JSON through SQLite and then have the emission path discover the
+/// problem at agent claim time. (beads_rust#297)
+#[allow(clippy::option_option)]
+fn agent_context_update_from_arg(value: Option<&str>) -> Result<Option<Option<String>>> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(Some(None));
+    }
+
+    let (source_label, body): (String, String) = if let Some(path_str) = raw.strip_prefix('@') {
+        let path = std::path::Path::new(path_str);
+        let contents = std::fs::read_to_string(path).map_err(|e| {
+            BeadsError::Config(format!(
+                "agent-context: cannot read {}: {e}",
+                path.display()
+            ))
+        })?;
+        let is_yaml = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml"));
+        let normalized = if is_yaml {
+            let value: serde_yml::Value = serde_yml::from_str(&contents).map_err(|e| {
+                BeadsError::Config(format!(
+                    "agent-context: YAML parse failed for {}: {e}",
+                    path.display()
+                ))
+            })?;
+            serde_json::to_string(&value).map_err(|e| {
+                BeadsError::Config(format!(
+                    "agent-context: YAML to JSON conversion failed for {}: {e}",
+                    path.display()
+                ))
+            })?
+        } else {
+            let value: serde_json::Value = serde_json::from_str(&contents).map_err(|e| {
+                BeadsError::Config(format!(
+                    "agent-context: JSON parse failed for {}: {e}",
+                    path.display()
+                ))
+            })?;
+            serde_json::to_string(&value).map_err(|e| {
+                BeadsError::Config(format!(
+                    "agent-context: JSON re-serialization failed for {}: {e}",
+                    path.display()
+                ))
+            })?
+        };
+        (path.display().to_string(), normalized)
+    } else {
+        let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+            BeadsError::Config(format!(
+                "agent-context: inline argument is not valid JSON: {e} (hint: use \
+                 `--agent-context @path/to/instructions.yaml` for a file, or pass an \
+                 empty string to clear)"
+            ))
+        })?;
+        let normalized = serde_json::to_string(&value).map_err(|e| {
+            BeadsError::Config(format!("agent-context: JSON re-serialization failed: {e}"))
+        })?;
+        ("<inline>".to_string(), normalized)
+    };
+    tracing::debug!(
+        bytes = body.len(),
+        source = %source_label,
+        "agent-context: parsed and normalized to canonical JSON"
+    );
+    Ok(Some(Some(body)))
 }
 
 #[allow(clippy::option_option)]
@@ -972,7 +1377,7 @@ fn validate_parent_updates(
             });
         }
 
-        if storage.would_create_cycle(issue_id, parent_id, true)? {
+        if storage.would_create_parent_child_cycle(issue_id, parent_id, true)? {
             return Err(BeadsError::DependencyCycle {
                 path: format!("Setting parent of {issue_id} to {parent_id} would create a cycle"),
             });
@@ -1131,24 +1536,119 @@ mod tests {
     fn test_build_update_with_status() {
         init_test_logging();
         info!("test_build_update_with_status: starting");
-        let args = UpdateArgs {
-            status: Some("closed".to_string()),
-            ..Default::default()
-        };
-        let update = build_update(&args, "test_actor", false).unwrap();
-        assert_eq!(update.status, Some(Status::Closed));
-        // closed_at should be set
-        assert!(update.closed_at.is_some());
-
+        // Non-terminal status transitions still flow through build_update.
+        // Terminal transitions (closed/tombstone) are rejected up-front by
+        // `reject_terminal_status_transition` — see beads_rust#301 and the
+        // dedicated tests below.
         let args_blocked = UpdateArgs {
             status: Some("blocked".to_string()),
             ..Default::default()
         };
         let update_blocked = build_update(&args_blocked, "test_actor", false).unwrap();
         assert_eq!(update_blocked.status, Some(Status::Blocked));
-        // closed_at should be explicitly cleared for non-terminal statuses
+        // Close metadata should be explicitly cleared for non-terminal statuses.
         assert_eq!(update_blocked.closed_at, Some(None));
+        assert_eq!(update_blocked.close_reason, Some(None));
+        assert_eq!(update_blocked.closed_by_session, Some(None));
+
+        let args_in_progress = UpdateArgs {
+            status: Some("in_progress".to_string()),
+            ..Default::default()
+        };
+        let update_in_progress = build_update(&args_in_progress, "test_actor", false).unwrap();
+        assert_eq!(update_in_progress.status, Some(Status::InProgress));
         info!("test_build_update_with_status: assertions passed");
+    }
+
+    /// beads_rust#301: `br update --status closed` must refuse and direct
+    /// the operator at `br close` so close-policy fires.
+    #[test]
+    fn reject_terminal_status_transition_refuses_closed() {
+        init_test_logging();
+        let err = reject_terminal_status_transition(Some("closed")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("br close"),
+            "error must point at br close; got: {msg}"
+        );
+        assert!(
+            msg.contains("close-policy"),
+            "error must mention close-policy; got: {msg}"
+        );
+        assert!(
+            msg.contains("#301") || msg.contains("issues/301"),
+            "error must link the originating issue; got: {msg}"
+        );
+    }
+
+    /// beads_rust#301: tombstone is also a terminal state with a dedicated
+    /// command (`br delete`); refuse the update path so dependency rewiring
+    /// is not skipped.
+    #[test]
+    fn reject_terminal_status_transition_refuses_tombstone() {
+        init_test_logging();
+        let err = reject_terminal_status_transition(Some("tombstone")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("br delete"),
+            "error must point at br delete; got: {msg}"
+        );
+    }
+
+    /// Non-terminal statuses (open/in_progress/blocked/deferred/draft) and
+    /// the absence of `--status` must keep working unchanged — the rejection
+    /// is scoped to terminal states only.
+    #[test]
+    fn reject_terminal_status_transition_allows_non_terminal_and_absent() {
+        init_test_logging();
+        reject_terminal_status_transition(None).expect("no --status must pass through");
+        for ok in &[
+            "open",
+            "in_progress",
+            "inprogress",
+            "blocked",
+            "deferred",
+            "draft",
+            "pinned",
+        ] {
+            let result = reject_terminal_status_transition(Some(ok));
+            assert!(
+                result.is_ok(),
+                "status {ok} must be accepted; got {:?}",
+                result.err()
+            );
+        }
+    }
+
+    /// Status comparison is case-insensitive and matches known aliases —
+    /// neither `CLOSED` nor `Closed` should sneak past the gate.
+    #[test]
+    fn reject_terminal_status_transition_is_case_insensitive() {
+        init_test_logging();
+        for terminal in &["Closed", "CLOSED", "Tombstone", "TOMBSTONE"] {
+            let result = reject_terminal_status_transition(Some(terminal));
+            assert!(result.is_err(), "status {terminal} must be rejected");
+            let err = result.unwrap_err();
+            assert!(!err.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_build_update_rejects_session_without_closing() {
+        let args = UpdateArgs {
+            session: Some("session-123".to_string()),
+            ..Default::default()
+        };
+        let err = build_update(&args, "test_actor", false).unwrap_err();
+        assert!(err.to_string().contains("--session can only be used"));
+
+        let args_open = UpdateArgs {
+            status: Some("open".to_string()),
+            session: Some("session-123".to_string()),
+            ..Default::default()
+        };
+        let err = build_update(&args_open, "test_actor", false).unwrap_err();
+        assert!(err.to_string().contains("--session can only be used"));
     }
 
     #[test]
@@ -1364,6 +1864,221 @@ mod tests {
     }
 
     #[test]
+    fn test_prepare_single_route_rejects_invalid_remove_label() {
+        init_test_logging();
+        info!("test_prepare_single_route_rejects_invalid_remove_label: starting");
+
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        {
+            let mut storage_ctx =
+                config::open_storage_with_cli(&beads_dir, &CliOverrides::default())
+                    .expect("storage");
+            let issue = Issue {
+                id: "bd-label".to_string(),
+                title: "Label target".to_string(),
+                status: Status::Open,
+                priority: Priority::MEDIUM,
+                issue_type: IssueType::Task,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                ..Issue::default()
+            };
+            storage_ctx
+                .storage
+                .create_issue(&issue, "tester")
+                .expect("create issue");
+        }
+
+        let args = UpdateArgs {
+            ids: vec!["bd-label".to_string()],
+            remove_label: vec!["has space".to_string()],
+            ..Default::default()
+        };
+        let result = prepare_single_route(&args, &CliOverrides::default(), &beads_dir, false);
+        assert!(result.is_err(), "invalid remove label should fail");
+        if let Err(err) = result {
+            assert!(err.to_string().contains("invalid characters"));
+        }
+        info!("test_prepare_single_route_rejects_invalid_remove_label: assertions passed");
+    }
+
+    #[test]
+    fn test_execute_prepared_route_bulk_label_add_updates_multiple_ids() {
+        init_test_logging();
+        info!("test_execute_prepared_route_bulk_label_add_updates_multiple_ids: starting");
+
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let mut storage_ctx =
+            config::open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
+        for id in ["bd-bulk-a", "bd-bulk-b"] {
+            let issue = Issue {
+                id: id.to_string(),
+                title: format!("Bulk target {id}"),
+                status: Status::Open,
+                priority: Priority::MEDIUM,
+                issue_type: IssueType::Task,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                ..Issue::default()
+            };
+            storage_ctx
+                .storage
+                .create_issue(&issue, "tester")
+                .expect("create issue");
+        }
+        storage_ctx
+            .storage
+            .clear_all_dirty_issues()
+            .expect("clear dirty state");
+
+        let prepared = PreparedUpdateRoute {
+            storage_ctx,
+            actor: "tester".to_string(),
+            resolved_ids: vec!["bd-bulk-a".to_string(), "bd-bulk-b".to_string()],
+            update: IssueUpdate::default(),
+            has_updates: true,
+            add_labels: vec!["bulk-route".to_string()],
+            remove_labels: Vec::new(),
+            set_labels: false,
+            valid_set_labels: Vec::new(),
+            resolved_parent: ParentUpdatePlan::Unchanged,
+            auto_flush_external: false,
+            attribution: EventAttribution::default(),
+            _routed_write_lock: RoutedWorkspaceWriteLock::local(),
+        };
+
+        let ctx = OutputContext::from_flags(true, false, true);
+        let output = execute_prepared_route(prepared, &ctx).expect("bulk route update");
+        assert_eq!(output.updated_issues.len(), 2);
+        assert_eq!(
+            output.resolved_ids,
+            vec!["bd-bulk-a".to_string(), "bd-bulk-b".to_string()]
+        );
+
+        let reopened =
+            config::open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("reopen");
+        assert_eq!(
+            reopened.storage.get_labels("bd-bulk-a").expect("labels a"),
+            vec!["bulk-route".to_string()]
+        );
+        assert_eq!(
+            reopened.storage.get_labels("bd-bulk-b").expect("labels b"),
+            vec!["bulk-route".to_string()]
+        );
+        let mut dirty = reopened.storage.get_dirty_issue_ids().expect("dirty ids");
+        dirty.sort();
+        assert_eq!(
+            dirty,
+            vec!["bd-bulk-a".to_string(), "bd-bulk-b".to_string()]
+        );
+
+        info!("test_execute_prepared_route_bulk_label_add_updates_multiple_ids: assertions passed");
+    }
+
+    #[test]
+    fn test_execute_prepared_route_bulk_label_remove_updates_multiple_ids() {
+        init_test_logging();
+        info!("test_execute_prepared_route_bulk_label_remove_updates_multiple_ids: starting");
+
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let mut storage_ctx =
+            config::open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
+        for id in ["bd-bulk-remove-a", "bd-bulk-remove-b"] {
+            let issue = Issue {
+                id: id.to_string(),
+                title: format!("Bulk remove target {id}"),
+                status: Status::Open,
+                priority: Priority::MEDIUM,
+                issue_type: IssueType::Task,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                ..Issue::default()
+            };
+            storage_ctx
+                .storage
+                .create_issue(&issue, "tester")
+                .expect("create issue");
+            storage_ctx
+                .storage
+                .add_label(id, "bulk-route-remove", "tester")
+                .expect("add label");
+        }
+        storage_ctx
+            .storage
+            .clear_all_dirty_issues()
+            .expect("clear dirty state");
+
+        let prepared = PreparedUpdateRoute {
+            storage_ctx,
+            actor: "tester".to_string(),
+            resolved_ids: vec![
+                "bd-bulk-remove-a".to_string(),
+                "bd-bulk-remove-b".to_string(),
+            ],
+            update: IssueUpdate::default(),
+            has_updates: true,
+            add_labels: Vec::new(),
+            remove_labels: vec!["bulk-route-remove".to_string()],
+            set_labels: false,
+            valid_set_labels: Vec::new(),
+            resolved_parent: ParentUpdatePlan::Unchanged,
+            auto_flush_external: false,
+            attribution: EventAttribution::default(),
+            _routed_write_lock: RoutedWorkspaceWriteLock::local(),
+        };
+
+        let ctx = OutputContext::from_flags(true, false, true);
+        let output = execute_prepared_route(prepared, &ctx).expect("bulk route update");
+        assert_eq!(output.updated_issues.len(), 2);
+        assert_eq!(
+            output.resolved_ids,
+            vec![
+                "bd-bulk-remove-a".to_string(),
+                "bd-bulk-remove-b".to_string()
+            ]
+        );
+
+        let reopened =
+            config::open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("reopen");
+        assert!(
+            reopened
+                .storage
+                .get_labels("bd-bulk-remove-a")
+                .expect("labels a")
+                .is_empty()
+        );
+        assert!(
+            reopened
+                .storage
+                .get_labels("bd-bulk-remove-b")
+                .expect("labels b")
+                .is_empty()
+        );
+        let mut dirty = reopened.storage.get_dirty_issue_ids().expect("dirty ids");
+        dirty.sort();
+        assert_eq!(
+            dirty,
+            vec![
+                "bd-bulk-remove-a".to_string(),
+                "bd-bulk-remove-b".to_string()
+            ]
+        );
+
+        info!(
+            "test_execute_prepared_route_bulk_label_remove_updates_multiple_ids: assertions passed"
+        );
+    }
+
+    #[test]
     fn test_execute_prepared_route_repairs_blocked_cache_after_late_update_error() {
         init_test_logging();
         info!(
@@ -1439,6 +2154,7 @@ mod tests {
             valid_set_labels: Vec::new(),
             resolved_parent: ParentUpdatePlan::Unchanged,
             auto_flush_external: false,
+            attribution: EventAttribution::default(),
             _routed_write_lock: RoutedWorkspaceWriteLock::local(),
         };
 

@@ -9,12 +9,14 @@ This guide covers how AI coding agents can effectively use `br` (beads_rust) for
 - [Overview](#overview)
 - [Quick Start for Agents](#quick-start-for-agents)
 - [JSON Mode](#json-mode)
+- [Agent Contract Inventory](#agent-contract-inventory)
 - [Workflow Patterns](#workflow-patterns)
 - [Parsing JSON Output](#parsing-json-output)
 - [Error Handling](#error-handling)
 - [MCP Server](#mcp-server)
 - [Robot Mode Flags](#robot-mode-flags)
 - [Degraded Coordination Without Agent Mail](#degraded-coordination-without-agent-mail)
+- [Swarm-Scale Tuning](#swarm-scale-tuning)
 - [Agent-Specific Configuration](#agent-specific-configuration)
 - [Best Practices](#best-practices)
 
@@ -94,7 +96,7 @@ br show br-123 --format toon
 Decode TOON to JSON when you need to pipe into JSON tools:
 
 ```bash
-br ready --format toon --limit 10 | tru --decode | jq '.[0]'
+br ready --format toon --limit 10 | tru --decode --expand-paths safe | jq '.[0]'
 ```
 
 ### Environment Defaults
@@ -150,6 +152,76 @@ $ br ready --json --limit 2
   }
 ]
 ```
+
+---
+
+## Agent Contract Inventory
+
+This inventory names the machine-readable and workflow surfaces that agents
+parse, discover, or treat as coordination contracts. Future contract tests for
+these surfaces must stay local-first and deterministic: no live Agent Mail
+calls, network access, git mutations, background daemons, or long-running MCP
+clients. Use offline fixtures, in-process helpers, temp workspaces, snapshots,
+and schema/TOON decoding instead.
+
+| Surface | Producer | Agent consumer | Stable contract | Current verifier or evidence | Gap / follow-up bead |
+|---------|----------|----------------|-----------------|------------------------------|----------------------|
+| `br schema all` and `br schema commands` targets | `src/cli/commands/schema.rs` (`build_schemas`, `build_commands`) | Agents discovering output shapes before parsing CLI results | JSON Schema documents plus command envelopes with `jq_filter`, `items_at`, and schema names | `tests/e2e_schema.rs`, `tests/conformance_schema.rs`, `tests/snapshots/schema_output.rs`, `agent_baseline/schemas/schema_all.json`, `agent_baseline/cli_schema.json` | `beads_rust-vqs1` adds emitted-target self-checks; `beads_rust-p1g4` validates command-shape paths against live fixtures |
+| JSON output for `list`, `show`, `ready`, `blocked`, `stale`, `search`, counts, labels, deps, comments, stats, and status | CLI command implementations plus the output/context layers | Shell-based agents, MCP adapters, docs examples, and baseline fixtures | Valid JSON on stdout, stable object/list envelopes, structured errors on failure | `tests/snapshots/json_output.rs`, `tests/snapshots/robot_output.rs`, `tests/e2e_create_output.rs`, `tests/common/json_baseline.rs`, `tests/fixtures/json_baseline/`, `agent_baseline/examples/*.json` | `beads_rust-p1g4` checks command metadata against actual JSON; `beads_rust-8bq8` collects the verifier commands |
+| TOON output for agent-read commands | CLI format handling and `toon_rust` integration | Token-sensitive agents using `--format toon` or `TOON_DEFAULT_FORMAT=toon` | TOON decodes to the documented JSON structure with safe folded-key expansion | `tests/snapshots/toon_output.rs`, `agent_baseline/examples/*.toon`, this guide's decode example | `beads_rust-q5jt` cross-checks JSON/TOON semantic parity, including nested coordination fields |
+| Coordination status evidence (`br.coordination.v1`) | `br coordination status`, coordination model code, and optional offline reservation/agent snapshots | Agents deciding whether an `in_progress` claim is fresh, stale, reclaimable, or blocked by missing Mail evidence | Read-only evidence envelope; no automatic reclaim, no Agent Mail calls, and no git operations | `docs/COORDINATION_EVIDENCE.md`, schema entries for `CoordinationStatusOutput` and `CoordinationClaimRow`, agent workflow examples in this guide | `beads_rust-p1g4` covers command-shape extraction; `beads_rust-q5jt` covers JSON/TOON parity for coordination output |
+| `agent_baseline/` examples and schemas | Curated baseline artifacts generated from representative `br` commands | Agents bootstrapping behavior from examples before running the binary | Checked-in JSON, TOON, schema, and journey artifacts that mirror current CLI contracts | `agent_baseline/README_first_80_lines.md`, `agent_baseline/AGENT_JOURNEY_NOTES.md`, `agent_baseline/examples/`, `agent_baseline/schemas/`, `agent_baseline/robot_mode_examples.jsonl` | `beads_rust-8bq8` defines the one-command verifier; later fixture work should prevent stale baseline artifacts |
+| Snapshot and golden tests for agent output | `tests/snapshots/*`, storage golden snapshots, and focused e2e fixtures | Release reviewers and agents checking whether a contract changed intentionally | Deterministic expected output for representative commands and storage states | `tests/snapshots/cli_output.rs`, `tests/snapshots/json_output.rs`, `tests/snapshots/robot_output.rs`, `tests/snapshots/schema_output.rs`, `tests/snapshots/toon_output.rs`, `tests/storage_golden_snapshot.rs` | `beads_rust-vqs1`, `beads_rust-p1g4`, and `beads_rust-q5jt` make the snapshots harder to update incompletely |
+| MCP resources, tools, and prompts | `src/mcp/resources.rs`, `src/mcp/tools.rs`, `src/mcp/prompts.rs`, and `src/mcp/mod.rs` behind the `mcp` feature | MCP-capable agents using `br serve` instead of shelling out | Stdio-only local server surface with stable resource URIs, tool names, prompt names, and JSON payloads | README and CLI reference MCP sections, this guide's MCP section, in-process MCP code paths | `beads_rust-hu4b` ties MCP metadata and representative payloads to CLI contract fixtures without live clients or network services |
+| README and docs command examples | `README.md`, `docs/CLI_REFERENCE.md`, this guide, `docs/SWARM_SCALE_TUNING.md`, `docs/COORDINATION_EVIDENCE.md` | Human operators and agents copying workflow commands | Examples use robot-safe flags, avoid hidden git automation, and state Mail/network boundaries accurately | Review plus `git diff --check`; relevant e2e/snapshot tests cover many listed commands indirectly | `beads_rust-8bq8` documents when to run the full drift verifier before changing docs or examples |
+| `bv` robot handoff expectations | External `bv` binary plus repo guidance in `AGENTS.md`, this guide, and `docs/SWARM_SCALE_TUNING.md` | Agents selecting work by graph priority before claiming with `br` and Agent Mail | Agents use only `--robot-*` or `--recipe ... --robot-*` flags; bare `bv` is interactive and outside `br`'s control | Documented workflow examples only; `bv` is outside the `br` binary and test harness | Keep this as an offline documentation contract; `br` tests should not shell out to live `bv` |
+
+The child beads intentionally split coverage by failure mode. Use
+`beads_rust-vqs1` when schema target discovery drifts, `beads_rust-p1g4` when
+command metadata and live JSON disagree, `beads_rust-q5jt` when TOON and JSON
+semantics diverge, `beads_rust-hu4b` when MCP metadata or payloads fall behind,
+and `beads_rust-8bq8` when agents need a single RCH-friendly verifier command
+sequence.
+
+### Agent Contract Drift Verifier
+
+Run the full agent-facing contract verifier before changing any surface that
+agents parse or copy:
+
+- `src/cli/commands/schema.rs` command metadata, schema names, `jq_filter`, or
+  `items_at` paths
+- CLI JSON or TOON output for agent-read commands
+- MCP resources, tools, prompts, descriptions, or representative payloads
+- README/docs examples that agents may copy
+- `agent_baseline/` schemas, JSON examples, TOON examples, help text, or journey
+  notes
+
+Agent sessions should run the verifier through RCH:
+
+```bash
+BR_AGENT_CONTRACT_USE_RCH=1 ./scripts/verify-agent-contracts.sh
+```
+
+The script itself only runs deterministic Cargo tests. With
+`BR_AGENT_CONTRACT_USE_RCH=1`, each Cargo target is delegated to `rch exec --`
+so agent sessions use the normal remote-compilation path when workers are
+available. The contract tests do not run git, project network calls, live Agent
+Mail, MCP stdio clients, background services, or fixture update modes. The
+script unsets `INSTA_UPDATE` and `UPDATE_AGENT_BASELINE` so a verification run
+detects drift instead of regenerating snapshots.
+
+The verifier currently covers:
+
+- schema document goldens: `schema_document_golden_json_all` and
+  `schema_document_golden_toon_all`
+- command-shape live fixture extraction:
+  `schema_command_shapes_match_live_json_outputs`
+- JSON/TOON semantic parity:
+  `agent_json_and_toon_outputs_match_semantically`
+- checked-in agent baselines:
+  `agent_baseline_snapshots_match_current_binary`
+- optional MCP metadata and payload contracts:
+  `cargo test --lib --features mcp mcp_contract`
 
 ---
 
@@ -239,6 +311,93 @@ If Agent Mail is down, include the intended file scope in the same comment or a
 follow-up degraded-coordination comment. The newest assignee owns the claim, but
 the old owner can still return; in that case, coordinate in the bead thread and
 split or hand off the work instead of silently overwriting each other.
+
+`br scheduler --json` uses the same coordination age policy for its
+`evidence.stale_claim` object, but it deliberately assumes
+`reservation_status: "no_snapshot"`. Treat `classification: "no_mail_snapshot"`
+and `recommended_action: "inspect_mail"` as a prompt to gather Agent Mail
+evidence, not as permission to reclaim the bead.
+
+For a read-only preflight, use coordination status with an explicit reservation
+snapshot when available:
+
+```bash
+br coordination status --reservations reservations.json --agents agents.jsonl --json
+```
+
+MCP-capable agents can read `beads://coordination/status` for the same
+`br.coordination.v1` evidence envelope without shelling out. The MCP resource is
+read-only and does not call Agent Mail, so it reports
+`reservation.state == "no_snapshot"` unless you use the CLI command above with
+offline reservation and agent snapshots.
+
+Operator runbook for a queue that appears dry:
+
+```bash
+# 1. Confirm actionable work and graph-priority output agree
+br ready --json
+bv --robot-next
+
+# 2. Inspect hidden in-progress claims without mutating them
+br list --status in_progress --json
+br coordination status --json
+
+# 3. If a claim looks stale, inspect the local issue trail
+br show <id> --json
+br comments list <id> --json
+git status --short
+```
+
+If Agent Mail is healthy, add reservation and liveness snapshots before making
+any ownership decision. `br` consumes those snapshots offline; it does not call
+Agent Mail itself:
+
+```bash
+br coordination status \
+  --reservations reservations.jsonl \
+  --agents agents.jsonl \
+  --json
+```
+
+Safe reclaim is still a manual, auditable sequence. Review
+`required_human_confirmation`, `reclaim_allowed_by_policy`, and
+`suggested_commands` first:
+
+```bash
+br coordination status --reservations reservations.jsonl --agents agents.jsonl --json \
+  | jq '.claims[] | {id: .issue.id, action: .assessment.recommended_action, reclaim_allowed_by_policy, required_human_confirmation, suggested_commands}'
+
+br comments add <id> --author "$BD_ACTOR" \
+  --message "reclaim: previous in_progress claim appears abandoned; evidence: updated_at=<timestamp>, assignee=<name>, no active reservation or pane" \
+  --json
+br update <id> --claim --json
+```
+
+Only run the final two commands when the advisory output and human policy allow
+it. `br coordination status` never auto-reclaims, never runs git, and never
+creates or releases Agent Mail reservations.
+
+The output is advisory only. `reclaim_allowed_by_policy=true` means the local
+policy and supplied snapshot evidence allow the documented audit-comment plus
+claim sequence. `suggested_commands` is empty for fresh claims, active
+reservations, missing or malformed snapshots, and human or unknown owners.
+`required_human_confirmation=true` means ask the owner or operator instead of
+copying a claim command.
+
+When a coordination snapshot matters for a handoff or review, record it through
+the audit log before taking follow-up action:
+
+```bash
+br coordination status --json \
+  | br audit coordination --stdin --command "br coordination status --json" --json
+```
+
+This appends one `coordination_incident` interaction per claim to the existing
+`.beads/interactions.jsonl` flight recorder. The recorded fields are bounded and
+normalized: `issue_id`, `classification`, `recommended_action` as
+`suggested_action`, `evidence_summary`, the producing `command`, and a stable
+`snapshot_hash`. After a human or agent reviews the evidence, label the
+interaction with `br audit label <interaction-id> --label reviewed --json`.
 
 ### Creating Related Issues
 
@@ -534,6 +693,7 @@ Resources:
 - `beads://issues/ready`
 - `beads://issues/blocked`
 - `beads://issues/in_progress`
+- `beads://coordination/status`
 - `beads://issues/deferred`
 - `beads://issues/bottlenecks`
 - `beads://graph/health`
@@ -593,6 +753,16 @@ br create "New issue" --silent
 br close br-123 --quiet --json
 # Outputs JSON, no status messages
 ```
+
+---
+
+## Swarm-Scale Tuning
+
+For 256GB+ RAM and 64+ core agent hosts, see
+[Swarm-Scale Tuning](SWARM_SCALE_TUNING.md). It covers conservative defaults,
+high-core build hygiene, `.write.lock` timeout profiles, Agent Mail reservation
+patterns, MCP serve topology, performance evidence collection, and rollback
+rules for future snapshot/cache/controller features.
 
 ---
 

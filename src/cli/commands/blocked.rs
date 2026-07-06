@@ -2,6 +2,7 @@
 //!
 //! Lists blocked issues from the `blocked_issues_cache`.
 
+use super::auto_import_external_projects_if_stale;
 use crate::cli::{BlockedArgs, OutputFormat, resolve_output_format_basic_with_outer_mode};
 use crate::config::{
     CliOverrides, discover_beads_dir_with_cli, external_project_db_paths, open_storage_with_cli,
@@ -91,25 +92,41 @@ fn execute_inner(
         .or_else(|| preloaded_storage_ctx.map(|ctx| &ctx.storage))
         .or_else(|| owned_storage_ctx.as_ref().map(|ctx| &ctx.storage))
         .expect("blocked should have an open storage handle");
-    let config_layer =
-        if let Some(storage_ctx) = preloaded_storage_ctx.or(owned_storage_ctx.as_ref()) {
-            storage_ctx.load_config(overrides)?
-        } else {
-            crate::config::load_config(beads_dir, Some(storage), overrides)?
-        };
-
-    let external_db_paths = external_project_db_paths(&config_layer, beads_dir);
-    let use_color = should_use_color(&config_layer);
     let output_format = resolve_output_format_basic_with_outer_mode(
         args.format,
         outer_ctx.inherited_output_mode(),
         args.robot,
     );
     let quiet = overrides.quiet.unwrap_or(false);
+    let fast_ctx = OutputContext::from_output_format(output_format, quiet, true);
+    if matches!(output_format, OutputFormat::Json | OutputFormat::Toon)
+        && !storage.may_have_blocked_command_results()?
+    {
+        let blocked_issues = Vec::new();
+        output_structured_blocked(args, output_format, &fast_ctx, &blocked_issues);
+        return Ok(());
+    }
+
+    let has_external_dependencies = storage.has_external_dependencies(true)?;
+    let needs_config = has_external_dependencies
+        || matches!(output_format, OutputFormat::Text | OutputFormat::Csv);
+    let config_layer = if needs_config {
+        Some(
+            if let Some(storage_ctx) = preloaded_storage_ctx.or(owned_storage_ctx.as_ref()) {
+                storage_ctx.load_config(overrides)?
+            } else {
+                crate::config::load_config(beads_dir, Some(storage), overrides)?
+            },
+        )
+    } else {
+        None
+    };
+    let use_color = matches!(output_format, OutputFormat::Text | OutputFormat::Csv)
+        && config_layer.as_ref().is_some_and(should_use_color);
     let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
 
     // Get blocked issues from cache
-    let blocked_raw = storage.get_blocked_issues()?;
+    let blocked_raw = storage.get_blocked_issues_for_command_output()?;
 
     tracing::debug!(
         count = blocked_raw.len(),
@@ -127,45 +144,53 @@ fn execute_inner(
         })
         .collect();
 
-    let external_statuses =
-        storage.resolve_external_dependency_statuses(&external_db_paths, true)?;
-    let mut external_blockers = storage.external_blockers(&external_statuses)?;
+    if has_external_dependencies {
+        let config_layer = config_layer
+            .as_ref()
+            .expect("external dependencies require config");
+        auto_import_external_projects_if_stale(config_layer, beads_dir, overrides);
+        let external_db_paths = external_project_db_paths(config_layer, beads_dir);
+        let external_statuses =
+            storage.resolve_external_dependency_statuses(&external_db_paths, true)?;
+        let mut external_blockers = storage.external_blockers(&external_statuses)?;
+        if !external_blockers.is_empty() {
+            let mut by_id: std::collections::HashMap<String, usize> = blocked_issues
+                .iter()
+                .enumerate()
+                .map(|(idx, bi)| (bi.issue.id.clone(), idx))
+                .collect();
 
-    if !external_blockers.is_empty() {
-        let mut by_id: std::collections::HashMap<String, usize> = blocked_issues
-            .iter()
-            .enumerate()
-            .map(|(idx, bi)| (bi.issue.id.clone(), idx))
-            .collect();
-
-        let mut external_ids_to_fetch = Vec::new();
-        for (issue_id, blockers) in &external_blockers {
-            if let Some(idx) = by_id.get(issue_id).copied() {
-                let entry = &mut blocked_issues[idx];
-                entry.blocked_by.extend(blockers.clone());
-                entry.blocked_by.sort();
-                entry.blocked_by.dedup();
-                entry.blocked_by_count = entry.blocked_by.len();
-            } else {
-                external_ids_to_fetch.push(issue_id.clone());
-            }
-        }
-
-        if !external_ids_to_fetch.is_empty() {
-            let fetched_issues = storage.get_issues_by_ids(&external_ids_to_fetch)?;
-            for issue in fetched_issues {
-                if !include_in_blocked_list(&issue.status) {
-                    continue;
+            let mut external_ids_to_fetch = Vec::new();
+            for (issue_id, blockers) in &external_blockers {
+                if let Some(entry) = by_id
+                    .get(issue_id)
+                    .and_then(|idx| blocked_issues.get_mut(*idx))
+                {
+                    entry.blocked_by.extend(blockers.clone());
+                    entry.blocked_by.sort();
+                    entry.blocked_by.dedup();
+                    entry.blocked_by_count = entry.blocked_by.len();
+                } else {
+                    external_ids_to_fetch.push(issue_id.clone());
                 }
-                if let Some(blockers) = external_blockers.remove(&issue.id) {
-                    let blocked_by_count = blockers.len();
-                    let issue_id = issue.id.clone();
-                    blocked_issues.push(BlockedIssue {
-                        blocked_by_count,
-                        blocked_by: blockers,
-                        issue,
-                    });
-                    by_id.insert(issue_id, blocked_issues.len() - 1);
+            }
+
+            if !external_ids_to_fetch.is_empty() {
+                let fetched_issues = storage.get_issues_by_ids(&external_ids_to_fetch)?;
+                for issue in fetched_issues {
+                    if !include_in_blocked_list(&issue.status) {
+                        continue;
+                    }
+                    if let Some(blockers) = external_blockers.remove(&issue.id) {
+                        let blocked_by_count = blockers.len();
+                        let issue_id = issue.id.clone();
+                        blocked_issues.push(BlockedIssue {
+                            blocked_by_count,
+                            blocked_by: blockers,
+                            issue,
+                        });
+                        by_id.insert(issue_id, blocked_issues.len() - 1);
+                    }
                 }
             }
         }
@@ -204,13 +229,8 @@ fn execute_inner(
     }
 
     match output_format {
-        OutputFormat::Json => {
-            let output = blocked_issue_outputs(&blocked_issues);
-            ctx.json_pretty(&output);
-        }
-        OutputFormat::Toon => {
-            let output = blocked_issue_outputs(&blocked_issues);
-            ctx.toon_with_stats(&output, args.stats);
+        OutputFormat::Json | OutputFormat::Toon => {
+            output_structured_blocked(args, output_format, &ctx, &blocked_issues);
         }
         OutputFormat::Text | OutputFormat::Csv => {
             let max_width = if args.wrap { ctx.width() } else { 0 };
@@ -231,6 +251,22 @@ fn include_in_blocked_list(status: &crate::model::Status) -> bool {
 
 fn blocked_issue_outputs(blocked_issues: &[BlockedIssue]) -> Vec<BlockedIssueOutput> {
     blocked_issues.iter().map(blocked_issue_output).collect()
+}
+
+fn output_structured_blocked(
+    args: &BlockedArgs,
+    output_format: OutputFormat,
+    ctx: &OutputContext,
+    blocked_issues: &[BlockedIssue],
+) {
+    match output_format {
+        OutputFormat::Json => ctx.json_array(blocked_issues.iter().map(blocked_issue_output)),
+        OutputFormat::Toon => {
+            let output = blocked_issue_outputs(blocked_issues);
+            ctx.toon_with_stats(&output, args.stats);
+        }
+        OutputFormat::Text | OutputFormat::Csv => {}
+    }
 }
 
 fn blocked_issue_output(bi: &BlockedIssue) -> BlockedIssueOutput {
@@ -260,6 +296,8 @@ fn sort_blocked_issues(issues: &mut [BlockedIssue]) {
         let pb = b.issue.priority.0;
         pa.cmp(&pb)
             .then_with(|| b.blocked_by_count.cmp(&a.blocked_by_count))
+            .then_with(|| b.issue.created_at.cmp(&a.issue.created_at))
+            .then_with(|| a.issue.id.cmp(&b.issue.id))
     });
 }
 
@@ -553,6 +591,8 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -600,6 +640,23 @@ mod tests {
     }
 
     #[test]
+    fn test_blocked_issue_output_iterator_matches_materialized_outputs() {
+        let issues = vec![
+            make_blocked_issue("a", "P0", 0, 1),
+            make_blocked_issue("b", "P1", 1, 2),
+        ];
+
+        let streamed: Vec<BlockedIssueOutput> = issues.iter().map(blocked_issue_output).collect();
+        let materialized = blocked_issue_outputs(&issues);
+
+        let streamed_json =
+            serde_json::to_vec(&streamed).expect("serialize streamed blocked output");
+        let materialized_json =
+            serde_json::to_vec(&materialized).expect("serialize materialized blocked output");
+        assert_eq!(streamed_json, materialized_json);
+    }
+
+    #[test]
     fn test_blocked_id_display_helpers_escape_terminal_controls() {
         let id = blocked_id_text("bd-bad\x1b]52;c;bad\x07");
         assert!(!id.chars().any(char::is_control));
@@ -634,6 +691,20 @@ mod tests {
         assert_eq!(issues[2].issue.id, "b"); // P1, 1 blocker
         assert_eq!(issues[3].issue.id, "a"); // P2
         info!("test_sort_by_priority_then_blocker_count: assertions passed");
+    }
+
+    #[test]
+    fn test_sort_ties_by_created_at_desc_then_id() {
+        let mut newer = make_blocked_issue("c", "newer", 1, 1);
+        newer.issue.created_at = Utc.with_ymd_and_hms(2025, 1, 2, 0, 0, 0).unwrap();
+        let older_a = make_blocked_issue("a", "older a", 1, 1);
+        let older_b = make_blocked_issue("b", "older b", 1, 1);
+        let mut issues = vec![older_b, newer, older_a];
+
+        sort_blocked_issues(&mut issues);
+
+        let ids: Vec<&str> = issues.iter().map(|issue| issue.issue.id.as_str()).collect();
+        assert_eq!(ids, vec!["c", "a", "b"]);
     }
 
     #[test]

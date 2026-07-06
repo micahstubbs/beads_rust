@@ -11,13 +11,23 @@ mod prompts;
 mod resources;
 mod tools;
 
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::UNIX_EPOCH;
 
-use fastmcp_rust::{McpError, McpErrorCode};
-use serde_json::json;
+use fastmcp_rust::{McpError, McpErrorCode, McpResult, StdioTransport};
+use serde_json::{Value, json};
 
-use crate::storage::SqliteStorage;
+use crate::error::StructuredError;
+use crate::model::Issue;
+use crate::storage::{ReadyFilters, ReadySortPolicy, SqliteStorage};
 use crate::{BeadsError, config};
+
+const MCP_READ_SNAPSHOT_ENV: &str = "BR_MCP_READ_SNAPSHOT";
+const MCP_READ_SNAPSHOT_CACHE_LIMIT: usize = 64;
 
 /// Map any `Display` error into a flat `McpError::tool_error`.
 ///
@@ -25,6 +35,69 @@ use crate::{BeadsError, config};
 /// Tools use the richer `beads_to_mcp` in `tools.rs` instead.
 pub(super) fn to_mcp(err: impl std::fmt::Display) -> McpError {
     McpError::tool_error(err.to_string())
+}
+
+fn shutdown_mcp_error() -> McpError {
+    let err = BeadsError::ShuttingDown;
+    let structured = StructuredError::from_error(&err);
+    let message = structured.message.clone();
+    let mut data = json!({
+        "error_type": structured.code.as_str(),
+        "recoverable": structured.retryable,
+        "message": message,
+    });
+    if let Some(object) = data.as_object_mut() {
+        if let Some(hint) = &structured.hint {
+            object.insert("hint".to_string(), json!(hint));
+        }
+        if let Some(context) = &structured.context {
+            object.insert("context".to_string(), context.clone());
+        }
+    }
+
+    McpError::with_data(McpErrorCode::ToolExecutionError, structured.message, data)
+}
+
+fn ensure_not_shutting_down_with(is_requested: impl FnOnce() -> bool) -> McpResult<()> {
+    if is_requested() {
+        Err(shutdown_mcp_error())
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn ensure_not_shutting_down() -> McpResult<()> {
+    ensure_not_shutting_down_with(crate::shutdown::is_requested)
+}
+
+pub(super) fn mcp_ready_issues(
+    state: &BeadsState,
+    storage: &SqliteStorage,
+) -> fastmcp_rust::McpResult<Vec<Issue>> {
+    let mut ready = storage
+        .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Hybrid)
+        .map_err(to_mcp)?;
+    if ready.is_empty() || !storage.has_external_dependencies(true).map_err(to_mcp)? {
+        return Ok(ready);
+    }
+
+    let config_layer = config::load_config(
+        &state.beads_dir,
+        Some(storage),
+        &config::CliOverrides::default(),
+    )
+    .map_err(to_mcp)?;
+    let external_db_paths = config::external_project_db_paths(&config_layer, &state.beads_dir);
+    let external_statuses = storage
+        .resolve_external_dependency_statuses(&external_db_paths, true)
+        .map_err(to_mcp)?;
+    let external_blockers = storage
+        .external_blockers(&external_statuses)
+        .map_err(to_mcp)?;
+    if !external_blockers.is_empty() {
+        ready.retain(|issue| !external_blockers.contains_key(&issue.id));
+    }
+    Ok(ready)
 }
 
 fn auto_flush_mcp_error(
@@ -82,28 +155,255 @@ fn dirty_auto_flush_incomplete_error(remaining_dirty: usize) -> BeadsError {
     ))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct McpReadSnapshotWitness {
+    files: Vec<McpReadSnapshotFile>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct McpReadSnapshotFile {
+    path: PathBuf,
+    metadata: Option<McpReadSnapshotFileMetadata>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct McpReadSnapshotFileMetadata {
+    len: u64,
+    modified_ns: Option<u128>,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    ctime_sec: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct McpReadSnapshotCache {
+    entries: Vec<McpReadSnapshotEntry>,
+}
+
+#[derive(Debug)]
+struct McpReadSnapshotEntry {
+    key: String,
+    witness: McpReadSnapshotWitness,
+    value: Value,
+}
+
+impl McpReadSnapshotCache {
+    fn get(&self, key: &str, witness: &McpReadSnapshotWitness) -> Option<Value> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| entry.key == key && entry.witness == *witness)
+            .map(|entry| entry.value.clone())
+    }
+
+    fn insert(&mut self, key: String, witness: McpReadSnapshotWitness, value: Value) {
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+            self.entries.remove(index);
+        }
+
+        self.entries.push(McpReadSnapshotEntry {
+            key,
+            witness,
+            value,
+        });
+
+        if self.entries.len() > MCP_READ_SNAPSHOT_CACHE_LIMIT {
+            self.entries.remove(0);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+fn mcp_read_snapshot_cache_from_env() -> Option<Mutex<McpReadSnapshotCache>> {
+    std::env::var(MCP_READ_SNAPSHOT_ENV)
+        .ok()
+        .filter(|value| env_value_is_truthy(value))
+        .map(|_| Mutex::new(McpReadSnapshotCache::default()))
+}
+
+fn env_value_is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn snapshot_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut raw = path.as_os_str().to_os_string();
+    raw.push(suffix);
+    PathBuf::from(raw)
+}
+
+fn system_time_ns(time: std::time::SystemTime) -> Option<u128> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_nanos())
+}
+
+fn snapshot_file(path: &Path) -> Option<McpReadSnapshotFile> {
+    match fs::metadata(path) {
+        Ok(metadata) => Some(McpReadSnapshotFile {
+            path: path.to_path_buf(),
+            metadata: Some(McpReadSnapshotFileMetadata {
+                len: metadata.len(),
+                modified_ns: metadata.modified().ok().and_then(system_time_ns),
+                #[cfg(unix)]
+                dev: metadata.dev(),
+                #[cfg(unix)]
+                ino: metadata.ino(),
+                #[cfg(unix)]
+                ctime_sec: metadata.ctime(),
+                #[cfg(unix)]
+                ctime_nsec: metadata.ctime_nsec(),
+            }),
+        }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(McpReadSnapshotFile {
+            path: path.to_path_buf(),
+            metadata: None,
+        }),
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                path = %path.display(),
+                "MCP read snapshot witness capture failed"
+            );
+            None
+        }
+    }
+}
+
 /// Shared configuration available to every MCP handler.
 ///
 /// Storage is intentionally **not** held open: `fsqlite::Connection` uses
 /// `Rc` internally and therefore cannot satisfy `Send + Sync`.  Each
-/// handler call opens a fresh connection via [`open_storage`].
+/// handler call opens a fresh connection via [`open_read_storage`] or
+/// [`open_storage`] depending on whether the operation may mutate state.
 pub struct BeadsState {
     pub db_path: PathBuf,
     pub beads_dir: PathBuf,
     pub jsonl_path: PathBuf,
+    pub write_lock_timeout_ms: Option<u64>,
     pub allow_external_jsonl: bool,
     pub actor: String,
     pub issue_prefix: Option<String>,
+    pub(super) read_snapshot_cache: Option<Mutex<McpReadSnapshotCache>>,
 }
 
 impl BeadsState {
-    /// Open a fresh `SqliteStorage` connection.
+    pub(super) fn cached_read_json(&self, key: &str) -> Option<Value> {
+        let cache = self.read_snapshot_cache.as_ref()?;
+        let before = self.capture_read_snapshot_witness()?;
+        let value = {
+            let guard = cache.lock().ok()?;
+            guard.get(key, &before)
+        };
+        let after = self.capture_read_snapshot_witness()?;
+
+        if before == after { value } else { None }
+    }
+
+    pub(super) fn capture_read_snapshot_witness(&self) -> Option<McpReadSnapshotWitness> {
+        self.read_snapshot_cache.as_ref()?;
+
+        let paths = [
+            self.db_path.clone(),
+            snapshot_sidecar_path(&self.db_path, "-wal"),
+            snapshot_sidecar_path(&self.db_path, "-shm"),
+            self.jsonl_path.clone(),
+        ];
+
+        paths
+            .iter()
+            .map(|path| snapshot_file(path))
+            .collect::<Option<Vec<_>>>()
+            .map(|files| McpReadSnapshotWitness { files })
+    }
+
+    pub(super) fn store_read_json_snapshot(
+        &self,
+        key: String,
+        before: Option<McpReadSnapshotWitness>,
+        value: &Value,
+    ) {
+        let Some(cache) = self.read_snapshot_cache.as_ref() else {
+            return;
+        };
+        let Some(before) = before else {
+            return;
+        };
+        let Some(after) = self.capture_read_snapshot_witness() else {
+            self.clear_read_snapshot_cache();
+            return;
+        };
+
+        if before != after {
+            return;
+        }
+
+        if let Ok(mut guard) = cache.lock() {
+            guard.insert(key, after, value.clone());
+        }
+    }
+
+    pub(super) fn clear_read_snapshot_cache(&self) {
+        if let Some(cache) = &self.read_snapshot_cache
+            && let Ok(mut guard) = cache.lock()
+        {
+            guard.clear();
+        }
+    }
+
+    /// Open a fresh writable `SqliteStorage` connection.
     ///
     /// # Errors
     ///
     /// Returns an error if the database file cannot be opened.
     pub fn open_storage(&self) -> crate::Result<SqliteStorage> {
         SqliteStorage::open(&self.db_path)
+    }
+
+    /// Open a fresh read-oriented storage connection.
+    ///
+    /// Current-schema databases open read-only to avoid schema, recovery, or
+    /// metadata writes for MCP resources, prompts, and read-only tools. If the
+    /// read-only fast path is unavailable, fall back to normal storage open
+    /// while holding the workspace write lock because that path may repair or
+    /// initialize database state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if storage cannot be opened.
+    pub fn open_read_storage(&self) -> crate::Result<SqliteStorage> {
+        match SqliteStorage::open_current_read_only(&self.db_path) {
+            Ok(Some(storage)) => Ok(storage),
+            Ok(None) => {
+                let _write_lock = crate::sync::blocking_write_lock_with_timeout(
+                    &self.beads_dir,
+                    self.write_lock_timeout_ms,
+                )?;
+                SqliteStorage::open(&self.db_path)
+            }
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    db_path = %self.db_path.display(),
+                    "MCP read-only storage open failed; falling back to locked writable open"
+                );
+                let _write_lock = crate::sync::blocking_write_lock_with_timeout(
+                    &self.beads_dir,
+                    self.write_lock_timeout_ms,
+                )?;
+                SqliteStorage::open(&self.db_path)
+            }
+        }
     }
 
     /// Execute a mutating closure against the storage, acquiring the cross-process
@@ -113,7 +413,11 @@ impl BeadsState {
         F: FnMut(&mut SqliteStorage) -> fastmcp_rust::McpResult<R>,
     {
         // 1. Acquire the cross-process write lock.
-        let _write_lock = crate::sync::blocking_write_lock(&self.beads_dir).map_err(to_mcp)?;
+        let _write_lock = crate::sync::blocking_write_lock_with_timeout(
+            &self.beads_dir,
+            self.write_lock_timeout_ms,
+        )
+        .map_err(to_mcp)?;
 
         // 2. Acquire the sync lock before committing a mutation. MCP writes
         // should not report success when JSONL export is known to be unguarded
@@ -131,6 +435,8 @@ impl BeadsState {
                 return Err(sync_lock_mcp_error(&self.beads_dir, &self.jsonl_path, err));
             }
         };
+
+        self.clear_read_snapshot_cache();
 
         // 3. Open storage.
         let mut storage = self.open_storage().map_err(to_mcp)?;
@@ -185,8 +491,10 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::rc::Rc;
+    use std::sync::Mutex;
 
     use chrono::Utc;
+    use serde_json::json;
     use tempfile::TempDir;
 
     use super::*;
@@ -214,10 +522,115 @@ mod tests {
             db_path,
             beads_dir,
             jsonl_path,
+            // Robust under heavy parallel-test load (a concurrent auto-flush can
+            // hold .write.lock for >25ms); no test asserts the timeout path.
+            write_lock_timeout_ms: Some(5_000),
             allow_external_jsonl: false,
             actor: "mcp-test".to_string(),
             issue_prefix: Some("br".to_string()),
+            read_snapshot_cache: None,
         }
+    }
+
+    fn test_state_with_read_snapshot(temp: &TempDir, jsonl_path: PathBuf) -> BeadsState {
+        let mut state = test_state(temp, jsonl_path);
+        state.read_snapshot_cache = Some(Mutex::new(McpReadSnapshotCache::default()));
+        state
+    }
+
+    #[test]
+    fn shutdown_guard_allows_handlers_when_no_signal_is_pending() {
+        ensure_not_shutting_down_with(|| false).expect("unsignalled MCP handler should proceed");
+    }
+
+    #[test]
+    fn shutdown_guard_returns_structured_mcp_error() {
+        let err = ensure_not_shutting_down_with(|| true).unwrap_err();
+
+        assert_eq!(err.code, McpErrorCode::ToolExecutionError);
+        assert_eq!(err.message, "Shutdown requested");
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|data| data.get("error_type"))
+                .and_then(serde_json::Value::as_str),
+            Some("SHUTTING_DOWN")
+        );
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|data| data.get("context"))
+                .and_then(|context| context.get("shutdown_requested"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn open_read_storage_uses_read_only_fast_path_without_write_lock() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let state = test_state(&temp, jsonl_path);
+        let _held_lock =
+            crate::sync::blocking_write_lock(&state.beads_dir).expect("hold write lock");
+
+        let storage = state
+            .open_read_storage()
+            .expect("current schema read storage should not wait for write lock");
+
+        assert_eq!(storage.count_all_issues().unwrap(), 0);
+    }
+
+    #[test]
+    fn read_snapshot_cache_returns_value_when_witness_is_stable() {
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join(".beads").join("issues.jsonl");
+        let state = test_state_with_read_snapshot(&temp, jsonl_path);
+        let cached = json!({"count": 1});
+
+        let witness = state.capture_read_snapshot_witness();
+        state.store_read_json_snapshot("test".to_string(), witness, &cached);
+
+        assert_eq!(state.cached_read_json("test"), Some(cached));
+    }
+
+    #[test]
+    fn read_snapshot_cache_rejects_jsonl_witness_mismatch() {
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join(".beads").join("issues.jsonl");
+        let state = test_state_with_read_snapshot(&temp, jsonl_path.clone());
+        let cached = json!({"count": 1});
+
+        let witness = state.capture_read_snapshot_witness();
+        state.store_read_json_snapshot("test".to_string(), witness, &cached);
+        fs::write(jsonl_path, "{\"id\":\"br-new\"}\n").unwrap();
+
+        assert_eq!(state.cached_read_json("test"), None);
+    }
+
+    #[test]
+    fn with_mutation_clears_read_snapshot_cache_before_writing() {
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join(".beads").join("issues.jsonl");
+        let state = test_state_with_read_snapshot(&temp, jsonl_path);
+        let cached = json!({"count": 1});
+        let witness = state.capture_read_snapshot_witness();
+        state.store_read_json_snapshot("test".to_string(), witness, &cached);
+
+        state
+            .with_mutation(|storage| {
+                storage
+                    .create_issue(
+                        &test_issue("br-mcp-cache-clear", "clear stale read cache"),
+                        "mcp-test",
+                    )
+                    .map_err(to_mcp)?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(state.cached_read_json("test"), None);
     }
 
     #[test]
@@ -347,7 +760,16 @@ pub struct ServeArgs {
 /// cannot be opened.
 pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(overrides)?;
-    let res = config::open_storage_with_cli(&beads_dir, overrides)?;
+    let startup = config::load_startup_config_with_paths(&beads_dir, overrides.db.as_ref())?;
+    let mut startup_layers = startup.layers.clone();
+    startup_layers.push(overrides.as_layer());
+    let merged_layer = config::ConfigLayer::merge_layers(&startup_layers);
+    let lock_timeout = overrides
+        .lock_timeout
+        .or_else(|| config::lock_timeout_from_layer(&merged_layer))
+        .or(Some(crate::sync::default_write_lock_timeout_ms()));
+    let write_lock = crate::sync::blocking_write_lock_with_timeout(&beads_dir, lock_timeout)?;
+    let res = config::open_storage_with_startup_config_under_write_lock(startup, overrides, false)?;
 
     let prefix = res.storage.get_config("issue_prefix")?;
     let db_path = res.paths.db_path.clone();
@@ -357,14 +779,17 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
 
     // Eagerly drop the bootstrap connection; handlers will open their own.
     drop(res.storage);
+    drop(write_lock);
 
     let state = std::sync::Arc::new(BeadsState {
         db_path,
         beads_dir,
         jsonl_path,
+        write_lock_timeout_ms: lock_timeout,
         allow_external_jsonl,
         actor: args.actor.clone(),
         issue_prefix: prefix,
+        read_snapshot_cache: mcp_read_snapshot_cache_from_env(),
     });
 
     let server = fastmcp_rust::Server::new("br", env!("CARGO_PKG_VERSION"))
@@ -379,6 +804,7 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
              4. Use list_issues to find specific issues\n\n\
              Discovery resources: beads://project/info, beads://schema, \
              beads://labels, beads://issues/ready, beads://issues/blocked, \
+             beads://issues/in_progress, beads://coordination/status, \
              beads://issues/deferred, beads://issues/bottlenecks, \
              beads://graph/health, beads://events/recent\n\n\
              Guided workflows:\n\
@@ -395,7 +821,7 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
         .tool(tools::CloseIssueTool::new(state.clone()))
         .tool(tools::ManageDependenciesTool::new(state.clone()))
         .tool(tools::ProjectOverviewTool::new(state.clone()))
-        // Resources (11)
+        // Resources (12)
         .resource(resources::ProjectInfoResource::new(state.clone()))
         .resource(resources::IssueResource::new(state.clone()))
         .resource(resources::SchemaResource)
@@ -403,6 +829,7 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
         .resource(resources::ReadyIssuesResource::new(state.clone()))
         .resource(resources::BlockedIssuesResource::new(state.clone()))
         .resource(resources::InProgressResource::new(state.clone()))
+        .resource(resources::CoordinationStatusResource::new(state.clone()))
         .resource(resources::EventsResource::new(state.clone()))
         .resource(resources::DeferredIssuesResource::new(state.clone()))
         .resource(resources::GraphHealthResource::new(state.clone()))
@@ -414,5 +841,6 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
         .prompt(prompts::PolishBacklogPrompt::new(state))
         .build();
 
-    server.run_stdio();
+    server.run_transport_returning(StdioTransport::stdio());
+    Ok(())
 }

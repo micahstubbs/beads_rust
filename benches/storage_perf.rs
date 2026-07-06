@@ -66,6 +66,8 @@ fn create_test_issue(i: usize) -> Issue {
         external_ref: None,
         source_system: None,
         source_repo: None,
+        source_repo_path: None,
+        agent_context: None,
         deleted_at: None,
         deleted_by: None,
         delete_reason: None,
@@ -116,6 +118,24 @@ fn setup_db_with_issues(count: usize) -> (TempDir, SqliteStorage) {
 
     for i in 0..count {
         let issue = create_test_issue(i);
+        storage
+            .create_issue(&issue, "benchmark")
+            .expect("Failed to create issue");
+    }
+
+    (dir, storage)
+}
+
+fn setup_db_with_multi_label_issues(count: usize) -> (TempDir, SqliteStorage) {
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let db_path = dir.path().join("bench.db");
+    let mut storage = SqliteStorage::open(&db_path).expect("Failed to open db");
+
+    for i in 0..count {
+        let mut issue = create_test_issue(i);
+        if i.is_multiple_of(2) {
+            issue.labels.push("label-even".to_string());
+        }
         storage
             .create_issue(&issue, "benchmark")
             .expect("Failed to create issue");
@@ -339,6 +359,9 @@ fn bench_update_issue(c: &mut Criterion) {
                 due_at: None,
                 defer_until: None,
                 external_ref: None,
+                source_repo: None,
+                source_repo_path: None,
+                agent_context: None,
                 closed_at: None,
                 close_reason: None,
                 closed_by_session: None,
@@ -504,6 +527,24 @@ fn bench_list_issues_filtered(c: &mut Criterion) {
         let bench_start = log_bench_start(bench_name);
         b.iter(|| {
             let issues = storage.list_issues(black_box(&filters)).unwrap();
+            black_box(issues)
+        });
+        log_bench_end(bench_name, bench_start);
+    });
+
+    let (_multi_label_dir, multi_label_storage) = setup_db_with_multi_label_issues(1000);
+    let multi_label_filters = ListFilters {
+        labels: Some(vec!["label-2".to_string(), "label-even".to_string()]),
+        ..ListFilters::default()
+    };
+
+    group.bench_function("filtered_multi_label_and", |b| {
+        let bench_name = "storage/list_filtered/filtered_multi_label_and";
+        let bench_start = log_bench_start(bench_name);
+        b.iter(|| {
+            let issues = multi_label_storage
+                .list_issues(black_box(&multi_label_filters))
+                .unwrap();
             black_box(issues)
         });
         log_bench_end(bench_name, bench_start);

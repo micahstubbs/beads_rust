@@ -572,7 +572,7 @@ do_uninstall() {
 # Platform Detection
 # ============================================================================
 detect_platform() {
-    local os arch
+    local os arch libc
 
     case "$(uname -s)" in
         Linux*)  os="linux" ;;
@@ -588,7 +588,49 @@ detect_platform() {
         *) die "Unsupported architecture: $(uname -m)" ;;
     esac
 
-    echo "${os}_${arch}"
+    # Distinguish glibc vs musl on Linux. Alpine and other musl-based distros
+    # need the statically linked musl binary; the gnu artifact references
+    # libgcc_s/_Unwind_* symbols that musl's libc-compat shim does not provide
+    # (see #284).
+    libc=""
+    if [ "$os" = "linux" ]; then
+        # Detection order, cheapest and most reliable first:
+        #   1. /etc/alpine-release  — Alpine fast path (cheap stat).
+        #   2. /proc/self/maps      — what *this running bash* is linked
+        #      against. Bulletproof: it survives systems that have the
+        #      musl cross-toolchain installed alongside glibc (which
+        #      makes /lib/ld-musl-*.so* present even on glibc hosts), and
+        #      side-steps the `set -o pipefail` interaction with `ldd`.
+        #   3. `ldd --version` output sniff — last resort for exotic
+        #      systems with no /proc (e.g. heavily restricted containers).
+        #
+        # Note on the ldd path: musl's `ldd` exits non-zero even when it
+        # prints "musl libc" to stderr, so `if … | grep -q …` is never
+        # taken under `pipefail`. We capture combined output first and
+        # match with `case` to avoid the pipeline entirely.
+        if [ -f /etc/alpine-release ]; then
+            libc="musl"
+        elif grep -q 'ld-musl' /proc/self/maps 2>/dev/null; then
+            libc="musl"
+        elif command -v ldd >/dev/null 2>&1; then
+            ldd_output=$(ldd --version 2>&1 || true)
+            case "$ldd_output" in
+                *[Mm]usl*) libc="musl" ;;
+            esac
+        fi
+        # Only musl_arm64 and musl_amd64 are published; armv7 keeps gnu (no musl
+        # artifact yet). If we somehow detected musl on armv7, fall back to gnu
+        # rather than fabricating an artifact name that does not exist.
+        if [ "$libc" = "musl" ] && [ "$arch" != "amd64" ] && [ "$arch" != "arm64" ]; then
+            libc=""
+        fi
+    fi
+
+    if [ -n "$libc" ]; then
+        echo "${os}_${libc}_${arch}"
+    else
+        echo "${os}_${arch}"
+    fi
 }
 
 # ============================================================================
@@ -640,6 +682,22 @@ resolve_version() {
 
     log_warn "Could not resolve latest version; will try building from source"
     VERSION=""
+}
+
+release_download_tag() {
+    local raw="$1"
+    if [ -z "$raw" ]; then
+        printf '%s\n' ""
+    elif [[ "$raw" == v* ]]; then
+        printf '%s\n' "$raw"
+    else
+        printf 'v%s\n' "$raw"
+    fi
+}
+
+release_asset_version() {
+    local raw="$1"
+    printf '%s\n' "${raw#v}"
 }
 
 # ============================================================================
@@ -702,6 +760,7 @@ TMP=""
 cleanup() {
     [ -n "$TMP" ] && rm -rf "$TMP"
     [ "$LOCKED" -eq 1 ] && rm -rf "$LOCK_DIR"
+    return 0
 }
 trap cleanup EXIT
 
@@ -962,17 +1021,8 @@ ensure_rust() {
 # Pre-build cleanup for source builds
 # ============================================================================
 prepare_for_build() {
-    # Kill any stuck cargo processes
-    pkill -9 -f "cargo build" 2>/dev/null || true
-
-    # Clear cargo locks
-    rm -f ~/.cargo/.package-cache 2>/dev/null || true
-    rm -f ~/.cargo/registry/.crate-cache.lock 2>/dev/null || true
-
-    # Clean up old br build directories
-    rm -rf /tmp/br-build-* 2>/dev/null || true
-
-    # Check disk space (need at least 1GB)
+    # Source builds use TMP-scoped clone and target directories, so preflight
+    # must not disturb unrelated Cargo processes or shared Cargo caches.
     local avail_kb
     if [[ "$OSTYPE" == "darwin"* ]]; then
         avail_kb=$(df -k /tmp | tail -1 | awk '{print $4}')
@@ -981,12 +1031,8 @@ prepare_for_build() {
     fi
 
     if [ "$avail_kb" -lt 1048576 ]; then
-        log_warn "Low disk space in /tmp ($(( avail_kb / 1024 ))MB). Cleaning up..."
-        rm -rf /tmp/cargo-target 2>/dev/null || true
-        rm -rf ~/.cargo/registry/cache 2>/dev/null || true
+        log_warn "Low disk space in /tmp ($(( avail_kb / 1024 ))MB). Source build may fail; set TMPDIR to a larger filesystem and retry if needed."
     fi
-
-    sleep 1
 }
 
 # ============================================================================
@@ -1356,12 +1402,15 @@ download_release() {
         url="$ARTIFACT_URL"
         archive_name="$(basename "$ARTIFACT_URL")"
     else
+        local release_tag asset_version
+        release_tag="$(release_download_tag "$VERSION")"
+        asset_version="$(release_asset_version "$VERSION")"
         local archive_ext="tar.gz"
         case "$platform" in
             windows_*) archive_ext="zip" ;;
         esac
-        archive_name="br-${VERSION}-${platform}.${archive_ext}"
-        url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${archive_name}"
+        archive_name="br-${asset_version}-${platform}.${archive_ext}"
+        url="https://github.com/${OWNER}/${REPO}/releases/download/${release_tag}/${archive_name}"
     fi
 
     run_with_spinner "Downloading $archive_name..." \
@@ -1380,7 +1429,7 @@ download_release() {
         if [ -n "$CHECKSUM_URL" ]; then
             checksum_url="$CHECKSUM_URL"
         else
-            checksum_url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${archive_name}.sha256"
+            checksum_url="https://github.com/${OWNER}/${REPO}/releases/download/$(release_download_tag "$VERSION")/${archive_name}.sha256"
         fi
 
         if download_file "$checksum_url" "$TMP/checksum.sha256"; then
@@ -1388,7 +1437,7 @@ download_release() {
         fi
     fi
 
-    verify_archive_checksum "$TMP/$archive_name" "$archive_name" "$expected" || return 1
+    verify_archive_checksum "$TMP/$archive_name" "$archive_name" "$expected" || return 2
 
     # Extract
     log_step "Extracting..."
@@ -1468,33 +1517,37 @@ check_conflicts() {
     fi
 
     if [ ${#conflicts[@]} -gt 0 ]; then
-        log_warn "Found br in multiple locations:"
-        log_step "  Installed: $installed_path"
-        for conflict in "${conflicts[@]}"; do
-            log_step "  Conflict:  $conflict"
-        done
-
-        # Check PATH priority
         local active_br
-        active_br=$(command -v br 2>/dev/null || echo "")
+        active_br=$(command -v "$BINARY_NAME" 2>/dev/null || echo "")
+
         if [ -n "$active_br" ] && [ "$active_br" != "$installed_path" ]; then
             log_warn "The active br ($active_br) differs from the newly installed version!"
-            log_warn "To use the new version, either:"
-            log_step "  1. Remove the conflicting binary: rm $active_br"
-            log_step "  2. Adjust PATH so $DEST comes first"
+            log_step "  Installed: $installed_path"
+            log_warn "Additional br location(s):"
+            for conflict in "${conflicts[@]}"; do
+                log_step "  Conflict:  $conflict"
+            done
+            log_warn "To use the new version, either adjust PATH so $DEST comes first, or move/remove the conflicting binary manually."
+
+            # Offer to remove conflicts in easy mode.
+            if [ "$EASY" -eq 1 ]; then
+                for conflict in "${conflicts[@]}"; do
+                    if [ -t 0 ] && [[ "$GUM_AVAILABLE" == "true" ]]; then
+                        if gum confirm "Remove conflicting binary at $conflict?"; then
+                            rm -f "$conflict"
+                            log_success "Removed $conflict"
+                        fi
+                    fi
+                done
+            fi
+
+            return 0
         fi
 
-        # Offer to remove conflicts in easy mode
-        if [ "$EASY" -eq 1 ]; then
-            for conflict in "${conflicts[@]}"; do
-                if [ -t 0 ] && [[ "$GUM_AVAILABLE" == "true" ]]; then
-                    if gum confirm "Remove conflicting binary at $conflict?"; then
-                        rm -f "$conflict"
-                        log_success "Removed $conflict"
-                    fi
-                fi
-            done
-        fi
+        log_step "Found additional br location(s); $installed_path remains active"
+        for conflict in "${conflicts[@]}"; do
+            log_step "  Other:     $conflict"
+        done
     fi
 }
 
@@ -1582,6 +1635,11 @@ main() {
             if [ "$downloaded" -eq 0 ]; then
                 if download_release "$platform"; then
                     downloaded=1
+                else
+                    local download_status=$?
+                    if [ "$download_status" -eq 2 ]; then
+                        die "Release artifact verification failed"
+                    fi
                 fi
             fi
             if [ "$downloaded" -eq 0 ]; then

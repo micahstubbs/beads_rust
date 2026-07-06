@@ -23,7 +23,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+#[cfg(target_os = "linux")]
 const WRITE_LOCK_WAIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "linux")]
 const WRITE_LOCK_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const CONTENTION_SUCCESS_LOCK_TIMEOUT_MS: &str = "1000";
 
@@ -156,7 +158,7 @@ where
     V: AsRef<OsStr>,
 {
     let start = Instant::now();
-    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("br"));
+    let mut cmd = Command::cargo_bin("br").expect("find br binary");
     cmd.current_dir(root);
     cmd.args(args);
     clear_inherited_br_env(&mut cmd);
@@ -207,14 +209,22 @@ fn is_expected_contention_failure(result: &BrResult) -> bool {
 }
 
 fn has_integrity_failure_signal(result: &BrResult) -> bool {
-    let combined = format!("{} {}", result.stdout, result.stderr).to_lowercase();
-    combined.contains("unique constraint failed: blocked_issues_cache.issue_id")
-        || combined.contains("constraint failed")
-        || combined.contains("constraint")
-        || combined.contains("corrupt")
-        || combined.contains("malformed")
-        || combined.contains("unexpected token")
-        || combined.contains("panic")
+    if contains_integrity_failure_signal(&result.stderr) {
+        return true;
+    }
+
+    !result.success && contains_integrity_failure_signal(&result.stdout)
+}
+
+fn contains_integrity_failure_signal(output: &str) -> bool {
+    let output = output.to_lowercase();
+    output.contains("unique constraint failed: blocked_issues_cache.issue_id")
+        || output.contains("constraint failed")
+        || output.contains("constraint")
+        || output.contains("corrupt")
+        || output.contains("malformed")
+        || output.contains("unexpected token")
+        || output.contains("panic")
 }
 
 fn assert_no_integrity_failure_signals(role: &str, results: &[BrResult]) {
@@ -332,6 +342,79 @@ fn assert_doctor_healthy(root: &PathBuf) {
          initial: stdout={} stderr={}\n\
          repair:  stdout={} stderr={}",
         doctor.stdout, doctor.stderr, repair.stdout, repair.stderr
+    );
+}
+
+fn assert_doctor_has_no_page_anomalies(root: &PathBuf, label: &str) {
+    let doctor = run_br_in_dir(root, ["doctor", "--json"]);
+    assert!(
+        doctor.success,
+        "{label}: doctor failed: stdout={} stderr={}",
+        doctor.stdout, doctor.stderr
+    );
+
+    let payload = extract_json_payload(&doctor.stdout);
+    let report: serde_json::Value =
+        serde_json::from_str(&payload).expect("doctor output should be valid json");
+    let checks = report
+        .get("checks")
+        .and_then(serde_json::Value::as_array)
+        .expect("doctor report should include checks array");
+
+    let page_anomalies: Vec<String> = checks
+        .iter()
+        .filter_map(|check| {
+            let name = check
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if name != "sqlite.integrity_check" && name != "sqlite3.integrity_check" {
+                return None;
+            }
+
+            let message = check
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let lower = message.to_ascii_lowercase();
+            (lower.contains("never used")
+                || lower.contains("free space corruption")
+                || lower.contains("malformed")
+                || lower.contains("disk image"))
+            .then(|| format!("{name}: {message}"))
+        })
+        .collect();
+
+    assert!(
+        page_anomalies.is_empty(),
+        "{label}: doctor reported page anomalies: {page_anomalies:?}\nstdout={}\nstderr={}",
+        doctor.stdout,
+        doctor.stderr
+    );
+}
+
+fn assert_upstream_sqlite_integrity_ok(root: &Path, label: &str) {
+    let db_path = root.join(".beads").join("beads.db");
+    let output = StdCommand::new("sqlite3")
+        .arg(&db_path)
+        .arg("PRAGMA integrity_check;")
+        .output();
+
+    let output = match output {
+        Ok(output) => output,
+        Err(err) => {
+            eprintln!("{label}: sqlite3 unavailable, skipping upstream integrity check: {err}");
+            return;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.trim() == "ok",
+        "{label}: upstream sqlite3 integrity_check failed for {}: status={:?} stdout={stdout} stderr={stderr}",
+        db_path.display(),
+        output.status.code()
     );
 }
 
@@ -645,6 +728,17 @@ fn e2e_read_command_witness_refresh_waits_for_write_lock() {
         .expect("delete jsonl_size witness");
     conn.execute("INSERT INTO metadata (key, value) VALUES ('jsonl_size', '0')")
         .expect("write stale jsonl_size witness");
+    // beads_rust-mjmk: also corrupt jsonl_content_hash so the staleness probe
+    // actually concludes the JSONL is newer. compute_jsonl_newer_impl falls
+    // back to hash comparison when size mismatches; if the hash still matches
+    // the actual JSONL, the probe returns "not newer" and the read command
+    // never tries to refresh witnesses, making this test a no-op.
+    conn.execute("DELETE FROM metadata WHERE key = 'jsonl_content_hash'")
+        .expect("delete jsonl_content_hash witness");
+    conn.execute(
+        "INSERT INTO metadata (key, value) VALUES ('jsonl_content_hash', 'stale_witness_hash_mjmk')",
+    )
+    .expect("write stale jsonl_content_hash witness");
     drop(conn);
 
     let lock_path = beads_dir.join(".write.lock");
@@ -657,16 +751,16 @@ fn e2e_read_command_witness_refresh_waits_for_write_lock() {
         .expect("open .write.lock");
     write_lock.lock().expect("hold .write.lock");
 
-    let mut blocked_list = spawn_br_child_in_dir(&root, ["list", "--json"]);
-    wait_for_child_to_block_on_write_lock(&mut blocked_list, "witness-refresh list");
+    let mut blocked_search = spawn_br_child_in_dir(&root, ["search", "Seed", "--json"]);
+    wait_for_child_to_block_on_write_lock(&mut blocked_search, "witness-refresh search");
 
     drop(write_lock);
-    let completed = blocked_list
+    let completed = blocked_search
         .wait_with_output()
-        .expect("collect list after lock release");
+        .expect("collect search after lock release");
     assert!(
         completed.status.success(),
-        "list after witness refresh failed: stdout={} stderr={}",
+        "search after witness refresh failed: stdout={} stderr={}",
         String::from_utf8_lossy(&completed.stdout),
         String::from_utf8_lossy(&completed.stderr)
     );
@@ -919,14 +1013,16 @@ fn e2e_concurrent_reads_succeed() {
     drop(temp_dir);
 }
 
-/// Test that parallel read-only commands do not contend on teardown.
+/// Test that parallel read-only commands serialize without teardown errors.
 ///
-/// This specifically guards against hidden write-like work during command
-/// shutdown, such as opportunistic WAL checkpoints from otherwise read-only
-/// operations.
+/// Read-only DB-family commands intentionally pass through `.write.lock` because
+/// storage open/recovery can touch shared DB state before the command body runs.
+/// This guards against the failure mode we actually care about: hidden
+/// write-like teardown work surfacing as `database is busy` or corrupting the
+/// workspace under concurrent read traffic.
 #[test]
-fn e2e_parallel_read_only_commands_do_not_busy_on_drop() {
-    let _log = common::test_log("e2e_parallel_read_only_commands_do_not_busy_on_drop");
+fn e2e_parallel_read_only_commands_serialize_without_busy_on_drop() {
+    let _log = common::test_log("e2e_parallel_read_only_commands_serialize_without_busy_on_drop");
 
     let registry = DatasetRegistry::new();
     if !registry.is_available(KnownDataset::BeadsRust) {
@@ -969,7 +1065,7 @@ fn e2e_parallel_read_only_commands_do_not_busy_on_drop() {
                         &root_clone,
                         [
                             "--lock-timeout",
-                            "1",
+                            "1000",
                             "--no-auto-import",
                             "--no-auto-flush",
                             "ready",
@@ -981,7 +1077,7 @@ fn e2e_parallel_read_only_commands_do_not_busy_on_drop() {
                         &root_clone,
                         [
                             "--lock-timeout",
-                            "1",
+                            "1000",
                             "--no-auto-import",
                             "--no-auto-flush",
                             "show",
@@ -2526,6 +2622,186 @@ fn e2e_close_update_reopen_preserve_blocked_cache_integrity() {
         let show = run_br_in_dir(&root, ["--no-auto-import", "show", issue_id, "--json"]);
         assert!(show.success, "show reopen target failed: {}", show.stderr);
     }
+}
+
+/// Regression for the ts2 report: mixed DB-backed commands in parallel must
+/// serialize cleanly and leave no upstream `sqlite3` page-integrity residue.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_parallel_mixed_db_commands_preserve_sqlite_integrity() {
+    let _log = common::test_log("e2e_parallel_mixed_db_commands_preserve_sqlite_integrity");
+
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let root = temp_dir.path().to_path_buf();
+
+    let init = run_br_in_dir(&root, ["init"]);
+    assert!(init.success, "init failed: {}", init.stderr);
+
+    let mut issue_ids = Vec::new();
+    for idx in 0..14 {
+        let created = run_br_in_dir(&root, ["create", &format!("ts2 mixed issue {idx}")]);
+        assert!(
+            created.success,
+            "seed create {idx} failed: stdout={} stderr={}",
+            created.stdout, created.stderr
+        );
+        issue_ids.push(parse_created_id(&created.stdout));
+    }
+
+    let barrier = Arc::new(Barrier::new(4));
+    let shared_root = Arc::new(root.clone());
+
+    let updater = {
+        let barrier = Arc::clone(&barrier);
+        let root = Arc::clone(&shared_root);
+        let issue_ids = issue_ids.clone();
+        thread::spawn(move || {
+            barrier.wait();
+            let mut results = Vec::new();
+            for (idx, issue_id) in issue_ids.iter().take(10).enumerate() {
+                let args = vec![
+                    "--lock-timeout".to_string(),
+                    "15000".to_string(),
+                    "update".to_string(),
+                    issue_id.clone(),
+                    "--title".to_string(),
+                    format!("ts2 mixed updated {idx}"),
+                    "--priority".to_string(),
+                    (idx % 5).to_string(),
+                    "--json".to_string(),
+                ];
+                results.push(run_br_in_dir(&root, args));
+                thread::sleep(Duration::from_millis(5));
+            }
+            results
+        })
+    };
+
+    let depper = {
+        let barrier = Arc::clone(&barrier);
+        let root = Arc::clone(&shared_root);
+        let issue_ids = issue_ids.clone();
+        thread::spawn(move || {
+            barrier.wait();
+            let mut results = Vec::new();
+            for idx in 1..issue_ids.len() {
+                let args = vec![
+                    "--lock-timeout".to_string(),
+                    "15000".to_string(),
+                    "dep".to_string(),
+                    "add".to_string(),
+                    issue_ids[idx].clone(),
+                    issue_ids[idx - 1].clone(),
+                    "--json".to_string(),
+                ];
+                results.push(run_br_in_dir(&root, args));
+                thread::sleep(Duration::from_millis(5));
+            }
+            results
+        })
+    };
+
+    let creator = {
+        let barrier = Arc::clone(&barrier);
+        let root = Arc::clone(&shared_root);
+        thread::spawn(move || {
+            barrier.wait();
+            let mut results = Vec::new();
+            for idx in 0..8 {
+                let args = vec![
+                    "--lock-timeout".to_string(),
+                    "15000".to_string(),
+                    "create".to_string(),
+                    format!("ts2 mixed concurrent create {idx}"),
+                    "--json".to_string(),
+                ];
+                results.push(run_br_in_dir(&root, args));
+                thread::sleep(Duration::from_millis(5));
+            }
+            results
+        })
+    };
+
+    let reader = {
+        let barrier = Arc::clone(&barrier);
+        let root = Arc::clone(&shared_root);
+        let issue_ids = issue_ids.clone();
+        thread::spawn(move || {
+            barrier.wait();
+            let mut results = Vec::new();
+            for idx in 0..12 {
+                let args = match idx % 4 {
+                    0 => vec![
+                        "--lock-timeout".to_string(),
+                        "15000".to_string(),
+                        "show".to_string(),
+                        issue_ids[idx % issue_ids.len()].clone(),
+                        "--json".to_string(),
+                    ],
+                    1 => vec![
+                        "--lock-timeout".to_string(),
+                        "15000".to_string(),
+                        "status".to_string(),
+                        "--no-activity".to_string(),
+                        "--json".to_string(),
+                    ],
+                    2 => vec![
+                        "--lock-timeout".to_string(),
+                        "15000".to_string(),
+                        "ready".to_string(),
+                        "--json".to_string(),
+                    ],
+                    _ => vec![
+                        "--lock-timeout".to_string(),
+                        "15000".to_string(),
+                        "doctor".to_string(),
+                        "--json".to_string(),
+                    ],
+                };
+                results.push(run_br_in_dir(&root, args));
+                thread::sleep(Duration::from_millis(5));
+            }
+            results
+        })
+    };
+
+    let update_results = updater.join().expect("updater panicked");
+    let dep_results = depper.join().expect("depper panicked");
+    let create_results = creator.join().expect("creator panicked");
+    let read_results = reader.join().expect("reader panicked");
+
+    for (role, results) in [
+        ("update", &update_results),
+        ("dep add", &dep_results),
+        ("create", &create_results),
+        ("read/status/doctor", &read_results),
+    ] {
+        assert_no_integrity_failure_signals(role, results);
+        let successes = assert_only_success_or_contention(role, results);
+        assert!(successes > 0, "{role} had no successful operations");
+    }
+
+    assert_doctor_has_no_page_anomalies(&root, "after mixed parallel DB load");
+    assert_upstream_sqlite_integrity_ok(&root, "after mixed parallel DB load");
+
+    for round in 0..4 {
+        let status = run_br_in_dir(&root, ["status", "--no-activity", "--json"]);
+        assert!(
+            status.success,
+            "post-load status round {round} failed: stdout={} stderr={}",
+            status.stdout, status.stderr
+        );
+
+        let doctor = run_br_in_dir(&root, ["doctor", "--json"]);
+        assert!(
+            doctor.success,
+            "post-load doctor round {round} failed: stdout={} stderr={}",
+            doctor.stdout, doctor.stderr
+        );
+    }
+
+    assert_doctor_has_no_page_anomalies(&root, "after repeated status/doctor reads");
+    assert_upstream_sqlite_integrity_ok(&root, "after repeated status/doctor reads");
 }
 
 /// Test that routed access remains bounded even while the routed workspace

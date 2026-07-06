@@ -1,6 +1,6 @@
 [package]
 name = "beads_rust"
-version = "0.2.4"
+version = "0.2.17"
 edition = "2024"
 rust-version = "1.88"
 autobenches = false
@@ -38,30 +38,30 @@ path = "src/main.rs"
 [dependencies]
 # CLI
 clap = { version = "4.5.60", features = ["derive", "env", "unstable-ext"] }
-clap_complete = { version = "4.5.66", features = ["unstable-dynamic"] }
+clap_complete = { version = "4.6.7", features = ["unstable-dynamic"] }
 
 # Database (pure-Rust SQLite with concurrent writer support)
 # NOTE: transitive fsqlite workspace deps listed explicitly so rch syncs them
-fsqlite = "0.1.7"
-fsqlite-types = "0.1.7"
-fsqlite-error = "0.1.7"
-fsqlite-core = "0.1.7"
-fsqlite-func = "0.1.7"
-fsqlite-vdbe = "0.1.7"
-fsqlite-vfs = "0.1.7"
-fsqlite-pager = "0.1.7"
-fsqlite-parser = "0.1.7"
-fsqlite-planner = "0.1.7"
-fsqlite-wal = "0.1.7"
-fsqlite-btree = "0.1.7"
-fsqlite-ast = "0.1.7"
-fsqlite-mvcc = "0.1.7"
-fsqlite-observability = "0.1.7"
+fsqlite = "0.1.13"
+fsqlite-types = "0.1.13"
+fsqlite-error = "0.1.13"
+fsqlite-core = "0.1.13"
+fsqlite-func = "0.1.13"
+fsqlite-vdbe = "0.1.13"
+fsqlite-vfs = "0.1.13"
+fsqlite-pager = "0.1.13"
+fsqlite-parser = "0.1.13"
+fsqlite-planner = "0.1.13"
+fsqlite-wal = "0.1.13"
+fsqlite-btree = "0.1.13"
+fsqlite-ast = "0.1.13"
+fsqlite-mvcc = "0.1.13"
+fsqlite-observability = "0.1.13"
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-serde_yml = "0.0.12"
+serde_json = "1.0.150"
+serde_yml = { package = "serde_norway", version = "0.9.42" }
 schemars = { version = "1.0", features = ["derive", "chrono04"] }
 
 # Time
@@ -71,7 +71,7 @@ chrono = { version = "0.4.43", features = ["serde"] }
 sha2 = "0.11.0"
 
 # Error handling
-anyhow = "1.0.102"
+anyhow = "1.0.103"
 thiserror = "2.0.18"
 
 # Logging
@@ -79,14 +79,16 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "json"] }
 
 # Terminal
-indicatif = "0.18.4"
+indicatif = "0.18.6"
 crossterm = "0.29"
 
-# Rich terminal output (sibling project)
-rich_rust = { version = "0.2.1", features = ["full"] }
+# Rich terminal output (sibling project). Keep syntax highlighting out of the
+# release build until the upstream syntect stack drops unmaintained transitive
+# crates.
+rich_rust = { version = "0.2.1", features = ["markdown", "json", "backtrace"] }
 
 # TOON format support (sibling project)
-toon_rust = { version = "0.2.2", package = "tru" }
+toon_rust = { version = "0.2.3", package = "tru" }
 
 # Path normalization (strips \\?\ prefix on Windows)
 dunce = "1.0.5"
@@ -95,7 +97,7 @@ dunce = "1.0.5"
 once_cell = "1.21"
 regex = "1.12"
 shell-words = "1.1.1"
-similar = "3.1.0"
+similar = "3.1.1"
 tempfile = "3.25"
 unicode-width = "0.2.2"
 
@@ -103,16 +105,24 @@ unicode-width = "0.2.2"
 semver = "1.0.27"
 
 # MCP server (optional; gated behind the `mcp` feature)
-fastmcp-rust = { version = "0.3.0", optional = true }
+fastmcp-rust = { version = "0.3.1", optional = true }
 
 # Self-update (optional; gated behind the `self_update` feature)
 self_update = { version = "0.44", features = ["reqwest", "rustls", "archive-tar", "compression-flate2"], default-features = false, optional = true }
+
+# Cooperative shutdown so SIGINT/SIGTERM/SIGHUP unwind through main and let
+# SqliteStorage::Drop flush the WAL instead of stranding frames on disk (#270).
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.4.4"
+
+[target.'cfg(not(windows))'.dependencies]
+mimalloc = "0.1.52"
 
 [build-dependencies]
 vergen-gix = { version = "9.1", features = ["build", "cargo", "rustc"] }
 
 [dev-dependencies]
-assert_cmd = "2.2.1"
+assert_cmd = "2.2.2"
 predicates = "3.1.4"
 criterion = { version = "0.8.2", features = ["html_reports"] }
 walkdir = "2.5"
@@ -156,8 +166,8 @@ self_update = [
 
 # NOTE: no `[patch.crates-io]` here.
 #
-# All dependencies — fsqlite 0.1.2+, its fsqlite-* transitive crates, and
-# fastmcp-rust 0.2.1+ — are published on crates.io, so this crate
+# All dependencies — fsqlite 0.1.3+, its fsqlite-* transitive crates, and
+# fastmcp-rust 0.3.1+ — are published on crates.io, so this crate
 # resolves everything from the registry out of the box.  That makes
 # `cargo install --git https://github.com/Dicklesworthstone/beads_rust.git`
 # work without requiring sibling `frankensqlite` or `fastmcp_rust`

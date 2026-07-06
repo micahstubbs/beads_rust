@@ -14,11 +14,12 @@ pub mod routing;
 use crate::error::{BeadsError, Result, ResultExt};
 use crate::model::{IssueType, Priority};
 use crate::storage::SqliteStorage;
+use crate::sync::path::validate_sync_path_with_external;
 use crate::sync::{
     ExportConfig, ImportConfig, ImportResult, JsonlTombstoneFilter, PreservedTombstone, auto_flush,
-    compute_jsonl_hash, export_to_jsonl_with_policy, finalize_export, import_from_jsonl,
-    preflight_import, restore_tombstones_after_rebuild, scan_jsonl_for_tombstone_filter,
-    snapshot_tombstones, tombstones_missing_from_jsonl_tombstones,
+    blocking_write_lock_with_timeout, compute_jsonl_hash, export_to_jsonl_with_policy,
+    finalize_export, import_from_jsonl, preflight_import, restore_tombstones_after_rebuild,
+    scan_jsonl_for_tombstone_filter, snapshot_tombstones, tombstones_missing_from_jsonl_tombstones,
 };
 use crate::util::id::{
     IdConfig, abbreviate_prefix, normalize_prefix, parse_id, split_prefix_remainder,
@@ -32,10 +33,11 @@ use sha2::{Digest, Sha256};
 use crate::util::hex_encode;
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::fs;
-use std::io::{BufRead, IsTerminal, Read};
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::UNIX_EPOCH;
 use tempfile::tempdir;
 use tracing::warn;
 
@@ -73,7 +75,9 @@ const EXCLUDED_JSONL_FILES: &[&str] = &[
 /// Startup metadata describing DB + JSONL paths.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Metadata {
+    #[serde(default = "default_database_filename")]
     pub database: String,
+    #[serde(default = "default_jsonl_export_filename")]
     pub jsonl_export: String,
     #[serde(default)]
     pub backend: Option<String>,
@@ -81,11 +85,19 @@ pub struct Metadata {
     pub deletions_retention_days: Option<u64>,
 }
 
+fn default_database_filename() -> String {
+    DEFAULT_DB_FILENAME.to_string()
+}
+
+fn default_jsonl_export_filename() -> String {
+    DEFAULT_JSONL_FILENAME.to_string()
+}
+
 impl Default for Metadata {
     fn default() -> Self {
         Self {
-            database: DEFAULT_DB_FILENAME.to_string(),
-            jsonl_export: DEFAULT_JSONL_FILENAME.to_string(),
+            database: default_database_filename(),
+            jsonl_export: default_jsonl_export_filename(),
             backend: None,
             deletions_retention_days: None,
         }
@@ -155,7 +167,7 @@ pub fn is_excluded_jsonl(filename: &str) -> bool {
 }
 
 /// Resolved paths for this workspace.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConfigPaths {
     pub beads_dir: PathBuf,
     pub db_path: PathBuf,
@@ -528,18 +540,50 @@ enum JsonlRecoveryStrategy {
     DeferToExplicitImport,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SqliteStartupOpenOptions {
+    defer_jsonl_recovery: bool,
+    read_only_fast_open: bool,
+    write_lock_already_held: bool,
+    allow_external_jsonl: bool,
+}
+
 fn open_sqlite_storage_with_recovery(
     beads_dir: &Path,
     paths: &ConfigPaths,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
+    allow_external_jsonl: bool,
 ) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
     open_sqlite_storage_with_recovery_strategy(
         beads_dir,
         paths,
         lock_timeout,
         bootstrap_layer,
+        allow_external_jsonl,
         JsonlRecoveryStrategy::RebuildFromJsonl,
+    )
+}
+
+fn open_sqlite_storage_with_recovery_after_fast_open_miss(
+    beads_dir: &Path,
+    paths: &ConfigPaths,
+    lock_timeout: Option<u64>,
+    bootstrap_layer: &ConfigLayer,
+    write_lock_already_held: bool,
+    allow_external_jsonl: bool,
+) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
+    let _write_lock = if write_lock_already_held {
+        None
+    } else {
+        Some(blocking_write_lock_with_timeout(beads_dir, lock_timeout)?)
+    };
+    open_sqlite_storage_with_recovery(
+        beads_dir,
+        paths,
+        lock_timeout,
+        bootstrap_layer,
+        allow_external_jsonl,
     )
 }
 
@@ -548,12 +592,14 @@ fn open_sqlite_storage_with_deferred_jsonl_recovery(
     paths: &ConfigPaths,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
+    allow_external_jsonl: bool,
 ) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
     open_sqlite_storage_with_recovery_strategy(
         beads_dir,
         paths,
         lock_timeout,
         bootstrap_layer,
+        allow_external_jsonl,
         JsonlRecoveryStrategy::DeferToExplicitImport,
     )
 }
@@ -563,6 +609,7 @@ fn open_sqlite_storage_with_recovery_strategy(
     paths: &ConfigPaths,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
+    allow_external_jsonl: bool,
     recovery_strategy: JsonlRecoveryStrategy,
 ) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
     if !paths.db_path.is_file() && paths.jsonl_path.is_file() {
@@ -571,6 +618,7 @@ fn open_sqlite_storage_with_recovery_strategy(
             paths,
             lock_timeout,
             bootstrap_layer,
+            allow_external_jsonl,
             recovery_strategy,
         );
     }
@@ -591,6 +639,7 @@ fn open_sqlite_storage_with_recovery_strategy(
                 paths,
                 lock_timeout,
                 bootstrap_layer,
+                allow_external_jsonl,
                 recovery_strategy,
                 &prepare_fresh_storage,
             ),
@@ -609,6 +658,7 @@ fn open_sqlite_storage_with_recovery_strategy(
                     paths,
                     lock_timeout,
                     bootstrap_layer,
+                    allow_external_jsonl,
                     recovery_strategy,
                     &prepare_fresh_storage,
                 )
@@ -624,6 +674,7 @@ fn open_sqlite_storage_with_recovery_strategy(
                 paths,
                 lock_timeout,
                 bootstrap_layer,
+                allow_external_jsonl,
                 recovery_strategy,
                 &prepare_fresh_storage,
             )
@@ -639,12 +690,18 @@ fn open_when_db_file_is_missing(
     paths: &ConfigPaths,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
+    allow_external_jsonl: bool,
     recovery_strategy: JsonlRecoveryStrategy,
 ) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
     match recovery_strategy {
         JsonlRecoveryStrategy::RebuildFromJsonl => {
-            let storage =
-                rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer)?;
+            let storage = rebuild_database_from_jsonl(
+                beads_dir,
+                paths,
+                lock_timeout,
+                bootstrap_layer,
+                allow_external_jsonl,
+            )?;
             Ok((storage, true, None))
         }
         JsonlRecoveryStrategy::DeferToExplicitImport => {
@@ -696,6 +753,13 @@ fn quarantine_truncated_wal_sidecar(db_path: &Path, beads_dir: &Path) {
         return;
     };
     if !meta.is_file() {
+        return;
+    }
+    // A 0-byte WAL is the documented post-`PRAGMA wal_checkpoint(TRUNCATE)`
+    // state — SqliteStorage::Drop runs that pragma on every mutating
+    // invocation, so quarantining the empty file would re-pathologize the
+    // healthy hand-off between two well-behaved processes (#291).
+    if meta.len() == 0 {
         return;
     }
     if meta.len() >= 32 {
@@ -771,12 +835,19 @@ fn rebuild_or_defer_after_open_error(
     paths: &ConfigPaths,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
+    allow_external_jsonl: bool,
     recovery_strategy: JsonlRecoveryStrategy,
     prepare_fresh_storage: &dyn Fn() -> Result<(SqliteStorage, RecoveryBackupSet)>,
 ) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
     match recovery_strategy {
         JsonlRecoveryStrategy::RebuildFromJsonl => {
-            match rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer) {
+            match rebuild_database_from_jsonl(
+                beads_dir,
+                paths,
+                lock_timeout,
+                bootstrap_layer,
+                allow_external_jsonl,
+            ) {
                 Ok(storage) => Ok((storage, true, None)),
                 Err(recovery_err) => {
                     warn!(
@@ -880,6 +951,7 @@ fn rebuild_or_defer_after_recoverable_anomaly(
     paths: &ConfigPaths,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
+    allow_external_jsonl: bool,
     recovery_strategy: JsonlRecoveryStrategy,
     prepare_fresh_storage: &dyn Fn() -> Result<(SqliteStorage, RecoveryBackupSet)>,
 ) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
@@ -906,6 +978,7 @@ fn rebuild_or_defer_after_recoverable_anomaly(
                 paths,
                 lock_timeout,
                 bootstrap_layer,
+                allow_external_jsonl,
             )?;
             Ok((storage, true, None))
         }
@@ -936,6 +1009,7 @@ fn rebuild_or_defer_after_probe_error(
     paths: &ConfigPaths,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
+    allow_external_jsonl: bool,
     recovery_strategy: JsonlRecoveryStrategy,
     prepare_fresh_storage: &dyn Fn() -> Result<(SqliteStorage, RecoveryBackupSet)>,
 ) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
@@ -960,6 +1034,7 @@ fn rebuild_or_defer_after_probe_error(
                 paths,
                 lock_timeout,
                 bootstrap_layer,
+                allow_external_jsonl,
             )?;
             Ok((storage, true, None))
         }
@@ -985,10 +1060,17 @@ fn rebuild_with_tombstone_preservation(
     paths: &ConfigPaths,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
+    allow_external_jsonl: bool,
 ) -> Result<SqliteStorage> {
     let preserved_tombstones = preserved_unflushed_tombstones(&storage, &paths.jsonl_path);
     drop(storage);
-    let mut storage = rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer)?;
+    let mut storage = rebuild_database_from_jsonl(
+        beads_dir,
+        paths,
+        lock_timeout,
+        bootstrap_layer,
+        allow_external_jsonl,
+    )?;
     restore_tombstones_after_rebuild(&mut storage, &preserved_tombstones)?;
     Ok(storage)
 }
@@ -998,6 +1080,7 @@ fn rebuild_database_from_jsonl(
     paths: &ConfigPaths,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
+    allow_external_jsonl: bool,
 ) -> Result<SqliteStorage> {
     repair_database_from_jsonl(
         beads_dir,
@@ -1006,6 +1089,7 @@ fn rebuild_database_from_jsonl(
         lock_timeout,
         bootstrap_layer,
         false,
+        allow_external_jsonl,
     )
     .map(|(storage, _, _)| storage)
 }
@@ -1057,13 +1141,47 @@ pub(crate) fn repair_database_from_jsonl(
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
     show_progress: bool,
+    allow_external_jsonl: bool,
 ) -> Result<(SqliteStorage, ImportResult, Vec<RecoveryBackupVerification>)> {
-    let prefix = resolve_bootstrap_issue_prefix(bootstrap_layer, beads_dir, jsonl_path)?;
-    let mut import_config = import_config_for_resolved_jsonl(beads_dir, db_path, jsonl_path);
+    let mut import_config =
+        import_config_for_resolved_jsonl(beads_dir, db_path, jsonl_path, allow_external_jsonl);
     import_config.show_progress = show_progress;
     import_config.skip_prefix_validation = true;
 
-    preflight_import(jsonl_path, &import_config, Some(&prefix))?.into_result()?;
+    repair_database_from_jsonl_with_import_config(
+        beads_dir,
+        db_path,
+        jsonl_path,
+        lock_timeout,
+        bootstrap_layer,
+        show_progress,
+        import_config,
+    )
+}
+
+pub(crate) fn repair_database_from_jsonl_with_import_config(
+    beads_dir: &Path,
+    db_path: &Path,
+    jsonl_path: &Path,
+    lock_timeout: Option<u64>,
+    bootstrap_layer: &ConfigLayer,
+    show_progress: bool,
+    mut import_config: ImportConfig,
+) -> Result<(SqliteStorage, ImportResult, Vec<RecoveryBackupVerification>)> {
+    import_config.beads_dir = Some(beads_dir.to_path_buf());
+    import_config.allow_external_jsonl |=
+        implicit_external_jsonl_allowed(beads_dir, db_path, jsonl_path);
+    import_config.show_progress = show_progress;
+    let prefix = resolve_bootstrap_issue_prefix(
+        bootstrap_layer,
+        beads_dir,
+        jsonl_path,
+        import_config.allow_external_jsonl,
+    )?;
+
+    let mut preflight_config = import_config.clone();
+    preflight_config.skip_prefix_validation = true;
+    preflight_import(jsonl_path, &preflight_config, Some(&prefix))?.into_result()?;
 
     warn!(
         db_path = %db_path.display(),
@@ -2205,6 +2323,7 @@ pub fn open_storage(
         &startup.paths,
         resolved_lock_timeout,
         &merged_layer,
+        false,
     )?;
     Ok((storage, startup.paths))
 }
@@ -2218,8 +2337,9 @@ pub struct OpenStorageResult {
     /// True when the SQLite DB file was just rebuilt from JSONL during this
     /// `open_storage_with_cli` call (either because the file didn't exist, or
     /// because a recoverable anomaly was detected after opening). Callers that
-    /// would otherwise re-run a full rebuild (e.g. `br sync --rebuild`) can
-    /// skip the redundant work — the DB is already a fresh import.
+    /// would otherwise re-run a full rebuild (e.g.
+    /// `br sync --import-only --rebuild`) can skip the redundant work — the DB
+    /// is already a fresh import.
     pub auto_rebuilt: bool,
     allow_external_jsonl: bool,
     startup_layers: Vec<ConfigLayer>,
@@ -2239,7 +2359,9 @@ impl OpenStorageResult {
     pub fn load_config(&self, cli: &CliOverrides) -> Result<ConfigLayer> {
         load_config_from_startup_layers(
             &self.startup_layers,
+            &self.paths.beads_dir,
             &self.paths.jsonl_path,
+            self.allow_external_jsonl,
             Some(&self.storage),
             cli,
         )
@@ -2277,8 +2399,8 @@ impl OpenStorageResult {
     ///
     /// On success, `auto_rebuilt` is set to `true` so downstream code can
     /// detect that the storage is now a fresh import of the JSONL and skip
-    /// redundant rebuilds (for example, `br sync --rebuild` short-circuits
-    /// when it sees this flag).
+    /// redundant rebuilds (for example, `br sync --import-only --rebuild`
+    /// short-circuits when it sees this flag).
     ///
     /// # Errors
     ///
@@ -2291,6 +2413,13 @@ impl OpenStorageResult {
                     .to_string(),
             ));
         }
+
+        // Preserve any attribution staged on the storage being replaced so the
+        // post-recovery retry can still stamp it (#312 hardening, F1). The
+        // failed first write did NOT commit, so `mutate()` left the staged value
+        // intact — but recovery swaps in a brand-new `SqliteStorage`, which would
+        // otherwise start with an empty pending slot and drop the attribution.
+        let preserved_attribution = self.storage.take_pending_event_attribution();
 
         // Close the old connection before rebuilding at the same path.
         // fsqlite tracks pages by file path, so keeping the old connection
@@ -2305,8 +2434,12 @@ impl OpenStorageResult {
             self.resolved_lock_timeout,
             &self.bootstrap_layer,
             false,
+            self.allow_external_jsonl,
         )?;
         self.storage = storage;
+        if let Some(attribution) = preserved_attribution {
+            self.storage.set_pending_event_attribution(attribution);
+        }
         self.loaded_jsonl_hash = None;
         self.auto_rebuilt = true;
         self.pending_recovery_backup = None;
@@ -2387,13 +2520,14 @@ impl OpenStorageResult {
                     "JSONL changed on disk since this --no-db session started: {}\n\
                      Refusing to flush a stale in-memory snapshot because it could overwrite \
                      concurrent changes.\n\
-                     Hint: rerun the command against the latest JSONL, or use `br sync` to \
-                     reconcile competing edits explicitly.",
+                     Hint: rerun the command against the latest JSONL, or use `br sync --merge` \
+                     to reconcile competing edits explicitly.",
                     self.paths.jsonl_path.display()
                 ),
             });
         }
 
+        let history_config = self.resolved_history_config();
         let export_config = ExportConfig {
             // When needs_flush is set (e.g. after purge_issue), force must be
             // true even if there are also dirty issues from related mutations
@@ -2405,6 +2539,7 @@ impl OpenStorageResult {
             beads_dir: Some(self.paths.beads_dir.clone()),
             allow_external_jsonl: self.allow_external_jsonl,
             show_progress: false,
+            history: history_config,
             ..Default::default()
         };
 
@@ -2460,6 +2595,24 @@ impl OpenStorageResult {
         )?;
         Ok(())
     }
+
+    /// Resolve a [`HistoryConfig`] honoring the merged config layer.
+    ///
+    /// Operators who set `sync.history_enabled: false` (or the inverted
+    /// `no-history: true`) get a config with `enabled = false`, which causes
+    /// [`crate::sync::history::backup_before_export`] to short-circuit instead
+    /// of creating the `.br_history/` directory. See br#293.
+    #[must_use]
+    pub fn resolved_history_config(&self) -> crate::sync::history::HistoryConfig {
+        let mut cfg = crate::sync::history::HistoryConfig::default();
+        if let Some(enabled) = history_enabled_from_layer(&self.bootstrap_layer) {
+            cfg.enabled = enabled;
+        }
+        if let Some(secs) = history_min_interval_secs_from_env() {
+            cfg.min_interval_secs = secs;
+        }
+        cfg
+    }
 }
 
 /// Open storage with a preloaded startup snapshot and support for `--no-db` mode.
@@ -2472,12 +2625,131 @@ pub fn open_storage_with_startup_config(
     cli: &CliOverrides,
     defer_jsonl_recovery: bool,
 ) -> Result<OpenStorageResult> {
+    open_storage_with_startup_config_impl(startup, cli, defer_jsonl_recovery, false, false)
+}
+
+/// Open storage with an explicit JSONL path policy supplied by a command that
+/// already validated its resolved path.
+///
+/// # Errors
+///
+/// Returns an error if JSONL import or storage setup fails.
+pub(crate) fn open_storage_with_startup_config_and_jsonl_policy(
+    startup: StartupConfig,
+    cli: &CliOverrides,
+    defer_jsonl_recovery: bool,
+    allow_external_jsonl: bool,
+) -> Result<OpenStorageResult> {
+    open_storage_with_startup_config_impl(
+        startup,
+        cli,
+        defer_jsonl_recovery,
+        false,
+        allow_external_jsonl,
+    )
+}
+
+/// Open storage with a preloaded startup snapshot while a caller-held write lock
+/// already serializes recovery and schema side effects.
+///
+/// # Errors
+///
+/// Returns an error if JSONL import or storage setup fails.
+pub fn open_storage_with_startup_config_under_write_lock(
+    startup: StartupConfig,
+    cli: &CliOverrides,
+    defer_jsonl_recovery: bool,
+) -> Result<OpenStorageResult> {
+    open_storage_with_startup_config_impl(startup, cli, defer_jsonl_recovery, true, false)
+}
+
+/// Open storage with a preloaded startup snapshot, a caller-held write lock,
+/// and an explicit JSONL path policy.
+///
+/// # Errors
+///
+/// Returns an error if JSONL import or storage setup fails.
+pub(crate) fn open_storage_with_startup_config_under_write_lock_and_jsonl_policy(
+    startup: StartupConfig,
+    cli: &CliOverrides,
+    defer_jsonl_recovery: bool,
+    allow_external_jsonl: bool,
+) -> Result<OpenStorageResult> {
+    open_storage_with_startup_config_impl(
+        startup,
+        cli,
+        defer_jsonl_recovery,
+        true,
+        allow_external_jsonl,
+    )
+}
+
+fn open_sqlite_storage_for_startup(
+    beads_dir: &Path,
+    paths: &ConfigPaths,
+    lock_timeout: Option<u64>,
+    bootstrap_layer: &ConfigLayer,
+    options: SqliteStartupOpenOptions,
+) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
+    if options.defer_jsonl_recovery {
+        open_sqlite_storage_with_deferred_jsonl_recovery(
+            beads_dir,
+            paths,
+            lock_timeout,
+            bootstrap_layer,
+            options.allow_external_jsonl,
+        )
+    } else if options.read_only_fast_open {
+        match SqliteStorage::open_current_read_only(&paths.db_path) {
+            Ok(Some(storage)) => Ok((storage, false, None)),
+            Ok(None) => open_sqlite_storage_with_recovery_after_fast_open_miss(
+                beads_dir,
+                paths,
+                lock_timeout,
+                bootstrap_layer,
+                options.write_lock_already_held,
+                options.allow_external_jsonl,
+            ),
+            Err(err) => {
+                tracing::trace!(
+                    error = %err,
+                    "read-only fast open failed; falling back to normal storage open"
+                );
+                open_sqlite_storage_with_recovery_after_fast_open_miss(
+                    beads_dir,
+                    paths,
+                    lock_timeout,
+                    bootstrap_layer,
+                    options.write_lock_already_held,
+                    options.allow_external_jsonl,
+                )
+            }
+        }
+    } else {
+        open_sqlite_storage_with_recovery(
+            beads_dir,
+            paths,
+            lock_timeout,
+            bootstrap_layer,
+            options.allow_external_jsonl,
+        )
+    }
+}
+
+fn open_storage_with_startup_config_impl(
+    startup: StartupConfig,
+    cli: &CliOverrides,
+    defer_jsonl_recovery: bool,
+    write_lock_already_held: bool,
+    explicit_allow_external_jsonl: bool,
+) -> Result<OpenStorageResult> {
     let StartupConfig {
         paths,
         layers: startup_layers,
         ..
     } = startup;
     let beads_dir = paths.beads_dir.clone();
+    let write_lock_already_held = write_lock_already_held || cli.holds_write_lock_for(&beads_dir);
     let cli_layer = cli.as_layer();
 
     let mut all_layers = startup_layers.clone();
@@ -2485,8 +2757,8 @@ pub fn open_storage_with_startup_config(
     let merged_layer = ConfigLayer::merge_layers(&all_layers);
 
     let no_db = no_db_from_layer(&merged_layer).unwrap_or(false);
-    let allow_external_jsonl =
-        implicit_external_jsonl_allowed(&beads_dir, &paths.db_path, &paths.jsonl_path);
+    let allow_external_jsonl = explicit_allow_external_jsonl
+        || implicit_external_jsonl_allowed(&beads_dir, &paths.db_path, &paths.jsonl_path);
 
     let resolved_lock_timeout = cli
         .lock_timeout
@@ -2495,8 +2767,16 @@ pub fn open_storage_with_startup_config(
 
     if no_db {
         let mut storage = SqliteStorage::open_memory()?;
-        let prefix = resolve_bootstrap_issue_prefix(&merged_layer, &beads_dir, &paths.jsonl_path)?;
+        let prefix = resolve_bootstrap_issue_prefix(
+            &merged_layer,
+            &beads_dir,
+            &paths.jsonl_path,
+            allow_external_jsonl,
+        )?;
         storage.set_config("issue_prefix", &prefix)?;
+        if paths.jsonl_path.exists() {
+            validate_sync_path_with_external(&paths.jsonl_path, &beads_dir, allow_external_jsonl)?;
+        }
 
         // Capture the JSONL content hash BEFORE the import so later
         // `flush_no_db_if_dirty` can detect that the file we imported from
@@ -2516,8 +2796,12 @@ pub fn open_storage_with_startup_config(
             None
         };
         if paths.jsonl_path.is_file() {
-            let mut import_config =
-                import_config_for_resolved_jsonl(&beads_dir, &paths.db_path, &paths.jsonl_path);
+            let mut import_config = import_config_for_resolved_jsonl(
+                &beads_dir,
+                &paths.db_path,
+                &paths.jsonl_path,
+                allow_external_jsonl,
+            );
             import_config.skip_prefix_validation = true;
             import_from_jsonl(
                 &mut storage,
@@ -2540,43 +2824,18 @@ pub fn open_storage_with_startup_config(
             pending_recovery_backup: None,
         })
     } else {
-        let (storage, auto_rebuilt, pending_recovery_backup) = if defer_jsonl_recovery {
-            open_sqlite_storage_with_deferred_jsonl_recovery(
-                &beads_dir,
-                &paths,
-                resolved_lock_timeout,
-                &merged_layer,
-            )?
-        } else if cli.read_only_fast_open {
-            match SqliteStorage::open_current_read_only(&paths.db_path) {
-                Ok(Some(storage)) => (storage, false, None),
-                Ok(None) => open_sqlite_storage_with_recovery(
-                    &beads_dir,
-                    &paths,
-                    resolved_lock_timeout,
-                    &merged_layer,
-                )?,
-                Err(err) => {
-                    tracing::debug!(
-                        error = %err,
-                        "read-only fast open failed; falling back to normal storage open"
-                    );
-                    open_sqlite_storage_with_recovery(
-                        &beads_dir,
-                        &paths,
-                        resolved_lock_timeout,
-                        &merged_layer,
-                    )?
-                }
-            }
-        } else {
-            open_sqlite_storage_with_recovery(
-                &beads_dir,
-                &paths,
-                resolved_lock_timeout,
-                &merged_layer,
-            )?
-        };
+        let (storage, auto_rebuilt, pending_recovery_backup) = open_sqlite_storage_for_startup(
+            &beads_dir,
+            &paths,
+            resolved_lock_timeout,
+            &merged_layer,
+            SqliteStartupOpenOptions {
+                defer_jsonl_recovery,
+                read_only_fast_open: cli.read_only_fast_open,
+                write_lock_already_held,
+                allow_external_jsonl,
+            },
+        )?;
         Ok(OpenStorageResult {
             storage,
             paths,
@@ -2648,6 +2907,54 @@ pub fn no_auto_flush_from_layer(layer: &ConfigLayer) -> Option<bool> {
         .and_then(|value| parse_bool(value))
 }
 
+/// Check merged config for `sync.history_enabled` (positive) or legacy `no-history` (inverted).
+///
+/// Priority order (highest first):
+/// 1. `sync.history_enabled` / `sync.history-enabled` / `sync.history.enabled` — canonical positive key
+/// 2. `no-history` / `no_history` / `no.history` — inverted convenience key
+///
+/// The canonical `sync.history_enabled: false` means "disable `.br_history/` backups".
+/// `no-history: true` means the same thing. Returns `None` when no key is set so the
+/// caller can keep the default-enabled behavior unchanged.
+///
+/// This is the storage-policy switch requested in
+/// <https://github.com/Dicklesworthstone/beads_rust/issues/293> — operators who
+/// want `issues.jsonl` to be the single durable state file can flip this and
+/// stop the `.br_history/` directory from being created.
+/// Resolve an override for the `.br_history` snapshot throttle (#313) from the
+/// `BR_HISTORY_MIN_INTERVAL_SECS` environment variable.
+///
+/// The throttle collapses bursts of `br` mutations into at most one snapshot per
+/// interval (default 5s — see [`crate::sync::history::HistoryConfig`]). Set this
+/// to `0` to disable the throttle (snapshot on every export), or to a larger
+/// value to snapshot less often. Returns `None` when unset/unparsable so the
+/// default applies.
+#[must_use]
+pub fn history_min_interval_secs_from_env() -> Option<u64> {
+    std::env::var("BR_HISTORY_MIN_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+#[must_use]
+pub fn history_enabled_from_layer(layer: &ConfigLayer) -> Option<bool> {
+    if let Some(v) = get_startup_value(
+        layer,
+        &[
+            "sync.history_enabled",
+            "sync.history-enabled",
+            "sync.history.enabled",
+        ],
+    )
+    .and_then(|value| parse_bool(value))
+    {
+        return Some(v);
+    }
+    get_startup_value(layer, &["no-history", "no_history", "no.history"])
+        .and_then(|value| parse_bool(value))
+        .map(|v| !v)
+}
+
 /// Check merged config for `sync.auto_import` (inverted) or legacy `no-auto-import`.
 ///
 /// Priority order (highest first):
@@ -2676,6 +2983,7 @@ fn resolve_bootstrap_issue_prefix(
     bootstrap_layer: &ConfigLayer,
     beads_dir: &Path,
     jsonl_path: &Path,
+    allow_external_jsonl: bool,
 ) -> Result<String> {
     if let Some(prefix) = get_value(bootstrap_layer, &["issue_prefix", "issue-prefix", "prefix"]) {
         let trimmed = prefix.trim();
@@ -2684,7 +2992,9 @@ fn resolve_bootstrap_issue_prefix(
         }
     }
 
-    if let Some(prefix) = first_prefix_from_jsonl(jsonl_path)? {
+    if let Some(prefix) =
+        first_prefix_from_resolved_jsonl(beads_dir, jsonl_path, allow_external_jsonl)?
+    {
         return Ok(normalize_prefix(&prefix));
     }
 
@@ -2701,14 +3011,28 @@ fn resolve_bootstrap_issue_prefix(
     Ok("br".to_string())
 }
 
+fn first_prefix_from_resolved_jsonl(
+    beads_dir: &Path,
+    jsonl_path: &Path,
+    allow_external_jsonl: bool,
+) -> Result<Option<String>> {
+    if !jsonl_path.is_file() {
+        return Ok(None);
+    }
+    validate_sync_path_with_external(jsonl_path, beads_dir, allow_external_jsonl)?;
+    first_prefix_from_jsonl(jsonl_path)
+}
+
 fn import_config_for_resolved_jsonl(
     beads_dir: &Path,
     db_path: &Path,
     jsonl_path: &Path,
+    explicit_allow_external_jsonl: bool,
 ) -> ImportConfig {
     ImportConfig {
         beads_dir: Some(beads_dir.to_path_buf()),
-        allow_external_jsonl: implicit_external_jsonl_allowed(beads_dir, db_path, jsonl_path),
+        allow_external_jsonl: explicit_allow_external_jsonl
+            || implicit_external_jsonl_allowed(beads_dir, db_path, jsonl_path),
         show_progress: false,
         ..Default::default()
     }
@@ -2878,7 +3202,7 @@ fn resolve_jsonl_path(
 }
 
 /// A configuration layer split into startup-only and runtime (DB) keys.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConfigLayer {
     pub startup: HashMap<String, String>,
     pub runtime: HashMap<String, String>,
@@ -3018,10 +3342,21 @@ pub struct CliOverrides {
     pub no_auto_flush: Option<bool>,
     pub no_auto_import: Option<bool>,
     pub lock_timeout: Option<u64>,
+    /// `.beads` directory whose `.write.lock` is already held by the caller.
+    ///
+    /// This is process-local execution state, not persisted configuration. It
+    /// lets command-local storage opens reuse the startup lock kept alive by
+    /// `main` instead of trying to acquire the same advisory lock again.
+    pub held_write_lock_beads_dir: Option<PathBuf>,
     pub read_only_fast_open: bool,
 }
 
 impl CliOverrides {
+    #[must_use]
+    pub fn holds_write_lock_for(&self, beads_dir: &Path) -> bool {
+        self.held_write_lock_beads_dir.as_deref() == Some(beads_dir)
+    }
+
     #[must_use]
     pub fn as_layer(&self) -> ConfigLayer {
         let mut layer = ConfigLayer::default();
@@ -3146,13 +3481,37 @@ pub fn load_config(
     storage: Option<&SqliteStorage>,
     cli: &CliOverrides,
 ) -> Result<ConfigLayer> {
+    load_config_with_external_jsonl_policy(beads_dir, storage, cli, false)
+}
+
+pub(crate) fn load_config_with_external_jsonl_policy(
+    beads_dir: &Path,
+    storage: Option<&SqliteStorage>,
+    cli: &CliOverrides,
+    allow_external_jsonl: bool,
+) -> Result<ConfigLayer> {
     let startup = load_startup_config_with_paths(beads_dir, cli.db.as_ref())?;
-    load_config_from_startup_layers(&startup.layers, &startup.paths.jsonl_path, storage, cli)
+    let allow_external_jsonl = allow_external_jsonl
+        || implicit_external_jsonl_allowed(
+            &startup.paths.beads_dir,
+            &startup.paths.db_path,
+            &startup.paths.jsonl_path,
+        );
+    load_config_from_startup_layers(
+        &startup.layers,
+        &startup.paths.beads_dir,
+        &startup.paths.jsonl_path,
+        allow_external_jsonl,
+        storage,
+        cli,
+    )
 }
 
 fn load_config_from_startup_layers(
     startup_layers: &[ConfigLayer],
+    beads_dir: &Path,
     jsonl_path: &Path,
+    allow_external_jsonl: bool,
     storage: Option<&SqliteStorage>,
     cli: &CliOverrides,
 ) -> Result<ConfigLayer> {
@@ -3164,7 +3523,9 @@ fn load_config_from_startup_layers(
     // Uses a fast single-line read (not full-file scan) since this runs on
     // every command.
     let mut jsonl_inferred = ConfigLayer::default();
-    if let Some(prefix) = first_prefix_from_jsonl(jsonl_path)? {
+    if let Some(prefix) =
+        first_prefix_from_resolved_jsonl(beads_dir, jsonl_path, allow_external_jsonl)?
+    {
         jsonl_inferred
             .runtime
             .insert("issue_prefix".to_string(), prefix);
@@ -3190,6 +3551,152 @@ pub struct StartupConfig {
     pub merged_config: ConfigLayer,
 }
 
+const STARTUP_CACHE_VERSION: u32 = 2;
+const STARTUP_CACHE_ENABLE_ENV: &str = "BR_STARTUP_CACHE";
+const STARTUP_CACHE_DIR_ENV: &str = "BR_STARTUP_CACHE_DIR";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StartupCacheRecord {
+    version: u32,
+    key: String,
+    witness: StartupCacheWitness,
+    paths: ConfigPaths,
+    layers: Vec<ConfigLayer>,
+    merged_config: ConfigLayer,
+}
+
+impl StartupCacheRecord {
+    fn into_startup(self) -> StartupConfig {
+        StartupConfig {
+            paths: self.paths,
+            layers: self.layers,
+            merged_config: self.merged_config,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct StartupCacheWitness {
+    db_override: Option<PathBuf>,
+    env: Vec<(String, Option<String>)>,
+    files: Vec<StartupFileWitness>,
+}
+
+impl StartupCacheWitness {
+    fn capture(beads_dir: &Path, db_override: Option<&PathBuf>) -> Self {
+        let env = startup_cache_env_witness();
+        let mut files = startup_cache_watch_paths(beads_dir)
+            .into_iter()
+            .map(StartupFileWitness::capture)
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+
+        Self {
+            db_override: db_override.cloned(),
+            env,
+            files,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct StartupFileWitness {
+    path: PathBuf,
+    state: StartupPathState,
+}
+
+impl StartupFileWitness {
+    fn capture(path: PathBuf) -> Self {
+        let state = match fs::symlink_metadata(&path) {
+            Ok(metadata) => StartupPathState::present(&metadata),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => StartupPathState::Missing,
+            Err(err) => StartupPathState::Unreadable {
+                kind: err.kind().to_string(),
+            },
+        };
+        Self { path, state }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+enum StartupPathState {
+    Missing,
+    Unreadable {
+        kind: String,
+    },
+    Present {
+        kind: StartupFileKind,
+        len: u64,
+        modified_nanos: Option<u128>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        unix: Option<StartupUnixFileWitness>,
+    },
+}
+
+impl StartupPathState {
+    fn present(metadata: &fs::Metadata) -> Self {
+        let file_type = metadata.file_type();
+        #[cfg(unix)]
+        let unix = Some(startup_unix_file_witness(metadata));
+        #[cfg(not(unix))]
+        let unix = None;
+
+        Self::Present {
+            kind: if file_type.is_symlink() {
+                StartupFileKind::Symlink
+            } else if file_type.is_file() {
+                StartupFileKind::File
+            } else if file_type.is_dir() {
+                StartupFileKind::Directory
+            } else {
+                StartupFileKind::Other
+            },
+            len: metadata.len(),
+            modified_nanos: metadata.modified().ok().and_then(|modified| {
+                modified.duration_since(UNIX_EPOCH).ok().map(|duration| {
+                    u128::from(duration.as_secs()) * 1_000_000_000
+                        + u128::from(duration.subsec_nanos())
+                })
+            }),
+            unix,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+enum StartupFileKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct StartupUnixFileWitness {
+    dev: u64,
+    ino: u64,
+    mode: u32,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+    ctime_sec: i64,
+    ctime_nsec: i64,
+}
+
+#[cfg(unix)]
+fn startup_unix_file_witness(metadata: &fs::Metadata) -> StartupUnixFileWitness {
+    use std::os::unix::fs::MetadataExt;
+
+    StartupUnixFileWitness {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        mode: metadata.mode(),
+        mtime_sec: metadata.mtime(),
+        mtime_nsec: metadata.mtime_nsec(),
+        ctime_sec: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec(),
+    }
+}
+
 /// Load startup-only config layers and resolve the effective storage paths once.
 ///
 /// # Errors
@@ -3197,6 +3704,18 @@ pub struct StartupConfig {
 /// Returns an error if any startup config layer cannot be read or parsed, or if
 /// path resolution fails.
 pub fn load_startup_config_with_paths(
+    beads_dir: &Path,
+    db_override: Option<&PathBuf>,
+) -> Result<StartupConfig> {
+    if startup_cache_enabled() {
+        let cache_dir = startup_cache_dir_from_env();
+        return load_startup_config_with_paths_cached_at(beads_dir, db_override, &cache_dir);
+    }
+
+    load_startup_config_with_paths_uncached(beads_dir, db_override)
+}
+
+fn load_startup_config_with_paths_uncached(
     beads_dir: &Path,
     db_override: Option<&PathBuf>,
 ) -> Result<StartupConfig> {
@@ -3227,6 +3746,286 @@ pub fn load_startup_config_with_paths(
         layers,
         merged_config: merged_startup,
     })
+}
+
+fn load_startup_config_with_paths_cached_at(
+    beads_dir: &Path,
+    db_override: Option<&PathBuf>,
+    cache_dir: &Path,
+) -> Result<StartupConfig> {
+    let before = StartupCacheWitness::capture(beads_dir, db_override);
+    let key = startup_cache_key(beads_dir, &before);
+    let cache_path = startup_cache_path(cache_dir, &key);
+
+    if let Some(startup) =
+        try_read_startup_cache(&cache_path, &key, &before, beads_dir, db_override)
+    {
+        return Ok(startup);
+    }
+
+    let direct = load_startup_config_with_paths_uncached(beads_dir, db_override)?;
+    let after = StartupCacheWitness::capture(beads_dir, db_override);
+    if before == after {
+        let record = StartupCacheRecord {
+            version: STARTUP_CACHE_VERSION,
+            key,
+            witness: after,
+            paths: direct.paths.clone(),
+            layers: direct.layers.clone(),
+            merged_config: direct.merged_config.clone(),
+        };
+        let _ = write_startup_cache_record(&cache_path, &record);
+    }
+    Ok(direct)
+}
+
+fn try_read_startup_cache(
+    cache_path: &Path,
+    key: &str,
+    before: &StartupCacheWitness,
+    beads_dir: &Path,
+    db_override: Option<&PathBuf>,
+) -> Option<StartupConfig> {
+    let contents = fs::read_to_string(cache_path).ok()?;
+    let record: StartupCacheRecord = serde_json::from_str(&contents).ok()?;
+    if record.version != STARTUP_CACHE_VERSION || record.key != key || record.witness != *before {
+        return None;
+    }
+
+    let after = StartupCacheWitness::capture(beads_dir, db_override);
+    if after == *before {
+        Some(record.into_startup())
+    } else {
+        None
+    }
+}
+
+fn write_startup_cache_record(cache_path: &Path, record: &StartupCacheRecord) -> Result<()> {
+    let Some(parent) = cache_path.parent() else {
+        return Ok(());
+    };
+    fs::create_dir_all(parent)?;
+    let bytes = serde_json::to_vec(record)?;
+    let tmp_path = cache_path.with_extension(format!("tmp.{}", std::process::id()));
+    let mut tmp_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)?;
+    if let Err(error) = tmp_file.write_all(&bytes) {
+        drop(tmp_file);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error.into());
+    }
+    drop(tmp_file);
+    fs::rename(&tmp_path, cache_path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp_path);
+    })?;
+    Ok(())
+}
+
+#[must_use]
+fn startup_cache_enabled() -> bool {
+    env::var(STARTUP_CACHE_ENABLE_ENV)
+        .ok()
+        .and_then(|value| parse_bool(&value))
+        .unwrap_or(false)
+}
+
+fn startup_cache_dir_from_env() -> PathBuf {
+    if let Some(path) = env::var_os(STARTUP_CACHE_DIR_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        return path;
+    }
+    if let Some(path) = env::var_os("XDG_CACHE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        return path.join("beads").join("startup");
+    }
+    if let Some(home) = env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        return home.join(".cache").join("beads").join("startup");
+    }
+    env::temp_dir().join("beads-startup-cache")
+}
+
+fn startup_cache_key(beads_dir: &Path, witness: &StartupCacheWitness) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"br-startup-cache-v2");
+    hasher.update(beads_dir.to_string_lossy().as_bytes());
+    hasher.update(b"\0");
+    if let Some(db_override) = &witness.db_override {
+        hasher.update(db_override.to_string_lossy().as_bytes());
+    }
+    hasher.update(b"\0");
+    for (key, value) in &witness.env {
+        hasher.update(key.as_bytes());
+        hasher.update(b"=");
+        if let Some(value) = value {
+            hasher.update(value.as_bytes());
+        }
+        hasher.update(b"\0");
+    }
+    hex_encode(&hasher.finalize())
+}
+
+fn startup_cache_path(cache_dir: &Path, key: &str) -> PathBuf {
+    cache_dir.join(format!("startup-{key}.json"))
+}
+
+/// Doctor-facing view of one poisoned startup-cache file. Pass-4 cycle 2:
+/// the cache types themselves stay private to this module; this struct is
+/// the narrow surface the doctor walks.
+#[derive(Debug, Clone)]
+pub struct PoisonedStartupCacheFile {
+    pub path: PathBuf,
+    pub kind: PoisonedStartupCacheKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum PoisonedStartupCacheKind {
+    /// The file exists but cannot be opened or read (corrupt FS, partial
+    /// write, perms drift).
+    Unreadable { error: String },
+    /// The file is readable but doesn't parse as a `StartupCacheRecord` — the
+    /// most common cause of silent cache misses with an on-disk artifact left
+    /// behind. We carry a short raw excerpt so the operator (or agent) has
+    /// something to triage.
+    ParseError { error: String, raw_excerpt: String },
+}
+
+/// Inspect the current workspace's startup-cache file and return it if it is
+/// poisoned (unreadable or unparseable). Used by `br doctor` (detector) and
+/// the `--repair` quarantine fixer.
+///
+/// This intentionally checks only the exact cache key the production startup
+/// path would read for `beads_dir` + `db_override`. Other `startup-*.json`
+/// files in the cache directory may belong to unrelated workspaces and must
+/// not make this workspace's doctor report noisy.
+#[must_use]
+pub fn doctor_inspect_startup_cache(
+    beads_dir: &Path,
+    db_override: Option<&PathBuf>,
+) -> Vec<PoisonedStartupCacheFile> {
+    doctor_inspect_startup_cache_at(&startup_cache_dir_from_env(), beads_dir, db_override)
+}
+
+#[must_use]
+pub(crate) fn doctor_inspect_startup_cache_at(
+    cache_dir: &Path,
+    beads_dir: &Path,
+    db_override: Option<&PathBuf>,
+) -> Vec<PoisonedStartupCacheFile> {
+    let path = doctor_startup_cache_path_at(cache_dir, beads_dir, db_override);
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(err) => {
+            return vec![PoisonedStartupCacheFile {
+                path,
+                kind: PoisonedStartupCacheKind::Unreadable {
+                    error: err.to_string(),
+                },
+            }];
+        }
+    };
+
+    if let Err(err) = serde_json::from_str::<StartupCacheRecord>(&contents) {
+        let raw_excerpt: String = contents.chars().take(256).collect();
+        return vec![PoisonedStartupCacheFile {
+            path,
+            kind: PoisonedStartupCacheKind::ParseError {
+                error: err.to_string(),
+                raw_excerpt,
+            },
+        }];
+    }
+
+    Vec::new()
+}
+
+/// Resolved startup-cache directory, exported so the doctor's repair flow
+/// can extend its `write_scopes` to include the cache dir without
+/// reaching for private cache internals.
+#[must_use]
+pub fn doctor_startup_cache_dir() -> PathBuf {
+    startup_cache_dir_from_env()
+}
+
+/// Resolved startup-cache file for the current workspace key.
+#[must_use]
+pub fn doctor_startup_cache_path(beads_dir: &Path, db_override: Option<&PathBuf>) -> PathBuf {
+    doctor_startup_cache_path_at(&startup_cache_dir_from_env(), beads_dir, db_override)
+}
+
+#[must_use]
+pub(crate) fn doctor_startup_cache_path_at(
+    cache_dir: &Path,
+    beads_dir: &Path,
+    db_override: Option<&PathBuf>,
+) -> PathBuf {
+    let witness = StartupCacheWitness::capture(beads_dir, db_override);
+    let key = startup_cache_key(beads_dir, &witness);
+    startup_cache_path(cache_dir, &key)
+}
+
+fn startup_cache_env_witness() -> Vec<(String, Option<String>)> {
+    let mut keys = vec![
+        "BEADS_AUTO_START_DAEMON".to_string(),
+        "BEADS_CACHE_DIR".to_string(),
+        "BEADS_DIR".to_string(),
+        "BEADS_FLUSH_DEBOUNCE".to_string(),
+        "BEADS_IDENTITY".to_string(),
+        "BEADS_JSONL".to_string(),
+        "BEADS_REMOTE_SYNC_INTERVAL".to_string(),
+        "HOME".to_string(),
+    ];
+    keys.extend(env::vars().filter_map(|(key, _)| key.starts_with("BD_").then_some(key)));
+    keys.sort();
+    keys.dedup();
+
+    keys.into_iter()
+        .map(|key| {
+            let value = env::var(&key).ok();
+            (key, value)
+        })
+        .collect()
+}
+
+fn startup_cache_watch_paths(beads_dir: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![
+        beads_dir.join("metadata.json"),
+        beads_dir.join("config.yaml"),
+        beads_dir.join("routes.jsonl"),
+        beads_dir.join("redirect"),
+    ];
+
+    if let Ok(home) = env::var("HOME")
+        && !home.trim().is_empty()
+    {
+        let home_path = PathBuf::from(home);
+        let config_root = home_path.join(".config");
+        paths.push(config_root.join("beads").join("config.yaml"));
+        paths.push(config_root.join("bd").join("config.yaml"));
+        paths.push(home_path.join(".beads").join("config.yaml"));
+    }
+
+    if let Some(project_root) = beads_dir.parent() {
+        for ancestor in project_root.ancestors() {
+            paths.push(ancestor.join("mayor").join("town.json"));
+        }
+        if let Some(town_root) = routing::find_town_root(project_root) {
+            paths.push(town_root.join(".beads").join("routes.jsonl"));
+        }
+    }
+
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 #[must_use]
@@ -3358,27 +4157,9 @@ pub fn external_project_db_paths(
     layer: &ConfigLayer,
     beads_dir: &Path,
 ) -> HashMap<String, PathBuf> {
-    let projects = external_projects_from_layer(layer, beads_dir);
     let mut db_paths = HashMap::new();
 
-    for (name, path) in projects {
-        let beads_path = if path.file_name().is_some_and(is_beads_dir_name) {
-            path.clone()
-        } else if path.join("_beads").is_dir() {
-            path.join("_beads")
-        } else {
-            path.join(".beads")
-        };
-
-        if !beads_path.is_dir() {
-            warn!(
-                project = %name,
-                path = %beads_path.display(),
-                "External project .beads directory not found"
-            );
-            continue;
-        }
-
+    for (name, beads_path) in external_project_beads_dirs(layer, beads_dir) {
         match ConfigPaths::resolve(&beads_path, None) {
             Ok(paths) => {
                 db_paths.insert(name, paths.db_path);
@@ -3395,6 +4176,46 @@ pub fn external_project_db_paths(
     }
 
     db_paths
+}
+
+/// Resolve configured external project `.beads` directories.
+///
+/// Projects are expected to be either a `.beads` directory or a project root
+/// containing `.beads/`.
+#[must_use]
+pub fn external_project_beads_dirs(
+    layer: &ConfigLayer,
+    beads_dir: &Path,
+) -> HashMap<String, PathBuf> {
+    let projects = external_projects_from_layer(layer, beads_dir);
+    let mut beads_dirs = HashMap::new();
+
+    for (name, path) in projects {
+        let beads_path = external_project_beads_dir(&path);
+
+        if !beads_path.is_dir() {
+            warn!(
+                project = %name,
+                path = %beads_path.display(),
+                "External project .beads directory not found"
+            );
+            continue;
+        }
+
+        beads_dirs.insert(name, beads_path);
+    }
+
+    beads_dirs
+}
+
+fn external_project_beads_dir(path: &Path) -> PathBuf {
+    if path.file_name().is_some_and(is_beads_dir_name) {
+        path.to_path_buf()
+    } else if path.join("_beads").is_dir() {
+        path.join("_beads")
+    } else {
+        path.join(".beads")
+    }
 }
 
 /// Resolve actor from a merged config layer.
@@ -3454,6 +4275,7 @@ pub fn is_startup_key(key: &str) -> bool {
             | "no-daemon"
             | "no-auto-flush"
             | "no-auto-import"
+            | "no-history"
             | "json"
             | "db"
             | "actor"
@@ -4152,6 +4974,35 @@ labels:
     }
 
     #[test]
+    fn metadata_load_tolerates_legacy_bd_migration_files() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let metadata_path = beads_dir.join("metadata.json");
+        let metadata = "{\n  \"database\": \"beads.db\",\n  \"created_at\": \"2025-01-01T00:00:00Z\",\n  \"version\": 1\n}";
+        fs::write(metadata_path, metadata).expect("write metadata");
+
+        let loaded = Metadata::load(&beads_dir).expect("metadata");
+        assert_eq!(loaded.database, "beads.db");
+        assert_eq!(loaded.jsonl_export, DEFAULT_JSONL_FILENAME);
+    }
+
+    #[test]
+    fn metadata_load_tolerates_missing_database_field() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let metadata_path = beads_dir.join("metadata.json");
+        fs::write(metadata_path, r#"{"jsonl_export": "issues.jsonl"}"#).expect("write metadata");
+
+        let loaded = Metadata::load(&beads_dir).expect("metadata");
+        assert_eq!(loaded.database, DEFAULT_DB_FILENAME);
+        assert_eq!(loaded.jsonl_export, "issues.jsonl");
+    }
+
+    #[test]
     fn metadata_with_backend_and_retention() {
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
@@ -4573,6 +5424,7 @@ labels:
             no_auto_import: Some(true),
             lock_timeout: Some(5000),
             identity: None,
+            held_write_lock_beads_dir: None,
             read_only_fast_open: false,
         };
 
@@ -4643,6 +5495,49 @@ labels:
             Some(false),
             "sync.auto_flush=true should win over legacy no-auto-flush=true"
         );
+    }
+
+    #[test]
+    fn history_enabled_from_layer_default_returns_none() {
+        let layer = ConfigLayer::default();
+        assert_eq!(history_enabled_from_layer(&layer), None);
+    }
+
+    #[test]
+    fn history_enabled_from_layer_canonical_disable() {
+        let mut layer = ConfigLayer::default();
+        insert_key_value(&mut layer, "sync.history_enabled", "false".to_string());
+        assert_eq!(history_enabled_from_layer(&layer), Some(false));
+    }
+
+    #[test]
+    fn history_enabled_from_layer_canonical_enable() {
+        let mut layer = ConfigLayer::default();
+        insert_key_value(&mut layer, "sync.history_enabled", "true".to_string());
+        assert_eq!(history_enabled_from_layer(&layer), Some(true));
+    }
+
+    #[test]
+    fn history_enabled_from_layer_legacy_no_history_disables() {
+        let mut layer = ConfigLayer::default();
+        insert_key_value(&mut layer, "no-history", "true".to_string());
+        assert_eq!(history_enabled_from_layer(&layer), Some(false));
+    }
+
+    #[test]
+    fn history_enabled_from_layer_canonical_beats_legacy() {
+        // sync.history_enabled=true should win even if no-history=true is present
+        let mut layer = ConfigLayer::default();
+        insert_key_value(&mut layer, "sync.history_enabled", "true".to_string());
+        insert_key_value(&mut layer, "no-history", "true".to_string());
+        assert_eq!(history_enabled_from_layer(&layer), Some(true));
+    }
+
+    #[test]
+    fn history_enabled_from_layer_hyphen_underscore_equivalence() {
+        let mut layer = ConfigLayer::default();
+        insert_key_value(&mut layer, "sync.history-enabled", "false".to_string());
+        assert_eq!(history_enabled_from_layer(&layer), Some(false));
     }
 
     #[test]
@@ -5356,8 +6251,9 @@ routing:
             .runtime
             .insert("issue_prefix".to_string(), "cfg".to_string());
 
-        let prefix = resolve_bootstrap_issue_prefix(&bootstrap_layer, &beads_dir, &jsonl_path)
-            .expect("prefix");
+        let prefix =
+            resolve_bootstrap_issue_prefix(&bootstrap_layer, &beads_dir, &jsonl_path, false)
+                .expect("prefix");
         assert_eq!(prefix, "cfg");
     }
 
@@ -5371,7 +6267,7 @@ routing:
         fs::write(&jsonl_path, "").expect("write empty jsonl");
 
         let prefix =
-            resolve_bootstrap_issue_prefix(&ConfigLayer::default(), &beads_dir, &jsonl_path)
+            resolve_bootstrap_issue_prefix(&ConfigLayer::default(), &beads_dir, &jsonl_path, false)
                 .expect("prefix");
         assert_eq!(prefix, "mpn");
     }
@@ -5767,6 +6663,291 @@ routing:
         );
     }
 
+    fn startup_cache_files(cache_dir: &Path) -> Vec<PathBuf> {
+        let mut files = fs::read_dir(cache_dir)
+            .expect("read cache dir")
+            .map(|entry| entry.expect("cache entry").path())
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn startup_config_cache_invalidates_metadata_changes() {
+        let temp = TempDir::new().expect("tempdir");
+        let cache = TempDir::new().expect("cache");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let first_jsonl = beads_dir.join("first.jsonl");
+        let second_jsonl = beads_dir.join("second-longer-name.jsonl");
+        write_single_issue_jsonl(&first_jsonl, "bd-first", "First startup snapshot");
+        write_single_issue_jsonl(&second_jsonl, "bd-second", "Second startup snapshot");
+
+        fs::write(
+            beads_dir.join("metadata.json"),
+            r#"{"database":"beads.db","jsonl_export":"first.jsonl"}"#,
+        )
+        .expect("write first metadata");
+
+        let first = load_startup_config_with_paths_cached_at(&beads_dir, None, cache.path())
+            .expect("first");
+        assert_eq!(first.paths.jsonl_path, first_jsonl);
+        assert_eq!(startup_cache_files(cache.path()).len(), 1);
+
+        fs::write(
+            beads_dir.join("metadata.json"),
+            r#"{"database":"beads.db","jsonl_export":"second-longer-name.jsonl"}"#,
+        )
+        .expect("write second metadata");
+
+        let second = load_startup_config_with_paths_cached_at(&beads_dir, None, cache.path())
+            .expect("second");
+        assert_eq!(second.paths.jsonl_path, second_jsonl);
+    }
+
+    #[test]
+    fn startup_config_cache_invalidates_project_config_changes() {
+        let temp = TempDir::new().expect("tempdir");
+        let cache = TempDir::new().expect("cache");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::write(beads_dir.join("config.yaml"), "no-db: true\n").expect("write config");
+
+        let first = load_startup_config_with_paths_cached_at(&beads_dir, None, cache.path())
+            .expect("first");
+        assert_eq!(no_db_from_layer(&first.merged_config), Some(true));
+
+        fs::write(beads_dir.join("config.yaml"), "no-db: false\n").expect("rewrite config");
+        let second = load_startup_config_with_paths_cached_at(&beads_dir, None, cache.path())
+            .expect("second");
+        assert_eq!(no_db_from_layer(&second.merged_config), Some(false));
+    }
+
+    #[test]
+    fn startup_config_cache_rejects_hit_if_witness_changes_during_optimistic_read() {
+        let temp = TempDir::new().expect("tempdir");
+        let cache = TempDir::new().expect("cache");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        fs::write(
+            beads_dir.join("metadata.json"),
+            r#"{"database":"beads.db","jsonl_export":"issues.jsonl"}"#,
+        )
+        .expect("write metadata");
+        let before = StartupCacheWitness::capture(&beads_dir, None);
+        let key = startup_cache_key(&beads_dir, &before);
+        let cache_path = startup_cache_path(cache.path(), &key);
+
+        load_startup_config_with_paths_cached_at(&beads_dir, None, cache.path())
+            .expect("prime cache");
+        assert!(cache_path.is_file(), "priming should write startup cache");
+
+        fs::write(
+            beads_dir.join("metadata.json"),
+            r#"{"database":"beads.db","jsonl_export":"mutated-after-first-witness.jsonl"}"#,
+        )
+        .expect("mutate metadata");
+
+        let stale = try_read_startup_cache(&cache_path, &key, &before, &beads_dir, None);
+        assert!(
+            stale.is_none(),
+            "second witness check must reject a torn optimistic cache read"
+        );
+    }
+
+    #[test]
+    fn startup_config_cache_falls_back_from_corrupt_cache() {
+        let temp = TempDir::new().expect("tempdir");
+        let cache = TempDir::new().expect("cache");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let startup = load_startup_config_with_paths_cached_at(&beads_dir, None, cache.path())
+            .expect("prime");
+        assert_eq!(startup.paths.metadata, Metadata::default());
+
+        let cache_file = startup_cache_files(cache.path())
+            .into_iter()
+            .next()
+            .expect("cache file");
+        fs::write(cache_file, "{ definitely not valid json").expect("corrupt cache");
+
+        let fallback =
+            load_startup_config_with_paths_cached_at(&beads_dir, None, cache.path()).expect("load");
+        assert_eq!(fallback.paths.metadata, Metadata::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_config_cache_rejects_existing_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let cache = TempDir::new().expect("cache");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let direct =
+            load_startup_config_with_paths_uncached(&beads_dir, None).expect("startup config");
+        let witness = StartupCacheWitness::capture(&beads_dir, None);
+        let key = startup_cache_key(&beads_dir, &witness);
+        let cache_path = startup_cache_path(cache.path(), &key);
+        let tmp_path = cache_path.with_extension(format!("tmp.{}", std::process::id()));
+        let outside_target = temp.path().join("outside-cache-target.json");
+        fs::write(&outside_target, "preserve").expect("write outside target");
+        symlink(&outside_target, &tmp_path).expect("create temp symlink");
+
+        let record = StartupCacheRecord {
+            version: STARTUP_CACHE_VERSION,
+            key,
+            witness,
+            paths: direct.paths,
+            layers: direct.layers,
+            merged_config: direct.merged_config,
+        };
+        let result = write_startup_cache_record(&cache_path, &record);
+
+        assert!(result.is_err(), "pre-existing temp symlink must fail");
+        assert_eq!(
+            fs::read_to_string(&outside_target).expect("read outside target"),
+            "preserve",
+            "startup cache temp symlink target must not receive cache bytes"
+        );
+        assert!(
+            !cache_path.exists(),
+            "failed cache write must not install cache record"
+        );
+        assert!(
+            fs::symlink_metadata(&tmp_path)
+                .expect("temp symlink metadata")
+                .file_type()
+                .is_symlink(),
+            "rejected pre-existing temp symlink should be left untouched"
+        );
+    }
+
+    #[test]
+    fn startup_config_cache_witness_tracks_routes_redirects_and_db_override() {
+        let temp = TempDir::new().expect("tempdir");
+        let town_root = temp.path().join("town");
+        let project_root = town_root.join("project");
+        let beads_dir = project_root.join(".beads");
+        let town_beads = town_root.join(".beads");
+        fs::create_dir_all(town_root.join("mayor")).expect("create mayor");
+        fs::create_dir_all(&beads_dir).expect("create project beads");
+        fs::create_dir_all(&town_beads).expect("create town beads");
+        fs::write(town_root.join("mayor").join("town.json"), "{}\n").expect("write town marker");
+
+        let initial = StartupCacheWitness::capture(&beads_dir, None);
+        fs::write(
+            beads_dir.join("routes.jsonl"),
+            r#"{"prefix":"other-","path":"../other"}"#,
+        )
+        .expect("write local routes");
+        assert_ne!(
+            initial,
+            StartupCacheWitness::capture(&beads_dir, None),
+            "local routes.jsonl must invalidate cached startup metadata"
+        );
+
+        let before_redirect = StartupCacheWitness::capture(&beads_dir, None);
+        fs::write(beads_dir.join("redirect"), ".\n").expect("write redirect");
+        assert_ne!(
+            before_redirect,
+            StartupCacheWitness::capture(&beads_dir, None),
+            "redirect changes must invalidate cached startup metadata"
+        );
+
+        let before_town_routes = StartupCacheWitness::capture(&beads_dir, None);
+        fs::write(
+            town_beads.join("routes.jsonl"),
+            r#"{"prefix":"town-","path":"."}"#,
+        )
+        .expect("write town routes");
+        assert_ne!(
+            before_town_routes,
+            StartupCacheWitness::capture(&beads_dir, None),
+            "town routes.jsonl must invalidate cached startup metadata"
+        );
+
+        let db_a = beads_dir.join("a.db");
+        let db_b = beads_dir.join("b.db");
+        assert_ne!(
+            StartupCacheWitness::capture(&beads_dir, Some(&db_a)),
+            StartupCacheWitness::capture(&beads_dir, Some(&db_b)),
+            "CLI database override changes must not reuse a stale cache entry"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_file_witness_tracks_ctime_when_mtime_is_preserved() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.yaml");
+        fs::write(&config_path, "no-db: true\n").expect("write config");
+
+        let file = fs::File::open(&config_path).expect("open config");
+        let metadata = file.metadata().expect("metadata");
+        let original_accessed = metadata.accessed().expect("accessed");
+        let original_modified = metadata.modified().expect("modified");
+        let before = StartupFileWitness::capture(config_path.clone());
+
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        fs::write(&config_path, "no-db: false\n").expect("rewrite config");
+        let file = fs::File::open(&config_path).expect("reopen config");
+        file.set_times(
+            fs::FileTimes::new()
+                .set_accessed(original_accessed)
+                .set_modified(original_modified),
+        )
+        .expect("restore mtime");
+
+        let after = StartupFileWitness::capture(config_path);
+        assert_ne!(
+            before, after,
+            "preserved-mtime rewrites still need to invalidate startup cache hits"
+        );
+
+        let before_parts = unix_file_witness_parts(&before.state);
+        let after_parts = unix_file_witness_parts(&after.state);
+        assert!(
+            before_parts.is_some() && after_parts.is_some(),
+            "expected Unix file witnesses"
+        );
+        let Some((before_modified, before_unix)) = before_parts else {
+            return;
+        };
+        let Some((after_modified, after_unix)) = after_parts else {
+            return;
+        };
+        assert_eq!(
+            before_modified, after_modified,
+            "test setup should preserve visible mtime"
+        );
+        assert_ne!(
+            before_unix.ctime_sec, after_unix.ctime_sec,
+            "ctime seconds must participate in the startup cache witness"
+        );
+    }
+
+    #[cfg(unix)]
+    fn unix_file_witness_parts(
+        state: &StartupPathState,
+    ) -> Option<(Option<u128>, &StartupUnixFileWitness)> {
+        match state {
+            StartupPathState::Present {
+                modified_nanos,
+                unix: Some(unix),
+                ..
+            } => Some((*modified_nanos, unix)),
+            StartupPathState::Missing
+            | StartupPathState::Unreadable { .. }
+            | StartupPathState::Present { .. } => None,
+        }
+    }
+
     #[test]
     fn open_storage_with_cli_recovers_using_resolved_external_jsonl() {
         let temp = TempDir::new().expect("tempdir");
@@ -5807,6 +6988,61 @@ routing:
 
         let storage_ctx =
             open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
+        let issue = storage_ctx
+            .storage
+            .get_issue("bd-recovered")
+            .expect("query issue")
+            .expect("issue should exist after rebuild");
+
+        assert_eq!(issue.title, "Recovered from JSONL only");
+        assert!(db_path.is_file(), "database should be rebuilt from JSONL");
+    }
+
+    #[test]
+    fn read_only_fast_open_miss_waits_for_write_lock_before_rebuild() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        write_single_issue_jsonl(&jsonl_path, "bd-recovered", "Recovered from JSONL only");
+        let _held_lock = crate::sync::blocking_write_lock(&beads_dir).expect("hold write lock");
+        let cli = CliOverrides {
+            lock_timeout: Some(1),
+            read_only_fast_open: true,
+            ..CliOverrides::default()
+        };
+
+        let err = open_storage_with_cli(&beads_dir, &cli)
+            .expect_err("read-only miss should wait for recovery lock");
+        let message = err.to_string();
+        assert!(
+            message.contains("Timed out after 1ms waiting for write lock"),
+            "{message}"
+        );
+        assert!(!db_path.exists(), "rebuild must not run without write lock");
+    }
+
+    #[test]
+    fn read_only_fast_open_miss_reuses_caller_write_lock_before_rebuild() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        write_single_issue_jsonl(&jsonl_path, "bd-recovered", "Recovered from JSONL only");
+        let _held_lock = crate::sync::blocking_write_lock(&beads_dir).expect("hold write lock");
+        let cli = CliOverrides {
+            lock_timeout: Some(1),
+            held_write_lock_beads_dir: Some(beads_dir.clone()),
+            read_only_fast_open: true,
+            ..CliOverrides::default()
+        };
+
+        let storage_ctx = open_storage_with_cli(&beads_dir, &cli)
+            .expect("caller-held write lock should not be reacquired");
         let issue = storage_ctx
             .storage
             .get_issue("bd-recovered")
@@ -6034,6 +7270,45 @@ routing:
     }
 
     #[test]
+    fn open_storage_with_cli_no_db_validates_external_jsonl_before_hashing() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let external_jsonl = temp.path().join("external-store").join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::create_dir_all(&external_jsonl).expect("create external jsonl directory");
+
+        let mut layer = ConfigLayer::default();
+        layer
+            .startup
+            .insert("no-db".to_string(), "true".to_string());
+        let startup = StartupConfig {
+            paths: ConfigPaths {
+                beads_dir: beads_dir.clone(),
+                db_path: beads_dir.join(DEFAULT_DB_FILENAME),
+                jsonl_path: external_jsonl,
+                metadata: Metadata::default(),
+            },
+            layers: vec![layer.clone()],
+            merged_config: layer,
+        };
+
+        let err = open_storage_with_startup_config_impl(
+            startup,
+            &CliOverrides::default(),
+            false,
+            false,
+            false,
+        )
+        .expect_err("external no-db JSONL should be rejected before hashing");
+        let message = err.to_string();
+        assert!(
+            message.contains("outside the beads directory")
+                || message.contains("must be a regular file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn open_storage_with_cli_no_db_keeps_distinct_closed_issues_with_identical_content() {
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
@@ -6109,6 +7384,75 @@ routing:
             &external_db,
             &external_jsonl
         ));
+    }
+
+    #[test]
+    fn load_config_validates_external_jsonl_before_prefix_inference() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let external_dir = temp.path().join("external-store");
+        let external_jsonl = external_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::create_dir_all(&external_dir).expect("create external dir");
+        write_single_issue_jsonl(&external_jsonl, "bd-extcfg", "External config prefix");
+        let storage = SqliteStorage::open_memory().expect("storage");
+
+        let err = load_config_from_startup_layers(
+            &[],
+            &beads_dir,
+            &external_jsonl,
+            false,
+            Some(&storage),
+            &CliOverrides::default(),
+        )
+        .expect_err("external JSONL should be rejected before prefix inference");
+        assert!(
+            err.to_string().contains("outside the beads directory"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn repair_database_replay_preserves_explicit_external_jsonl_allowance() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let external_dir = temp.path().join("external-store");
+        let jsonl_path = external_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::create_dir_all(&external_dir).expect("create external dir");
+
+        write_single_issue_jsonl(&jsonl_path, "source-extimp", "Imported from external JSONL");
+        let mut bootstrap_layer = ConfigLayer::default();
+        bootstrap_layer
+            .runtime
+            .insert("issue_prefix".to_string(), "target".to_string());
+        let import_config = ImportConfig {
+            allow_external_jsonl: true,
+            rename_on_import: true,
+            clear_duplicate_external_refs: true,
+            beads_dir: Some(beads_dir.clone()),
+            ..ImportConfig::default()
+        };
+
+        let (storage, import_result, _) = repair_database_from_jsonl_with_import_config(
+            &beads_dir,
+            &db_path,
+            &jsonl_path,
+            None,
+            &bootstrap_layer,
+            false,
+            import_config,
+        )
+        .expect("external JSONL repair replay should preserve explicit allowance");
+
+        assert_eq!(import_result.created_count, 1);
+        let ids = storage.get_all_ids().expect("query rebuilt ids");
+        assert_eq!(ids.len(), 1);
+        assert!(
+            ids[0].starts_with("target-"),
+            "rename-prefix replay should import with target prefix, got {ids:?}"
+        );
     }
 
     #[test]
@@ -6675,6 +8019,35 @@ routing:
             fs::read(shm_backup).expect("read quarantined shm"),
             b"sidecar shared memory",
             "quarantined shm bytes must remain inspectable"
+        );
+    }
+
+    #[test]
+    fn quarantine_truncated_wal_sidecar_leaves_zero_byte_wal_in_place() {
+        // Regression for beads_rust#291. A 0-byte WAL is the documented
+        // post-`PRAGMA wal_checkpoint(TRUNCATE)` resting state, which
+        // SqliteStorage::Drop runs on every mutating br invocation. The
+        // pre-fix heuristic quarantined that healthy hand-off as corruption
+        // and flooded `.beads/.br_recovery/` with empty-file artifacts at
+        // ~1 entry / 2 invocations on multi-agent repos.
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+        let shm_path = PathBuf::from(format!("{}-shm", db_path.to_string_lossy()));
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        fs::write(&db_path, b"db").expect("write db");
+        fs::write(&wal_path, b"").expect("write 0-byte wal");
+        fs::write(&shm_path, b"live shm").expect("write shm");
+
+        quarantine_truncated_wal_sidecar(&db_path, &beads_dir);
+
+        assert!(wal_path.is_file(), "0-byte wal should remain live");
+        assert!(shm_path.is_file(), "shm should remain live with 0-byte wal");
+        assert!(
+            !recovery_dir_for_db_path(&db_path, &beads_dir).exists(),
+            "0-byte wal should not create a recovery quarantine"
         );
     }
 

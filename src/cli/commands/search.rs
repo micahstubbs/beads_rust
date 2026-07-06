@@ -2,7 +2,10 @@
 //!
 //! Classic bd-style LIKE search across title/description/id with list-like filters.
 
-use crate::cli::{ListArgs, OutputFormat, SearchArgs, resolve_output_format_with_outer_mode};
+use crate::cli::{
+    DEFAULT_LIST_OFFSET, DEFAULT_SEARCH_LIMIT, ListArgs, OutputFormat, SearchArgs,
+    resolve_output_format_with_outer_mode,
+};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{
@@ -57,14 +60,19 @@ pub fn execute_with_storage_ctx(
 ) -> Result<()> {
     let query = validate_query(args)?;
     let storage = &storage_ctx.storage;
-    let issues = collect_search_results(storage, query, &args.filters)?;
+    let output_format = resolve_output_format_with_outer_mode(
+        args.filters.format,
+        outer_ctx.inherited_output_mode(),
+        false,
+    );
+    let issues = collect_search_results_for_output(storage, query, &args.filters, output_format)?;
     render_search_results(
         storage,
         issues,
         query,
         &args.filters,
+        output_format,
         cli,
-        outer_ctx,
         storage_ctx,
     )
 }
@@ -80,10 +88,34 @@ fn validate_query(args: &SearchArgs) -> Result<&str> {
     Ok(query)
 }
 
+#[cfg(test)]
 fn collect_search_results(
     storage: &SqliteStorage,
     query: &str,
     list_args: &ListArgs,
+) -> Result<Vec<Issue>> {
+    collect_search_results_with_projection(storage, query, list_args, false)
+}
+
+fn collect_search_results_for_output(
+    storage: &SqliteStorage,
+    query: &str,
+    list_args: &ListArgs,
+    output_format: OutputFormat,
+) -> Result<Vec<Issue>> {
+    collect_search_results_with_projection(
+        storage,
+        query,
+        list_args,
+        matches!(output_format, OutputFormat::Text),
+    )
+}
+
+fn collect_search_results_with_projection(
+    storage: &SqliteStorage,
+    query: &str,
+    list_args: &ListArgs,
+    use_text_projection: bool,
 ) -> Result<Vec<Issue>> {
     let mut filters = build_filters(list_args)?;
     let client_filters = needs_client_filters(list_args);
@@ -98,7 +130,11 @@ fn collect_search_results(
         filters.reverse = false;
     }
 
-    let issues = storage.search_issues(query, &filters)?;
+    let issues = if use_text_projection && !client_filters {
+        storage.search_issues_for_command_output(query, &filters)?
+    } else {
+        storage.search_issues(query, &filters)?
+    };
     let mut issues = if client_filters {
         apply_client_filters(issues, list_args)?
     } else {
@@ -106,10 +142,7 @@ fn collect_search_results(
     };
 
     if needs_post_query_ordering {
-        apply_issue_sort(&mut issues, list_args.sort.as_deref())?;
-        if list_args.reverse {
-            issues.reverse();
-        }
+        apply_issue_sort(&mut issues, list_args.sort.as_deref(), list_args.reverse)?;
         if let Some(offset) = offset
             && offset > 0
         {
@@ -136,16 +169,10 @@ fn render_search_results(
     issues: Vec<Issue>,
     query: &str,
     list_args: &ListArgs,
+    output_format: OutputFormat,
     cli: &config::CliOverrides,
-    outer_ctx: &OutputContext,
     storage_ctx: &config::OpenStorageResult,
 ) -> Result<()> {
-    let output_format = resolve_output_format_with_outer_mode(
-        list_args.format,
-        outer_ctx.inherited_output_mode(),
-        false,
-    );
-
     let quiet = cli.quiet.unwrap_or(false);
     let early_ctx = OutputContext::from_output_format(output_format, quiet, true);
     if matches!(early_ctx.mode(), OutputMode::Quiet) {
@@ -154,12 +181,19 @@ fn render_search_results(
 
     match output_format {
         OutputFormat::Json => {
-            let issues_with_counts = attach_counts(storage, issues)?;
-            early_ctx.json_pretty(&issues_with_counts);
+            let mut relation_metadata = load_search_relation_metadata(storage, &issues)?;
+            early_ctx.json_array(
+                issues
+                    .into_iter()
+                    .map(|issue| issue_with_counts(issue, &mut relation_metadata)),
+            );
             return Ok(());
         }
         OutputFormat::Toon => {
             let issues_with_counts = attach_counts(storage, issues)?;
+            if early_ctx.toon_issue_counts_array_with_stats(&issues_with_counts, list_args.stats) {
+                return Ok(());
+            }
             early_ctx.toon_with_stats(&issues_with_counts, list_args.stats);
             return Ok(());
         }
@@ -232,32 +266,64 @@ fn render_search_results(
     Ok(())
 }
 
+#[derive(Default)]
+struct SearchRelationMetadata {
+    labels_by_id: HashMap<String, Vec<String>>,
+    dependency_counts: HashMap<String, usize>,
+    dependent_counts: HashMap<String, usize>,
+}
+
+fn load_search_relation_metadata(
+    storage: &SqliteStorage,
+    issues: &[Issue],
+) -> Result<SearchRelationMetadata> {
+    if issues.is_empty() {
+        return Ok(SearchRelationMetadata::default());
+    }
+
+    let issue_ids: Vec<String> = issues.iter().map(|issue| issue.id.clone()).collect();
+    let labels_by_id = storage.get_labels_for_issues(&issue_ids)?;
+    let (dependency_counts, dependent_counts) =
+        storage.count_relation_counts_for_issues(&issue_ids)?;
+
+    Ok(SearchRelationMetadata {
+        labels_by_id,
+        dependency_counts,
+        dependent_counts,
+    })
+}
+
+fn issue_with_counts(
+    mut issue: Issue,
+    relation_metadata: &mut SearchRelationMetadata,
+) -> IssueWithCounts {
+    let dependency_count = *relation_metadata
+        .dependency_counts
+        .get(&issue.id)
+        .unwrap_or(&0);
+    let dependent_count = *relation_metadata
+        .dependent_counts
+        .get(&issue.id)
+        .unwrap_or(&0);
+    if let Some(labels) = relation_metadata.labels_by_id.remove(&issue.id) {
+        issue.labels = labels;
+    }
+    IssueWithCounts {
+        issue,
+        dependency_count,
+        dependent_count,
+    }
+}
+
 fn attach_counts(
     storage: &SqliteStorage,
     issues: Vec<crate::model::Issue>,
 ) -> Result<Vec<IssueWithCounts>> {
-    if issues.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let issue_ids: Vec<String> = issues.iter().map(|issue| issue.id.clone()).collect();
-    let mut labels_map = storage.get_labels_for_issues(&issue_ids)?;
-    let (dep_counts, dependent_counts) = storage.count_relation_counts_for_issues(&issue_ids)?;
+    let mut relation_metadata = load_search_relation_metadata(storage, &issues)?;
 
     Ok(issues
         .into_iter()
-        .map(|mut issue| {
-            let dependency_count = *dep_counts.get(&issue.id).unwrap_or(&0);
-            let dependent_count = *dependent_counts.get(&issue.id).unwrap_or(&0);
-            if let Some(labels) = labels_map.remove(&issue.id) {
-                issue.labels = labels;
-            }
-            IssueWithCounts {
-                issue,
-                dependency_count,
-                dependent_count,
-            }
-        })
+        .map(|issue| issue_with_counts(issue, &mut relation_metadata))
         .collect())
 }
 
@@ -302,6 +368,8 @@ fn snippet_around_match(text: &str, start: usize, end: usize, radius: usize) -> 
     if text.is_empty() {
         return String::new();
     }
+    let start = start.min(text.len());
+    let end = end.min(text.len()).max(start);
 
     let mut char_starts: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
     char_starts.push(text.len());
@@ -313,13 +381,21 @@ fn snippet_around_match(text: &str, start: usize, end: usize, radius: usize) -> 
     let snippet_start_char = start_char.saturating_sub(radius);
     let snippet_end_char = (end_char + radius).min(total_chars);
 
-    let snippet_start_byte = char_starts[snippet_start_char];
-    let snippet_end_byte = char_starts[snippet_end_char];
+    let (Some(&snippet_start_byte), Some(&snippet_end_byte)) = (
+        char_starts.get(snippet_start_char),
+        char_starts.get(snippet_end_char),
+    ) else {
+        return String::new();
+    };
 
-    let mut snippet = text[snippet_start_byte..snippet_end_byte]
-        .trim()
-        .to_string();
+    let Some(snippet_slice) = text.get(snippet_start_byte..snippet_end_byte) else {
+        return String::new();
+    };
+    let mut snippet = snippet_slice.trim().to_string();
     snippet = normalize_whitespace(&snippet);
+    if snippet.is_empty() {
+        return snippet;
+    }
 
     if snippet_start_char > 0 {
         snippet.insert_str(0, "...");
@@ -393,8 +469,10 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         include_deferred,
         include_templates: false,
         title_contains: args.title_contains.clone(),
-        limit: args.limit,
-        offset: args.offset,
+        // #349: search stays capped (a broad text query can match a large
+        // fraction of the corpus); list/ready are complete by default.
+        limit: Some(args.limit.unwrap_or(DEFAULT_SEARCH_LIMIT)),
+        offset: Some(args.offset.unwrap_or(DEFAULT_LIST_OFFSET)),
         sort: args.sort.clone(),
         reverse: args.reverse,
         labels: if args.label.is_empty() {
@@ -469,9 +547,11 @@ fn apply_client_filters(
             .ok()
     });
 
-    // Deferred issues are included by default when no status filter is specified
+    // Deferred issues are included by default when no status filter is specified,
+    // except `--overdue` keeps deferred work hidden unless requested.
     let include_deferred = args.deferred
-        || args.status.is_empty()
+        || args.all
+        || (!args.overdue && args.status.is_empty())
         || args
             .status
             .iter()
@@ -544,22 +624,74 @@ fn apply_client_filters(
 fn apply_sort_by_issue<T>(
     items: &mut [T],
     sort: Option<&str>,
+    reverse: bool,
     mut issue_of: impl FnMut(&T) -> &crate::model::Issue,
 ) -> Result<()> {
-    let Some(sort_key) = sort else {
-        return Ok(());
-    };
-
-    match sort_key {
-        "priority" => items.sort_by_key(|item| issue_of(item).priority),
-        "created_at" | "created" => {
-            items.sort_by_key(|item| std::cmp::Reverse(issue_of(item).created_at));
+    match sort {
+        None | Some("priority") => {
+            if reverse {
+                items.sort_by_cached_key(|item| {
+                    let issue = issue_of(item);
+                    (
+                        std::cmp::Reverse(issue.priority),
+                        issue.created_at,
+                        issue.id.clone(),
+                    )
+                });
+            } else {
+                items.sort_by_cached_key(|item| {
+                    let issue = issue_of(item);
+                    (
+                        issue.priority,
+                        std::cmp::Reverse(issue.created_at),
+                        issue.id.clone(),
+                    )
+                });
+            }
         }
-        "updated_at" | "updated" => {
-            items.sort_by_key(|item| std::cmp::Reverse(issue_of(item).updated_at));
+        Some("created_at" | "created") => {
+            if reverse {
+                items.sort_by_cached_key(|item| {
+                    let issue = issue_of(item);
+                    (issue.created_at, issue.id.clone())
+                });
+            } else {
+                items.sort_by_cached_key(|item| {
+                    let issue = issue_of(item);
+                    (std::cmp::Reverse(issue.created_at), issue.id.clone())
+                });
+            }
         }
-        "title" => items.sort_by_cached_key(|item| issue_of(item).title.to_lowercase()),
-        _ => {
+        Some("updated_at" | "updated") => {
+            if reverse {
+                items.sort_by_cached_key(|item| {
+                    let issue = issue_of(item);
+                    (issue.updated_at, issue.id.clone())
+                });
+            } else {
+                items.sort_by_cached_key(|item| {
+                    let issue = issue_of(item);
+                    (std::cmp::Reverse(issue.updated_at), issue.id.clone())
+                });
+            }
+        }
+        Some("title") => {
+            if reverse {
+                items.sort_by_cached_key(|item| {
+                    let issue = issue_of(item);
+                    (
+                        std::cmp::Reverse(issue.title.to_lowercase()),
+                        issue.id.clone(),
+                    )
+                });
+            } else {
+                items.sort_by_cached_key(|item| {
+                    let issue = issue_of(item);
+                    (issue.title.to_lowercase(), issue.id.clone())
+                });
+            }
+        }
+        Some(sort_key) => {
             return Err(BeadsError::Validation {
                 field: "sort".to_string(),
                 reason: format!("invalid sort field '{sort_key}'"),
@@ -571,12 +703,16 @@ fn apply_sort_by_issue<T>(
 }
 
 #[cfg(test)]
-fn apply_sort(issues: &mut [IssueWithCounts], sort: Option<&str>) -> Result<()> {
-    apply_sort_by_issue(issues, sort, |issue| &issue.issue)
+fn apply_sort(issues: &mut [IssueWithCounts], sort: Option<&str>, reverse: bool) -> Result<()> {
+    apply_sort_by_issue(issues, sort, reverse, |issue| &issue.issue)
 }
 
-fn apply_issue_sort(issues: &mut [crate::model::Issue], sort: Option<&str>) -> Result<()> {
-    apply_sort_by_issue(issues, sort, |issue| issue)
+fn apply_issue_sort(
+    issues: &mut [crate::model::Issue],
+    sort: Option<&str>,
+    reverse: bool,
+) -> Result<()> {
+    apply_sort_by_issue(issues, sort, reverse, |issue| issue)
 }
 
 #[cfg(test)]
@@ -616,6 +752,8 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -632,6 +770,17 @@ mod tests {
             dependencies: vec![],
             comments: vec![],
         }
+    }
+
+    #[test]
+    fn test_snippet_around_match_clamps_invalid_offsets() {
+        assert_eq!(snippet_around_match("alpha beta", 999, 1000, 0), "");
+
+        let snippet = snippet_around_match("alpha beta", 999, 1000, 5);
+        assert_eq!(snippet, "...beta");
+
+        let multibyte = snippet_around_match("alpha βeta", 7, 6, 2);
+        assert_eq!(multibyte, "...βet...");
     }
 
     #[test]
@@ -662,6 +811,26 @@ mod tests {
     }
 
     #[test]
+    fn issue_with_counts_applies_relation_metadata() {
+        let issue = make_issue("bd-001", "Search result", None, Utc::now());
+        let mut relation_metadata = SearchRelationMetadata {
+            labels_by_id: std::collections::HashMap::from([(
+                "bd-001".to_string(),
+                vec!["perf".to_string(), "search".to_string()],
+            )]),
+            dependency_counts: std::collections::HashMap::from([("bd-001".to_string(), 2)]),
+            dependent_counts: std::collections::HashMap::from([("bd-001".to_string(), 3)]),
+        };
+
+        let output = issue_with_counts(issue, &mut relation_metadata);
+
+        assert_eq!(output.issue.labels, vec!["perf", "search"]);
+        assert_eq!(output.dependency_count, 2);
+        assert_eq!(output.dependent_count, 3);
+        assert!(relation_metadata.labels_by_id.is_empty());
+    }
+
+    #[test]
     fn test_label_filters_do_not_require_client_filtering() {
         let args = ListArgs {
             label: vec!["backend".to_string()],
@@ -679,6 +848,16 @@ mod tests {
         };
 
         assert!(!needs_client_filters(&args));
+    }
+
+    #[test]
+    fn test_search_build_filters_applies_search_defaults_when_cli_omits_pagination() {
+        // #349: search stays capped at DEFAULT_SEARCH_LIMIT (50) by default,
+        // even though list/ready became unlimited.
+        let filters = build_filters(&ListArgs::default()).expect("build filters");
+
+        assert_eq!(filters.limit, Some(DEFAULT_SEARCH_LIMIT));
+        assert_eq!(filters.offset, Some(DEFAULT_LIST_OFFSET));
     }
 
     #[test]
@@ -746,7 +925,7 @@ mod tests {
             older_created_but_newer_updated,
         ];
 
-        apply_issue_sort(&mut items, Some("updated")).expect("sort");
+        apply_issue_sort(&mut items, Some("updated"), false).expect("sort");
         items.truncate(1);
         assert_eq!(items[0].id, "bd-b");
     }
@@ -814,6 +993,69 @@ mod tests {
     }
 
     #[test]
+    fn test_search_overdue_excludes_deferred_unless_requested() {
+        let mut storage = SqliteStorage::open_memory().expect("db");
+        let created_at = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let overdue_at = Utc::now() - chrono::Duration::days(1);
+
+        let mut open_overdue = make_issue("bd-open", "match open overdue", None, created_at);
+        open_overdue.due_at = Some(overdue_at);
+
+        let mut deferred_overdue =
+            make_issue("bd-deferred", "match deferred overdue", None, created_at);
+        deferred_overdue.status = Status::Deferred;
+        deferred_overdue.due_at = Some(overdue_at);
+
+        for issue in [open_overdue, deferred_overdue] {
+            storage.create_issue(&issue, "tester").expect("create");
+        }
+
+        let overdue_only = collect_search_results(
+            &storage,
+            "match",
+            &ListArgs {
+                overdue: true,
+                ..Default::default()
+            },
+        )
+        .expect("search overdue");
+        let overdue_only_ids: Vec<_> = overdue_only.iter().map(|issue| issue.id.as_str()).collect();
+        assert_eq!(overdue_only_ids, vec!["bd-open"]);
+
+        let overdue_with_deferred = collect_search_results(
+            &storage,
+            "match",
+            &ListArgs {
+                overdue: true,
+                deferred: true,
+                ..Default::default()
+            },
+        )
+        .expect("search overdue with deferred");
+        let overdue_with_deferred_ids: Vec<_> = overdue_with_deferred
+            .iter()
+            .map(|issue| issue.id.as_str())
+            .collect();
+        assert_eq!(overdue_with_deferred_ids, vec!["bd-deferred", "bd-open"]);
+
+        let overdue_with_all = collect_search_results(
+            &storage,
+            "match",
+            &ListArgs {
+                overdue: true,
+                all: true,
+                ..Default::default()
+            },
+        )
+        .expect("search overdue with all");
+        let overdue_with_all_ids: Vec<_> = overdue_with_all
+            .iter()
+            .map(|issue| issue.id.as_str())
+            .collect();
+        assert_eq!(overdue_with_all_ids, vec!["bd-deferred", "bd-open"]);
+    }
+
+    #[test]
     fn test_search_respects_reverse_without_explicit_sort() {
         let mut storage = SqliteStorage::open_memory().expect("db");
         let t1 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
@@ -870,16 +1112,38 @@ mod tests {
 
         let mut issues = storage.search_issues("match", &filters).expect("search");
 
-        apply_issue_sort(&mut issues, args.sort.as_deref()).expect("sort");
-        if args.reverse {
-            issues.reverse();
-        }
+        apply_issue_sort(&mut issues, args.sort.as_deref(), args.reverse).expect("sort");
         if let Some(limit) = limit {
             issues.truncate(limit);
         }
 
         assert_eq!(issues[0].id, "bd-old");
         assert_eq!(issues[1].id, "bd-new");
+    }
+
+    #[test]
+    fn test_search_client_filter_reverse_keeps_id_tiebreaker_ascending() {
+        let mut storage = SqliteStorage::open_memory().expect("db");
+        let timestamp = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+
+        for issue in [
+            make_issue("bd-tie-b", "match tie b", Some("needle"), timestamp),
+            make_issue("bd-tie-a", "match tie a", Some("needle"), timestamp),
+        ] {
+            storage.create_issue(&issue, "tester").expect("create");
+        }
+
+        let args = ListArgs {
+            desc_contains: Some("needle".to_string()),
+            reverse: true,
+            limit: Some(2),
+            ..Default::default()
+        };
+
+        let results = collect_search_results(&storage, "match", &args).expect("search");
+        let ids: Vec<_> = results.iter().map(|issue| issue.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["bd-tie-a", "bd-tie-b"]);
     }
 
     #[test]
@@ -903,9 +1167,9 @@ mod tests {
             },
         ];
 
-        apply_sort(&mut items, Some("title")).expect("sort");
+        apply_sort(&mut items, Some("title"), false).expect("sort");
         assert_eq!(items[0].issue.title, "Alpha");
-        items.reverse();
+        apply_sort(&mut items, Some("title"), true).expect("sort");
         assert_eq!(items[0].issue.title, "Beta");
     }
 
@@ -930,7 +1194,7 @@ mod tests {
             },
         ];
 
-        apply_sort(&mut items, Some("created_at")).expect("sort");
+        apply_sort(&mut items, Some("created_at"), false).expect("sort");
         assert_eq!(items[0].issue.id, "bd-new");
     }
 

@@ -7,7 +7,7 @@ use crate::error::{BeadsError, Result};
 use crate::output::{OutputContext, OutputMode};
 use regex::Regex;
 use rich_rust::prelude::*;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -138,6 +138,30 @@ impl AgentFileDetection {
         }
         self.has_blurb && self.blurb_version < BLURB_VERSION
     }
+
+    fn file_path_ref(&self, context: &str) -> Result<&Path> {
+        self.file_path.as_deref().ok_or_else(|| {
+            BeadsError::internal(format!(
+                "agent file detection is missing file_path while handling {context}"
+            ))
+        })
+    }
+
+    fn file_type_ref(&self, context: &str) -> Result<&str> {
+        self.file_type.as_deref().ok_or_else(|| {
+            BeadsError::internal(format!(
+                "agent file detection is missing file_type while handling {context}"
+            ))
+        })
+    }
+
+    fn content_ref(&self, context: &str) -> Result<&str> {
+        self.content.as_deref().ok_or_else(|| {
+            BeadsError::internal(format!(
+                "agent file detection is missing content while handling {context}"
+            ))
+        })
+    }
 }
 
 #[must_use]
@@ -238,7 +262,31 @@ fn check_agent_file_with_reader<R>(
 where
     R: for<'a> Fn(&'a Path) -> io::Result<String>,
 {
-    if !file_path.exists() || file_path.is_dir() {
+    let metadata = match fs::symlink_metadata(file_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            return Some(AgentFileDetection {
+                file_path: Some(file_path.to_path_buf()),
+                file_type: Some(file_type.to_string()),
+                read_error: Some(err.to_string()),
+                ..Default::default()
+            });
+        }
+    };
+
+    if metadata.file_type().is_symlink() {
+        return Some(AgentFileDetection {
+            file_path: Some(file_path.to_path_buf()),
+            file_type: Some(file_type.to_string()),
+            read_error: Some(
+                "symbolic links are not supported for agent instruction files".to_string(),
+            ),
+            ..Default::default()
+        });
+    }
+
+    if metadata.is_dir() {
         return None;
     }
 
@@ -405,6 +453,10 @@ pub fn update_blurb(content: &str) -> String {
     append_blurb(&content)
 }
 
+fn remove_all_agent_blurbs(content: &str) -> String {
+    remove_blurb(&remove_legacy_blurb(content))
+}
+
 fn find_marker_end_after(content: &str, start_idx: usize, end_marker: &str) -> Option<usize> {
     content[start_idx..]
         .find(end_marker)
@@ -480,10 +532,145 @@ fn require_force_for_json_action(force: bool, ctx: &OutputContext) -> Result<()>
     Ok(())
 }
 
+fn create_temp_agent_file(file_path: &Path) -> Result<(PathBuf, File)> {
+    let pid = std::process::id();
+    let base_extension = file_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("tmp");
+
+    for attempt in 0..64_u32 {
+        let extension = if attempt == 0 {
+            format!("{base_extension}.{pid}.tmp")
+        } else {
+            format!("{base_extension}.{pid}.{attempt}.tmp")
+        };
+        let temp_path = file_path.with_extension(extension);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    Err(BeadsError::Config(format!(
+        "Failed to allocate temp agent file for {}",
+        file_path.display()
+    )))
+}
+
+fn write_new_agent_file(file_path: &Path, contents: &[u8]) -> Result<()> {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(file_path)
+    {
+        Ok(mut file) => {
+            if let Err(error) = file.write_all(contents).and_then(|()| file.sync_all()) {
+                drop(file);
+                let _ = fs::remove_file(file_path);
+                return Err(error.into());
+            }
+            drop(file);
+            crate::util::sync_parent_directory(file_path)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            Err(BeadsError::Config(format!(
+                "Agent instruction file already exists: {}",
+                file_path.display()
+            )))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_agent_rewrite_target(file_path: &Path) -> Result<Option<fs::Permissions>> {
+    match fs::symlink_metadata(file_path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                return Err(BeadsError::Config(format!(
+                    "Agent instruction file '{}' must not be a symlink",
+                    file_path.display()
+                )));
+            }
+            if !file_type.is_file() {
+                return Err(BeadsError::Config(format!(
+                    "Agent instruction file '{}' must be a regular file",
+                    file_path.display()
+                )));
+            }
+            Ok(Some(metadata.permissions()))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_agent_file_atomically(file_path: &Path, contents: &[u8]) -> Result<()> {
+    let existing_permissions = validate_agent_rewrite_target(file_path)?;
+    let (temp_path, mut temp_file) = create_temp_agent_file(file_path)?;
+    if let Some(permissions) = existing_permissions
+        && let Err(error) = fs::set_permissions(&temp_path, permissions)
+    {
+        tracing::warn!(
+            path = %file_path.display(),
+            error = %error,
+            "Failed to apply original agent file permissions before atomic rewrite"
+        );
+    }
+    if let Err(error) = temp_file
+        .write_all(contents)
+        .and_then(|()| temp_file.sync_all())
+    {
+        drop(temp_file);
+        let _ = fs::remove_file(&temp_path);
+        return Err(error.into());
+    }
+    drop(temp_file);
+    crate::util::durable_rename(&temp_path, file_path).inspect_err(|_| {
+        let _ = fs::remove_file(&temp_path);
+    })?;
+    Ok(())
+}
+
+fn write_added_agent_file(
+    file_path: &Path,
+    new_content: &str,
+    replacing_existing_file: bool,
+) -> Result<()> {
+    if replacing_existing_file {
+        write_agent_file_atomically(file_path, new_content.as_bytes())
+    } else {
+        write_new_agent_file(file_path, new_content.as_bytes())
+    }
+}
+
+fn read_agent_file_for_backup(file_path: &Path) -> Result<Vec<u8>> {
+    validate_agent_rewrite_target(file_path)?;
+    fs::read(file_path).map_err(Into::into)
+}
+
 fn backup_agent_file(file_path: &Path, ctx: &OutputContext) -> Option<PathBuf> {
     let backup_path = file_path.with_extension("md.bak");
-    match fs::copy(file_path, &backup_path) {
-        Ok(_) => {
+    let backup_bytes = match read_agent_file_for_backup(file_path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!(
+                "Warning: Could not read {} for backup: {}",
+                file_path.display(),
+                e
+            );
+            return None;
+        }
+    };
+    match write_agent_file_atomically(&backup_path, &backup_bytes) {
+        Ok(()) => {
             if !ctx.is_json() && !matches!(ctx.mode(), OutputMode::Rich) {
                 println!("Backup created: {}", backup_path.display());
             }
@@ -688,7 +875,7 @@ fn execute_dry_run_inferred(
     }
 
     if let Some(err) = detection.read_error.as_deref() {
-        let file_path = detection.file_path.as_ref().unwrap();
+        let file_path = detection.file_path_ref("agents dry-run unreadable file")?;
         let file_type = detection.file_type.as_deref().unwrap_or("agent file");
         if is_rich {
             render_unreadable_rich(file_path, file_type, err, "Dry Run", ctx);
@@ -705,7 +892,7 @@ fn execute_dry_run_inferred(
 
     if detection.needs_upgrade() {
         // Would update existing blurb
-        let file_path = detection.file_path.as_ref().unwrap();
+        let file_path = detection.file_path_ref("agents dry-run update")?;
         let from_version = if detection.has_legacy_blurb {
             "bv (legacy)".to_string()
         } else {
@@ -724,7 +911,7 @@ fn execute_dry_run_inferred(
 
     if detection.needs_blurb() {
         // File exists but has no blurb -- would add
-        let file_path = detection.file_path.as_ref().unwrap();
+        let file_path = detection.file_path_ref("agents dry-run add")?;
         if is_rich {
             render_dry_run_add_rich(file_path, ctx);
         } else {
@@ -807,8 +994,7 @@ fn execute_check(
     ctx: &OutputContext,
 ) -> Result<()> {
     if matches!(ctx.mode(), OutputMode::Rich) {
-        render_check_rich(detection, work_dir, ctx);
-        return Ok(());
+        return render_check_rich(detection, work_dir, ctx);
     }
 
     if !detection.found() {
@@ -821,8 +1007,8 @@ fn execute_check(
         return Ok(());
     }
 
-    let file_path = detection.file_path.as_ref().unwrap();
-    let file_type = detection.file_type.as_ref().unwrap();
+    let file_path = detection.file_path_ref("agents check")?;
+    let file_type = detection.file_type_ref("agents check")?;
 
     println!("Found: {} at {}", file_type, file_path.display());
 
@@ -888,11 +1074,13 @@ fn execute_add(
         if let Some(ref err) = detection.read_error {
             return Err(BeadsError::Config(format!(
                 "Cannot add instructions: {} exists but is unreadable: {}",
-                detection.file_type.as_ref().unwrap(),
+                detection.file_type_ref("agents add unreadable file")?,
                 err
             )));
         }
-        let path = detection.file_path.clone().unwrap();
+        let path = detection
+            .file_path_ref("agents add existing file")?
+            .to_path_buf();
         let content = detection.content.clone().unwrap_or_default();
         (path, content)
     } else {
@@ -948,7 +1136,7 @@ fn execute_add(
         .then(|| backup_agent_file(&file_path, ctx))
         .flatten();
 
-    fs::write(&file_path, &new_content)?;
+    write_added_agent_file(&file_path, &new_content, detection.found())?;
     if ctx.is_json() {
         let output = serde_json::json!({
             "action": "add",
@@ -989,7 +1177,7 @@ fn execute_remove(
     if let Some(ref err) = detection.read_error {
         return Err(BeadsError::Config(format!(
             "Cannot remove instructions: {} exists but is unreadable: {}",
-            detection.file_type.as_ref().unwrap(),
+            detection.file_type_ref("agents remove unreadable file")?,
             err
         )));
     }
@@ -1012,14 +1200,10 @@ fn execute_remove(
         return Ok(());
     }
 
-    let file_path = detection.file_path.as_ref().unwrap();
-    let content = detection.content.as_ref().unwrap();
+    let file_path = detection.file_path_ref("agents remove")?;
+    let content = detection.content_ref("agents remove")?;
 
-    let new_content = if detection.has_legacy_blurb {
-        remove_legacy_blurb(content)
-    } else {
-        remove_blurb(content)
-    };
+    let new_content = remove_all_agent_blurbs(content);
 
     if dry_run {
         if ctx.is_json() {
@@ -1063,7 +1247,7 @@ fn execute_remove(
     // Backup
     let backup_path = backup_agent_file(file_path, ctx);
 
-    fs::write(file_path, &new_content)?;
+    write_agent_file_atomically(file_path, new_content.as_bytes())?;
     if ctx.is_json() {
         let output = serde_json::json!({
             "action": "remove",
@@ -1103,7 +1287,7 @@ fn execute_update(
     if let Some(ref err) = detection.read_error {
         return Err(BeadsError::Config(format!(
             "Cannot update instructions: {} exists but is unreadable: {}",
-            detection.file_type.as_ref().unwrap(),
+            detection.file_type_ref("agents update unreadable file")?,
             err
         )));
     }
@@ -1126,8 +1310,8 @@ fn execute_update(
         return Ok(());
     }
 
-    let file_path = detection.file_path.as_ref().unwrap();
-    let content = detection.content.as_ref().unwrap();
+    let file_path = detection.file_path_ref("agents update")?;
+    let content = detection.content_ref("agents update")?;
     let new_content = update_blurb(content);
 
     let from_version = if detection.has_legacy_blurb {
@@ -1179,7 +1363,7 @@ fn execute_update(
     // Backup
     let backup_path = backup_agent_file(file_path, ctx);
 
-    fs::write(file_path, &new_content)?;
+    write_agent_file_atomically(file_path, new_content.as_bytes())?;
     if ctx.is_json() {
         let output = serde_json::json!({
             "action": "update",
@@ -1207,7 +1391,11 @@ fn execute_update(
 // --- Rich output render functions ---
 
 /// Render check result as a rich panel.
-fn render_check_rich(detection: &AgentFileDetection, work_dir: &Path, ctx: &OutputContext) {
+fn render_check_rich(
+    detection: &AgentFileDetection,
+    work_dir: &Path,
+    ctx: &OutputContext,
+) -> Result<()> {
     let console = Console::default();
     let theme = ctx.theme();
     let width = ctx.width();
@@ -1215,8 +1403,8 @@ fn render_check_rich(detection: &AgentFileDetection, work_dir: &Path, ctx: &Outp
     let mut content = Text::new("");
 
     if detection.found() {
-        let file_path = detection.file_path.as_ref().unwrap();
-        let file_type = detection.file_type.as_ref().unwrap();
+        let file_path = detection.file_path_ref("agents check rich")?;
+        let file_type = detection.file_type_ref("agents check rich")?;
 
         content.append_styled("File        ", theme.dimmed.clone());
         content.append_styled(file_type, theme.emphasis.clone());
@@ -1274,6 +1462,7 @@ fn render_check_rich(detection: &AgentFileDetection, work_dir: &Path, ctx: &Outp
         .box_style(theme.box_style);
 
     console.print_renderable(&panel);
+    Ok(())
 }
 
 fn render_unreadable_rich(
@@ -1469,6 +1658,11 @@ mod tests {
 
     use tempfile::TempDir;
 
+    fn assert_unexpected_error(other: &BeadsError) {
+        let message = format!("{other:?}");
+        assert!(message.is_empty(), "unexpected error: {message}");
+    }
+
     struct DirGuard {
         previous: PathBuf,
     }
@@ -1626,6 +1820,45 @@ mod tests {
     }
 
     #[test]
+    fn test_execute_check_reports_inconsistent_detection_metadata() {
+        let detection = AgentFileDetection {
+            file_path: Some(PathBuf::from("AGENTS.md")),
+            ..Default::default()
+        };
+
+        for mode in [OutputMode::Plain, OutputMode::Rich] {
+            let ctx = OutputContext::with_mode(mode);
+            let err = execute_check(&detection, Path::new("."), &ctx)
+                .expect_err("missing file_type should be an internal error");
+
+            assert!(matches!(
+                err,
+                BeadsError::Internal { message } if message.contains("missing file_type")
+            ));
+        }
+    }
+
+    #[test]
+    fn test_execute_update_reports_missing_detection_content() {
+        let detection = AgentFileDetection {
+            file_path: Some(PathBuf::from("AGENTS.md")),
+            file_type: Some("AGENTS.md".to_string()),
+            has_blurb: true,
+            blurb_version: 0,
+            ..Default::default()
+        };
+        let ctx = OutputContext::from_flags(false, false, true);
+
+        let err = execute_update(&detection, Path::new("."), true, true, &ctx)
+            .expect_err("missing content should be an internal error");
+
+        assert!(matches!(
+            err,
+            BeadsError::Internal { message } if message.contains("missing content")
+        ));
+    }
+
+    #[test]
     fn test_append_blurb() {
         let content = "# Agents\n\nSome content.";
         let result = append_blurb(content);
@@ -1721,6 +1954,18 @@ mod tests {
     }
 
     #[test]
+    fn test_remove_all_agent_blurbs_removes_legacy_and_current_blocks() {
+        let legacy_blurb =
+            "<!-- bv-agent-instructions-v1 -->\nold\n<!-- end-bv-agent-instructions -->";
+        let content = format!("# Agents\n\n{legacy_blurb}\n\n{AGENT_BLURB}\n\nMore content.");
+
+        let result = remove_all_agent_blurbs(&content);
+
+        assert_eq!(result, "# Agents\n\nMore content.");
+        assert!(!contains_any_blurb(&result));
+    }
+
+    #[test]
     fn test_detect_in_parents() {
         let temp_dir = TempDir::new().unwrap();
         let sub_dir = temp_dir.path().join("subdir");
@@ -1782,6 +2027,167 @@ mod tests {
     }
 
     #[test]
+    fn test_execute_remove_strips_legacy_and_current_blurbs() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let _guard = DirGuard::new(temp_dir.path());
+        let legacy_blurb =
+            "<!-- bv-agent-instructions-v1 -->\nold\n<!-- end-bv-agent-instructions -->";
+        let agents_path = temp_dir.path().join("AGENTS.md");
+        fs::write(
+            &agents_path,
+            format!("# Agents\n\n{legacy_blurb}\n\n{AGENT_BLURB}\n\nMore content."),
+        )
+        .expect("write AGENTS.md with both blurb formats");
+        let ctx = OutputContext::from_flags(true, false, true);
+
+        execute(
+            &AgentsArgs {
+                remove: true,
+                force: true,
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .expect("remove both agent blurb formats");
+
+        let content = fs::read_to_string(&agents_path).expect("read AGENTS.md after remove");
+        assert_eq!(content, "# Agents\n\nMore content.");
+        assert!(!contains_any_blurb(&content));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_detect_agent_file_refuses_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().unwrap();
+        let outside_target = temp_dir.path().join("outside-agents.md");
+        fs::write(&outside_target, "# Outside\n").unwrap();
+        let agents_path = temp_dir.path().join("AGENTS.md");
+        symlink(&outside_target, &agents_path).unwrap();
+
+        let detection = detect_agent_file(temp_dir.path());
+
+        assert!(detection.found());
+        assert!(detection.unreadable());
+        assert!(
+            detection
+                .read_error
+                .as_deref()
+                .is_some_and(|message| message.contains("symbolic links")),
+            "symlinked AGENTS.md should be reported as unsupported"
+        );
+        assert!(detection.content.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_agent_file_atomically_rejects_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().unwrap();
+        let outside_target = temp_dir.path().join("outside-agents.md");
+        fs::write(&outside_target, "# Outside\n").unwrap();
+        let agents_path = temp_dir.path().join("AGENTS.md");
+        symlink(&outside_target, &agents_path).unwrap();
+
+        let err = write_agent_file_atomically(&agents_path, b"# New\n")
+            .expect_err("atomic rewrite should reject symlink targets");
+
+        assert!(
+            format!("{err}").contains("must not be a symlink"),
+            "error should explain that symlinked rewrite targets are unsupported"
+        );
+        assert_eq!(
+            fs::read_to_string(&outside_target).unwrap(),
+            "# Outside\n",
+            "rewrite must not modify the symlink target"
+        );
+        assert!(
+            fs::symlink_metadata(&agents_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "rejected rewrite target symlink should be left untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_backup_agent_file_refuses_symlinked_backup_path() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().unwrap();
+        let agents_path = temp_dir.path().join("AGENTS.md");
+        fs::write(&agents_path, "# Agents\n").unwrap();
+        let outside_backup_target = temp_dir.path().join("outside-backup.md");
+        fs::write(&outside_backup_target, "# Outside backup\n").unwrap();
+        let backup_path = agents_path.with_extension("md.bak");
+        symlink(&outside_backup_target, &backup_path).unwrap();
+        let ctx = OutputContext::from_flags(true, false, true);
+
+        let backup = backup_agent_file(&agents_path, &ctx);
+
+        assert!(
+            backup.is_none(),
+            "backup creation should fail when the backup path is a symlink"
+        );
+        assert_eq!(
+            fs::read_to_string(&outside_backup_target).unwrap(),
+            "# Outside backup\n",
+            "backup creation must not modify the symlink target"
+        );
+        assert!(
+            fs::symlink_metadata(&backup_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "rejected backup path symlink should be left untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_execute_json_add_refuses_dangling_agents_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let outside_target = temp_dir.path().join("outside-agents.md");
+        let agents_path = temp_dir.path().join("AGENTS.md");
+        symlink(&outside_target, &agents_path).unwrap();
+        let _guard = DirGuard::new(temp_dir.path());
+        let ctx = OutputContext::from_flags(true, false, true);
+
+        let err = execute(
+            &AgentsArgs {
+                add: true,
+                force: true,
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .expect_err("json add should reject symlinked AGENTS.md");
+
+        assert!(
+            format!("{err}").contains("symbolic links"),
+            "error should explain that symlinked agent files are unsupported"
+        );
+        assert!(
+            !outside_target.exists(),
+            "br agents --add must not create a dangling symlink target"
+        );
+        assert!(
+            fs::symlink_metadata(&agents_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "rejected AGENTS.md symlink should be left untouched"
+        );
+    }
+
+    #[test]
     fn test_execute_json_add_requires_force() {
         let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
@@ -1802,7 +2208,7 @@ mod tests {
                 assert_eq!(field, "force");
                 assert!(reason.contains("--force"));
             }
-            other => panic!("unexpected error: {other:?}"),
+            other => assert_unexpected_error(&other),
         }
     }
 
@@ -1851,7 +2257,7 @@ mod tests {
                 assert_eq!(field, "AGENTS.md");
                 assert!(reason.contains("current directory"));
             }
-            other => panic!("unexpected error: {other:?}"),
+            other => assert_unexpected_error(&other),
         }
     }
 
@@ -1877,7 +2283,7 @@ mod tests {
                 assert_eq!(field, "AGENTS.md");
                 assert!(reason.contains("current directory"));
             }
-            other => panic!("unexpected error: {other:?}"),
+            other => assert_unexpected_error(&other),
         }
     }
 
@@ -1954,7 +2360,7 @@ mod tests {
                 assert!(reason.contains("--add"));
                 assert!(reason.contains("--check"));
             }
-            other => panic!("unexpected error: {other:?}"),
+            other => assert_unexpected_error(&other),
         }
     }
 }

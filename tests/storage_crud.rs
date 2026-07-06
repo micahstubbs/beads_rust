@@ -70,6 +70,8 @@ fn create_issue_all_fields_populated() {
         closed_by_session: None,
         source_system: None,
         source_repo: None,
+        source_repo_path: None,
+        agent_context: None,
         deleted_at: None,
         deleted_by: None,
         delete_reason: None,
@@ -520,6 +522,8 @@ fn update_issue_clear_optional_fields() {
         external_ref: None,
         source_system: None,
         source_repo: None,
+        source_repo_path: None,
+        agent_context: None,
         deleted_at: None,
         deleted_by: None,
         delete_reason: None,
@@ -765,6 +769,58 @@ fn upsert_issue_for_import_updates_existing() {
 }
 
 #[test]
+fn dotted_issue_ids_upsert_lookup_and_update_exact_rows() {
+    let mut storage = test_db();
+    let mut parent = fixtures::issue("dotted parent");
+    parent.id = "bd-rchk0.5".to_string();
+    let mut target = fixtures::issue("dotted target");
+    target.id = "bd-rchk0.5.6".to_string();
+    let mut child = fixtures::issue("dotted child");
+    child.id = "bd-rchk0.5.6.1".to_string();
+
+    storage.upsert_issue_for_import(&parent).unwrap();
+    storage.upsert_issue_for_import(&target).unwrap();
+    storage.upsert_issue_for_import(&child).unwrap();
+
+    assert!(storage.id_exists("bd-rchk0.5").unwrap());
+    assert!(storage.id_exists("bd-rchk0.5.6").unwrap());
+    assert!(storage.id_exists("bd-rchk0.5.6.1").unwrap());
+    assert_eq!(
+        storage.find_ids_by_hash("rchk0.5.6").unwrap(),
+        vec!["bd-rchk0.5.6".to_string()]
+    );
+
+    let update = IssueUpdate {
+        title: Some("Updated dotted target".to_string()),
+        priority: Some(Priority::HIGH),
+        ..IssueUpdate::default()
+    };
+    let updated = storage
+        .update_issue("bd-rchk0.5.6", &update, "tester")
+        .unwrap();
+
+    assert_eq!(updated.id, "bd-rchk0.5.6");
+    assert_eq!(updated.title, "Updated dotted target");
+    assert_eq!(updated.priority, Priority::HIGH);
+    assert_eq!(
+        storage
+            .get_issue("bd-rchk0.5")
+            .unwrap()
+            .expect("parent exists")
+            .title,
+        "dotted parent"
+    );
+    assert_eq!(
+        storage
+            .get_issue("bd-rchk0.5.6.1")
+            .unwrap()
+            .expect("child exists")
+            .title,
+        "dotted child"
+    );
+}
+
+#[test]
 fn upsert_issue_stores_all_fields() {
     let storage = test_db();
     let now = Utc::now();
@@ -800,6 +856,8 @@ fn upsert_issue_stores_all_fields() {
         closed_by_session: None,
         source_system: Some("test".to_string()),
         source_repo: None,
+        source_repo_path: None,
+        agent_context: None,
         deleted_at: None,
         deleted_by: None,
         delete_reason: None,

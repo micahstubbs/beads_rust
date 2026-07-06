@@ -439,6 +439,53 @@ fn e2e_dependency_errors() {
 }
 
 #[test]
+fn e2e_dep_add_blocks_ignores_non_blocking_cycle_edges() {
+    let _log = common::test_log("e2e_dep_add_blocks_ignores_non_blocking_cycle_edges");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let issue_a = run_br(&workspace, ["create", "Issue A"], "create_a");
+    assert!(
+        issue_a.status.success(),
+        "create A failed: {}",
+        issue_a.stderr
+    );
+    let id_a = parse_created_id(&issue_a.stdout);
+
+    let issue_b = run_br(&workspace, ["create", "Issue B"], "create_b");
+    assert!(
+        issue_b.status.success(),
+        "create B failed: {}",
+        issue_b.stderr
+    );
+    let id_b = parse_created_id(&issue_b.stdout);
+
+    let related = run_br(
+        &workspace,
+        ["dep", "add", &id_a, &id_b, "--type", "related"],
+        "dep_related",
+    );
+    assert!(
+        related.status.success(),
+        "related dep add failed: {}",
+        related.stderr
+    );
+
+    let blocks = run_br(
+        &workspace,
+        ["dep", "add", &id_b, &id_a, "--type", "blocks"],
+        "dep_blocks",
+    );
+    assert!(
+        blocks.status.success(),
+        "blocking dep should ignore non-blocking related edge: {}",
+        blocks.stderr
+    );
+}
+
+#[test]
 fn e2e_sync_invalid_orphans() {
     let _log = common::test_log("e2e_sync_invalid_orphans");
     let workspace = BrWorkspace::new();
@@ -3235,5 +3282,69 @@ fn e2e_sync_merge_detects_conflict_markers_in_base_snapshot() {
         !lower.contains("invalid json in base snapshot"),
         "merge error should surface the conflict-markers diagnostic rather than the generic JSON parse failure, got stderr: {}",
         merge.stderr
+    );
+}
+
+/// #336: In `--json` mode, the structured error envelope must go to STDOUT
+/// (where success JSON already goes) so robot callers read ONE clean,
+/// parseable stream. Tracing/log lines belong on stderr and must not be
+/// interleaved into the stdout JSON. Human mode keeps errors on stderr.
+#[test]
+fn e2e_json_failure_emits_parseable_json_on_stdout() {
+    let _log = common::test_log("e2e_json_failure_emits_parseable_json_on_stdout");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    // A failing command in --json mode: showing a non-existent issue.
+    let show = run_br(
+        &workspace,
+        ["show", "bd-doesnotexist", "--json"],
+        "show_missing_json",
+    );
+    assert!(
+        !show.status.success(),
+        "showing a missing issue should fail: stdout={} stderr={}",
+        show.stdout,
+        show.stderr
+    );
+
+    // The structured error envelope must be on STDOUT and fully parseable.
+    assert!(
+        !show.stdout.trim().is_empty(),
+        "json-mode error must be emitted on stdout, got empty stdout (stderr={})",
+        show.stderr
+    );
+    let payload = extract_json_payload(&show.stdout);
+    let value: Value = serde_json::from_str(&payload).unwrap_or_else(|e| {
+        panic!(
+            "json-mode error stdout must be parseable JSON: {e}\nstdout={}\nstderr={}",
+            show.stdout, show.stderr
+        )
+    });
+    // Sanity-check the structured envelope shape.
+    assert!(
+        value.get("error").is_some()
+            || value.get("code").is_some()
+            || value.get("message").is_some(),
+        "json error envelope should carry an error/code/message field, got: {value}"
+    );
+
+    // The HUMAN-mode counterpart keeps the error on stderr (stdout stays clean).
+    let human = run_br(
+        &workspace,
+        ["show", "bd-doesnotexist"],
+        "show_missing_human",
+    );
+    assert!(!human.status.success());
+    assert!(
+        serde_json::from_str::<Value>(human.stdout.trim()).is_err(),
+        "human mode must not emit JSON on stdout, got: {}",
+        human.stdout
+    );
+    assert!(
+        !human.stderr.trim().is_empty(),
+        "human-mode error should be on stderr"
     );
 }

@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env, run_br_with_stdin};
 use serde_json::Value;
 use std::fs;
 use std::process::Command;
@@ -98,6 +98,54 @@ fn rewrite_jsonl_issue_as_closed(workspace: &BrWorkspace, issue_id: &str) {
         .join("\n");
 
     fs::write(&jsonl_path, format!("{rewritten}\n")).expect("write issues.jsonl");
+}
+
+fn imported_issue_from_seed(seed_issue: &Value, id: &str, title: &str, description: &str) -> Value {
+    let mut issue = seed_issue.clone();
+    issue["id"] = Value::String(id.to_string());
+    issue["title"] = Value::String(title.to_string());
+    issue["description"] = Value::String(description.to_string());
+    issue["content_hash"] = Value::Null;
+    issue
+}
+
+fn mark_imported_issue_closed(issue: &mut Value) {
+    issue["status"] = Value::String("closed".to_string());
+    issue["closed_at"] = Value::String("2099-01-01T00:00:00Z".to_string());
+    issue["close_reason"] = Value::String("Closed before commit scan".to_string());
+}
+
+fn assert_mixed_prefix_dotted_orphans(stdout: &str) {
+    let payload = extract_json_payload(stdout);
+    let json: Value = serde_json::from_str(&payload).expect("parse orphans JSON");
+    let arr = json.as_array().expect("orphans output should be an array");
+    let ids: Vec<&str> = arr
+        .iter()
+        .filter_map(|orphan| orphan["issue_id"].as_str())
+        .collect();
+
+    assert!(
+        ids.contains(&"other-abc12"),
+        "missing mixed-prefix root issue in {ids:?}"
+    );
+    assert!(
+        ids.contains(&"other-abc12.1"),
+        "missing dotted mixed-prefix child issue in {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"other-dead99.1"),
+        "closed dotted child should not be reported as an orphan"
+    );
+
+    let child = arr
+        .iter()
+        .find(|orphan| orphan["issue_id"].as_str() == Some("other-abc12.1"))
+        .expect("dotted child orphan should be present");
+    assert_eq!(
+        child["title"].as_str(),
+        Some("Imported dotted child"),
+        "dotted child should retain imported issue details"
+    );
 }
 
 // =============================================================================
@@ -223,6 +271,55 @@ fn e2e_orphans_auto_imports_newer_jsonl_before_scanning_issue_state() {
 }
 
 #[test]
+fn e2e_orphans_fix_auto_flushes_closed_issue_to_jsonl() {
+    common::init_test_logging();
+    info!("e2e_orphans_fix_auto_flushes_closed_issue_to_jsonl: starting");
+    let workspace = BrWorkspace::new();
+
+    init_git(&workspace, "git_init");
+    let init = run_br(&workspace, ["init"], "br_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Close via orphans fix"],
+        "create_issue",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let issue_id = parse_created_id(&create.stdout);
+
+    git_commit(
+        &workspace,
+        &format!("Implement orphaned issue {issue_id}"),
+        "commit_ref",
+    );
+
+    let fix = run_br_with_stdin(&workspace, ["orphans", "--fix"], "y\n", "orphans_fix");
+    assert!(fix.status.success(), "orphans --fix failed: {}", fix.stderr);
+
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let exported_issue = fs::read_to_string(&jsonl_path)
+        .expect("read issues.jsonl")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).expect("parse issue json"))
+        .find(|issue| issue["id"].as_str() == Some(issue_id.as_str()))
+        .expect("exported issue");
+
+    assert_eq!(
+        exported_issue["status"].as_str(),
+        Some("closed"),
+        "orphans --fix must auto-flush the nested close to JSONL"
+    );
+    assert_eq!(
+        exported_issue["close_reason"].as_str(),
+        Some("Implemented (detected by orphans scan)")
+    );
+
+    info!("e2e_orphans_fix_auto_flushes_closed_issue_to_jsonl: assertions passed");
+}
+
+#[test]
 fn e2e_orphans_detects_issue_without_parens() {
     common::init_test_logging();
     info!("e2e_orphans_detects_issue_without_parens: starting");
@@ -303,6 +400,95 @@ fn e2e_orphans_json_output_structure() {
         "missing latest_commit_message"
     );
     info!("e2e_orphans_json_output_structure: assertions passed");
+}
+
+#[test]
+fn e2e_orphans_detects_mixed_prefix_and_dotted_child_refs() {
+    common::init_test_logging();
+    info!("e2e_orphans_detects_mixed_prefix_and_dotted_child_refs: starting");
+    let workspace = BrWorkspace::new();
+
+    init_git(&workspace, "git_init");
+    let init = run_br(
+        &workspace,
+        ["init", "--prefix", "local"],
+        "br_init_local_prefix",
+    );
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Local seed issue", "--json"],
+        "create_seed_issue",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let seed_payload = extract_json_payload(&create.stdout);
+    let seed_issue: Value = serde_json::from_str(&seed_payload).expect("seed issue JSON");
+
+    let imported_root = imported_issue_from_seed(
+        &seed_issue,
+        "other-abc12",
+        "Imported mixed-prefix root",
+        "Open issue with a non-default prefix",
+    );
+    let imported_child = imported_issue_from_seed(
+        &seed_issue,
+        "other-abc12.1",
+        "Imported dotted child",
+        "Open hierarchical issue with a non-default prefix",
+    );
+    let mut imported_closed_child = imported_issue_from_seed(
+        &seed_issue,
+        "other-dead99.1",
+        "Imported closed dotted child",
+        "Closed hierarchical issue with a non-default prefix",
+    );
+    mark_imported_issue_closed(&mut imported_closed_child);
+
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    fs::write(
+        &jsonl_path,
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            serde_json::to_string(&seed_issue).expect("serialize seed issue"),
+            serde_json::to_string(&imported_root).expect("serialize imported root"),
+            serde_json::to_string(&imported_child).expect("serialize imported child"),
+            serde_json::to_string(&imported_closed_child).expect("serialize imported closed child"),
+        ),
+    )
+    .expect("write mixed-prefix issues.jsonl");
+
+    let import = run_br(
+        &workspace,
+        ["sync", "--import-only", "--json"],
+        "sync_import_mixed_prefix_dotted",
+    );
+    assert!(
+        import.status.success(),
+        "sync --import-only failed: {}",
+        import.stderr
+    );
+
+    git_commit(
+        &workspace,
+        "Implement other-abc12 and child other-abc12.1; closed other-dead99.1",
+        "commit_mixed_prefix_dotted",
+    );
+
+    let orphans = run_br(
+        &workspace,
+        ["orphans", "--json"],
+        "orphans_mixed_prefix_dotted",
+    );
+    assert!(
+        orphans.status.success(),
+        "orphans failed: {}",
+        orphans.stderr
+    );
+
+    assert_mixed_prefix_dotted_orphans(&orphans.stdout);
+
+    info!("e2e_orphans_detects_mixed_prefix_and_dotted_child_refs: assertions passed");
 }
 
 // =============================================================================
@@ -420,6 +606,55 @@ fn e2e_orphans_before_init_returns_empty() {
         orphans.stdout
     );
     info!("e2e_orphans_before_init_returns_empty: assertions passed");
+}
+
+#[test]
+fn e2e_orphans_fix_before_init_returns_empty() {
+    common::init_test_logging();
+    info!("e2e_orphans_fix_before_init_returns_empty: starting");
+    let workspace = BrWorkspace::new();
+
+    let orphans = run_br_with_stdin(
+        &workspace,
+        ["orphans", "--fix"],
+        "\n",
+        "orphans_fix_no_init",
+    );
+    assert!(
+        orphans.status.success(),
+        "orphans --fix should succeed before init: {}",
+        orphans.stderr
+    );
+    assert!(
+        orphans.stdout.contains("No orphan"),
+        "expected empty orphans message, got: {}",
+        orphans.stdout
+    );
+    info!("e2e_orphans_fix_before_init_returns_empty: assertions passed");
+}
+
+#[test]
+fn e2e_orphans_fix_before_init_rejects_machine_output() {
+    common::init_test_logging();
+    info!("e2e_orphans_fix_before_init_rejects_machine_output: starting");
+    let workspace = BrWorkspace::new();
+
+    let orphans = run_br_with_stdin(
+        &workspace,
+        ["--json", "orphans", "--fix"],
+        "\n",
+        "orphans_fix_json_no_init",
+    );
+    assert!(
+        !orphans.status.success(),
+        "orphans --fix --json should fail before init"
+    );
+    assert!(
+        orphans.stderr.contains("--fix is interactive"),
+        "expected interactive-mode error, got: {}",
+        orphans.stderr
+    );
+    info!("e2e_orphans_fix_before_init_rejects_machine_output: assertions passed");
 }
 
 #[test]

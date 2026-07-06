@@ -15,7 +15,7 @@ mod common;
 
 use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env};
 use serde_json::Value;
-use toon_rust::try_decode;
+use toon_rust::try_decode as decode_toon;
 
 /// Helper to create a routes.jsonl file with given entries.
 fn create_routes_file(workspace: &BrWorkspace, entries: &[(&str, &str)]) {
@@ -74,6 +74,12 @@ fn issue_from_jsonl(workspace: &BrWorkspace, issue_id: &str) -> Value {
         .map(|line| serde_json::from_str::<Value>(line).expect("parse issue jsonl line"))
         .find(|issue| issue["id"].as_str() == Some(issue_id))
         .expect("issue should exist in issues.jsonl")
+}
+
+fn write_single_issue_jsonl(workspace: &BrWorkspace, issue: &Value) {
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let serialized = serde_json::to_string(issue).expect("serialize issue jsonl");
+    fs::write(&jsonl_path, format!("{serialized}\n")).expect("write issues.jsonl");
 }
 
 fn last_touched_path(workspace: &BrWorkspace) -> PathBuf {
@@ -450,7 +456,7 @@ fn e2e_routing_show_format_toon_routes_external_issue() {
     );
     assert!(show.status.success(), "show failed: {}", show.stderr);
 
-    let shown = Value::from(try_decode(show.stdout.trim(), None).expect("valid show TOON"));
+    let shown = Value::from(decode_toon(show.stdout.trim(), None).expect("valid show TOON"));
     let items = shown.as_array().expect("show TOON array");
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["id"].as_str(), Some(external_id.as_str()));
@@ -1150,6 +1156,93 @@ fn e2e_routing_defer_and_undefer_external_issue_via_main_workspace() {
 }
 
 #[test]
+fn e2e_routing_defer_and_undefer_import_stale_external_jsonl() {
+    let _log = common::test_log("e2e_routing_defer_and_undefer_import_stale_external_jsonl");
+
+    let main_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+
+    init_workspace(&main_workspace, "init_main");
+    init_workspace(&external_workspace, "init_external");
+    configure_external_route(&main_workspace, &external_workspace);
+
+    let external_id = create_issue_and_get_id(
+        &external_workspace,
+        "External defer stale db target",
+        "create_external_defer_stale_target",
+    );
+    let routed_input = routed_partial_id(&external_id);
+
+    let mut jsonl_issue = issue_from_jsonl(&external_workspace, &external_id);
+    jsonl_issue["title"] = Value::String("External defer title from JSONL".to_string());
+    jsonl_issue["updated_at"] = Value::String("2099-01-01T00:00:00Z".to_string());
+    write_single_issue_jsonl(&external_workspace, &jsonl_issue);
+
+    let defer = run_br(
+        &main_workspace,
+        ["defer", &routed_input, "--json"],
+        "defer_external_stale_jsonl_via_route",
+    );
+    assert!(defer.status.success(), "defer failed: {}", defer.stderr);
+    let deferred: Value =
+        serde_json::from_str(&extract_json_payload(&defer.stdout)).expect("defer json");
+    let deferred_array = deferred["deferred"].as_array().expect("deferred array");
+    assert_eq!(deferred_array.len(), 1);
+    assert_eq!(deferred_array[0]["id"].as_str(), Some(external_id.as_str()));
+    assert_eq!(deferred_array[0]["status"].as_str(), Some("deferred"));
+    assert_eq!(
+        deferred_array[0]["title"].as_str(),
+        Some("External defer title from JSONL")
+    );
+
+    let deferred_jsonl_issue = issue_from_jsonl(&external_workspace, &external_id);
+    assert_eq!(
+        deferred_jsonl_issue["title"].as_str(),
+        Some("External defer title from JSONL")
+    );
+    assert_eq!(deferred_jsonl_issue["status"].as_str(), Some("deferred"));
+
+    let mut stale_deferred_jsonl_issue = deferred_jsonl_issue;
+    stale_deferred_jsonl_issue["title"] =
+        Value::String("External undefer title from JSONL".to_string());
+    stale_deferred_jsonl_issue["updated_at"] = Value::String("2099-01-02T00:00:00Z".to_string());
+    write_single_issue_jsonl(&external_workspace, &stale_deferred_jsonl_issue);
+
+    let undefer = run_br(
+        &main_workspace,
+        ["undefer", &routed_input, "--json"],
+        "undefer_external_stale_jsonl_via_route",
+    );
+    assert!(
+        undefer.status.success(),
+        "undefer failed: {}",
+        undefer.stderr
+    );
+    let undeferred: Value =
+        serde_json::from_str(&extract_json_payload(&undefer.stdout)).expect("undefer json");
+    let undeferred_array = undeferred["undeferred"]
+        .as_array()
+        .expect("undeferred array");
+    assert_eq!(undeferred_array.len(), 1);
+    assert_eq!(
+        undeferred_array[0]["id"].as_str(),
+        Some(external_id.as_str())
+    );
+    assert_eq!(undeferred_array[0]["status"].as_str(), Some("open"));
+    assert_eq!(
+        undeferred_array[0]["title"].as_str(),
+        Some("External undefer title from JSONL")
+    );
+
+    let undeferred_jsonl_issue = issue_from_jsonl(&external_workspace, &external_id);
+    assert_eq!(
+        undeferred_jsonl_issue["title"].as_str(),
+        Some("External undefer title from JSONL")
+    );
+    assert_eq!(undeferred_jsonl_issue["status"].as_str(), Some("open"));
+}
+
+#[test]
 fn e2e_routing_label_add_and_list_external_issue_via_main_workspace() {
     let _log = common::test_log("e2e_routing_label_add_and_list_external_issue_via_main_workspace");
 
@@ -1414,6 +1507,67 @@ fn e2e_routing_comments_add_and_list_external_issue_via_main_workspace() {
     assert_eq!(
         jsonl_issue["comments"][0]["text"].as_str(),
         Some("Routed comment")
+    );
+}
+
+#[test]
+fn e2e_routing_comments_list_imports_stale_external_jsonl() {
+    let _log = common::test_log("e2e_routing_comments_list_imports_stale_external_jsonl");
+
+    let main_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+
+    init_workspace(&main_workspace, "init_main");
+    init_workspace(&external_workspace, "init_external");
+    configure_external_route(&main_workspace, &external_workspace);
+
+    let external_id = create_issue_and_get_id(
+        &external_workspace,
+        "External comments stale db target",
+        "create_external_comments_stale_target",
+    );
+    let routed_input = routed_partial_id(&external_id);
+
+    let mut jsonl_issue = issue_from_jsonl(&external_workspace, &external_id);
+    jsonl_issue["comments"] = serde_json::json!([
+        {
+            "id": 1,
+            "issue_id": external_id,
+            "author": "jsonl-author",
+            "text": "External comment from stale JSONL",
+            "created_at": "2099-01-01T00:00:00Z"
+        }
+    ]);
+    jsonl_issue["updated_at"] = Value::String("2099-01-01T00:00:00Z".to_string());
+    write_single_issue_jsonl(&external_workspace, &jsonl_issue);
+
+    let comment_list = run_br(
+        &main_workspace,
+        ["comments", "list", &routed_input, "--json"],
+        "comments_list_external_stale_jsonl_via_route",
+    );
+    assert!(
+        comment_list.status.success(),
+        "comments list failed: {}",
+        comment_list.stderr
+    );
+    let comments: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&comment_list.stdout)).expect("comments json");
+    assert_eq!(comments.len(), 1);
+    assert_eq!(comments[0]["issue_id"].as_str(), Some(external_id.as_str()));
+    assert_eq!(
+        comments[0]["text"].as_str(),
+        Some("External comment from stale JSONL")
+    );
+
+    let shown = show_issue_json(
+        &external_workspace,
+        &external_id,
+        "show_external_after_stale_comments_list",
+    );
+    assert_eq!(
+        shown[0]["comments"][0]["text"].as_str(),
+        Some("External comment from stale JSONL")
     );
 }
 
@@ -1739,7 +1893,7 @@ fn e2e_routing_graph_external_issue_via_main_workspace() {
     let routed_parent = routed_partial_id(&parent_id);
     let graph = run_br(
         &main_workspace,
-        ["graph", &routed_parent, "--json"],
+        ["--lock-timeout", "5", "graph", &routed_parent, "--json"],
         "graph_external_via_route",
     );
     assert!(graph.status.success(), "graph failed: {}", graph.stderr);
@@ -1905,6 +2059,95 @@ fn e2e_routing_delete_preview_does_not_mutate_earlier_local_batch() {
 
     let external_issue = issue_from_jsonl(&external_workspace, &blocker_id);
     assert_eq!(external_issue["status"].as_str(), Some("open"));
+}
+
+#[test]
+fn e2e_routing_delete_force_dry_run_reports_orphans_not_cascade() {
+    let _log = common::test_log("e2e_routing_delete_force_dry_run_reports_orphans_not_cascade");
+
+    let main_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+
+    init_workspace(&main_workspace, "init_main");
+    init_workspace(&external_workspace, "init_external");
+    configure_external_route(&main_workspace, &external_workspace);
+
+    let blocker_id = create_issue_and_get_id(
+        &external_workspace,
+        "External dry-run force blocker",
+        "create_external_dry_run_force_blocker",
+    );
+    let child_id = create_issue_and_get_id(
+        &external_workspace,
+        "External dry-run force child",
+        "create_external_dry_run_force_child",
+    );
+    let grandchild_id = create_issue_and_get_id(
+        &external_workspace,
+        "External dry-run force grandchild",
+        "create_external_dry_run_force_grandchild",
+    );
+
+    let child_dep = run_br(
+        &external_workspace,
+        ["dep", "add", &child_id, &blocker_id, "--json"],
+        "external_child_dep_add_for_force_dry_run",
+    );
+    assert!(
+        child_dep.status.success(),
+        "child dep add failed: {}",
+        child_dep.stderr
+    );
+    let grandchild_dep = run_br(
+        &external_workspace,
+        ["dep", "add", &grandchild_id, &child_id, "--json"],
+        "external_grandchild_dep_add_for_force_dry_run",
+    );
+    assert!(
+        grandchild_dep.status.success(),
+        "grandchild dep add failed: {}",
+        grandchild_dep.stderr
+    );
+
+    let routed_blocker = routed_partial_id(&blocker_id);
+    let delete = run_br(
+        &main_workspace,
+        ["delete", &routed_blocker, "--dry-run", "--force", "--json"],
+        "delete_force_dry_run_external_via_route",
+    );
+    assert!(
+        delete.status.success(),
+        "force dry-run delete failed: {}",
+        delete.stderr
+    );
+
+    let json: Value =
+        serde_json::from_str(&extract_json_payload(&delete.stdout)).expect("delete preview json");
+    assert_eq!(json["preview"].as_bool(), Some(true));
+    assert_eq!(
+        json["would_delete"].as_array().expect("would_delete array"),
+        &[Value::String(blocker_id.clone())]
+    );
+    assert_eq!(
+        json["orphaned_issues"]
+            .as_array()
+            .expect("orphaned_issues array"),
+        &[Value::String(child_id.clone())]
+    );
+    assert!(
+        json["cascade_delete"]
+            .as_array()
+            .expect("cascade_delete array")
+            .is_empty(),
+        "force dry-run must not report cascade deletes: {json}"
+    );
+
+    let blocker_issue = issue_from_jsonl(&external_workspace, &blocker_id);
+    assert_eq!(blocker_issue["status"].as_str(), Some("open"));
+    let child_issue = issue_from_jsonl(&external_workspace, &child_id);
+    assert_eq!(child_issue["status"].as_str(), Some("open"));
+    let grandchild_issue = issue_from_jsonl(&external_workspace, &grandchild_id);
+    assert_eq!(grandchild_issue["status"].as_str(), Some("open"));
 }
 
 #[test]

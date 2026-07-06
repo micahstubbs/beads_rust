@@ -1,5 +1,6 @@
 //! Version command implementation.
 
+use super::github_latest_release_api_url;
 use crate::cli::VersionArgs;
 use crate::error::{BeadsError, Result};
 use crate::output::{OutputContext, OutputMode};
@@ -279,11 +280,11 @@ fn fetch_latest_version() -> Result<String> {
     use std::io::Read;
 
     // Use GitHub API to get latest release
-    let url = "https://api.github.com/repos/Dicklesworthstone/beads_rust/releases/latest";
+    let url = github_latest_release_api_url();
 
     // Build request with User-Agent (required by GitHub)
     let mut handle = std::process::Command::new("curl")
-        .args(["-sS", "-H", "User-Agent: br-cli", url])
+        .args(["-sS", "-H", "User-Agent: br-cli", url.as_str()])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -413,6 +414,18 @@ mod tests {
         assert!(
             version.split('.').count() >= 2,
             "Version should have at least major.minor"
+        );
+    }
+
+    #[test]
+    fn latest_release_api_url_uses_shared_repo_constants() {
+        assert_eq!(
+            github_latest_release_api_url(),
+            format!(
+                "https://api.github.com/repos/{}/{}/releases/latest",
+                crate::cli::commands::GITHUB_REPO_OWNER,
+                crate::cli::commands::GITHUB_REPO_NAME
+            )
         );
     }
 }

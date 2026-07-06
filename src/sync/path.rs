@@ -149,6 +149,46 @@ fn normalize_path_lexically(path: &Path) -> Option<PathBuf> {
     Some(normalized)
 }
 
+fn symlink_escape_for_existing_ancestor(
+    path: &Path,
+    canonical_beads: &Path,
+) -> Option<PathValidation> {
+    for ancestor in path.ancestors() {
+        let Ok(metadata) = std::fs::symlink_metadata(ancestor) else {
+            continue;
+        };
+
+        if !metadata.file_type().is_symlink() {
+            continue;
+        }
+
+        let target = std::fs::read_link(ancestor)
+            .map(|target| resolve_symlink_target_for_validation(ancestor, &target))
+            .unwrap_or_else(|_| ancestor.to_path_buf());
+        if !target.starts_with(canonical_beads) {
+            return Some(PathValidation::SymlinkEscape {
+                path: ancestor.to_path_buf(),
+                target,
+            });
+        }
+    }
+
+    None
+}
+
+fn resolve_symlink_target_for_validation(link_path: &Path, target: &Path) -> PathBuf {
+    let anchored = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        link_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(target)
+    };
+    let normalized = normalize_path_lexically(&anchored).unwrap_or(anchored);
+    dunce::canonicalize(&normalized).unwrap_or(normalized)
+}
+
 /// Validates that a path does not target git internals.
 ///
 /// This is a hard safety invariant: sync operations NEVER access `.git/` directories.
@@ -188,18 +228,17 @@ pub fn validate_no_git_path(path: &Path) -> PathValidation {
         };
     }
 
-    // Resolve the canonical path when possible (catches symlinks to .git)
-    if let Ok(canonical) = dunce::canonicalize(path) {
-        if has_git_component(&canonical) {
-            return PathValidation::GitPathAttempt { path: canonical };
-        }
-    } else if let Some(parent) = path.parent()
-        && let Ok(canonical_parent) = dunce::canonicalize(parent)
-        && has_git_component(&canonical_parent)
-    {
-        return PathValidation::GitPathAttempt {
-            path: canonical_parent,
+    // Resolve each existing ancestor. The final path or its immediate parent
+    // may not exist yet, but a higher symlinked ancestor can still target .git.
+    for ancestor in path.ancestors() {
+        let Ok(canonical_ancestor) = dunce::canonicalize(ancestor) else {
+            continue;
         };
+        if has_git_component(&canonical_ancestor) {
+            return PathValidation::GitPathAttempt {
+                path: canonical_ancestor,
+            };
+        }
     }
 
     PathValidation::Allowed
@@ -277,6 +316,15 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
         }
     };
 
+    if let Some(result) = symlink_escape_for_existing_ancestor(&normalized_path, &canonical_beads) {
+        warn!(
+            path = %path.display(),
+            reason = %result.rejection_reason().unwrap_or_default(),
+            "Path validation rejected"
+        );
+        return result;
+    }
+
     if had_parent_dir
         && !normalized_path.starts_with(beads_dir)
         && !normalized_path.starts_with(&canonical_beads)
@@ -343,7 +391,7 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
     if normalized_path.is_symlink()
         && let Ok(target) = std::fs::read_link(&normalized_path)
     {
-        let canonical_target = dunce::canonicalize(&target).unwrap_or_else(|_| target.clone());
+        let canonical_target = resolve_symlink_target_for_validation(&normalized_path, &target);
         if !canonical_target.starts_with(&canonical_beads) {
             let result = PathValidation::SymlinkEscape {
                 path: path.to_path_buf(),
@@ -504,12 +552,6 @@ pub fn is_sync_path_allowed(path: &Path, beads_dir: &Path) -> bool {
         return false;
     };
 
-    // Check if path is under beads_dir and has allowed extension
-    if normalized_path.starts_with(beads_dir) {
-        return validate_extension_and_name(&normalized_path).is_allowed();
-    }
-
-    // Full validation for edge cases
     validate_sync_path(&normalized_path, beads_dir).is_allowed()
 }
 
@@ -554,7 +596,27 @@ pub fn validate_sync_path_with_external(
         ));
     }
 
-    // If external paths are allowed, only validate file type (not containment)
+    // If a path still points at `.beads/`, keep the stricter internal
+    // allowlist and symlink-escape checks even when external JSONL is enabled.
+    let canonical_beads =
+        dunce::canonicalize(beads_dir).unwrap_or_else(|_| beads_dir.to_path_buf());
+    let resolved_path = if path.is_relative() {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+    let is_internal = path.starts_with(beads_dir)
+        || path.starts_with(&canonical_beads)
+        || resolved_path.starts_with(beads_dir)
+        || resolved_path.starts_with(&canonical_beads);
+
+    if is_internal {
+        return require_valid_sync_path(path, beads_dir);
+    }
+
+    // If external paths are allowed, only validate file type (not containment).
     if allow_external {
         // Log the external path usage (safety invariant PC-2)
         tracing::info!(path = %path.display(), "Using external JSONL path (--allow-external-jsonl)");
@@ -1057,6 +1119,25 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn test_relative_internal_symlink_is_not_misclassified_as_escape() {
+        use std::os::unix::fs::symlink;
+
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let target_path = beads_dir.join("actual.jsonl");
+        std::fs::write(&target_path, "{}\n").expect("write target");
+        let symlink_path = beads_dir.join("linked.jsonl");
+        symlink("actual.jsonl", &symlink_path).expect("create relative symlink");
+
+        let result = validate_sync_path(&symlink_path, &beads_dir);
+
+        assert!(
+            matches!(result, PathValidation::NonRegularFile { .. }),
+            "internal relative symlink should be rejected as non-regular, not as an escape: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn test_validate_no_git_path_rejects_symlinked_git_parent() {
         use std::os::unix::fs::symlink;
 
@@ -1072,6 +1153,57 @@ mod tests {
         assert!(
             matches!(result, PathValidation::GitPathAttempt { .. }),
             "Symlinked parents targeting .git should be rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_no_git_path_rejects_missing_descendant_under_symlinked_git_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("create temp dir");
+        let git_dir = temp.path().join(".git");
+        std::fs::create_dir_all(&git_dir).expect("create .git dir");
+
+        let symlink_parent = temp.path().join("gitlink");
+        symlink(&git_dir, &symlink_parent).expect("create git symlink");
+
+        let candidate = symlink_parent.join("missing").join("issues.jsonl");
+        let result = validate_no_git_path(&candidate);
+        assert!(
+            matches!(result, PathValidation::GitPathAttempt { .. }),
+            "Missing descendants under symlinked .git parents should be rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_sync_path_with_external_rejects_missing_descendant_under_symlinked_git_parent()
+    {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("create temp dir");
+        let beads_dir = temp.path().join(".beads");
+        let git_dir = temp.path().join(".git");
+        std::fs::create_dir_all(&beads_dir).expect("create beads dir");
+        std::fs::create_dir_all(&git_dir).expect("create .git dir");
+
+        let symlink_parent = temp.path().join("gitlink");
+        symlink(&git_dir, &symlink_parent).expect("create git symlink");
+
+        let candidate = symlink_parent.join("missing").join("issues.jsonl");
+        let result = validate_sync_path_with_external(&candidate, &beads_dir, true);
+        assert!(
+            result.is_err(),
+            "External JSONL opt-in must not permit missing descendants under symlinked .git parents"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("git"),
+            "error should mention git path rejection"
+        );
+        assert!(
+            !git_dir.join("missing").exists(),
+            "validation must not create missing directories inside .git"
         );
     }
 
@@ -1101,6 +1233,50 @@ mod tests {
                 .to_string()
                 .contains("must not be a symlink"),
             "Error should explain why the external path was rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_sync_path_with_external_keeps_internal_symlink_escape_checks() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, beads_dir) = setup_test_beads_dir();
+        let outside_dir = temp.path().join("outside");
+        std::fs::create_dir_all(&outside_dir).expect("create outside dir");
+        let symlink_parent = beads_dir.join("linked");
+        symlink(&outside_dir, &symlink_parent).expect("create symlinked parent");
+
+        let path = symlink_parent.join("issues.jsonl");
+        let result = validate_sync_path_with_external(&path, &beads_dir, true);
+
+        assert!(
+            result.is_err(),
+            "Internal-looking paths must not bypass .beads symlink-escape checks"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_sync_path_rejects_missing_descendant_under_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, beads_dir) = setup_test_beads_dir();
+        let outside_dir = temp.path().join("outside");
+        std::fs::create_dir_all(&outside_dir).expect("create outside dir");
+        let symlink_parent = beads_dir.join("linked");
+        symlink(&outside_dir, &symlink_parent).expect("create symlinked parent");
+
+        let path = symlink_parent.join("nested").join("issues.jsonl");
+        let result = validate_sync_path(&path, &beads_dir);
+
+        assert!(
+            matches!(result, PathValidation::SymlinkEscape { .. }),
+            "Missing descendants below an escaping symlink parent must be rejected"
+        );
+        assert!(
+            !outside_dir.join("nested").exists(),
+            "validation must not create external parent directories"
         );
     }
 
@@ -1357,6 +1533,137 @@ mod tests {
                 .to_string()
                 .contains("not a regular file"),
             "error should mention regular file"
+        );
+    }
+
+    // ========================================================================
+    // beads_rust-yyxo: tests for sync-safety invariants under SYNC_SAFETY_INVARIANTS.md
+    // PC-1, PC-3, PC-RECOVERY (added 2026-05-09 by audit-2026-05-09)
+    // ========================================================================
+
+    /// PC-1 / PC-3: a symlink inside `.beads/` whose canonicalized target
+    /// escapes via `..` must be rejected as a SymlinkEscape, not silently
+    /// accepted via lexical normalization. Linux-only because Windows
+    /// symlink semantics differ.
+    #[cfg(unix)]
+    #[test]
+    fn validate_sync_path_rejects_canonicalized_traversal() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, beads_dir) = setup_test_beads_dir();
+        // External target outside .beads/
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(&external).expect("create external");
+        let external_target = external.join("escape.jsonl");
+        std::fs::write(&external_target, "{}").expect("write external");
+
+        // Create a symlink inside .beads/ that points to the external file
+        let symlink_path = beads_dir.join("issues.jsonl");
+        symlink(&external_target, &symlink_path).expect("create escape symlink");
+
+        let result = validate_sync_path(&symlink_path, &beads_dir);
+        assert!(
+            !result.is_allowed(),
+            "symlink whose target escapes .beads/ must be rejected; got {result:?}"
+        );
+        assert!(
+            matches!(result, PathValidation::SymlinkEscape { .. }),
+            "expected SymlinkEscape, got {result:?}"
+        );
+    }
+
+    /// PC-RECOVERY: paths under `.beads/.br_recovery/` are NOT directly
+    /// validated by `validate_sync_path` (recovery has its own path
+    /// validation in `src/config/mod.rs`). This test asserts the contract
+    /// boundary: `.bak` extension is NOT in the sync-direct allowlist
+    /// (it was never written through sync's path), but the test
+    /// allowlist in `tests/e2e_sync_git_safety.rs` recognizes them as
+    /// legitimate side-effect writes during sync invocation.
+    #[test]
+    fn validate_sync_path_does_not_accept_recovery_bak_directly() {
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let recovery = beads_dir.join(".br_recovery");
+        std::fs::create_dir_all(&recovery).expect("create recovery dir");
+        let bak = recovery.join("beads.db.20260101_000000_0.bak");
+        std::fs::write(&bak, "").expect("write");
+
+        let result = validate_sync_path(&bak, &beads_dir);
+        assert!(
+            !result.is_allowed(),
+            "sync's validate_sync_path must NOT accept .bak (recovery owns its own path validation); got {result:?}"
+        );
+        assert!(
+            matches!(result, PathValidation::DisallowedExtension { .. }),
+            "expected DisallowedExtension, got {result:?}"
+        );
+    }
+
+    /// PC-1 / PC-3: a path constructed to look like `.beads/.git/foo` must
+    /// be rejected as `GitPathAttempt` regardless of whether `.beads/.git`
+    /// exists or contains the actual repo. Hard invariant NGI-3.
+    #[test]
+    fn validate_sync_path_rejects_dotgit_under_beads() {
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let git_path = beads_dir.join(".git").join("HEAD");
+
+        let result = validate_sync_path(&git_path, &beads_dir);
+        assert!(
+            !result.is_allowed(),
+            ".beads/.git/* must always be rejected; got {result:?}"
+        );
+        assert!(
+            matches!(result, PathValidation::GitPathAttempt { .. }),
+            "expected GitPathAttempt, got {result:?}"
+        );
+    }
+
+    /// PC-1: `validate_sync_path` (the in-tree validator) MUST reject
+    /// arbitrary external paths even when `BEADS_JSONL`-style env vars
+    /// are NOT in play. Use `validate_sync_path_with_external` when the
+    /// caller has explicit external-jsonl authorization.
+    #[test]
+    fn validate_sync_path_rejects_absolute_external_path() {
+        let (temp, beads_dir) = setup_test_beads_dir();
+        let external = temp.path().join("outside");
+        std::fs::create_dir_all(&external).expect("create external");
+        let outside = external.join("issues.jsonl");
+        std::fs::write(&outside, "{}").expect("write");
+
+        let result = validate_sync_path(&outside, &beads_dir);
+        assert!(
+            !result.is_allowed(),
+            "external path must be rejected by in-tree validator; got {result:?}"
+        );
+        assert!(
+            matches!(result, PathValidation::OutsideBeadsDir { .. }),
+            "expected OutsideBeadsDir, got {result:?}"
+        );
+    }
+
+    /// PC-1: the explicit-external-jsonl validator
+    /// (`validate_sync_path_with_external`) MUST accept a non-`.beads/`
+    /// path when `allow_external` is true, but still reject
+    /// `.beads/.git/*` and traversal attempts.
+    #[test]
+    fn validate_sync_path_with_external_accepts_explicit_outside_target() {
+        let (temp, beads_dir) = setup_test_beads_dir();
+        let external_root = temp.path().join("custom-jsonl-store");
+        std::fs::create_dir_all(&external_root).expect("create external root");
+        let external_target = external_root.join("my-issues.jsonl");
+        std::fs::write(&external_target, "{}").expect("write external");
+
+        let result = validate_sync_path_with_external(&external_target, &beads_dir, true);
+        assert!(
+            result.is_ok(),
+            "explicit external path must be allowed when allow_external=true; got {result:?}"
+        );
+
+        // But .git rejection still applies
+        let git_under_external = external_root.join(".git").join("HEAD");
+        let git_result = validate_sync_path_with_external(&git_under_external, &beads_dir, true);
+        assert!(
+            git_result.is_err(),
+            "explicit external must STILL reject .git/* even with allow_external=true; got {git_result:?}"
         );
     }
 }

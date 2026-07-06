@@ -12,26 +12,36 @@
 //! - [`storage`] - `SQLite` database layer
 //! - [`sync`] - JSONL import/export operations
 //! - [`config`] - Configuration management
+//! - [`cache`] - Pure cache policies for high-RAM acceleration
+//! - [`coordination`] - Pure swarm coordination evidence contracts
 //! - [`error`] - Error types and handling
 //! - [`format`] - Output formatting (text, JSON)
 //! - [`util`] - Utility functions (hashing, time, paths)
+//! - [`write_combining`] - Compatibility contracts for future write combining
 
 #![forbid(unsafe_code)]
 // Lint configuration is in Cargo.toml [lints.clippy] section
 #![allow(clippy::module_name_repetitions)]
 
+pub mod cache;
 pub mod cli;
+pub mod close_policy;
 pub mod config;
+pub mod coordination;
 pub mod error;
 pub mod format;
 pub mod health;
+pub mod inheritance;
 pub mod logging;
 pub mod model;
 pub mod output;
+pub mod policy;
+pub mod shutdown;
 pub mod storage;
 pub mod sync;
 pub mod util;
 pub mod validation;
+pub mod write_combining;
 
 #[cfg(feature = "mcp")]
 pub mod mcp;

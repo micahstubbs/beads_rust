@@ -163,16 +163,141 @@ use isolated workspaces so source datasets are never mutated.
 ```bash
 cargo test --test bench_cold_warm_start -- --nocapture --ignored
 HARNESS_ARTIFACTS=1 cargo test --test bench_cold_warm_start -- --nocapture --ignored
+cargo test --test bench_cold_warm_start startup_matrix_smoke_bundle -- --nocapture
+cargo test --test bench_cold_warm_start perf_evidence_smoke_bundle -- --nocapture
 ```
 Outputs: `target/benchmark-results/cold_warm_*_latest.json`,
-`target/benchmark-results/cold_warm_all_<timestamp>.json`
+`target/benchmark-results/cold_warm_all_<timestamp>.json`. The startup matrix
+smoke test also writes a validated bundle under
+`target/perf-artifacts/startup-matrix-smoke-*/` with command logs, timing,
+syscall, RSS, and raw stdout/stderr slots for clean, stale, routed, no-db,
+read-only-fast-open, sync-status, and recovery-anomaly startup states. The perf
+evidence smoke test writes `target/perf-artifacts/perf-evidence-smoke-*/` with
+the `perf-evidence-manifest.json`, timing samples, placeholder syscall/IO/RSS
+slots, golden stdout/stderr checksums, an isomorphism note, and an enforcing
+self-baseline comparison.
 
-**Synthetic scale (10k–250k issues)**
+**Synthetic scale (CI profile, 10k–250k issues, and manual million-agent profile)**
 ```bash
+ cargo test --test bench_synthetic_scale synthetic_ci_profile -- --nocapture
 BR_E2E_STRESS=1 cargo test --test bench_synthetic_scale -- --nocapture --ignored
+BR_E2E_STRESS=1 BR_SYNTHETIC_MILLION=1 BR_SYNTHETIC_SEED=42 \
+  cargo test --test bench_synthetic_scale stress_synthetic_million -- --nocapture --ignored
 ```
 Outputs: `target/benchmark-results/synthetic_*_latest.json`,
-`target/benchmark-results/synthetic_all_<timestamp>.json`
+`target/benchmark-results/synthetic_all_<timestamp>.json`. The generator streams
+deterministic JSONL directly, then validates the corpus through real
+`br sync --import-only`, `br doctor --json`, and `br sync --status --json`
+surfaces. Each generated workspace writes `synthetic-corpus-manifest.json` with
+the seed, issue count, dependency density, label/comment distributions, simulated
+agent count, claim density, skewed-DAG factor, JSONL hash, file-size report, and
+health results. The manual million profile targets 1,000,000 issues and 10,000
+simulated agents when the host has enough memory and CPU. The benchmark operation
+set includes `graph_hot_hub` for wide reverse-dependent graph reads and
+`dep_tree_hot_leaf` for bounded deep dependency-tree reads on the skewed DAG.
+`graph_all_components` is included only for corpora up to 10,000 issues so the
+small profile records full connected-component graph evidence without forcing
+million-issue profiles to materialize a full graph JSON document.
+
+**Contention replay lab (CI smoke and manual 64-worker profile)**
+```bash
+cargo test --test bench_contention_replay -- --nocapture
+BR_CONTENTION_64=1 cargo test --test bench_contention_replay \
+  manual_64_worker_contention_profile_records_replayable_trace -- --ignored --nocapture
+```
+Outputs: `target/test-artifacts/contention-replay/<profile>-seed-*/`.
+The trace schema records worker id, command, start/end timing, estimated write
+lock wait, auto-import/auto-flush classification, exit code, stdout/stderr
+hashes, and replay seed. Replay creates a fresh workspace from only the trace
+plan and reports the first divergent worker/event if exit codes or created
+issue effects differ.
+
+**NUMA/high-core read-command profile (manual 64+ core evidence)**
+```bash
+export BR_NUMA_PROFILE_DIR=tests/artifacts/perf/beads-perf-<timestamp>-numa-read-command-profile
+export BR_NUMA_PROFILE_WORKSPACE=/data/tmp/br-large-read-profile
+export BR_NUMA_PROFILE_BINARY=/data/tmp/br-release/release/br
+
+mkdir -p "$BR_NUMA_PROFILE_DIR"/{env,commands,golden,timing,syscalls,raw}
+lscpu > "$BR_NUMA_PROFILE_DIR/env/lscpu.txt"
+lscpu --json > "$BR_NUMA_PROFILE_DIR/env/lscpu.json"
+numactl --hardware > "$BR_NUMA_PROFILE_DIR/env/numactl-hardware.txt"
+free -b > "$BR_NUMA_PROFILE_DIR/env/free-bytes.txt"
+
+hyperfine --warmup 2 --runs 10 \
+  --export-json "$BR_NUMA_PROFILE_DIR/timing/hyperfine-default.json" \
+  --command-name list_json_limit100 \
+    "NO_COLOR=1 $BR_NUMA_PROFILE_BINARY --no-auto-import --no-auto-flush list --json --limit 100" \
+  --command-name ready_json_limit100 \
+    "NO_COLOR=1 $BR_NUMA_PROFILE_BINARY --no-auto-import --no-auto-flush ready --json --limit 100" \
+  --command-name scheduler_json_candidate100 \
+    "NO_COLOR=1 $BR_NUMA_PROFILE_BINARY --no-auto-import --no-auto-flush scheduler --json --candidate-limit 100" \
+  --command-name search_agent_json_limit100 \
+    "NO_COLOR=1 $BR_NUMA_PROFILE_BINARY --no-auto-import --no-auto-flush search agent --json --limit 100" \
+  --command-name stats_no_activity_json \
+    "NO_COLOR=1 $BR_NUMA_PROFILE_BINARY --no-auto-import --no-auto-flush stats --no-activity --json" \
+  --command-name label_list_all_json \
+    "NO_COLOR=1 $BR_NUMA_PROFILE_BINARY --no-auto-import --no-auto-flush label list-all --json"
+```
+Run the same matrix pinned to one logical CPU:
+
+```bash
+hyperfine --warmup 2 --runs 10 \
+  --export-json "$BR_NUMA_PROFILE_DIR/timing/hyperfine-pinned-cpu0.json" \
+  --command-name list_json_limit100_cpu0 \
+    "taskset -c 0 env NO_COLOR=1 $BR_NUMA_PROFILE_BINARY --no-auto-import --no-auto-flush list --json --limit 100" \
+  --command-name ready_json_limit100_cpu0 \
+    "taskset -c 0 env NO_COLOR=1 $BR_NUMA_PROFILE_BINARY --no-auto-import --no-auto-flush ready --json --limit 100" \
+  --command-name scheduler_json_candidate100_cpu0 \
+    "taskset -c 0 env NO_COLOR=1 $BR_NUMA_PROFILE_BINARY --no-auto-import --no-auto-flush scheduler --json --candidate-limit 100" \
+  --command-name search_agent_json_limit100_cpu0 \
+    "taskset -c 0 env NO_COLOR=1 $BR_NUMA_PROFILE_BINARY --no-auto-import --no-auto-flush search agent --json --limit 100" \
+  --command-name stats_no_activity_json_cpu0 \
+    "taskset -c 0 env NO_COLOR=1 $BR_NUMA_PROFILE_BINARY --no-auto-import --no-auto-flush stats --no-activity --json" \
+  --command-name label_list_all_json_cpu0 \
+    "taskset -c 0 env NO_COLOR=1 $BR_NUMA_PROFILE_BINARY --no-auto-import --no-auto-flush label list-all --json"
+```
+On hosts where `numactl --hardware` reports at least two nodes, also run a
+cross-node matrix such as `numactl --cpunodebind=0 --membind=1 ...` and the
+reverse binding. On single-node hosts, keep a `cross_numa` entry in
+`manifest.json` with `status: "unavailable_on_pilot_host"` and preserve the raw
+`numactl` output.
+
+For each command, capture one `strace -qq -c -o ...` summary and one golden
+stdout/stderr pair. The profile bundle must include `env.json`, `manifest.json`,
+command stdout/stderr files, `golden/command-output-sha256.txt`, raw hyperfine
+samples, p50/p95/p99 summaries, syscall summaries, and `notes.md` with the tail
+decomposition across queueing/lock, service CPU, IO/page reads, and
+serialization/output. See `docs/ARTIFACT_LOG_SCHEMA.md` for
+`br.numa-read-command-profile.v1`.
+
+**Swarm capacity-planning report (manual operator artifact)**
+```bash
+export BR_CAPACITY_REPORT_DIR=tests/artifacts/perf/beads-perf-<timestamp>-swarm-capacity-planning
+export BR_CAPACITY_WORKSPACE=/data/tmp/br-large-read-profile
+export BR_CAPACITY_BINARY=/data/tmp/br-release/release/br
+export BR_NUMA_PROFILE_DIR=tests/artifacts/perf/beads-perf-<timestamp>-numa-read-command-profile
+
+mkdir -p "$BR_CAPACITY_REPORT_DIR"/{inputs,golden}
+cp "$BR_NUMA_PROFILE_DIR/env.json" "$BR_CAPACITY_REPORT_DIR/inputs/numa-env.json"
+cp "$BR_NUMA_PROFILE_DIR/timing/default-summary.json" \
+  "$BR_CAPACITY_REPORT_DIR/inputs/read-default-summary.json"
+cp "$BR_NUMA_PROFILE_DIR/timing/pinned-cpu0-summary.json" \
+  "$BR_CAPACITY_REPORT_DIR/inputs/read-pinned-cpu0-summary.json"
+
+"$BR_CAPACITY_BINARY" --no-auto-import --no-auto-flush count --json \
+  > "$BR_CAPACITY_REPORT_DIR/inputs/count.json"
+"$BR_CAPACITY_BINARY" --no-auto-import --no-auto-flush sync --status --json \
+  > "$BR_CAPACITY_REPORT_DIR/inputs/sync-status.json"
+"$BR_CAPACITY_BINARY" --no-auto-import --no-auto-flush doctor --json \
+  > "$BR_CAPACITY_REPORT_DIR/inputs/doctor.json"
+```
+The report should emit both `report.json` and `report.md`. The JSON report uses
+`br.swarm-capacity-report.v1` and must include source evidence paths, issue
+count, dirty/export state, doctor status, host profile, weighted read p95,
+assumed command cadence, green/yellow/red agent bands, laptop/small-VM fallback
+guidance, and invalidation rules. The Markdown report is the operator-facing
+view. Always include `golden/report-sha256.txt` for snapshot-style checks.
 
 **Real datasets**
 ```bash

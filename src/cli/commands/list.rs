@@ -3,7 +3,10 @@
 //! Primary discovery interface with classic filter semantics and
 //! paginated `ListPage` JSON output. Supports text, JSON, and CSV formats.
 
-use crate::cli::{ListArgs, OutputFormat, resolve_output_format_with_outer_mode};
+use crate::cli::{
+    DEFAULT_LIST_LIMIT, DEFAULT_LIST_OFFSET, ListArgs, OutputFormat,
+    resolve_output_format_with_outer_mode,
+};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::csv;
@@ -12,11 +15,16 @@ use crate::format::{
     format_issue_pretty_with, terminal_width,
 };
 use crate::model::{IssueType, Priority, Status};
-use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
+use crate::output::{IssueTable, IssueTableColumns, JsonArrayPageMeta, OutputContext, OutputMode};
 use crate::storage::ListFilters;
+use crate::storage::sqlite::ListRelationMetadata;
 use chrono::Utc;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
+
+// Large default-visible structured pages are faster through the existing full
+// scan/relation path; smaller pages keep the medium-page relation queries.
+const LARGE_STRUCTURED_LIST_FULL_SCAN_THRESHOLD: usize = 96;
 
 /// Execute the list command.
 ///
@@ -72,15 +80,29 @@ fn execute_inner(
     let is_json_output = matches!(output_format, OutputFormat::Json | OutputFormat::Toon);
 
     // The effective limit and offset from the user's request.
-    let user_limit = args.limit.unwrap_or(50);
-    let user_offset = args.offset.unwrap_or(0);
+    let user_limit = args.limit.unwrap_or(DEFAULT_LIST_LIMIT);
+    let user_offset = args.offset.unwrap_or(DEFAULT_LIST_OFFSET);
+    let use_full_default_visible_structured_scan = should_use_full_default_visible_structured_scan(
+        args,
+        client_filters,
+        is_json_output,
+        user_limit,
+        user_offset,
+    );
+    if use_full_default_visible_structured_scan {
+        filters.limit = Some(0);
+        filters.offset = Some(0);
+    }
 
     // For paginated structured SQL-path queries, run a COUNT(*) query using the
     // same filters (without LIMIT/OFFSET) so we can include pagination metadata.
     // Unlimited output already materializes the full matching set, so its exact
     // total is the issue vector length after the list query.
     // For client-filter path, the total count is determined after filtering in Rust.
-    let needs_sql_total = is_json_output && !client_filters && user_limit != 0;
+    let needs_sql_total = is_json_output
+        && !client_filters
+        && !use_full_default_visible_structured_scan
+        && (user_limit != 0 || user_offset != 0);
     let sql_total: Option<usize> = if needs_sql_total {
         Some(storage.count_issues_with_filters(&filters)?)
     } else {
@@ -98,7 +120,11 @@ fn execute_inner(
     } else {
         // Bump SQL limit by 1 to detect whether results were truncated (text output).
         // For JSON output, we already have the exact total from the count query.
-        let ul = filters.limit;
+        let ul = if use_full_default_visible_structured_scan {
+            Some(user_limit)
+        } else {
+            filters.limit
+        };
         if !is_json_output
             && let Some(lim) = filters.limit
             && lim > 0
@@ -111,8 +137,17 @@ fn execute_inner(
     // Validate sort key before query
     validate_sort_key(args.sort.as_deref())?;
 
+    let use_projected_text_rows = matches!(output_format, OutputFormat::Text)
+        && !args.long
+        && !args.pretty
+        && !client_filters;
+
     // Query issues
-    let mut issues = storage.list_issues(&filters)?;
+    let mut issues = if use_projected_text_rows {
+        storage.list_text_issues_for_command_output(&filters)?
+    } else {
+        storage.list_issues(&filters)?
+    };
     if client_filters {
         issues = apply_client_filters(issues, args)?;
     }
@@ -178,47 +213,8 @@ fn execute_inner(
     match output_format {
         OutputFormat::Json | OutputFormat::Toon => {
             let ctx = OutputContext::from_output_format(output_format, quiet, true);
-            let use_full_relation_scan =
-                should_use_full_relation_scan(args, client_filters, user_limit, user_offset);
-            let issues_with_counts: Vec<IssueWithCounts> = if use_full_relation_scan {
-                let mut relation_metadata = storage.get_all_list_relation_metadata()?;
-                issues
-                    .into_iter()
-                    .map(|mut issue| {
-                        let metadata = relation_metadata.remove(&issue.id).unwrap_or_default();
-                        issue.labels = metadata.labels;
-
-                        IssueWithCounts {
-                            issue,
-                            dependency_count: metadata.dependency_count,
-                            dependent_count: metadata.dependent_count,
-                        }
-                    })
-                    .collect()
-            } else {
-                let issue_ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
-                let mut labels_map = storage.get_labels_for_issues(&issue_ids)?;
-                let (dependency_counts, dependent_counts) =
-                    storage.count_relation_counts_for_issues(&issue_ids)?;
-
-                issues
-                    .into_iter()
-                    .map(|mut issue| {
-                        if let Some(labels) = labels_map.remove(&issue.id) {
-                            issue.labels = labels;
-                        }
-
-                        let dependency_count = *dependency_counts.get(&issue.id).unwrap_or(&0);
-                        let dependent_count = *dependent_counts.get(&issue.id).unwrap_or(&0);
-
-                        IssueWithCounts {
-                            issue,
-                            dependency_count,
-                            dependent_count,
-                        }
-                    })
-                    .collect()
-            };
+            let use_full_relation_scan = use_full_default_visible_structured_scan
+                || should_use_full_relation_scan(args, client_filters, user_limit, user_offset);
 
             let has_more = if user_limit == 0 {
                 false
@@ -226,8 +222,7 @@ fn execute_inner(
                 json_total > user_offset.saturating_add(user_limit)
             };
 
-            let page = ListPage {
-                issues: issues_with_counts,
+            let page_meta = JsonArrayPageMeta {
                 total: json_total,
                 limit: user_limit,
                 offset: user_offset,
@@ -235,9 +230,26 @@ fn execute_inner(
             };
 
             if matches!(output_format, OutputFormat::Toon) {
-                ctx.toon_with_stats(&page, args.stats);
+                let issues_with_counts =
+                    collect_issues_with_counts(storage, issues, use_full_relation_scan)?;
+                let page = ListPage {
+                    issues: issues_with_counts,
+                    total: page_meta.total,
+                    limit: page_meta.limit,
+                    offset: page_meta.offset,
+                    has_more: page_meta.has_more,
+                };
+                if !ctx.toon_list_page_with_stats(&page, args.stats) {
+                    ctx.toon_with_stats(&page, args.stats);
+                }
             } else {
-                ctx.json_pretty(&page);
+                stream_issues_with_counts(
+                    &ctx,
+                    storage,
+                    issues,
+                    use_full_relation_scan,
+                    page_meta,
+                )?;
             }
         }
         OutputFormat::Csv => {
@@ -308,6 +320,120 @@ fn execute_inner(
     Ok(())
 }
 
+fn collect_issues_with_counts(
+    storage: &crate::storage::SqliteStorage,
+    issues: Vec<crate::model::Issue>,
+    use_full_relation_scan: bool,
+) -> Result<Vec<IssueWithCounts>> {
+    if use_full_relation_scan {
+        let mut relation_metadata = storage.get_all_list_relation_metadata()?;
+        Ok(issues
+            .into_iter()
+            .map(|issue| issue_with_full_relation_metadata(issue, &mut relation_metadata))
+            .collect())
+    } else {
+        let (mut labels_map, dependency_counts, dependent_counts) =
+            load_relation_metadata_for_issues(storage, &issues)?;
+        Ok(issues
+            .into_iter()
+            .map(|issue| {
+                issue_with_batched_relation_metadata(
+                    issue,
+                    &mut labels_map,
+                    &dependency_counts,
+                    &dependent_counts,
+                )
+            })
+            .collect())
+    }
+}
+
+fn stream_issues_with_counts(
+    ctx: &OutputContext,
+    storage: &crate::storage::SqliteStorage,
+    issues: Vec<crate::model::Issue>,
+    use_full_relation_scan: bool,
+    page_meta: JsonArrayPageMeta,
+) -> Result<()> {
+    if use_full_relation_scan {
+        let mut relation_metadata = storage.get_all_list_relation_metadata()?;
+        ctx.json_array_page(
+            "issues",
+            issues
+                .into_iter()
+                .map(|issue| issue_with_full_relation_metadata(issue, &mut relation_metadata)),
+            page_meta,
+        );
+    } else {
+        let (mut labels_map, dependency_counts, dependent_counts) =
+            load_relation_metadata_for_issues(storage, &issues)?;
+        ctx.json_array_page(
+            "issues",
+            issues.into_iter().map(|issue| {
+                issue_with_batched_relation_metadata(
+                    issue,
+                    &mut labels_map,
+                    &dependency_counts,
+                    &dependent_counts,
+                )
+            }),
+            page_meta,
+        );
+    }
+    Ok(())
+}
+
+type BatchedRelationMetadata = (
+    HashMap<String, Vec<String>>,
+    HashMap<String, usize>,
+    HashMap<String, usize>,
+);
+
+fn load_relation_metadata_for_issues(
+    storage: &crate::storage::SqliteStorage,
+    issues: &[crate::model::Issue],
+) -> Result<BatchedRelationMetadata> {
+    let issue_ids: Vec<String> = issues.iter().map(|issue| issue.id.clone()).collect();
+    let labels_map = storage.get_labels_for_issues(&issue_ids)?;
+    let (dependency_counts, dependent_counts) =
+        storage.count_relation_counts_for_issues(&issue_ids)?;
+    Ok((labels_map, dependency_counts, dependent_counts))
+}
+
+fn issue_with_full_relation_metadata(
+    mut issue: crate::model::Issue,
+    relation_metadata: &mut HashMap<String, ListRelationMetadata>,
+) -> IssueWithCounts {
+    let metadata = relation_metadata.remove(&issue.id).unwrap_or_default();
+    issue.labels = metadata.labels;
+
+    IssueWithCounts {
+        issue,
+        dependency_count: metadata.dependency_count,
+        dependent_count: metadata.dependent_count,
+    }
+}
+
+fn issue_with_batched_relation_metadata(
+    mut issue: crate::model::Issue,
+    labels_map: &mut HashMap<String, Vec<String>>,
+    dependency_counts: &HashMap<String, usize>,
+    dependent_counts: &HashMap<String, usize>,
+) -> IssueWithCounts {
+    if let Some(labels) = labels_map.remove(&issue.id) {
+        issue.labels = labels;
+    }
+
+    let dependency_count = *dependency_counts.get(&issue.id).unwrap_or(&0);
+    let dependent_count = *dependent_counts.get(&issue.id).unwrap_or(&0);
+
+    IssueWithCounts {
+        issue,
+        dependency_count,
+        dependent_count,
+    }
+}
+
 /// Convert CLI args to storage filter.
 fn build_filters(args: &ListArgs) -> Result<ListFilters> {
     // Parse status strings to Status enums
@@ -370,8 +496,8 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         include_deferred,
         include_templates: false,
         title_contains: args.title_contains.clone(),
-        limit: args.limit,
-        offset: args.offset,
+        limit: Some(args.limit.unwrap_or(DEFAULT_LIST_LIMIT)),
+        offset: Some(args.offset.unwrap_or(DEFAULT_LIST_OFFSET)),
         sort: args.sort.clone(),
         reverse: args.reverse,
         labels: if args.label.is_empty() {
@@ -416,7 +542,6 @@ fn should_use_full_relation_scan(
     !client_filters
         && user_limit == 0
         && user_offset == 0
-        && args.all
         && args.status.is_empty()
         && args.type_.is_empty()
         && args.priority.is_empty()
@@ -425,6 +550,30 @@ fn should_use_full_relation_scan(
         && args.title_contains.is_none()
         && args.label.is_empty()
         && args.label_any.is_empty()
+}
+
+fn should_use_full_default_visible_structured_scan(
+    args: &ListArgs,
+    client_filters: bool,
+    is_structured_output: bool,
+    user_limit: usize,
+    user_offset: usize,
+) -> bool {
+    is_structured_output
+        && !client_filters
+        && user_offset == 0
+        && user_limit >= LARGE_STRUCTURED_LIST_FULL_SCAN_THRESHOLD
+        && !args.all
+        && args.status.is_empty()
+        && args.type_.is_empty()
+        && args.priority.is_empty()
+        && args.assignee.is_none()
+        && !args.unassigned
+        && args.title_contains.is_none()
+        && args.label.is_empty()
+        && args.label_any.is_empty()
+        && args.sort.is_none()
+        && !args.reverse
 }
 
 fn apply_client_filters(
@@ -443,8 +592,10 @@ fn apply_client_filters(
     let max_priority = args.priority_max.map(i32::from);
     let desc_needle = args.desc_contains.as_deref().map(str::to_lowercase);
     let notes_needle = args.notes_contains.as_deref().map(str::to_lowercase);
-    // Deferred issues are included by default when no status filter is specified
+    // Deferred issues are included by default when no status filter is specified,
+    // except `--overdue` keeps deferred work hidden unless requested.
     let include_deferred = args.deferred
+        || args.all
         || (!args.overdue && args.status.is_empty())
         || args
             .status
@@ -617,6 +768,19 @@ mod tests {
     }
 
     #[test]
+    fn test_build_filters_applies_list_defaults_when_cli_omits_pagination() {
+        init_logging();
+        let filters = build_filters(&ListArgs::default()).expect("build filters");
+
+        // #349: list is COMPLETE by default — the default limit is unlimited
+        // (`0`), not a silent cap. `Some(0)` is the query layer's "no LIMIT".
+        assert_eq!(DEFAULT_LIST_LIMIT, 0, "list default must be unlimited");
+        assert_eq!(filters.limit, Some(0));
+        assert_eq!(filters.limit, Some(DEFAULT_LIST_LIMIT));
+        assert_eq!(filters.offset, Some(DEFAULT_LIST_OFFSET));
+    }
+
+    #[test]
     fn test_needs_client_filters_detects_fields() {
         init_logging();
         info!("test_needs_client_filters_detects_fields: starting");
@@ -721,7 +885,7 @@ mod tests {
         assert_eq!(overdue_only_ids, vec!["bd-1"]);
 
         let overdue_with_deferred = apply_client_filters(
-            vec![overdue_open, overdue_deferred],
+            vec![overdue_open.clone(), overdue_deferred.clone()],
             &ListArgs {
                 overdue: true,
                 deferred: true,
@@ -734,6 +898,21 @@ mod tests {
             .map(|issue| issue.id.as_str())
             .collect();
         assert_eq!(overdue_with_deferred_ids, vec!["bd-1", "bd-2"]);
+
+        let overdue_with_all = apply_client_filters(
+            vec![overdue_open, overdue_deferred],
+            &ListArgs {
+                overdue: true,
+                all: true,
+                ..Default::default()
+            },
+        )
+        .expect("overdue with all filter");
+        let overdue_with_all_ids: Vec<_> = overdue_with_all
+            .iter()
+            .map(|issue| issue.id.as_str())
+            .collect();
+        assert_eq!(overdue_with_all_ids, vec!["bd-1", "bd-2"]);
     }
 
     #[test]
@@ -746,6 +925,88 @@ mod tests {
         .expect_err("invalid sort should fail");
 
         assert!(matches!(err, BeadsError::Validation { field, .. } if field == "sort"));
+    }
+
+    #[test]
+    fn test_full_relation_scan_covers_unbounded_default_json_list() {
+        init_logging();
+        assert!(should_use_full_relation_scan(
+            &ListArgs {
+                limit: Some(0),
+                ..Default::default()
+            },
+            false,
+            0,
+            0,
+        ));
+
+        assert!(!should_use_full_relation_scan(
+            &ListArgs {
+                limit: Some(50),
+                ..Default::default()
+            },
+            false,
+            50,
+            0,
+        ));
+
+        assert!(!should_use_full_relation_scan(
+            &ListArgs {
+                limit: Some(0),
+                label: vec!["backend".to_string()],
+                ..Default::default()
+            },
+            false,
+            0,
+            0,
+        ));
+    }
+
+    #[test]
+    fn test_large_structured_pages_use_full_default_scan() {
+        init_logging();
+        assert!(should_use_full_default_visible_structured_scan(
+            &ListArgs::default(),
+            false,
+            true,
+            LARGE_STRUCTURED_LIST_FULL_SCAN_THRESHOLD,
+            0,
+        ));
+
+        assert!(!should_use_full_default_visible_structured_scan(
+            &ListArgs::default(),
+            false,
+            true,
+            LARGE_STRUCTURED_LIST_FULL_SCAN_THRESHOLD - 1,
+            0,
+        ));
+
+        assert!(!should_use_full_default_visible_structured_scan(
+            &ListArgs {
+                label: vec!["backend".to_string()],
+                ..Default::default()
+            },
+            false,
+            true,
+            LARGE_STRUCTURED_LIST_FULL_SCAN_THRESHOLD,
+            0,
+        ));
+
+        assert!(!should_use_full_default_visible_structured_scan(
+            &ListArgs::default(),
+            false,
+            false,
+            LARGE_STRUCTURED_LIST_FULL_SCAN_THRESHOLD,
+            0,
+        ));
+
+        assert!(!should_use_full_default_visible_structured_scan(
+            &ListArgs::default(),
+            false,
+            true,
+            LARGE_STRUCTURED_LIST_FULL_SCAN_THRESHOLD,
+            1,
+        ));
     }
 
     #[test]

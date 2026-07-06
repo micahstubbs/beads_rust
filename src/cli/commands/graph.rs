@@ -6,12 +6,13 @@
 //! - `br graph --all`: Show connected components for all nonterminal issues
 
 use super::{
-    acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale, resolve_issue_id,
+    acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
+    cli_for_routed_workspace, resolve_issue_id,
 };
 use crate::cli::GraphArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::format::{format_status_label, sanitize_terminal_inline};
+use crate::format::{IssueWithDependencyMetadata, format_status_label, sanitize_terminal_inline};
 use crate::model::{Issue, Priority, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
@@ -22,6 +23,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use tracing::debug;
 use unicode_width::UnicodeWidthStr;
+
+const GRAPH_DEPENDENTS_BATCH_SIZE: usize = 400;
 
 /// JSON output for a single node in the graph.
 #[derive(Debug, Clone, Serialize)]
@@ -81,7 +84,7 @@ pub fn execute(args: &GraphArgs, cli: &config::CliOverrides, ctx: &OutputContext
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let route_cli = routed_cli_for_graph(cli, args, &beads_dir)?;
     let (storage_ctx, _routed_write_lock) = open_storage_for_graph(args, &route_cli, &beads_dir)?;
-    execute_with_storage_ctx(args, &route_cli, ctx, &beads_dir, &storage_ctx)
+    execute_graph_with_storage_ctx(args, &route_cli, ctx, &storage_ctx)
 }
 
 fn routed_cli_for_graph(
@@ -89,14 +92,14 @@ fn routed_cli_for_graph(
     args: &GraphArgs,
     local_beads_dir: &std::path::Path,
 ) -> Result<config::CliOverrides> {
-    let mut route_cli = cli.clone();
-    if let Some(issue_input) = args.issue.as_deref()
+    let is_external = if let Some(issue_input) = args.issue.as_deref()
         && !args.all
-        && config::routing::resolve_route(issue_input, local_beads_dir)?.is_external
     {
-        route_cli.db = None;
-    }
-    Ok(route_cli)
+        config::routing::resolve_route(issue_input, local_beads_dir)?.is_external
+    } else {
+        false
+    };
+    Ok(cli_for_routed_workspace(cli, is_external))
 }
 
 fn open_storage_for_graph(
@@ -108,10 +111,15 @@ fn open_storage_for_graph(
         && !args.all
     {
         let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
-        let routed_write_lock =
-            acquire_routed_workspace_write_lock(&route.beads_dir, route.is_external)?;
-        let mut storage_ctx = config::open_storage_with_cli(&route.beads_dir, cli)?;
-        auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
+        let mut route_cli = cli_for_routed_workspace(cli, route.is_external);
+        let routed_write_lock = acquire_routed_workspace_write_lock(
+            &route.beads_dir,
+            route.is_external,
+            route_cli.lock_timeout,
+        )?;
+        routed_write_lock.mark_cli_write_lock_held(&mut route_cli);
+        let mut storage_ctx = config::open_storage_with_cli(&route.beads_dir, &route_cli)?;
+        auto_import_storage_ctx_if_stale(&mut storage_ctx, &route_cli)?;
         return Ok((storage_ctx, routed_write_lock));
     }
 
@@ -138,9 +146,13 @@ pub fn execute_with_storage_ctx(
     {
         let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
         if route.is_external {
-            let mut route_cli = cli.clone();
-            route_cli.db = None;
-            let _routed_write_lock = acquire_routed_workspace_write_lock(&route.beads_dir, true)?;
+            let mut route_cli = cli_for_routed_workspace(cli, true);
+            let routed_write_lock = acquire_routed_workspace_write_lock(
+                &route.beads_dir,
+                true,
+                route_cli.lock_timeout,
+            )?;
+            routed_write_lock.mark_cli_write_lock_held(&mut route_cli);
             let mut routed_storage_ctx =
                 config::open_storage_with_cli(&route.beads_dir, &route_cli)?;
             auto_import_storage_ctx_if_stale(&mut routed_storage_ctx, &route_cli)?;
@@ -161,14 +173,20 @@ fn execute_graph_with_storage_ctx(
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     if args.all {
-        graph_all(&storage_ctx.storage, args.compact, ctx)
+        graph_all(&storage_ctx.storage, args.compact, args.dot, ctx)
     } else {
         let issue_id = args.issue.as_ref().ok_or_else(|| {
             BeadsError::validation("issue", "Issue ID required unless --all is specified")
         })?;
 
         let resolved_id = resolve_issue_id(&storage_ctx.storage, &resolver, issue_id)?;
-        graph_single(&storage_ctx.storage, &resolved_id, args.compact, ctx)
+        graph_single(
+            &storage_ctx.storage,
+            &resolved_id,
+            args.compact,
+            args.dot,
+            ctx,
+        )
     }
 }
 
@@ -177,6 +195,7 @@ fn graph_single(
     storage: &SqliteStorage,
     root_id: &str,
     compact: bool,
+    dot: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     // Verify the root issue exists
@@ -199,6 +218,15 @@ fn graph_single(
     );
     let mut nodes = build_graph_nodes(&traversal.traversal_order, &traversal.issues_by_id, &depths);
     sort_single_graph_nodes(&mut nodes, root_id);
+
+    // DOT/Graphviz output takes precedence over text/JSON rendering.
+    if dot {
+        print!(
+            "{}",
+            format_single_graph_dot(&nodes, &traversal.edges, root_id)
+        );
+        return Ok(());
+    }
 
     if ctx.is_json() || ctx.is_toon() {
         let output = SingleGraphOutput {
@@ -245,7 +273,7 @@ fn graph_single(
 
 /// Show graph for all nonterminal issues.
 #[allow(clippy::too_many_lines)]
-fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Result<()> {
+fn graph_all(storage: &SqliteStorage, compact: bool, dot: bool, ctx: &OutputContext) -> Result<()> {
     if ctx.is_quiet() {
         return Ok(());
     }
@@ -258,11 +286,13 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
         ..Default::default()
     };
 
-    let issues = storage.list_issues(&filters)?;
+    let issues = storage.list_graph_issues_for_command_output(&filters)?;
     debug!(count = issues.len(), "Found issues for graph");
 
     if issues.is_empty() {
-        if ctx.is_json() || ctx.is_toon() {
+        if dot {
+            print!("{}", format_all_graph_dot(&[]));
+        } else if ctx.is_json() || ctx.is_toon() {
             let output = AllGraphOutput {
                 components: vec![],
                 total_nodes: 0,
@@ -302,16 +332,23 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
                 if !dependency.dep_type.affects_ready_work() {
                     continue;
                 }
-                let dep_id = &dependency.depends_on_id;
+                let (dependent_id, dependency_id) = if matches!(
+                    dependency.dep_type,
+                    crate::model::DependencyType::ParentChild
+                ) {
+                    (dependency.depends_on_id.as_str(), issue.id.as_str())
+                } else {
+                    (issue.id.as_str(), dependency.depends_on_id.as_str())
+                };
                 // Only include edges within our issue set
-                if issue_set.contains(dep_id) {
-                    adj.entry(issue.id.clone())
+                if issue_set.contains(dependency_id) && issue_set.contains(dependent_id) {
+                    adj.entry(dependent_id.to_string())
                         .or_default()
-                        .push(dep_id.clone());
-                    adj.entry(dep_id.clone())
+                        .push(dependency_id.to_string());
+                    adj.entry(dependency_id.to_string())
                         .or_default()
-                        .push(issue.id.clone());
-                    blocking_edges.push((issue.id.clone(), dep_id.clone()));
+                        .push(dependent_id.to_string());
+                    blocking_edges.push((dependent_id.to_string(), dependency_id.to_string()));
                 }
             }
         }
@@ -348,7 +385,7 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
 
         // Calculate depths using longest path from roots
         // Roots are issues with no unsatisfied dependencies within the component
-        let component_set: HashSet<&String> = component_nodes.iter().collect();
+        let component_set: HashSet<&str> = component_nodes.iter().map(String::as_str).collect();
         let (mut depths, mut roots) =
             calculate_depths(&all_dependencies, &component_nodes, &component_set);
 
@@ -380,7 +417,9 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
         // Filter edges to this component
         let component_edges: Vec<(String, String)> = blocking_edges
             .iter()
-            .filter(|(from, to)| component_set.contains(from) && component_set.contains(to))
+            .filter(|(from, to)| {
+                component_set.contains(from.as_str()) && component_set.contains(to.as_str())
+            })
             .cloned()
             .collect();
 
@@ -395,6 +434,12 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
     components.sort_by_key(|b| std::cmp::Reverse(b.nodes.len()));
 
     let total_nodes: usize = components.iter().map(|c| c.nodes.len()).sum();
+
+    // DOT/Graphviz output takes precedence over text/JSON rendering.
+    if dot {
+        print!("{}", format_all_graph_dot(&components));
+        return Ok(());
+    }
 
     if ctx.is_json() || ctx.is_toon() {
         let output = AllGraphOutput {
@@ -483,7 +528,7 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
 fn calculate_depths(
     all_dependencies: &HashMap<String, Vec<crate::model::Dependency>>,
     nodes: &[String],
-    component_set: &HashSet<&String>,
+    component_set: &HashSet<&str>,
 ) -> (HashMap<String, usize>, Vec<String>) {
     let dependency_edges = dependency_edges_for_component(all_dependencies, nodes, component_set);
     let dependency_map = build_dependency_map(nodes, &dependency_edges);
@@ -499,7 +544,7 @@ fn calculate_depths(
 fn dependency_edges_for_component(
     all_dependencies: &HashMap<String, Vec<crate::model::Dependency>>,
     nodes: &[String],
-    component_set: &HashSet<&String>,
+    component_set: &HashSet<&str>,
 ) -> Vec<(String, String)> {
     let mut dependency_edges = Vec::new();
 
@@ -510,8 +555,17 @@ fn dependency_edges_for_component(
                     continue;
                 }
 
-                if component_set.contains(&dependency.depends_on_id) {
-                    dependency_edges.push((node_id.clone(), dependency.depends_on_id.clone()));
+                let (dependent_id, dependency_id) = if matches!(
+                    dependency.dep_type,
+                    crate::model::DependencyType::ParentChild
+                ) {
+                    (dependency.depends_on_id.as_str(), node_id.as_str())
+                } else {
+                    (node_id.as_str(), dependency.depends_on_id.as_str())
+                };
+
+                if component_set.contains(dependency_id) && component_set.contains(dependent_id) {
+                    dependency_edges.push((dependent_id.to_string(), dependency_id.to_string()));
                 }
             }
         }
@@ -538,7 +592,7 @@ fn collect_single_graph(
     let mut queued_nodes: HashSet<String> = HashSet::new();
 
     let metadata_cache = storage.get_active_issues_metadata()?;
-    let dependents_cache = storage.prefetch_blocking_dependents()?;
+    let mut dependents_cache: HashMap<String, Vec<IssueWithDependencyMetadata>> = HashMap::new();
 
     let mut stack: Vec<String> = vec![root_id.to_string()];
     queued_nodes.insert(root_id.to_string());
@@ -555,6 +609,11 @@ fn collect_single_graph(
         if !expanded_nodes.insert(current_id.clone()) {
             continue;
         }
+
+        let mut frontier_batch = Vec::with_capacity(stack.len().saturating_add(1));
+        frontier_batch.push(current_id.clone());
+        frontier_batch.extend(stack.iter().rev().cloned());
+        cache_graph_dependents(storage, &mut dependents_cache, &frontier_batch)?;
 
         let mut dependents: Vec<_> = dependents_cache
             .get(&current_id)
@@ -604,6 +663,38 @@ fn collect_single_graph(
         issues_by_id,
         edges,
     })
+}
+
+fn cache_graph_dependents(
+    storage: &SqliteStorage,
+    dependents_cache: &mut HashMap<String, Vec<IssueWithDependencyMetadata>>,
+    issue_ids: &[String],
+) -> Result<()> {
+    let mut missing_ids = Vec::new();
+    let mut seen_ids = HashSet::new();
+    for issue_id in issue_ids {
+        if dependents_cache.contains_key(issue_id.as_str()) || !seen_ids.insert(issue_id.as_str()) {
+            continue;
+        }
+        missing_ids.push(issue_id.clone());
+        if missing_ids.len() == GRAPH_DEPENDENTS_BATCH_SIZE {
+            break;
+        }
+    }
+
+    if missing_ids.is_empty() {
+        return Ok(());
+    }
+
+    let fetched = storage.get_blocking_dependents_for_issue_ids(&missing_ids)?;
+    for issue_id in &missing_ids {
+        dependents_cache.insert(
+            issue_id.clone(),
+            fetched.get(issue_id).cloned().unwrap_or_default(),
+        );
+    }
+
+    Ok(())
 }
 
 fn build_graph_nodes(
@@ -986,6 +1077,117 @@ fn render_single_graph_plain(nodes: &[GraphNode], edges: &[(String, String)], ro
             parents
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Graphviz DOT Output Rendering
+// ─────────────────────────────────────────────────────────────
+
+/// Escape a string for use inside a double-quoted Graphviz DOT literal.
+///
+/// First strips terminal control sequences (sharing the same hardening as the
+/// human renderers), then escapes the DOT metacharacters `\` and `"` so the
+/// emitted document stays well-formed regardless of issue id/title contents.
+fn sanitize_dot_string(text: &str) -> String {
+    sanitize_terminal_inline(text)
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
+/// Graphviz fill color for a status (named X11 colors understood by `dot`).
+fn dot_status_fillcolor(status: &str) -> &'static str {
+    match status {
+        "open" => "lightblue",
+        "in_progress" => "khaki",
+        "blocked" => "lightcoral",
+        "deferred" => "lightcyan",
+        "closed" => "lightgrey",
+        "tombstone" => "grey",
+        _ => "white",
+    }
+}
+
+/// Append one DOT node statement for `node` at the given indentation.
+///
+/// The root (or a component root) is drawn with a heavier border so it stands
+/// out in the rendered image.
+fn push_dot_node(out: &mut String, indent: &str, node: &GraphNode, is_root: bool) {
+    let label = format!(
+        "{}\\n{} [P{}]",
+        sanitize_dot_string(&node.id),
+        sanitize_dot_string(&node.title),
+        node.priority
+    );
+    let root_attr = if is_root { ", penwidth=2" } else { "" };
+    out.push_str(&format!(
+        "{indent}\"{}\" [label=\"{}\", fillcolor=\"{}\"{}];\n",
+        sanitize_dot_string(&node.id),
+        label,
+        dot_status_fillcolor(&node.status),
+        root_attr
+    ));
+}
+
+/// Append one DOT edge statement for a dependency relationship.
+///
+/// Edges are stored as `(dependent, dependency)`; the arrow points from the
+/// dependent to what it depends on (matching the `br dep --format mermaid`
+/// convention), so `A -> B` reads "A depends on B".
+fn push_dot_edge(out: &mut String, dependent: &str, dependency: &str) {
+    out.push_str(&format!(
+        "    \"{}\" -> \"{}\";\n",
+        sanitize_dot_string(dependent),
+        sanitize_dot_string(dependency)
+    ));
+}
+
+/// Format the single-issue dependents graph as a Graphviz DOT document.
+fn format_single_graph_dot(
+    nodes: &[GraphNode],
+    edges: &[(String, String)],
+    root_id: &str,
+) -> String {
+    let mut out = String::new();
+    out.push_str("digraph dependencies {\n");
+    out.push_str("    node [shape=box, style=\"rounded,filled\", fontname=\"sans-serif\"];\n");
+    for node in nodes {
+        push_dot_node(&mut out, "    ", node, node.id == root_id);
+    }
+    for (dependent, dependency) in edges {
+        push_dot_edge(&mut out, dependent, dependency);
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// Format the all-issues connected-component graph as a Graphviz DOT document.
+///
+/// Each connected component becomes its own `subgraph cluster_N` so the
+/// rendered image visually groups independent dependency islands.
+fn format_all_graph_dot(components: &[ConnectedComponent]) -> String {
+    let mut out = String::new();
+    out.push_str("digraph dependencies {\n");
+    out.push_str("    node [shape=box, style=\"rounded,filled\", fontname=\"sans-serif\"];\n");
+    for (index, component) in components.iter().enumerate() {
+        out.push_str(&format!("    subgraph cluster_{index} {{\n"));
+        out.push_str(&format!("        label=\"Component {}\";\n", index + 1));
+        for node in &component.nodes {
+            push_dot_node(
+                &mut out,
+                "        ",
+                node,
+                component.roots.contains(&node.id),
+            );
+        }
+        out.push_str("    }\n");
+    }
+    for component in components {
+        for (dependent, dependency) in &component.edges {
+            push_dot_edge(&mut out, dependent, dependency);
+        }
+    }
+    out.push_str("}\n");
+    out
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1665,7 +1867,7 @@ mod tests {
 
         let all_dependencies = storage.get_all_dependency_records().unwrap();
         let nodes = vec!["bd-a".to_string(), "bd-b".to_string()];
-        let component_set: HashSet<&String> = nodes.iter().collect();
+        let component_set: HashSet<&str> = nodes.iter().map(String::as_str).collect();
 
         let (depths, roots) = calculate_depths(&all_dependencies, &nodes, &component_set);
         assert!(roots.is_empty());
@@ -1732,7 +1934,7 @@ mod tests {
 
         // This should not hang even with root feeding into cycle
         // If it hangs, the test runner will timeout
-        let result = graph_all(&storage, false, &ctx);
+        let result = graph_all(&storage, false, false, &ctx);
         assert!(result.is_ok());
     }
 
@@ -1833,6 +2035,137 @@ mod tests {
                 "bd-b".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn test_graph_parent_child_edges_use_blocker_direction() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = chrono::Utc::now();
+
+        for (id, title) in [("bd-parent", "Parent"), ("bd-child", "Child")] {
+            let issue = Issue {
+                id: id.to_string(),
+                title: title.to_string(),
+                status: Status::Open,
+                priority: crate::model::Priority::MEDIUM,
+                issue_type: crate::model::IssueType::Task,
+                created_at: t1,
+                updated_at: t1,
+                ..Default::default()
+            };
+            storage.create_issue(&issue, "test").unwrap();
+        }
+
+        storage
+            .add_dependency("bd-child", "bd-parent", "parent-child", "tester")
+            .unwrap();
+
+        let child = storage
+            .get_issue("bd-child")
+            .unwrap()
+            .expect("child issue should exist");
+        let child_traversal = collect_single_graph(&storage, "bd-child", &child)
+            .expect("child graph traversal should work");
+        assert_eq!(
+            child_traversal.traversal_order,
+            vec!["bd-child".to_string(), "bd-parent".to_string()]
+        );
+        assert_eq!(
+            child_traversal.edges,
+            vec![("bd-parent".to_string(), "bd-child".to_string())],
+            "parent-child rows are stored child -> parent but block parent -> child"
+        );
+
+        let parent = storage
+            .get_issue("bd-parent")
+            .unwrap()
+            .expect("parent issue should exist");
+        let parent_traversal = collect_single_graph(&storage, "bd-parent", &parent)
+            .expect("parent graph traversal should work");
+        assert_eq!(
+            parent_traversal.traversal_order,
+            vec!["bd-parent".to_string()]
+        );
+        assert!(
+            parent_traversal.edges.is_empty(),
+            "a child is not a dependent of its parent in the blocker graph"
+        );
+
+        let all_dependencies = storage.get_all_dependency_records().unwrap();
+        let nodes = vec!["bd-parent".to_string(), "bd-child".to_string()];
+        let component_set: HashSet<&str> = nodes.iter().map(String::as_str).collect();
+        let dependency_edges =
+            dependency_edges_for_component(&all_dependencies, &nodes, &component_set);
+        assert_eq!(
+            dependency_edges,
+            vec![("bd-parent".to_string(), "bd-child".to_string())]
+        );
+
+        let (depths, roots) = calculate_depths(&all_dependencies, &nodes, &component_set);
+        assert_eq!(roots, vec!["bd-child".to_string()]);
+        assert_eq!(depths.get("bd-child"), Some(&0));
+        assert_eq!(depths.get("bd-parent"), Some(&1));
+    }
+
+    #[test]
+    fn test_cache_graph_dependents_batches_frontier_roots() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = chrono::Utc::now();
+
+        for (id, title, priority) in [
+            ("bd-root", "Root", 1),
+            ("bd-a", "A", 1),
+            ("bd-b", "B", 2),
+            ("bd-c", "C", 3),
+        ] {
+            let issue = Issue {
+                id: id.to_string(),
+                title: title.to_string(),
+                status: Status::Open,
+                priority: crate::model::Priority(priority),
+                issue_type: crate::model::IssueType::Task,
+                created_at: t1,
+                updated_at: t1,
+                ..Default::default()
+            };
+            storage.create_issue(&issue, "test").unwrap();
+        }
+
+        let created_at = t1.to_rfc3339();
+        storage
+            .execute_test_sql(&format!(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('bd-a', 'bd-root', 'blocks', '{created_at}', 'test');
+                 INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('bd-b', 'bd-root', 'blocks', '{created_at}', 'test');
+                 INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('bd-c', 'bd-a', 'blocks', '{created_at}', 'test');"
+            ))
+            .unwrap();
+
+        let mut cache = HashMap::new();
+        cache_graph_dependents(
+            &storage,
+            &mut cache,
+            &["bd-root".to_string(), "bd-a".to_string()],
+        )
+        .unwrap();
+
+        let root_dependents: Vec<_> = cache.get("bd-root").map_or_else(Vec::new, |dependents| {
+            dependents
+                .iter()
+                .map(|dependent| dependent.id.as_str())
+                .collect()
+        });
+        assert_eq!(root_dependents, vec!["bd-a", "bd-b"]);
+
+        let a_dependents: Vec<_> = cache.get("bd-a").map_or_else(Vec::new, |dependents| {
+            dependents
+                .iter()
+                .map(|dependent| dependent.id.as_str())
+                .collect()
+        });
+        assert_eq!(a_dependents, vec!["bd-c"]);
     }
 
     #[test]
@@ -1976,6 +2309,141 @@ mod tests {
         assert_eq!(
             ordered_ids,
             vec!["root", "branch-a", "middle", "leaf", "branch-b"]
+        );
+    }
+
+    #[test]
+    fn test_format_single_graph_dot_emits_valid_dot() {
+        let nodes = vec![
+            GraphNode {
+                id: "bd-001".to_string(),
+                title: "Root \"issue\"".to_string(),
+                status: "open".to_string(),
+                priority: 0,
+                depth: 0,
+            },
+            GraphNode {
+                id: "bd-002".to_string(),
+                title: "Dependent".to_string(),
+                status: "blocked".to_string(),
+                priority: 2,
+                depth: 1,
+            },
+        ];
+        let edges = vec![("bd-002".to_string(), "bd-001".to_string())];
+
+        let dot = format_single_graph_dot(&nodes, &edges, "bd-001");
+
+        // Structural well-formedness.
+        assert!(dot.starts_with("digraph dependencies {"));
+        assert!(dot.trim_end().ends_with('}'));
+        assert_eq!(
+            dot.matches('{').count(),
+            dot.matches('}').count(),
+            "DOT braces must be balanced: {dot}"
+        );
+
+        // Both nodes declared and the dependency edge present.
+        assert!(dot.contains("\"bd-001\" [label="));
+        assert!(dot.contains("\"bd-002\" [label="));
+        assert!(dot.contains("\"bd-002\" -> \"bd-001\";"));
+
+        // Root carries the heavier border; status drives fill color.
+        assert!(dot.contains("penwidth=2"));
+        assert!(dot.contains("fillcolor=\"lightblue\""));
+        assert!(dot.contains("fillcolor=\"lightcoral\""));
+
+        // Quotes inside titles are escaped, never emitted raw.
+        assert!(dot.contains("Root \\\"issue\\\""));
+        assert!(!dot.contains("Root \"issue\""));
+    }
+
+    #[test]
+    fn test_format_single_graph_dot_root_only_is_valid() {
+        let nodes = vec![GraphNode {
+            id: "bd-001".to_string(),
+            title: "Lonely root".to_string(),
+            status: "open".to_string(),
+            priority: 1,
+            depth: 0,
+        }];
+
+        let dot = format_single_graph_dot(&nodes, &[], "bd-001");
+
+        assert!(dot.starts_with("digraph dependencies {"));
+        assert_eq!(dot.matches('{').count(), dot.matches('}').count());
+        assert!(dot.contains("\"bd-001\" [label="));
+        assert!(!dot.contains("->"));
+    }
+
+    #[test]
+    fn test_format_all_graph_dot_clusters_components() {
+        let components = vec![
+            ConnectedComponent {
+                nodes: vec![
+                    GraphNode {
+                        id: "bd-001".to_string(),
+                        title: "Root".to_string(),
+                        status: "open".to_string(),
+                        priority: 1,
+                        depth: 0,
+                    },
+                    GraphNode {
+                        id: "bd-002".to_string(),
+                        title: "Child".to_string(),
+                        status: "blocked".to_string(),
+                        priority: 2,
+                        depth: 1,
+                    },
+                ],
+                edges: vec![("bd-002".to_string(), "bd-001".to_string())],
+                roots: vec!["bd-001".to_string()],
+            },
+            ConnectedComponent {
+                nodes: vec![GraphNode {
+                    id: "bd-003".to_string(),
+                    title: "Solo".to_string(),
+                    status: "open".to_string(),
+                    priority: 0,
+                    depth: 0,
+                }],
+                edges: vec![],
+                roots: vec!["bd-003".to_string()],
+            },
+        ];
+
+        let dot = format_all_graph_dot(&components);
+
+        assert!(dot.starts_with("digraph dependencies {"));
+        assert_eq!(
+            dot.matches('{').count(),
+            dot.matches('}').count(),
+            "DOT braces must be balanced: {dot}"
+        );
+        assert!(dot.contains("subgraph cluster_0 {"));
+        assert!(dot.contains("subgraph cluster_1 {"));
+        assert!(dot.contains("label=\"Component 1\";"));
+        assert!(dot.contains("label=\"Component 2\";"));
+        assert!(dot.contains("\"bd-002\" -> \"bd-001\";"));
+        assert!(dot.contains("\"bd-003\" [label="));
+    }
+
+    #[test]
+    fn test_format_all_graph_dot_empty_is_valid() {
+        let dot = format_all_graph_dot(&[]);
+        assert!(dot.starts_with("digraph dependencies {"));
+        assert!(dot.trim_end().ends_with('}'));
+        assert_eq!(dot.matches('{').count(), dot.matches('}').count());
+    }
+
+    #[test]
+    fn test_sanitize_dot_string_escapes_metacharacters_and_controls() {
+        let escaped = sanitize_dot_string("a\"b\\c\x1b[2J");
+        assert!(!escaped.chars().any(char::is_control));
+        assert!(escaped.contains("\\\""), "quote must be escaped: {escaped}");
+        assert!(
+            !escaped.contains("a\"b"),
+            "raw quote must not survive: {escaped}"
         );
     }
 }

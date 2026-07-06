@@ -354,9 +354,26 @@ For CI pipelines:
       sync_test_output.log
 ```
 
+## Shell harnesses
+
+`tests/e2e_scripts/sync_safety_witness.sh` — runs `br sync --flush-only` and `br sync --import-only --force` against a fresh workspace, captures every filesystem mutation (via `strace` on Linux when available, polling-snapshot fallback otherwise), and asserts each mutation is in the PC-1 / PC-RECOVERY allowlist. Emits a structured JSONL event log to `/tmp/sync_safety_witness_<UTC-ts>.jsonl` with one event per filesystem op (`{ts, op, path, allowed, reason_if_blocked}`).
+
+```bash
+# Run locally (needs cargo build --release first, or set BR_BIN=path/to/br)
+BR_BIN=$CARGO_TARGET_DIR/release/br tests/e2e_scripts/sync_safety_witness.sh
+echo "exit: $?"   # 0 = PASS, 1 = allowlist violation, 2/3 = prerequisite issue
+ls -1t /tmp/sync_safety_witness_*.jsonl | head -1
+```
+
+Exit codes:
+- `0` — all mutations within allowlist (PASS)
+- `1` — one or more mutations outside allowlist (FAIL — full details in event log)
+- `2` — prerequisite missing (br binary, tmpdir)
+- `3` — tracing tool unavailable (strace/inotifywait/dtrace; harness falls back to polling)
+
 ## Related Documentation
 
 - [SYNC_SAFETY.md](SYNC_SAFETY.md) - Sync safety model and design
-- `.beads/SYNC_SAFETY_INVARIANTS.md` - Safety invariants specification
+- `.beads/SYNC_SAFETY_INVARIANTS.md` - Safety invariants specification (PC-1, PC-3, PC-RECOVERY, NGI-3, ...)
 - `.beads/SYNC_CLI_FLAG_SEMANTICS.md` - CLI flag behavior
 - `.beads/SYNC_THREAT_MODEL.md` - Threat model for sync operations

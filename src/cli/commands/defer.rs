@@ -1,9 +1,9 @@
 //! Defer and Undefer command implementations.
 
 use crate::cli::commands::{
-    acquire_routed_workspace_write_lock, finalize_batched_blocked_cache_refresh,
-    preserve_blocked_cache_on_error, report_auto_flush_failure, resolve_issue_ids,
-    update_issue_with_recovery,
+    acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
+    finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
+    report_auto_flush_failure, resolve_issue_ids, update_issue_with_recovery,
 };
 use crate::cli::{DeferArgs, UndeferArgs};
 use crate::config;
@@ -210,8 +210,10 @@ fn execute_defer_route(
     beads_dir: &Path,
     auto_flush_external: bool,
 ) -> Result<DeferResult> {
-    let _routed_write_lock = acquire_routed_workspace_write_lock(beads_dir, auto_flush_external)?;
+    let _routed_write_lock =
+        acquire_routed_workspace_write_lock(beads_dir, auto_flush_external, cli.lock_timeout)?;
     let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
+    auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
 
     let config_layer = storage_ctx.load_config(cli)?;
     let actor = config::resolve_actor(&config_layer);
@@ -280,6 +282,15 @@ fn execute_defer_route(
             ..Default::default()
         };
 
+        // Stage Tier 1 attribution (issue #312, Layer 3 capture-only) for the
+        // defer status-change audit event. Recorded only — never gated.
+        storage_ctx
+            .storage
+            .set_pending_event_attribution(crate::storage::EventAttribution::new(
+                args.agent_name.as_deref(),
+                args.harness.as_deref(),
+                args.model.as_deref(),
+            ));
         let update_result = update_issue_with_recovery(
             &mut storage_ctx,
             !cache_dirty,
@@ -462,8 +473,10 @@ fn execute_undefer_route(
     beads_dir: &Path,
     auto_flush_external: bool,
 ) -> Result<UndeferResult> {
-    let _routed_write_lock = acquire_routed_workspace_write_lock(beads_dir, auto_flush_external)?;
+    let _routed_write_lock =
+        acquire_routed_workspace_write_lock(beads_dir, auto_flush_external, cli.lock_timeout)?;
     let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
+    auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
 
     let config_layer = storage_ctx.load_config(cli)?;
     let actor = config::resolve_actor(&config_layer);
@@ -532,6 +545,15 @@ fn execute_undefer_route(
             ..Default::default()
         };
 
+        // Stage Tier 1 attribution (issue #312, Layer 3 capture-only) for the
+        // undefer status-change audit event. Recorded only — never gated.
+        storage_ctx
+            .storage
+            .set_pending_event_attribution(crate::storage::EventAttribution::new(
+                args.agent_name.as_deref(),
+                args.harness.as_deref(),
+                args.model.as_deref(),
+            ));
         let update_result = update_issue_with_recovery(
             &mut storage_ctx,
             !cache_dirty,
@@ -815,6 +837,8 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -1109,6 +1133,7 @@ mod tests {
             ids: vec![issue_id.clone()],
             until: Some("+1d".to_string()),
             robot: true,
+            ..Default::default()
         };
         execute_defer(&args, true, &cli, &ctx).expect("defer");
 
@@ -1146,6 +1171,7 @@ mod tests {
             ids: vec![issue_id.clone()],
             until: None,
             robot: true,
+            ..Default::default()
         };
         execute_defer(&args, true, &cli, &ctx).expect("defer");
 
@@ -1188,12 +1214,14 @@ mod tests {
             ids: vec![issue_id.clone()],
             until: Some("+1d".to_string()),
             robot: true,
+            ..Default::default()
         };
         execute_defer(&defer_args, true, &cli, &ctx).expect("defer");
 
         let undefer_args = UndeferArgs {
             ids: vec![issue_id.clone()],
             robot: true,
+            ..Default::default()
         };
         execute_undefer(&undefer_args, true, &cli, &ctx).expect("undefer");
 
@@ -1233,6 +1261,7 @@ mod tests {
         let undefer_args = UndeferArgs {
             ids: vec![issue_id.clone()],
             robot: true,
+            ..Default::default()
         };
         execute_undefer(&undefer_args, true, &cli, &ctx).expect("undefer");
 
@@ -1271,6 +1300,7 @@ mod tests {
         let undefer_args = UndeferArgs {
             ids: vec![issue_id.clone()],
             robot: true,
+            ..Default::default()
         };
         execute_undefer(&undefer_args, true, &cli, &ctx)?;
 

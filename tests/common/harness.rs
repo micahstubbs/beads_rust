@@ -1520,7 +1520,7 @@ mod tests {
     fn test_parse_created_id() {
         let stdout = "Created bd-abc123: Test issue\n";
         let id = parse_created_id(stdout);
-        assert_eq!(id, "bd-abc123");
+        assert_eq!(id, "bd-abc123"); // invariant: parser test, not ID-pinning
     }
 
     // ========================================================================

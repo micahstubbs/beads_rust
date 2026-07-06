@@ -1,5 +1,6 @@
 //! Database schema definitions and migration logic.
 
+use chrono::Utc;
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
 
@@ -7,7 +8,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 7;
+pub const CURRENT_SCHEMA_VERSION: i32 = 14;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -54,6 +55,18 @@ pub const SCHEMA_SQL: &str = r"
         ephemeral INTEGER NOT NULL DEFAULT 0,
         pinned INTEGER NOT NULL DEFAULT 0,
         is_template INTEGER NOT NULL DEFAULT 0,
+        -- source_repo_path is appended at the end (after is_template) to match
+        -- the position SQLite assigns to ALTER TABLE ADD COLUMN on existing DBs.
+        -- This keeps `EXPECTED_ISSUE_COLUMN_ORDER` consistent for both freshly-
+        -- created and migrated databases. See #289 for context.
+        source_repo_path TEXT,
+        -- agent_context (schema v11, #297) carries canonical-JSON governing
+        -- instructions inherited by descendants on br update --status
+        -- in_progress / --claim and br show. The on-disk shape is a JSON
+        -- string; serde_json validation happens at the CLI boundary so the
+        -- column itself stays a TEXT bag. NULL means no inherited context;
+        -- emission for descendants silently skips ancestors with NULL.
+        agent_context TEXT,
         CHECK (
             (status = 'closed' AND closed_at IS NOT NULL) OR
             (status = 'tombstone') OR
@@ -89,6 +102,15 @@ pub const SCHEMA_SQL: &str = r"
         AND ephemeral = 0
         AND pinned = 0
         AND is_template = 0;
+
+    -- Widened ready group (issue #354): when `workflow.status_groups.ready`
+    -- surfaces statuses beyond `open` (e.g. `rework`), the partial
+    -- `idx_issues_ready` above (which only covers `status = 'open'`) cannot serve
+    -- the `status IN (...) ORDER BY priority, created_at` query, so a non-partial
+    -- composite keeps the widened path index-covered. The tighter partial index
+    -- still wins for the common default `[open]` group.
+    CREATE INDEX IF NOT EXISTS idx_issues_status_priority_created
+        ON issues(status, priority, created_at);
 
     -- Common active list path: non-terminal issues sorted by priority/created_at.
     -- Uses ASC on created_at (not DESC) to avoid frankensqlite B-tree ordering
@@ -154,6 +176,15 @@ pub const SCHEMA_SQL: &str = r"
         new_value TEXT,
         comment TEXT,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        -- Tier 1 attribution captured on status-mutating commands (issue #312,
+        -- Layer 3 capture-only). Self-reported agent/harness/model identity is
+        -- recorded as an audit trail ONLY — never gated/enforced on. All three
+        -- are nullable so events without attribution (the common case) and
+        -- older databases stay valid. Like `close_metadata` attribution these
+        -- columns are DB-only and are not part of the JSONL sync surface.
+        agent_name TEXT,
+        harness TEXT,
+        model TEXT,
         FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_events_issue ON events(issue_id);
@@ -172,7 +203,9 @@ pub const SCHEMA_SQL: &str = r"
     CREATE INDEX IF NOT EXISTS idx_config_key ON config(key);
 
     -- Metadata
-    -- Same rationale as config: keep it as key-value with explicit index.
+    -- Same rationale as config: keep it as key-value with an explicit index.
+    -- Storage code reads the newest duplicate row and harmonizes duplicate
+    -- rows on write; doctor still reports duplicates as recoverable anomalies.
     CREATE TABLE IF NOT EXISTS metadata (
         key TEXT NOT NULL,
         value TEXT NOT NULL
@@ -212,6 +245,47 @@ pub const SCHEMA_SQL: &str = r"
         last_child INTEGER NOT NULL DEFAULT 0,
         FOREIGN KEY (parent_id) REFERENCES issues(id) ON DELETE CASCADE
     );
+
+    -- Close metadata (issue #274 — closure-time policy gates Phase 1).
+    --
+    -- One row per terminal close. Tier 1 attribution + bypass-policy auditing
+    -- live here so the issues table stays untouched (avoids breaking JSONL
+    -- round-trip and the wide SELECT statements throughout sqlite.rs).
+    --
+    -- All gate-related columns are nullable / default-valued so older
+    -- databases upgraded with a single ALTER TABLE chain remain valid.
+    CREATE TABLE IF NOT EXISTS close_metadata (
+        issue_id TEXT PRIMARY KEY,
+        closed_by_agent_name TEXT,
+        closed_by_harness TEXT,
+        closed_by_model TEXT,
+        bypassed_policy INTEGER NOT NULL DEFAULT 0,
+        bypass_reason TEXT,
+        policy_gates_fired TEXT,
+        recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_close_metadata_recorded_at ON close_metadata(recorded_at);
+    CREATE INDEX IF NOT EXISTS idx_close_metadata_bypassed
+        ON close_metadata(bypassed_policy)
+        WHERE bypassed_policy = 1;
+
+    -- Workflow gate results (issue #312, layer 2). One row per
+    -- (issue, gate, provider): a provider's most-recent pass/fail verdict for
+    -- a named gate on an issue. A re-report from the same provider for the
+    -- same gate overwrites the prior verdict (INSERT OR REPLACE).
+    CREATE TABLE IF NOT EXISTS gate_results (
+        issue_id TEXT NOT NULL,
+        gate TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        passed INTEGER NOT NULL DEFAULT 0,
+        note TEXT,
+        recorded_by TEXT,
+        recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (issue_id, gate, provider),
+        FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_gate_results_issue ON gate_results(issue_id);
 ";
 
 /// Split a SQL script into individual statements, respecting string literals,
@@ -450,6 +524,86 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Run schema migrations to bring the connected database from
+/// `PRAGMA user_version == from` up to `target_version`.
+///
+/// This is the **public hook** for `doctor_subsystems::mutate::Op::DbMigrate`
+/// (`beads_rust-folg`). The chokepoint already verifies the
+/// precondition (`PRAGMA user_version == from`) and snapshots the DB
+/// file verbatim before calling here; this function does the actual
+/// DDL.
+///
+/// The inner `run_migrations` was previously private and contained
+/// its own per-step transactions. This wrapper:
+///
+/// 1. Re-verifies the `PRAGMA user_version == from` precondition on the
+///    connection that will run the migration.
+/// 2. Calls `run_migrations` with `issues_rebuilt: false` — the
+///    chokepoint path is always invoked against an existing DB whose
+///    `issues` table is already in place; the issues-rebuild signaling
+///    is a property of fresh `apply_schema` paths, not chokepoint-driven
+///    migrations.
+/// 3. Stamps `PRAGMA user_version = target_version` so subsequent
+///    `apply_schema` opens short-circuit.
+///
+/// # Errors
+///
+/// Returns [`BeadsError::Database`] if any underlying SQL fails, or
+/// [`BeadsError::internal`] if the post-migration `user_version` does
+/// not match `target_version`.
+pub fn run_migrations_atomic(conn: &Connection, from: u32, target_version: u32) -> Result<()> {
+    // Re-verify the precondition on this connection (the chokepoint
+    // already did one read against a separate connection; doing it
+    // again here closes the TOCTOU window between the chokepoint's read
+    // and this call's migration connection).
+    let row = conn.query_row("PRAGMA user_version")?;
+    let current = row
+        .get(0)
+        .and_then(|v| match v {
+            fsqlite_types::value::SqliteValue::Integer(n) => u32::try_from(*n).ok(),
+            _ => None,
+        })
+        .unwrap_or(0);
+    if current != from {
+        return Err(BeadsError::internal(format!(
+            "schema migrate refused — user_version mismatch (expected {from}, got {current})"
+        )));
+    }
+
+    // No outer transaction here. The inner `run_migrations` already
+    // opens `BEGIN IMMEDIATE` / `COMMIT` around the migration step
+    // bundles that need atomicity (e.g., the `blocked_issues_cache`
+    // pre-schema rebuild), and fsqlite does not support nested
+    // BEGINs ("cannot start a transaction within a transaction"). The
+    // chokepoint's pre-migrate snapshot
+    // (`backups/db/beads.db.pre-migrate`) is the full-rollback safety
+    // net: on any error here, the caller restores the DB file from
+    // the snapshot before returning.
+    run_migrations(conn, false)?;
+    conn.execute(&format!("PRAGMA user_version = {target_version}"))
+        .map_err(BeadsError::Database)?;
+
+    // Post-state verification: `user_version` must reflect the target.
+    // If fsqlite raced its own PRAGMA cache and didn't persist the
+    // stamp, the chokepoint will see the mismatch and restore from
+    // the pre-migrate snapshot.
+    let post = conn
+        .query_row("PRAGMA user_version")?
+        .get(0)
+        .and_then(|v| match v {
+            fsqlite_types::value::SqliteValue::Integer(n) => u32::try_from(*n).ok(),
+            _ => None,
+        })
+        .unwrap_or(0);
+    if post != target_version {
+        return Err(BeadsError::internal(format!(
+            "schema migrate post-check failed — expected user_version={target_version}, observed {post}"
+        )));
+    }
+
+    Ok(())
+}
+
 pub(crate) fn apply_runtime_compatible_schema(conn: &Connection) -> Result<()> {
     // The table layouts are already safe to operate on, so we can skip the
     // heavier pre-schema rebuilds and just restore any missing canonical DDL.
@@ -584,6 +738,13 @@ const ISSUE_COLUMNS: &[(&str, &str)] = &[
     ("ephemeral", "INTEGER NOT NULL DEFAULT 0"),
     ("pinned", "INTEGER NOT NULL DEFAULT 0"),
     ("is_template", "INTEGER NOT NULL DEFAULT 0"),
+    // Appended at the end so SQLite's ALTER TABLE ADD COLUMN on existing DBs
+    // produces the same final column order as a fresh SCHEMA_SQL build.
+    ("source_repo_path", "TEXT"),
+    // beads_rust#297: inherited governing instructions, JSON-stored.
+    // Append-at-end keeps EXPECTED_ISSUE_COLUMN_ORDER aligned for fresh
+    // and migrated databases.
+    ("agent_context", "TEXT"),
 ];
 
 const DEPENDENCY_COLUMNS: &[(&str, &str)] = &[
@@ -607,6 +768,11 @@ const EVENT_COLUMNS: &[(&str, &str)] = &[
     ("new_value", "TEXT"),
     ("comment", "TEXT"),
     ("created_at", "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+    // Tier 1 attribution audit columns (issue #312, Layer 3 capture-only).
+    // Nullable and additive: older databases gain them via ensure_columns().
+    ("agent_name", "TEXT"),
+    ("harness", "TEXT"),
+    ("model", "TEXT"),
 ];
 
 fn ensure_columns(conn: &Connection, table: &str, columns: &[(&str, &str)]) -> Result<()> {
@@ -629,6 +795,48 @@ fn table_has_columns(conn: &Connection, table: &str, required_columns: &[&str]) 
         && required_columns
             .iter()
             .all(|column| column_exists(conn, table, column))
+}
+
+fn blocked_cache_table_canonical(conn: &Connection) -> bool {
+    if !table_exists(conn, "blocked_issues_cache") {
+        return false;
+    }
+
+    let Ok(rows) = conn.query("PRAGMA table_info(blocked_issues_cache)") else {
+        return false;
+    };
+
+    let mut issue_id_primary_key = false;
+    let mut blocked_by_not_null = false;
+    let mut blocked_at_not_null = false;
+    let mut has_legacy_blocked_by_json = false;
+
+    for row in &rows {
+        let Some(name) = row.get(1).and_then(SqliteValue::as_text) else {
+            continue;
+        };
+        let not_null = row
+            .get(3)
+            .and_then(SqliteValue::as_integer)
+            .is_some_and(|value| value != 0);
+        let primary_key = row
+            .get(5)
+            .and_then(SqliteValue::as_integer)
+            .is_some_and(|value| value != 0);
+
+        match name {
+            "issue_id" => issue_id_primary_key = primary_key,
+            "blocked_by" => blocked_by_not_null = not_null,
+            "blocked_at" => blocked_at_not_null = not_null,
+            "blocked_by_json" => has_legacy_blocked_by_json = true,
+            _ => {}
+        }
+    }
+
+    issue_id_primary_key
+        && blocked_by_not_null
+        && blocked_at_not_null
+        && !has_legacy_blocked_by_json
 }
 
 fn current_schema_version_declared(conn: &Connection) -> bool {
@@ -696,6 +904,8 @@ const EXPECTED_ISSUE_COLUMN_ORDER: &[&str] = &[
     "ephemeral",
     "pinned",
     "is_template",
+    "source_repo_path",
+    "agent_context",
 ];
 
 /// Check whether the issues table has columns in the expected order.
@@ -981,6 +1191,62 @@ fn parse_not_null_default_literal(col_def: &str) -> Option<String> {
     }
 
     None
+/// Backfill storage-class NULL values in NOT NULL DEFAULT columns.
+///
+/// SQLite's `ALTER TABLE ADD COLUMN ... NOT NULL DEFAULT ...` enforces the
+/// default for new and existing rows, but legacy databases — predating
+/// br's current migration code, or carrying history from Go bd or raw
+/// `sqlite3` edits — can hold storage-class NULLs in such columns. The
+/// `typeof(col) = 'null'` predicate detects these directly even when
+/// partial indexes cause `IS NULL` to silently miss them (see #269).
+///
+/// Idempotent: rows that already hold the default are not rewritten.
+/// Tables/columns that don't exist on the current schema are skipped.
+///
+/// Best-effort: per-column failures are logged but do not abort the
+/// caller, so a single broken column never blocks bootstrap.
+fn backfill_storage_null_in_default_columns(conn: &Connection) {
+    // (table, column, default_sql_literal). Mirrors the NOT NULL DEFAULT
+    // clauses in SCHEMA_SQL and the *_COLUMNS migration constants.
+    const COLUMNS: &[(&str, &str, &str)] = &[
+        // issues
+        ("issues", "description", "''"),
+        ("issues", "design", "''"),
+        ("issues", "acceptance_criteria", "''"),
+        ("issues", "notes", "''"),
+        ("issues", "status", "'open'"),
+        ("issues", "priority", "2"),
+        ("issues", "issue_type", "'task'"),
+        ("issues", "source_repo", "'.'"),
+        ("issues", "ephemeral", "0"),
+        ("issues", "pinned", "0"),
+        ("issues", "is_template", "0"),
+        // dependencies
+        ("dependencies", "type", "'blocks'"),
+        ("dependencies", "created_by", "''"),
+        // comments
+        ("comments", "author", "''"),
+        ("comments", "text", "''"),
+        // events
+        ("events", "event_type", "''"),
+        ("events", "actor", "''"),
+    ];
+
+    for (table, column, default) in COLUMNS {
+        if !table_exists(conn, table) || !column_exists(conn, table, column) {
+            continue;
+        }
+        let sql =
+            format!("UPDATE {table} SET {column} = {default} WHERE typeof({column}) = 'null'");
+        if let Err(err) = conn.execute(&sql) {
+            tracing::warn!(
+                table = table,
+                column = column,
+                error = %err,
+                "backfill of storage-NULL default failed; continuing"
+            );
+        }
+    }
 }
 
 fn kv_table_uses_primary_key(conn: &Connection, table: &str) -> bool {
@@ -1061,16 +1327,12 @@ fn run_pre_schema_migrations(conn: &Connection) -> Result<bool> {
         rebuild_kv_table_without_unique(conn, "metadata")?;
     }
 
-    // Drop blocked_issues_cache if it exists but lacks required columns.
+    // Drop blocked_issues_cache if it exists but is not canonical. The table is
+    // a derived cache, so rebuilding is preferable to preserving legacy NULLs
+    // or weak constraints that can poison later command reads.
     // The main schema will recreate it with the correct structure.
-    if table_exists(conn, "blocked_issues_cache") {
-        let has_blocked_at = column_exists(conn, "blocked_issues_cache", "blocked_at");
-        let has_blocked_by = column_exists(conn, "blocked_issues_cache", "blocked_by");
-        let has_issue_id = column_exists(conn, "blocked_issues_cache", "issue_id");
-
-        if !has_blocked_at || !has_blocked_by || !has_issue_id {
-            conn.execute("DROP TABLE IF EXISTS blocked_issues_cache")?;
-        }
+    if table_exists(conn, "blocked_issues_cache") && !blocked_cache_table_canonical(conn) {
+        conn.execute("DROP TABLE IF EXISTS blocked_issues_cache")?;
     }
 
     // Rebuild the issues table if columns are out of order or missing.
@@ -1112,6 +1374,7 @@ fn run_pre_schema_migrations(conn: &Connection) -> Result<bool> {
 pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
     if current_schema_version_declared(conn)
         && core_runtime_tables_exist(conn)
+        && blocked_cache_table_canonical(conn)
         && !kv_table_uses_primary_key(conn, "config")
         && !kv_table_uses_primary_key(conn, "metadata")
     {
@@ -1144,11 +1407,7 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
         "export_hashes",
         &["issue_id", "content_hash", "exported_at"],
     );
-    let blocked_cache_ok = table_has_columns(
-        conn,
-        "blocked_issues_cache",
-        &["issue_id", "blocked_by", "blocked_at"],
-    );
+    let blocked_cache_ok = blocked_cache_table_canonical(conn);
     let child_counters_ok = table_has_columns(conn, "child_counters", &["parent_id", "last_child"]);
 
     let compatible = issues_ok
@@ -1188,13 +1447,10 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
 /// This handles upgrades for tables that may have been created with older schemas.
 #[allow(clippy::too_many_lines)]
 fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
-    // Migration: Ensure blocked_issues_cache has correct schema (blocked_by, blocked_at)
-    // Check for old column name (blocked_by_json) or missing columns
-    let has_blocked_by = column_exists(conn, "blocked_issues_cache", "blocked_by");
-    let has_blocked_at = column_exists(conn, "blocked_issues_cache", "blocked_at");
-    let has_issue_id = column_exists(conn, "blocked_issues_cache", "issue_id");
-
-    if !has_blocked_by || !has_blocked_at || !has_issue_id {
+    // Migration: ensure blocked_issues_cache has the canonical derived-cache
+    // schema, including NOT NULL payload columns. Older br/bd paths could
+    // leave a nullable blocked_by column with stale NULL cache rows.
+    if !blocked_cache_table_canonical(conn) {
         // Table needs update - drop and recreate (it's a cache, data is regenerated)
         // Wrap in transaction so concurrent opens don't see a partially migrated state
         conn.execute("BEGIN IMMEDIATE")?;
@@ -1314,18 +1570,164 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         }
     }
 
-    // v7: Recompute stored content hashes after aligning Rust's algorithm to
-    // Go bd's canonical hash writer. Marking all rows dirty is intentional:
-    // the per-issue export hashes were computed with the old Rust algorithm,
-    // so the next flush must rewrite JSONL tracking metadata.
+    // v7: Historical content-hash rebuild. For databases older than v7 that
+    // open under current br, compute the current canonical format directly
+    // instead of replaying obsolete intermediate encodings. Marking rows dirty
+    // is intentional: per-issue export hashes were computed with an older
+    // algorithm, so the next flush must rewrite JSONL tracking metadata.
     if user_version < 7 && table_exists(conn, "issues") {
-        tracing::info!("Migrating database to schema version 7 (Go bd content hashes)");
-        rebuild_content_hashes_for_go_parity(conn)?;
+        tracing::info!("Migrating database to schema version 7 (content hashes)");
+        rebuild_content_hashes_for_current_format(conn)?;
+    }
+
+    // v9: Add close_metadata table for closure-time policy gates (issue #274).
+    //
+    // Pure additive migration: a brand-new dedicated table to capture the
+    // optional Phase 1 fields (Tier 1 attribution + policy bypass auditing).
+    // Older databases get the table on next open; no existing rows or columns
+    // change. Repos that never enable a policy never read or write to it, so
+    // the migration is a no-op for solo-dev workflows.
+    if user_version < 9 {
+        tracing::info!(
+            "Migrating database to schema version 9 (close_metadata table for policy gates)"
+        );
+        execute_batch(
+            conn,
+            r"
+            CREATE TABLE IF NOT EXISTS close_metadata (
+                issue_id TEXT PRIMARY KEY,
+                closed_by_agent_name TEXT,
+                closed_by_harness TEXT,
+                closed_by_model TEXT,
+                bypassed_policy INTEGER NOT NULL DEFAULT 0,
+                bypass_reason TEXT,
+                policy_gates_fired TEXT,
+                recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_close_metadata_recorded_at ON close_metadata(recorded_at);
+            CREATE INDEX IF NOT EXISTS idx_close_metadata_bypassed
+                ON close_metadata(bypassed_policy)
+                WHERE bypassed_policy = 1;
+            ",
+        )?;
+    }
+
+    // v8: Backfill storage-class NULL values in NOT NULL DEFAULT columns.
+    //
+    // Older databases — particularly those carrying history from Go bd or
+    // br versions where ALTER TABLE ADD COLUMN ran without a DEFAULT
+    // clause — accumulate storage-class NULL in columns declared NOT NULL
+    // DEFAULT. `PRAGMA integrity_check` then flags these as constraint
+    // violations even though `WHERE col IS NULL` won't always match them
+    // (the planner can use partial indexes that bypass the check). We use
+    // `typeof(col) = 'null'` to detect storage-class NULLs directly and
+    // backfill with each column's declared default. See issue #269.
+    if user_version < 8 {
+        tracing::info!(
+            "Migrating database to schema version 8 (backfill storage-NULL in NOT NULL DEFAULT columns)"
+        );
+        backfill_storage_null_in_default_columns(conn);
     }
 
     // Note: source_repo and is_template column backfills are handled in
     // run_pre_schema_migrations() via ensure_columns(). Repeating ALTER TABLE
     // here can create duplicate column definitions on some engines.
+
+    // v10: Ensure source_repo_path column is present on the issues table
+    // (beads_rust#289) for migration paths that call `run_migrations` directly
+    // and therefore skip `run_pre_schema_migrations`/`ensure_columns`. Without
+    // this guard, a direct v9 -> v10 migration could stamp user_version=10 with
+    // the column still missing, and the next open would fast-path past schema
+    // setup and start hitting "no such column: source_repo_path" on every
+    // INSERT/UPDATE.
+    //
+    // Idempotent: skipped when the column already exists. The ADD COLUMN
+    // appends at the end, matching SCHEMA_SQL and EXPECTED_ISSUE_COLUMN_ORDER.
+    // If the pre-schema path rebuilt `issues`, skip this check: the rebuilt
+    // table already has the current shape, and fsqlite's in-memory schema cache
+    // may not be refreshed enough for a second column probe.
+    if !issues_rebuilt
+        && user_version < 10
+        && table_exists(conn, "issues")
+        && !column_exists(conn, "issues", "source_repo_path")
+    {
+        tracing::info!(
+            "Migrating database to schema version 10 (source_repo_path on issues - beads_rust#289)"
+        );
+        conn.execute("ALTER TABLE issues ADD COLUMN source_repo_path TEXT")?;
+    }
+
+    // Migration v10 -> v11 (beads_rust#297): add `agent_context TEXT` to
+    // `issues` for inherited governing instructions emitted on
+    // `br update --status in_progress` / `--claim` and `br show`.
+    // Pure additive — existing rows get NULL and existing consumers ignore
+    // it. Same idempotence pattern as the v10 source_repo_path migration:
+    // skipped when the column already exists, skipped when the table was
+    // just rebuilt from scratch (rebuild already produced the v11 layout).
+    if !issues_rebuilt
+        && user_version < 11
+        && table_exists(conn, "issues")
+        && !column_exists(conn, "issues", "agent_context")
+    {
+        tracing::info!(
+            "Migrating database to schema version 11 (agent_context on issues - beads_rust#297)"
+        );
+        conn.execute("ALTER TABLE issues ADD COLUMN agent_context TEXT")?;
+    }
+
+    // Migration v11 -> v12 (beads_rust#319): add the `gate_results` table for
+    // workflow gate engine (#312, layer 2). Pure additive — a new table, no
+    // existing-row rewrite. Idempotent via CREATE TABLE IF NOT EXISTS, so it
+    // is safe to run on every open regardless of `user_version`. The canonical
+    // DDL also lives in SCHEMA_SQL for fresh databases; re-asserting here keeps
+    // upgraded databases in lock-step.
+    if user_version < 12 {
+        tracing::info!(
+            "Migrating database to schema version 12 (gate_results table - beads_rust#319)"
+        );
+        execute_batch(
+            conn,
+            r"
+            CREATE TABLE IF NOT EXISTS gate_results (
+                issue_id TEXT NOT NULL,
+                gate TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                passed INTEGER NOT NULL DEFAULT 0,
+                note TEXT,
+                recorded_by TEXT,
+                recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (issue_id, gate, provider),
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_gate_results_issue ON gate_results(issue_id);
+        ",
+        )?;
+    }
+
+    // Migration v12 -> v13 (beads_rust#312, Layer 3 capture-only): add Tier 1
+    // attribution columns (`agent_name`, `harness`, `model`) to the `events`
+    // table so create/update/status-mutating commands can record self-reported
+    // agent identity as an audit trail. Pure additive, nullable columns — no
+    // existing rows change, no enforcement is performed, and the JSONL sync
+    // surface is unaffected (events are DB-only). Idempotent: ensure_columns
+    // skips columns that already exist, mirroring the v10/v11 ADD COLUMN guards.
+    if user_version < 13 && table_exists(conn, "events") {
+        tracing::info!(
+            "Migrating database to schema version 13 (events attribution columns - beads_rust#312)"
+        );
+        ensure_columns(conn, "events", EVENT_COLUMNS)?;
+    }
+
+    // v14: Recompute stored issue content hashes after switching from
+    // NUL-separated fields to length-prefixed fields. Existing v7-v13
+    // databases may contain hashes where embedded NUL bytes can blur field
+    // boundaries, so rewrite the issue hash and force JSONL tracking metadata
+    // to refresh on the next flush.
+    if (7..14).contains(&user_version) && table_exists(conn, "issues") {
+        tracing::info!("Migrating database to schema version 14 (length-prefixed content hashes)");
+        rebuild_content_hashes_for_current_format(conn)?;
+    }
 
     // Migration: Add missing indexes for bd parity
     // These use IF NOT EXISTS so they're safe to run multiple times
@@ -1352,6 +1754,12 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
             AND ephemeral = 0
             AND pinned = 0
             AND is_template = 0;
+
+        -- Widened ready group (issue #354): non-partial composite so a
+        -- configured `status IN (...) ORDER BY priority, created_at` ready query
+        -- stays index-covered even on pre-existing databases.
+        CREATE INDEX IF NOT EXISTS idx_issues_status_priority_created
+            ON issues(status, priority, created_at);
 
         -- Common active list path: non-terminal issues sorted by priority/created_at
         CREATE INDEX IF NOT EXISTS idx_issues_list_active_order
@@ -1478,7 +1886,7 @@ fn repair_legacy_status_values(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn rebuild_content_hashes_for_go_parity(conn: &Connection) -> Result<usize> {
+fn rebuild_content_hashes_for_current_format(conn: &Connection) -> Result<usize> {
     let rows = conn.query(
         "SELECT id, title, description, design, acceptance_criteria, notes, \
                 status, priority, issue_type, assignee, owner, created_by, \
@@ -1493,6 +1901,10 @@ fn rebuild_content_hashes_for_go_parity(conn: &Connection) -> Result<usize> {
     conn.execute("BEGIN IMMEDIATE")?;
     let result = (|| -> Result<usize> {
         let mut updated = 0;
+        // Pre-compute once outside the loop and pass explicitly: legacy DBs
+        // created before the `DEFAULT CURRENT_TIMESTAMP` was added to
+        // `dirty_issues.marked_at` reject INSERTs that omit the column.
+        let now_str = Utc::now().to_rfc3339();
         for row in &rows {
             let id = row_text(row, 0).ok_or_else(|| BeadsError::Internal {
                 message: "content hash migration found issue row without id".to_string(),
@@ -1555,8 +1967,11 @@ fn rebuild_content_hashes_for_go_parity(conn: &Connection) -> Result<usize> {
                 &[SqliteValue::from(id.as_str())],
             )?;
             conn.execute_with_params(
-                "INSERT INTO dirty_issues (issue_id) VALUES (?)",
-                &[SqliteValue::from(id.as_str())],
+                "INSERT INTO dirty_issues (issue_id, marked_at) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(id.as_str()),
+                    SqliteValue::from(now_str.as_str()),
+                ],
             )?;
             updated += 1;
         }
@@ -1796,8 +2211,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             row.get(0).and_then(SqliteValue::as_text),
-            Some("c8e7e2783cc1fbb37322ae61efcf0e5c7d79a2cc6203e878fa6556c41742398d"),
-            "v7 should rewrite stored issue hashes to Go bd canonical values"
+            Some("c42bf13dfd6447e08d119f8b0ad0a503d23ccaa92b211348fb6dfbc55a4e0779"),
+            "v7 should rewrite stored issue hashes to the current canonical format"
         );
 
         let dirty_row = conn
@@ -1809,6 +2224,256 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM export_hashes")
             .unwrap();
         assert_eq!(export_row.get(0).and_then(SqliteValue::as_integer), Some(0));
+    }
+
+    #[test]
+    fn test_v14_rebuilds_length_prefixed_content_hashes_and_marks_dirty() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("Failed to apply schema");
+
+        conn.execute(
+            "INSERT INTO issues (id, content_hash, title, status, priority, issue_type, created_at, updated_at) \
+             VALUES ('bd-hash-v14', 'old-go-hash', 'Test', 'open', 2, 'task', '2026-04-02T20:00:00Z', '2026-04-03T01:00:00Z')",
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO export_hashes (issue_id, content_hash, exported_at) \
+             VALUES ('bd-hash-v14', 'old-go-hash', '2026-04-03T01:00:00Z')",
+        )
+        .unwrap();
+        conn.execute("DELETE FROM dirty_issues").unwrap();
+        conn.execute("PRAGMA user_version = 13").unwrap();
+
+        run_migrations(&conn, false).expect("v14 migration should succeed");
+
+        let row = conn
+            .query_row("SELECT content_hash FROM issues WHERE id = 'bd-hash-v14'")
+            .unwrap();
+        assert_eq!(
+            row.get(0).and_then(SqliteValue::as_text),
+            Some("c42bf13dfd6447e08d119f8b0ad0a503d23ccaa92b211348fb6dfbc55a4e0779"),
+            "v14 should rewrite stored issue hashes to length-prefixed values"
+        );
+
+        let dirty_row = conn
+            .query_row("SELECT COUNT(*) FROM dirty_issues WHERE issue_id = 'bd-hash-v14'")
+            .unwrap();
+        assert_eq!(dirty_row.get(0).and_then(SqliteValue::as_integer), Some(1));
+
+        let export_row = conn
+            .query_row("SELECT COUNT(*) FROM export_hashes")
+            .unwrap();
+        assert_eq!(export_row.get(0).and_then(SqliteValue::as_integer), Some(0));
+    }
+
+    /// Regression for beads_rust#290: legacy DBs that pre-date the
+    /// `marked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP` definition
+    /// kept `dirty_issues.marked_at` as a plain NOT NULL column with no
+    /// default. The v7 migration's `INSERT INTO dirty_issues (issue_id)`
+    /// path then tripped the constraint and bricked every `br` command
+    /// against the legacy DB. The fix passes `marked_at` explicitly so
+    /// the absence of a column-level default no longer matters.
+    #[test]
+    fn test_v7_rebuild_works_when_dirty_issues_has_no_default() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("Failed to apply schema");
+
+        // Re-create dirty_issues without the DEFAULT to mirror what
+        // a DB initialized under the pre-v7 schema looks like in the wild.
+        conn.execute("DROP TABLE dirty_issues").unwrap();
+        conn.execute(
+            "CREATE TABLE dirty_issues (
+                 issue_id TEXT PRIMARY KEY,
+                 marked_at TEXT NOT NULL
+             )",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO issues (id, content_hash, title, status, priority, issue_type, created_at, updated_at) \
+             VALUES ('bd-legacy', 'old-rust-hash', 'Legacy', 'open', 2, 'task', '2026-04-02T20:00:00Z', '2026-04-03T01:00:00Z')",
+        ).unwrap();
+        conn.execute("PRAGMA user_version = 6").unwrap();
+
+        run_migrations(&conn, false)
+            .expect("v7 migration must succeed against legacy dirty_issues schema");
+
+        let dirty_row = conn
+            .query_row("SELECT COUNT(*) FROM dirty_issues WHERE issue_id = 'bd-legacy'")
+            .unwrap();
+        assert_eq!(
+            dirty_row.get(0).and_then(SqliteValue::as_integer),
+            Some(1),
+            "issue must be flagged dirty after v7 even on legacy table shape"
+        );
+    }
+
+    #[test]
+    fn test_v8_backfills_storage_null_in_default_columns() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("Failed to apply schema");
+
+        // Seed a row with all required columns set, then force storage-NULLs
+        // into the columns the migration is supposed to heal. We rely on
+        // direct UPDATEs reaching the storage layer; if the engine refuses
+        // any individual UPDATE, the corresponding assertion below still
+        // exercises the no-op path of the migration.
+        conn.execute(
+            "INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at) \
+             VALUES ('bd-null', 'legacy null row', 'open', 2, 'task', '2026-04-30T00:00:00Z', '2026-04-30T00:00:00Z')",
+        )
+        .expect("seed row");
+
+        // Best-effort: not every column accepts a direct NULL update under
+        // every storage engine. The migration must only act on columns
+        // that *do* hold storage-NULL values, so we forge as many as the
+        // engine allows and verify the migration heals every successful one.
+        let columns_to_null: &[&str] = &[
+            "description",
+            "design",
+            "acceptance_criteria",
+            "notes",
+            "status",
+            "priority",
+            "issue_type",
+            "source_repo",
+            "ephemeral",
+            "pinned",
+            "is_template",
+        ];
+        for column in columns_to_null {
+            let _ = conn.execute(&format!(
+                "UPDATE issues SET {column} = NULL WHERE id = 'bd-null'"
+            ));
+        }
+
+        // Run the v8 migration directly so this test stays focused on the
+        // backfill behaviour rather than the surrounding migration ladder.
+        backfill_storage_null_in_default_columns(&conn);
+
+        // Idempotent: every NOT NULL DEFAULT column must hold a non-NULL
+        // storage class after the backfill, regardless of which UPDATE-to-
+        // NULL succeeded above.
+        for column in columns_to_null {
+            let row = conn
+                .query_row(&format!(
+                    "SELECT typeof({column}) FROM issues WHERE id = 'bd-null'"
+                ))
+                .unwrap();
+            let actual_type = row.get(0).and_then(SqliteValue::as_text);
+            assert_ne!(
+                actual_type,
+                Some("null"),
+                "{column} should be backfilled to its declared default (got typeof = null)"
+            );
+        }
+
+        // Second pass is a no-op (the UPDATEs touch zero rows).
+        backfill_storage_null_in_default_columns(&conn);
+        let row = conn
+            .query_row("SELECT typeof(notes) FROM issues WHERE id = 'bd-null'")
+            .unwrap();
+        assert_ne!(row.get(0).and_then(SqliteValue::as_text), Some("null"));
+    }
+
+    #[test]
+    fn test_v10_migration_adds_source_repo_path_when_missing() {
+        // Regression for beads_rust#289: a v9 database stamped with
+        // user_version=9 (no source_repo_path column yet) MUST get the column
+        // back when migrated by a v10+ binary. Without an explicit v10
+        // migration, direct migration callers can stamp the DB current while
+        // leaving every subsequent INSERT to hit "no such column".
+        //
+        // This test simulates a v9 layout by creating the issues table
+        // without source_repo_path and stamping user_version=9, then asserts
+        // that the direct migration hook heals the column.
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("legacy_v9.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+
+        // Hand-build the canonical v9 issues table: all the columns that
+        // existed before #289 landed, in the canonical EXPECTED order, but
+        // intentionally missing the source_repo_path tail column.
+        execute_batch(
+            &conn,
+            r"
+            CREATE TABLE issues (
+                id TEXT PRIMARY KEY,
+                content_hash TEXT,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                design TEXT NOT NULL DEFAULT '',
+                acceptance_criteria TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'open',
+                priority INTEGER NOT NULL DEFAULT 2,
+                issue_type TEXT NOT NULL DEFAULT 'task',
+                assignee TEXT,
+                owner TEXT DEFAULT '',
+                estimated_minutes INTEGER,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                created_by TEXT DEFAULT '',
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                closed_at DATETIME,
+                close_reason TEXT DEFAULT '',
+                closed_by_session TEXT DEFAULT '',
+                due_at DATETIME,
+                defer_until DATETIME,
+                external_ref TEXT,
+                source_system TEXT DEFAULT '',
+                source_repo TEXT NOT NULL DEFAULT '.',
+                deleted_at DATETIME,
+                deleted_by TEXT DEFAULT '',
+                delete_reason TEXT DEFAULT '',
+                original_type TEXT DEFAULT '',
+                compaction_level INTEGER DEFAULT 0,
+                compacted_at DATETIME,
+                compacted_at_commit TEXT,
+                original_size INTEGER,
+                sender TEXT DEFAULT '',
+                ephemeral INTEGER NOT NULL DEFAULT 0,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                is_template INTEGER NOT NULL DEFAULT 0
+            );
+            ",
+        )
+        .expect("seed v9 issues table");
+
+        // Stamp the legacy version so the open-path would otherwise
+        // short-circuit and skip migrations.
+        conn.execute("PRAGMA user_version = 9")
+            .expect("stamp legacy user_version");
+
+        assert!(
+            !column_exists(&conn, "issues", "source_repo_path"),
+            "precondition: legacy v9 table must not have source_repo_path"
+        );
+
+        run_migrations_atomic(&conn, 9, 10).expect("v10 migration must succeed on v9 layout");
+
+        assert!(
+            column_exists(&conn, "issues", "source_repo_path"),
+            "source_repo_path column should be present after schema upgrade"
+        );
+
+        // The user_version stamp must advance to the migration's target so
+        // future opens take the fast path safely. This test pins the v9→v10
+        // step specifically (run_migrations_atomic above used target=10), so
+        // the assertion stays at 10 even as CURRENT_SCHEMA_VERSION advances.
+        let stamped = conn
+            .query_row("PRAGMA user_version")
+            .ok()
+            .and_then(|row| row.get(0).and_then(SqliteValue::as_integer))
+            .unwrap_or(-1);
+        assert_eq!(
+            stamped, 10,
+            "user_version should reflect the v10 migration target after run_migrations_atomic(9, 10)"
+        );
     }
 
     #[test]
@@ -1835,10 +2500,19 @@ mod tests {
             !issues_sql.contains("CREATE TABLE IF NOT EXISTS issues"),
             "issues table SQL must not preserve IF NOT EXISTS because bd ALTER TABLE reparses sqlite_master SQL, got: {issues_sql}"
         );
+        // Use trailing space to disambiguate from `source_repo_path` (which
+        // contains `source_repo` as a prefix). The column declaration is
+        // `source_repo TEXT ...`, so the space-suffixed form matches the
+        // canonical declaration site exactly once.
         assert_eq!(
-            issues_sql.matches("source_repo").count(),
+            issues_sql.matches("source_repo ").count(),
             1,
             "issues table SQL should define source_repo exactly once"
+        );
+        assert_eq!(
+            issues_sql.matches("source_repo_path ").count(),
+            1,
+            "issues table SQL should define source_repo_path exactly once"
         );
         assert_eq!(
             issues_sql.matches("is_template").count(),
@@ -1996,6 +2670,12 @@ mod tests {
         assert!(
             indexes.contains("idx_issues_ready"),
             "missing idx_issues_ready composite index"
+        );
+        // Widened ready group (#354): non-partial composite must exist on real DBs
+        // so a configured `status IN (...)` ready query stays index-covered.
+        assert!(
+            indexes.contains("idx_issues_status_priority_created"),
+            "missing idx_issues_status_priority_created composite index"
         );
         assert!(
             indexes.contains("idx_issues_list_active_order"),
@@ -2224,6 +2904,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_apply_schema_rebuilds_nullable_blocked_cache_table() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let conn = Connection::open(temp.path().to_string_lossy().into_owned()).unwrap();
+
+        execute_batch(
+            &conn,
+            r"
+            CREATE TABLE blocked_issues_cache (
+                issue_id TEXT PRIMARY KEY,
+                blocked_by TEXT,
+                blocked_at DATETIME
+            );
+            INSERT INTO blocked_issues_cache (issue_id, blocked_by, blocked_at)
+            VALUES ('bd-null-cache', NULL, CURRENT_TIMESTAMP);
+            ",
+        )
+        .unwrap();
+
+        apply_schema(&conn).unwrap();
+
+        let column_rows = conn
+            .query("PRAGMA table_info(blocked_issues_cache)")
+            .unwrap();
+        let mut issue_id_primary_key = false;
+        let mut blocked_by_not_null = false;
+        let mut blocked_at_not_null = false;
+        for row in &column_rows {
+            let Some(name) = row.get(1).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let not_null = row
+                .get(3)
+                .and_then(SqliteValue::as_integer)
+                .is_some_and(|value| value != 0);
+            let primary_key = row
+                .get(5)
+                .and_then(SqliteValue::as_integer)
+                .is_some_and(|value| value != 0);
+            match name {
+                "issue_id" => issue_id_primary_key = primary_key,
+                "blocked_by" => blocked_by_not_null = not_null,
+                "blocked_at" => blocked_at_not_null = not_null,
+                _ => {}
+            }
+        }
+
+        assert!(
+            issue_id_primary_key,
+            "issue_id should be the cache primary key"
+        );
+        assert!(
+            blocked_by_not_null,
+            "blocked_by must be NOT NULL after schema repair"
+        );
+        assert!(
+            blocked_at_not_null,
+            "blocked_at must be NOT NULL after schema repair"
+        );
+
+        let null_rows = conn
+            .query_row("SELECT COUNT(*) FROM blocked_issues_cache WHERE blocked_by IS NULL")
+            .unwrap()
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(-1);
+        assert_eq!(
+            null_rows, 0,
+            "derived blocked cache NULL rows should be discarded during schema repair"
+        );
+    }
+
     /// Migration: drop old blocked_issues_cache missing issue_id column.
     #[test]
     fn test_migration_blocked_cache_missing_issue_id() {
@@ -2358,6 +3110,11 @@ mod tests {
             "created_by",
             "updated_at",
             "source_repo",
+            // Pins the v10 column-add: a legacy `(id, title)`-only table opened
+            // by a v10+ binary must end up with `source_repo_path` present, so
+            // the live INSERT/UPDATE SQL emitted by the storage layer doesn't
+            // crash with "no such column" on the very next write.
+            "source_repo_path",
             "compaction_level",
             "sender",
             "is_template",

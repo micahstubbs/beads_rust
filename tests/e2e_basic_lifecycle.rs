@@ -1,14 +1,18 @@
 mod common;
 
-use beads_rust::model::{Issue, IssueType, Priority, Status};
+use beads_rust::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use beads_rust::storage::SqliteStorage;
 use chrono::Utc;
 use common::cli::{
-    BrWorkspace, extract_json_payload, parse_list_issues, run_br, run_br_smoke_at_root_with_env,
+    BrRun, BrWorkspace, extract_json_payload, parse_json_value, parse_list_issues, run_br,
+    run_br_smoke_at_root_with_env,
 };
 use common::isolated_workspace_failure_fixture;
 use serde_json::Value;
 use std::fs;
+use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::process::{Command as StdCommand, Stdio};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -52,6 +56,8 @@ fn make_issue(id: &str, title: &str, now: chrono::DateTime<Utc>) -> Issue {
         external_ref: None,
         source_system: None,
         source_repo: None,
+        source_repo_path: None,
+        agent_context: None,
         deleted_at: None,
         deleted_by: None,
         delete_reason: None,
@@ -68,6 +74,64 @@ fn make_issue(id: &str, title: &str, now: chrono::DateTime<Utc>) -> Issue {
         dependencies: vec![],
         comments: vec![],
     }
+}
+
+fn dotted_parent_child_dependency(
+    issue_id: &str,
+    depends_on_id: &str,
+    now: chrono::DateTime<Utc>,
+) -> Dependency {
+    Dependency {
+        issue_id: issue_id.to_string(),
+        depends_on_id: depends_on_id.to_string(),
+        dep_type: DependencyType::ParentChild,
+        created_at: now,
+        created_by: Some("tester".to_string()),
+        metadata: Some("{}".to_string()),
+        thread_id: None,
+    }
+}
+
+fn write_dotted_jsonl_fixture(workspace: &BrWorkspace) -> PathBuf {
+    let beads_dir = workspace.root.join(".beads");
+    fs::create_dir_all(&beads_dir).expect("create .beads");
+    let jsonl_path = beads_dir.join("issues.jsonl");
+    let now = Utc::now();
+
+    let parent = make_issue("bd-rchk0.5", "Dotted parent", now);
+    let mut target = make_issue("bd-rchk0.5.6", "Dotted target", now);
+    target
+        .dependencies
+        .push(dotted_parent_child_dependency(&target.id, &parent.id, now));
+    let mut child = make_issue("bd-rchk0.5.6.1", "Dotted child", now);
+    child
+        .dependencies
+        .push(dotted_parent_child_dependency(&child.id, &target.id, now));
+    let blocker = make_issue("bd-blocker7", "Dotted blocker", now);
+
+    let records = [&parent, &target, &child, &blocker]
+        .into_iter()
+        .map(|issue| serde_json::to_string(issue).expect("serialize dotted fixture"))
+        .collect::<Vec<_>>();
+    fs::write(&jsonl_path, records.join("\n") + "\n").expect("write dotted jsonl");
+    jsonl_path
+}
+
+fn assert_br_success(run: &BrRun, context: &str) {
+    assert!(run.status.success(), "{context}: {}", run.stderr);
+}
+
+fn parse_json_array(stdout: &str, context: &str) -> Vec<Value> {
+    serde_json::from_str(&extract_json_payload(stdout)).expect(context)
+}
+
+fn read_jsonl_values(path: &Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .expect("read jsonl")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("parse exported issue"))
+        .collect()
 }
 
 fn prepare_merge_conflict_workspace() -> (BrWorkspace, String) {
@@ -129,6 +193,25 @@ fn assert_issue_description(workspace: &BrWorkspace, issue_id: &str, expected: &
     let payload = extract_json_payload(&show.stdout);
     let issues: Vec<Value> = serde_json::from_str(&payload).expect("parse show json");
     assert_eq!(issues[0]["description"].as_str(), Some(expected));
+}
+
+#[cfg(target_os = "linux")]
+fn clear_br_env_for_std_command(cmd: &mut StdCommand) {
+    for (key, _) in std::env::vars_os() {
+        let key = key.to_string_lossy();
+        if key.starts_with("BD_")
+            || key.starts_with("BEADS_")
+            || matches!(
+                key.as_ref(),
+                "BR_DISABLE_READ_ONLY_FAST_OPEN"
+                    | "BR_OUTPUT_FORMAT"
+                    | "TOON_DEFAULT_FORMAT"
+                    | "TOON_STATS"
+            )
+        {
+            cmd.env_remove(key.as_ref());
+        }
+    }
 }
 
 #[test]
@@ -203,6 +286,50 @@ fn e2e_basic_lifecycle() {
     ];
     let close = run_br(&workspace, close_args, "close");
     assert!(close.status.success(), "close failed: {}", close.stderr);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn json_stdout_write_failure_exits_with_io_error() {
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_stdout_failure");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "stdout failure probe"],
+        "create_stdout_failure",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let dev_full = fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("open /dev/full");
+    let mut cmd = StdCommand::new(assert_cmd::cargo::cargo_bin!("br"));
+    cmd.current_dir(&workspace.root);
+    cmd.args(["list", "--json", "--no-auto-import", "--no-auto-flush"]);
+    clear_br_env_for_std_command(&mut cmd);
+    cmd.env("NO_COLOR", "1");
+    cmd.env("RUST_LOG", "beads_rust=debug");
+    cmd.env("RUST_BACKTRACE", "1");
+    cmd.env("HOME", &workspace.root);
+    cmd.stdout(Stdio::from(dev_full));
+    cmd.stderr(Stdio::piped());
+
+    let output = cmd.output().expect("run br with /dev/full stdout");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(8),
+        "stdout write failure should exit as I/O error; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("failed to serialize JSON output"),
+        "stderr should report the output serialization failure: {stderr}"
+    );
 }
 
 #[test]
@@ -919,6 +1046,178 @@ fn e2e_no_db_mixed_prefixes_are_supported() {
 }
 
 #[test]
+fn e2e_dotted_ids_survive_no_db_import_update_dep_and_flush() {
+    let workspace = BrWorkspace::new();
+    let jsonl_path = write_dotted_jsonl_fixture(&workspace);
+
+    let no_db_show = run_br(
+        &workspace,
+        ["--no-db", "show", "bd-rchk0.5.6", "--json"],
+        "dotted_no_db_show",
+    );
+    assert_br_success(&no_db_show, "no-db show failed for dotted id");
+    let shown = parse_json_array(&no_db_show.stdout, "show json");
+    assert_eq!(shown[0]["id"].as_str(), Some("bd-rchk0.5.6"));
+
+    let no_db_update = run_br(
+        &workspace,
+        [
+            "--no-db",
+            "update",
+            "bd-rchk0.5.6",
+            "--priority",
+            "1",
+            "--json",
+        ],
+        "dotted_no_db_update",
+    );
+    assert_br_success(&no_db_update, "no-db update failed for dotted id");
+    let updated = parse_json_array(&no_db_update.stdout, "update json");
+    assert_eq!(updated[0]["id"].as_str(), Some("bd-rchk0.5.6"));
+    assert_eq!(updated[0]["priority"].as_i64(), Some(1));
+
+    let imported = run_br(
+        &workspace,
+        ["sync", "--import-only", "--json"],
+        "dotted_import",
+    );
+    assert_br_success(&imported, "import failed for dotted ids");
+    let import_json = parse_json_value(&imported.stdout);
+    assert_eq!(import_json["created"].as_i64(), Some(4));
+
+    let db_show = run_br(
+        &workspace,
+        ["show", "bd-rchk0.5.6", "--json"],
+        "dotted_db_show",
+    );
+    assert_br_success(&db_show, "db show failed for dotted id");
+    let db_show_json = parse_json_array(&db_show.stdout, "db show json");
+    assert_eq!(db_show_json[0]["id"].as_str(), Some("bd-rchk0.5.6"));
+    assert!(
+        db_show_json[0]["dependents"]
+            .as_array()
+            .is_some_and(|items| items
+                .iter()
+                .any(|item| item["id"].as_str() == Some("bd-rchk0.5.6.1"))),
+        "dotted child dependent should resolve to the exact parent"
+    );
+
+    let db_update = run_br(
+        &workspace,
+        [
+            "--no-auto-flush",
+            "update",
+            "bd-rchk0.5.6",
+            "--priority",
+            "0",
+            "--json",
+        ],
+        "dotted_db_update",
+    );
+    assert_br_success(&db_update, "db update failed for dotted id");
+    let db_update_json = parse_json_array(&db_update.stdout, "db update json");
+    assert_eq!(db_update_json[0]["id"].as_str(), Some("bd-rchk0.5.6"));
+    assert_eq!(db_update_json[0]["priority"].as_i64(), Some(0));
+
+    let dep_add = run_br(
+        &workspace,
+        [
+            "--no-auto-flush",
+            "dep",
+            "add",
+            "bd-rchk0.5.6",
+            "bd-blocker7",
+            "--json",
+        ],
+        "dotted_dep_add",
+    );
+    assert_br_success(&dep_add, "dep add failed for dotted id");
+
+    let flush = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--json"],
+        "dotted_flush",
+    );
+    assert_br_success(&flush, "flush failed after dotted mutations");
+
+    let exported_issues = read_jsonl_values(&jsonl_path);
+    assert_eq!(exported_issues.len(), 4);
+    let exported_target = exported_issues
+        .iter()
+        .find(|issue| issue["id"].as_str() == Some("bd-rchk0.5.6"))
+        .expect("exported dotted target");
+    assert_eq!(exported_target["priority"].as_i64(), Some(0));
+    assert!(
+        exported_target["dependencies"]
+            .as_array()
+            .is_some_and(|items| items
+                .iter()
+                .any(|item| item["depends_on_id"].as_str() == Some("bd-blocker7"))),
+        "exported dotted target should retain the added dependency"
+    );
+}
+
+#[test]
+fn dep_import_auto_flushes_imported_edges_to_jsonl() {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "dep_import_auto_flush_init");
+    assert_br_success(&init, "init failed");
+
+    let source = run_br(
+        &workspace,
+        ["create", "Bulk import source"],
+        "dep_import_auto_flush_source",
+    );
+    assert_br_success(&source, "source create failed");
+    let source_id = parse_created_id(&source.stdout);
+
+    let target = run_br(
+        &workspace,
+        ["create", "Bulk import target"],
+        "dep_import_auto_flush_target",
+    );
+    assert_br_success(&target, "target create failed");
+    let target_id = parse_created_id(&target.stdout);
+
+    let import_path = workspace.root.join("edges.jsonl");
+    fs::write(
+        &import_path,
+        format!(
+            "{{\"issue_id\":\"{}\",\"depends_on_id\":\"{}\",\"type\":\"blocks\"}}\n",
+            source_id, target_id
+        ),
+    )
+    .expect("write dependency import jsonl");
+
+    let import_arg = import_path.to_string_lossy().to_string();
+    let import = run_br(
+        &workspace,
+        ["dep", "import", import_arg.as_str(), "--robot"],
+        "dep_import_auto_flush_import",
+    );
+    assert_br_success(&import, "dep import failed");
+    let import_result: Value =
+        serde_json::from_str(&extract_json_payload(&import.stdout)).expect("parse import result");
+    assert_eq!(import_result["imported"].as_u64(), Some(1));
+
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let exported = read_jsonl_values(&jsonl_path);
+    let source_record = exported
+        .iter()
+        .find(|issue| issue["id"].as_str() == Some(source_id.as_str()))
+        .expect("source issue exported after dep import");
+    assert!(
+        source_record["dependencies"]
+            .as_array()
+            .is_some_and(|deps| deps.iter().any(|dep| {
+                dep["depends_on_id"].as_str() == Some(target_id.as_str())
+                    && dep["type"].as_str() == Some("blocks")
+            })),
+        "dep import should auto-flush imported edges into issues.jsonl"
+    );
+}
+
+#[test]
 fn e2e_no_db_mutations_succeed_with_large_export_hash_batches() {
     let _log = common::test_log("e2e_no_db_mutations_succeed_with_large_export_hash_batches");
     let workspace = BrWorkspace::new();
@@ -1106,6 +1405,362 @@ fn e2e_sync_status_json() {
     let payload = extract_json_payload(&status.stdout);
     let status_json: Value = serde_json::from_str(&payload).expect("sync status json");
     assert!(status_json["dirty_count"].is_number());
+}
+
+#[test]
+fn e2e_sync_witness_json_is_deterministic_and_read_only() {
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let first = run_br(&workspace, ["create", "Witness issue A"], "create_a");
+    assert!(first.status.success(), "create A failed: {}", first.stderr);
+
+    let second = run_br(&workspace, ["create", "Witness issue B"], "create_b");
+    assert!(
+        second.status.success(),
+        "create B failed: {}",
+        second.stderr
+    );
+
+    let flush = run_br(&workspace, ["sync", "--flush-only", "--json"], "sync_flush");
+    assert!(
+        flush.status.success(),
+        "sync flush failed: {}",
+        flush.stderr
+    );
+
+    let status_before = run_br(
+        &workspace,
+        ["sync", "--status", "--json"],
+        "status_before_witness",
+    );
+    assert!(
+        status_before.status.success(),
+        "pre-witness status failed: {}",
+        status_before.stderr
+    );
+    let status_before_json: Value =
+        serde_json::from_str(&extract_json_payload(&status_before.stdout))
+            .expect("pre-witness status json");
+    assert_eq!(status_before_json["dirty_count"].as_u64(), Some(0));
+
+    let witness = run_br(
+        &workspace,
+        ["sync", "--witness", "--witness-chunk-lines", "1", "--json"],
+        "sync_witness",
+    );
+    assert!(
+        witness.status.success(),
+        "sync witness failed: {}",
+        witness.stderr
+    );
+    let witness_json: Value =
+        serde_json::from_str(&extract_json_payload(&witness.stdout)).expect("sync witness json");
+
+    assert!(
+        witness_json["jsonl_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with(".beads/issues.jsonl")),
+        "unexpected witness path: {witness_json}"
+    );
+    let witness_body = &witness_json["witness"];
+    assert_eq!(witness_body["schema_version"], "br.jsonl-witness.v1");
+    assert_eq!(witness_body["chunk_size_lines"].as_u64(), Some(1));
+    assert_eq!(witness_body["line_count"].as_u64(), Some(2));
+    assert!(witness_body["byte_count"].as_u64().is_some_and(|n| n > 0));
+    assert_eq!(witness_body["root_hash"].as_str().map(str::len), Some(64));
+    assert_eq!(witness_body["chunks"].as_array().map(Vec::len), Some(2));
+
+    let witness_again = run_br(
+        &workspace,
+        ["sync", "--witness", "--witness-chunk-lines", "1", "--json"],
+        "sync_witness_again",
+    );
+    assert!(
+        witness_again.status.success(),
+        "second sync witness failed: {}",
+        witness_again.stderr
+    );
+    let witness_again_json: Value =
+        serde_json::from_str(&extract_json_payload(&witness_again.stdout))
+            .expect("second sync witness json");
+    assert_eq!(
+        witness_body["root_hash"],
+        witness_again_json["witness"]["root_hash"]
+    );
+
+    let status_after = run_br(
+        &workspace,
+        ["sync", "--status", "--json"],
+        "status_after_witness",
+    );
+    assert!(
+        status_after.status.success(),
+        "post-witness status failed: {}",
+        status_after.stderr
+    );
+    let status_after_json: Value =
+        serde_json::from_str(&extract_json_payload(&status_after.stdout))
+            .expect("post-witness status json");
+    assert_eq!(status_after_json["dirty_count"].as_u64(), Some(0));
+}
+
+fn assert_base_witness_reuse_plan(witness_json: &Value) {
+    let reuse_plan = &witness_json["base_reuse_plan"];
+    assert_eq!(
+        reuse_plan["comparison"]["safe_reuse_prefix_chunks"].as_u64(),
+        Some(1)
+    );
+    let schedule = &reuse_plan["schedule"];
+    assert_eq!(schedule["candidate_output_actions"].as_u64(), Some(2));
+    assert_eq!(schedule["metadata_only_drop_actions"].as_u64(), Some(0));
+    assert_eq!(schedule["reusable_actions"].as_u64(), Some(1));
+    assert_eq!(schedule["read_added_actions"].as_u64(), Some(1));
+    assert_eq!(schedule["max_parallel_candidate_actions"].as_u64(), Some(2));
+    assert_eq!(
+        schedule["deterministic_candidate_order"].as_bool(),
+        Some(true)
+    );
+    let actions = reuse_plan["actions"].as_array().expect("reuse actions");
+    assert_eq!(actions.len(), 2);
+    assert_eq!(actions[0]["action"].as_str(), Some("reuse_unchanged"));
+    assert_eq!(actions[0]["base_index"].as_u64(), Some(0));
+    assert_eq!(actions[0]["candidate_index"].as_u64(), Some(0));
+    assert_eq!(actions[1]["action"].as_str(), Some("read_added"));
+    assert!(actions[1]["base_index"].is_null());
+    assert_eq!(actions[1]["candidate_index"].as_u64(), Some(1));
+
+    let work_plan = &witness_json["base_parallel_work_plan"];
+    assert_eq!(work_plan["max_parallelism"].as_u64(), Some(1));
+    assert_eq!(work_plan["total_batches"].as_u64(), Some(2));
+    assert_eq!(work_plan["candidate_output_batches"].as_u64(), Some(2));
+    assert_eq!(work_plan["metadata_only_drop_batches"].as_u64(), Some(0));
+    assert_eq!(work_plan["deterministic_batch_order"].as_bool(), Some(true));
+    let batches = work_plan["batches"].as_array().expect("work batches");
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[0]["kind"].as_str(), Some("candidate_output"));
+    assert_eq!(batches[0]["candidate_start_index"].as_u64(), Some(0));
+    assert_eq!(batches[0]["candidate_end_index"].as_u64(), Some(1));
+    assert_eq!(batches[0]["action_count"].as_u64(), Some(1));
+    assert_eq!(batches[0]["actions"].as_array().map(Vec::len), Some(1));
+    assert_eq!(batches[1]["kind"].as_str(), Some("candidate_output"));
+    assert_eq!(batches[1]["candidate_start_index"].as_u64(), Some(1));
+    assert_eq!(batches[1]["candidate_end_index"].as_u64(), Some(2));
+    assert_eq!(batches[1]["action_count"].as_u64(), Some(1));
+
+    let materialization = &witness_json["base_reuse_materialization"];
+    assert_eq!(materialization["reused_chunks"].as_u64(), Some(1));
+    assert_eq!(materialization["rebuilt_chunks"].as_u64(), Some(0));
+    assert_eq!(materialization["read_added_chunks"].as_u64(), Some(1));
+    assert_eq!(materialization["dropped_chunks"].as_u64(), Some(0));
+    assert_eq!(
+        materialization["output_byte_count"].as_u64(),
+        witness_json["witness"]["byte_count"].as_u64()
+    );
+    assert_eq!(
+        materialization["reused_byte_count"].as_u64(),
+        reuse_plan["schedule"]["reusable_byte_count"].as_u64()
+    );
+    assert_eq!(
+        materialization["read_added_byte_count"].as_u64(),
+        reuse_plan["schedule"]["read_added_byte_count"].as_u64()
+    );
+}
+
+#[test]
+fn e2e_sync_flush_export_parallelism_preserves_jsonl_bytes() {
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_parallel_export");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let now = Utc::now();
+    let records = (0..300)
+        .map(|index| {
+            let id = format!("bd-pex{index:04}");
+            let mut issue = make_issue(&id, &format!("Parallel export issue {index:04}"), now);
+            issue.description = Some(format!(
+                "Synthetic JSONL export payload {index:04} with enough stable text to exercise ordered line preparation."
+            ));
+            issue.assignee = Some(format!("agent-{:03}", index % 64));
+            issue.labels = vec![
+                "parallel-export".to_string(),
+                "jsonl".to_string(),
+                format!("lane-{:02}", index % 16),
+            ];
+            issue.comments.push(Comment {
+                id: i64::from(index) + 1,
+                issue_id: id,
+                author: format!("agent-{:03}", index % 64),
+                body: format!(
+                    "Deterministic comment payload {index:04} for serde_json export parity."
+                ),
+                created_at: now,
+            });
+            serde_json::to_string(&issue).expect("serialize parallel export fixture issue")
+        })
+        .collect::<Vec<_>>();
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    fs::write(&jsonl_path, records.join("\n") + "\n").expect("write parallel export fixture");
+
+    let import = run_br(
+        &workspace,
+        ["sync", "--import-only", "--force", "--json"],
+        "import_parallel_export_fixture",
+    );
+    assert!(
+        import.status.success(),
+        "import fixture failed: {}",
+        import.stderr
+    );
+
+    let serial = run_br(
+        &workspace,
+        [
+            "sync",
+            "--flush-only",
+            "--force",
+            "--export-parallelism",
+            "1",
+            "--json",
+        ],
+        "flush_parallel_export_serial",
+    );
+    assert!(
+        serial.status.success(),
+        "serial export failed: {}",
+        serial.stderr
+    );
+    let serial_json: Value =
+        serde_json::from_str(&extract_json_payload(&serial.stdout)).expect("serial flush json");
+    let serial_bytes = fs::read(&jsonl_path).expect("read serial jsonl");
+
+    let parallel = run_br(
+        &workspace,
+        [
+            "sync",
+            "--flush-only",
+            "--force",
+            "--export-parallelism",
+            "4",
+            "--json",
+        ],
+        "flush_parallel_export_parallel",
+    );
+    assert!(
+        parallel.status.success(),
+        "parallel export failed: {}",
+        parallel.stderr
+    );
+    let parallel_json: Value =
+        serde_json::from_str(&extract_json_payload(&parallel.stdout)).expect("parallel flush json");
+    let parallel_bytes = fs::read(&jsonl_path).expect("read parallel jsonl");
+
+    assert_eq!(parallel_bytes, serial_bytes);
+    assert_eq!(serial_json["exported_issues"].as_u64(), Some(300));
+    assert_eq!(parallel_json["exported_issues"].as_u64(), Some(300));
+    assert_eq!(parallel_json["content_hash"], serial_json["content_hash"]);
+}
+
+#[test]
+fn e2e_sync_witness_reports_base_snapshot_drift() {
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_base_witness");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let first = run_br(
+        &workspace,
+        ["create", "Base witness issue A"],
+        "create_base_witness_a",
+    );
+    assert!(first.status.success(), "create A failed: {}", first.stderr);
+
+    let first_flush = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--json"],
+        "sync_flush_base_witness_a",
+    );
+    assert!(
+        first_flush.status.success(),
+        "first sync flush failed: {}",
+        first_flush.stderr
+    );
+
+    let second = run_br(
+        &workspace,
+        ["create", "Base witness issue B"],
+        "create_base_witness_b",
+    );
+    assert!(
+        second.status.success(),
+        "create B failed: {}",
+        second.stderr
+    );
+
+    let second_flush = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--json"],
+        "sync_flush_base_witness_b",
+    );
+    assert!(
+        second_flush.status.success(),
+        "second sync flush failed: {}",
+        second_flush.stderr
+    );
+
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let base_snapshot_path = workspace.root.join(".beads").join("beads.base.jsonl");
+    let current_jsonl = fs::read_to_string(&jsonl_path).expect("read current jsonl");
+    let first_candidate_line = current_jsonl
+        .lines()
+        .next()
+        .expect("candidate jsonl should contain at least one issue");
+    fs::write(&base_snapshot_path, format!("{first_candidate_line}\n"))
+        .expect("seed base witness snapshot");
+
+    let witness = run_br(
+        &workspace,
+        [
+            "sync",
+            "--witness",
+            "--witness-chunk-lines",
+            "1",
+            "--witness-parallelism",
+            "1",
+            "--json",
+        ],
+        "sync_witness_base_compare",
+    );
+    assert!(
+        witness.status.success(),
+        "sync witness failed: {}",
+        witness.stderr
+    );
+    let witness_json: Value =
+        serde_json::from_str(&extract_json_payload(&witness.stdout)).expect("sync witness json");
+
+    assert!(
+        witness_json["base_jsonl_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with(".beads/beads.base.jsonl")),
+        "unexpected base witness path: {witness_json}"
+    );
+    let comparison = &witness_json["base_comparison"];
+    assert_eq!(comparison["schema_versions_match"].as_bool(), Some(true));
+    assert_eq!(comparison["chunk_size_lines_match"].as_bool(), Some(true));
+    assert_eq!(comparison["drift_detected"].as_bool(), Some(true));
+    assert_eq!(comparison["base_line_count"].as_u64(), Some(1));
+    assert_eq!(comparison["candidate_line_count"].as_u64(), Some(2));
+    assert_eq!(comparison["unchanged_chunks"].as_u64(), Some(1));
+    assert_eq!(comparison["changed_chunks"].as_u64(), Some(0));
+    assert_eq!(comparison["added_chunks"].as_u64(), Some(1));
+    assert_eq!(comparison["removed_chunks"].as_u64(), Some(0));
+    assert_eq!(comparison["safe_reuse_prefix_chunks"].as_u64(), Some(1));
+    assert_eq!(comparison["first_changed_chunk_index"].as_u64(), Some(1));
+    assert_base_witness_reuse_plan(&witness_json);
 }
 
 #[test]

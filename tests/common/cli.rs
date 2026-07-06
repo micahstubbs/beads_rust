@@ -21,7 +21,10 @@ fn should_clear_inherited_br_env(key: &OsStr) -> bool {
         || key.starts_with("BEADS_")
         || matches!(
             key.as_ref(),
-            "BR_OUTPUT_FORMAT" | "TOON_DEFAULT_FORMAT" | "TOON_STATS"
+            "BR_DISABLE_READ_ONLY_FAST_OPEN"
+                | "BR_OUTPUT_FORMAT"
+                | "TOON_DEFAULT_FORMAT"
+                | "TOON_STATS"
         )
 }
 
@@ -185,6 +188,11 @@ where
     } else {
         clear_inherited_br_env(&mut cmd);
     }
+    // Default e2e runs un-throttled so history-mechanics tests (backup
+    // chronology, prune, restore) observe one `.br_history` snapshot per
+    // mutation. Set before caller `env_vars` so a test can override this to
+    // exercise the #313 snapshot throttle.
+    cmd.env("BR_HISTORY_MIN_INTERVAL_SECS", "0");
     cmd.envs(env_vars);
     cmd.env("NO_COLOR", "1");
     cmd.env("RUST_LOG", "beads_rust=debug");
@@ -304,6 +312,7 @@ mod tests {
             "BD_ACTOR",
             "BEADS_CACHE_DIR",
             "BEADS_JSONL",
+            "BR_DISABLE_READ_ONLY_FAST_OPEN",
             "BR_OUTPUT_FORMAT",
             "TOON_DEFAULT_FORMAT",
             "TOON_STATS",

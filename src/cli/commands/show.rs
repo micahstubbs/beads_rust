@@ -1,6 +1,9 @@
 //! Show command implementation.
 
-use crate::cli::commands::{acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale};
+use crate::cli::commands::{
+    acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
+    cli_for_routed_workspace, external_project_db_paths_after_auto_import_if_needed,
+};
 use crate::cli::{ShowArgs, resolve_output_format_basic_with_outer_mode};
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -11,11 +14,13 @@ use crate::format::{
 use crate::model::{Dependency, Issue, Priority, Status};
 use crate::output::{IssuePanel, OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
-use crate::sync::read_issues_from_jsonl;
-use crate::util::id::{IdResolver, ResolverConfig};
+use crate::sync::{path as sync_path, read_issues_from_jsonl};
+use crate::util::id::{IdResolver, ResolverConfig, normalize_id};
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as FmtWrite;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 /// Execute the show command.
@@ -107,10 +112,13 @@ fn execute_routed(
             let normalized_batch_beads_dir =
                 dunce::canonicalize(&batch_beads_dir).unwrap_or_else(|_| batch_beads_dir.clone());
             let use_preloaded = normalized_batch_beads_dir == normalized_local_beads_dir;
-            let mut batch_cli = cli.clone();
-            batch_cli.db = if use_preloaded { cli.db.clone() } else { None };
-            let _routed_write_lock =
-                acquire_routed_workspace_write_lock(&batch_beads_dir, !use_preloaded)?;
+            let mut batch_cli = cli_for_routed_workspace(cli, !use_preloaded);
+            let routed_write_lock = acquire_routed_workspace_write_lock(
+                &batch_beads_dir,
+                !use_preloaded,
+                batch_cli.lock_timeout,
+            )?;
+            routed_write_lock.mark_cli_write_lock_held(&mut batch_cli);
             let (batch_details, _) = load_issue_details_for_route(
                 &batch_args,
                 &batch_cli,
@@ -133,7 +141,7 @@ fn execute_routed(
         let structured_ctx = OutputContext::from_output_format(output_format, quiet, true);
 
         match output_format {
-            crate::cli::OutputFormat::Json => structured_ctx.json_pretty(&details_list),
+            crate::cli::OutputFormat::Json => structured_ctx.json_array(details_list.iter()),
             crate::cli::OutputFormat::Toon => {
                 structured_ctx.toon_with_stats(&details_list, args.stats);
             }
@@ -154,10 +162,13 @@ fn execute_routed(
         let normalized_batch_beads_dir =
             dunce::canonicalize(&batch.beads_dir).unwrap_or_else(|_| batch.beads_dir.clone());
         let use_preloaded = normalized_batch_beads_dir == normalized_local_beads_dir;
-        let mut batch_cli = cli.clone();
-        batch_cli.db = if use_preloaded { cli.db.clone() } else { None };
-        let _routed_write_lock =
-            acquire_routed_workspace_write_lock(&batch.beads_dir, !use_preloaded)?;
+        let mut batch_cli = cli_for_routed_workspace(cli, !use_preloaded);
+        let routed_write_lock = acquire_routed_workspace_write_lock(
+            &batch.beads_dir,
+            !use_preloaded,
+            batch_cli.lock_timeout,
+        )?;
+        routed_write_lock.mark_cli_write_lock_held(&mut batch_cli);
         let (batch_details, use_color) = load_issue_details_for_route(
             &batch_args,
             &batch_cli,
@@ -197,9 +208,9 @@ fn execute_routed(
         let ctx = OutputContext::from_output_format(output_format, quiet, !*use_color);
         if matches!(ctx.mode(), OutputMode::Rich) {
             let panel = IssuePanel::from_details(details, ctx.theme());
-            panel.print(&ctx, args.wrap);
+            panel.print(&ctx, !args.no_wrap);
         } else {
-            print_issue_details(details, *use_color);
+            print_issue_details(details, *use_color, !args.no_wrap);
         }
     }
 
@@ -249,21 +260,60 @@ fn execute_inner(
     }
     match output_format {
         crate::cli::OutputFormat::Json => {
-            ctx.json_pretty(&details_list);
+            ctx.json_array(details_list.iter());
         }
         crate::cli::OutputFormat::Toon => {
             ctx.toon_with_stats(&details_list, args.stats);
         }
         crate::cli::OutputFormat::Text | crate::cli::OutputFormat::Csv => {
+            // beads_rust#297: emit inherited governing context for each
+            // bead before its own details, when the project has opted
+            // in. Prefer the caller's preloaded storage; fall back to
+            // opening a transient read connection so the feature works
+            // from both `br show` and `br show --workspace …` paths.
+            // Failure to open is non-fatal — the alternative would be
+            // failing the entire show over an optional feature.
+            let inheritance_enabled = crate::inheritance::is_enabled(beads_dir);
+            let transient_ctx = if inheritance_enabled
+                && preloaded_storage.is_none()
+                && preloaded_storage_ctx.is_none()
+            {
+                config::open_storage_with_cli(beads_dir, cli).ok()
+            } else {
+                None
+            };
+            let inheritance_storage: Option<&SqliteStorage> = preloaded_storage
+                .or_else(|| preloaded_storage_ctx.map(|ctx| &ctx.storage))
+                .or_else(|| transient_ctx.as_ref().map(|ctx| &ctx.storage));
+            // beads_rust#351: when showing several siblings, each child's
+            // ancestor chain resolves independently, so the same epic/parent
+            // block would be re-rendered once per sibling. Dedup across the
+            // whole invocation: each inherited source is emitted exactly
+            // once, before the first child that references it.
+            let mut emitted_sources: HashSet<String> = HashSet::new();
             for (i, details) in details_list.iter().enumerate() {
                 if i > 0 {
                     println!(); // Separate multiple issues
                 }
+                if inheritance_enabled
+                    && let Some(storage) = inheritance_storage
+                    && let Ok(mut blocks) =
+                        crate::inheritance::collect_inherited_blocks(storage, &details.issue.id)
+                {
+                    blocks.retain(|block| emitted_sources.insert(block.source_id.clone()));
+                    if !blocks.is_empty() {
+                        let rendered = crate::inheritance::render_text(&blocks);
+                        print!("{rendered}");
+                        if !rendered.ends_with('\n') {
+                            println!();
+                        }
+                    }
+                }
                 if matches!(ctx.mode(), OutputMode::Rich) {
                     let panel = IssuePanel::from_details(details, ctx.theme());
-                    panel.print(&ctx, args.wrap);
+                    panel.print(&ctx, !args.no_wrap);
                 } else {
-                    print_issue_details(details, use_color);
+                    print_issue_details(details, use_color, !args.no_wrap);
                 }
             }
         }
@@ -310,7 +360,12 @@ fn reorder_routed_items_by_requested_inputs<T>(
                     "{context} returned unexpected issue input {input}"
                 )));
             };
-            ordered_details[index] = Some(item);
+            let slot = ordered_details.get_mut(index).ok_or_else(|| {
+                BeadsError::internal(format!(
+                    "{context} returned out-of-range issue index {index}"
+                ))
+            })?;
+            *slot = Some(item);
         }
     }
 
@@ -342,7 +397,12 @@ fn load_issue_details_for_route(
         let use_color = config::should_use_color(&config_layer);
         let id_config = config::id_config_from_layer(&config_layer);
         let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-        let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
+        let external_db_paths = external_project_db_paths_after_auto_import_if_needed(
+            &storage_ctx.storage,
+            &config_layer,
+            beads_dir,
+            cli,
+        )?;
         let details_list = load_issue_details_from_storage(
             &target_ids,
             &resolver,
@@ -372,8 +432,8 @@ fn load_issue_details_for_route(
     let use_color = config::should_use_color(&config_layer);
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
     let details_list = if no_db {
+        let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
         load_issue_details_from_jsonl(
             &target_ids,
             &resolver,
@@ -387,6 +447,12 @@ fn load_issue_details_for_route(
                 .expect("show should have an open storage handle")
                 .storage
         });
+        let external_db_paths = external_project_db_paths_after_auto_import_if_needed(
+            storage,
+            &config_layer,
+            beads_dir,
+            cli,
+        )?;
         load_issue_details_from_storage(&target_ids, &resolver, storage, &external_db_paths)?
     };
 
@@ -436,6 +502,21 @@ fn load_issue_details_from_jsonl(
     jsonl_path: &Path,
     external_db_paths: &HashMap<String, PathBuf>,
 ) -> Result<Vec<IssueDetails>> {
+    if let Some(details_list) =
+        load_exact_issue_details_from_jsonl(target_ids, resolver, jsonl_path, external_db_paths)?
+    {
+        return Ok(details_list);
+    }
+
+    load_issue_details_from_jsonl_materialized(target_ids, resolver, jsonl_path, external_db_paths)
+}
+
+fn load_issue_details_from_jsonl_materialized(
+    target_ids: &[String],
+    resolver: &IdResolver,
+    jsonl_path: &Path,
+    external_db_paths: &HashMap<String, PathBuf>,
+) -> Result<Vec<IssueDetails>> {
     let issues = read_issues_from_jsonl(jsonl_path)?;
     let mut issues_by_id = HashMap::with_capacity(issues.len());
     for issue in issues {
@@ -470,6 +551,235 @@ fn load_issue_details_from_jsonl(
     }
 
     Ok(details_list)
+}
+
+#[derive(Clone)]
+struct JsonlIssueSummary {
+    id: String,
+    title: String,
+    status: Status,
+    priority: Priority,
+    created_at: DateTime<Utc>,
+}
+
+impl JsonlIssueSummary {
+    fn from_issue(issue: &Issue) -> Self {
+        Self {
+            id: issue.id.clone(),
+            title: issue.title.clone(),
+            status: issue.status.clone(),
+            priority: issue.priority,
+            created_at: issue.created_at,
+        }
+    }
+
+    fn dependency_metadata(&self, dep_type: &str) -> IssueWithDependencyMetadata {
+        IssueWithDependencyMetadata {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            status: self.status.clone(),
+            priority: self.priority,
+            dep_type: dep_type.to_string(),
+        }
+    }
+}
+
+type JsonlDependencyDisplayEntry = (IssueWithDependencyMetadata, Priority, DateTime<Utc>);
+
+const MAX_EXACT_JSONL_SHOW_INITIAL_CAPACITY: usize = 64 * 1024;
+
+struct ExactJsonlShowIndex {
+    summaries: HashMap<String, JsonlIssueSummary>,
+    targets: HashMap<String, Issue>,
+    dependents: HashMap<String, Vec<JsonlDependencyDisplayEntry>>,
+}
+
+fn load_exact_issue_details_from_jsonl(
+    target_ids: &[String],
+    resolver: &IdResolver,
+    jsonl_path: &Path,
+    external_db_paths: &HashMap<String, PathBuf>,
+) -> Result<Option<Vec<IssueDetails>>> {
+    let Some(direct_target_ids) = direct_jsonl_target_ids(target_ids, resolver) else {
+        return Ok(None);
+    };
+    let direct_target_set = direct_target_ids.iter().cloned().collect::<HashSet<_>>();
+    let index = scan_exact_jsonl_show_index(jsonl_path, &direct_target_set)?;
+
+    if direct_target_ids
+        .iter()
+        .any(|id| !index.targets.contains_key(id))
+    {
+        return Ok(None);
+    }
+
+    let mut details_list = direct_target_ids
+        .iter()
+        .map(|id| build_issue_details_from_exact_jsonl_index(id, &index))
+        .collect::<Result<Vec<_>>>()?;
+
+    let external_ids = collect_external_dependency_ids(&details_list);
+    if !external_ids.is_empty() {
+        let statuses = SqliteStorage::resolve_external_dependency_statuses_for_ids(
+            &external_ids,
+            external_db_paths,
+        );
+        for details in &mut details_list {
+            apply_external_dependency_metadata(&mut details.dependencies, &statuses);
+            apply_external_dependency_metadata(&mut details.dependents, &statuses);
+        }
+    }
+
+    Ok(Some(details_list))
+}
+
+fn direct_jsonl_target_ids(target_ids: &[String], resolver: &IdResolver) -> Option<Vec<String>> {
+    let mut direct_ids = Vec::with_capacity(target_ids.len());
+    for id_input in target_ids {
+        let trimmed = id_input.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let normalized = normalize_id(trimmed);
+        if normalized.contains('-') {
+            direct_ids.push(normalized);
+        } else {
+            direct_ids.push(format!("{}-{normalized}", resolver.default_prefix()));
+        }
+    }
+    Some(direct_ids)
+}
+
+fn scan_exact_jsonl_show_index(
+    jsonl_path: &Path,
+    target_ids: &HashSet<String>,
+) -> Result<ExactJsonlShowIndex> {
+    let file = File::open(jsonl_path)?;
+    sync_path::validate_jsonl_fd_metadata(&file, jsonl_path)?;
+    let file_size = file.metadata().map_or(0, |metadata| metadata.len());
+    let estimated_count = estimated_jsonl_show_capacity(file_size);
+    let mut reader = BufReader::new(file);
+    let mut summaries_by_id = HashMap::with_capacity(estimated_count);
+    let mut target_issues_by_id = HashMap::with_capacity(target_ids.len());
+    let mut dependents_by_target_id: HashMap<String, Vec<JsonlDependencyDisplayEntry>> =
+        HashMap::new();
+    let mut seen_ids = HashSet::with_capacity(estimated_count);
+    let mut line = String::new();
+    let mut line_num = 0;
+
+    loop {
+        line.clear();
+        let bytes_read = reader.read_line(&mut line)?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            line_num += 1;
+            continue;
+        }
+
+        let issue: Issue = serde_json::from_str(trimmed).map_err(|error| {
+            BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num + 1, error))
+        })?;
+        let issue_id = issue.id.clone();
+        if !seen_ids.insert(issue_id.clone()) {
+            return Err(BeadsError::Config(format!(
+                "Duplicate issue id '{}' in {} at line {}",
+                issue_id,
+                jsonl_path.display(),
+                line_num + 1
+            )));
+        }
+
+        let summary = JsonlIssueSummary::from_issue(&issue);
+        for dep in &issue.dependencies {
+            if target_ids.contains(&dep.depends_on_id) {
+                dependents_by_target_id
+                    .entry(dep.depends_on_id.clone())
+                    .or_default()
+                    .push((
+                        summary.dependency_metadata(dep.dep_type.as_str()),
+                        summary.priority,
+                        summary.created_at,
+                    ));
+            }
+        }
+
+        if target_ids.contains(&issue_id) {
+            target_issues_by_id.insert(issue_id.clone(), issue);
+        }
+        summaries_by_id.insert(issue_id, summary);
+        line_num += 1;
+    }
+
+    Ok(ExactJsonlShowIndex {
+        summaries: summaries_by_id,
+        targets: target_issues_by_id,
+        dependents: dependents_by_target_id,
+    })
+}
+
+fn estimated_jsonl_show_capacity(file_size: u64) -> usize {
+    usize::try_from(file_size / 500)
+        .unwrap_or(usize::MAX)
+        .min(MAX_EXACT_JSONL_SHOW_INITIAL_CAPACITY)
+}
+
+fn build_issue_details_from_exact_jsonl_index(
+    issue_id: &str,
+    index: &ExactJsonlShowIndex,
+) -> Result<IssueDetails> {
+    let issue = index
+        .targets
+        .get(issue_id)
+        .ok_or_else(|| BeadsError::IssueNotFound {
+            id: issue_id.to_string(),
+        })?;
+
+    let mut dependencies = issue
+        .dependencies
+        .iter()
+        .map(|dep| dependency_metadata_from_jsonl_summary(dep, &index.summaries, true))
+        .collect::<Vec<_>>();
+    dependencies.sort_by(|left, right| {
+        left.1
+            .cmp(&right.1)
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.0.id.cmp(&right.0.id))
+    });
+
+    let mut dependents = index.dependents.get(issue_id).cloned().unwrap_or_default();
+    dependents.sort_by(|left, right| {
+        left.1
+            .cmp(&right.1)
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.0.id.cmp(&right.0.id))
+    });
+
+    let mut issue_without_relations = issue.clone();
+    let labels = issue_without_relations.labels.clone();
+    let comments = issue_without_relations.comments.clone();
+    issue_without_relations.labels.clear();
+    issue_without_relations.dependencies.clear();
+    issue_without_relations.comments.clear();
+
+    Ok(IssueDetails {
+        issue: issue_without_relations,
+        labels,
+        dependencies: dependencies.into_iter().map(|(item, _, _)| item).collect(),
+        dependents: dependents.into_iter().map(|(item, _, _)| item).collect(),
+        comments,
+        events: Vec::new(),
+        parent: issue
+            .dependencies
+            .iter()
+            .rev()
+            .find(|dep| dep.dep_type.as_str() == "parent-child")
+            .map(|dep| dep.depends_on_id.clone()),
+    })
 }
 
 fn build_issue_details_from_jsonl(
@@ -555,6 +865,50 @@ fn dependency_metadata_from_jsonl(
                 priority: target.priority,
                 dep_type: dep.dep_type.as_str().to_string(),
             },
+            target.priority,
+            target.created_at,
+        );
+    }
+
+    if allow_external_placeholder && dep.depends_on_id.starts_with("external:") {
+        return (
+            IssueWithDependencyMetadata {
+                id: dep.depends_on_id.clone(),
+                title: dep
+                    .depends_on_id
+                    .strip_prefix("external:")
+                    .unwrap_or(&dep.depends_on_id)
+                    .to_string(),
+                status: Status::Blocked,
+                priority: Priority::MEDIUM,
+                dep_type: dep.dep_type.as_str().to_string(),
+            },
+            Priority::MEDIUM,
+            dep.created_at,
+        );
+    }
+
+    (
+        IssueWithDependencyMetadata {
+            id: dep.depends_on_id.clone(),
+            title: format!("[missing issue: {}]", dep.depends_on_id),
+            status: Status::Tombstone,
+            priority: Priority::MEDIUM,
+            dep_type: dep.dep_type.as_str().to_string(),
+        },
+        Priority::MEDIUM,
+        dep.created_at,
+    )
+}
+
+fn dependency_metadata_from_jsonl_summary(
+    dep: &Dependency,
+    summaries_by_id: &HashMap<String, JsonlIssueSummary>,
+    allow_external_placeholder: bool,
+) -> JsonlDependencyDisplayEntry {
+    if let Some(target) = summaries_by_id.get(&dep.depends_on_id) {
+        return (
+            target.dependency_metadata(dep.dep_type.as_str()),
             target.priority,
             target.created_at,
         );
@@ -684,14 +1038,76 @@ fn parse_external_dep_id(dep_id: &str) -> Option<(String, String)> {
     Some((project, capability))
 }
 
-fn print_issue_details(details: &IssueDetails, use_color: bool) {
-    let output = format_issue_details(details, use_color);
+fn print_issue_details(details: &IssueDetails, use_color: bool, wrap: bool) {
+    let output = format_issue_details(details, use_color, wrap);
     print!("{output}");
 }
 
+/// Width used to soft-wrap free-text bodies in the non-Rich (piped / no-TTY)
+/// `br show --format text` output. Honors `$COLUMNS` when set to a sane value,
+/// otherwise falls back to a readable 100 columns (#370). The Rich panel path
+/// uses the live terminal width instead.
+fn compact_wrap_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.trim().parse::<usize>().ok())
+        .filter(|w| *w >= 20)
+        .unwrap_or(100)
+}
+
+/// Soft-wrap `text` to `width` columns on word boundaries (#370). Existing line
+/// breaks are preserved, a line's leading indentation is carried onto wrapped
+/// continuations, and a single over-long word is never split. Passing
+/// `usize::MAX` is a no-op, so callers can disable wrapping cheaply.
+fn wrap_body(text: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let width = width.max(1);
+    let mut out = String::new();
+    for (line_idx, line) in text.split('\n').enumerate() {
+        if line_idx > 0 {
+            out.push('\n');
+        }
+        if UnicodeWidthStr::width(line) <= width {
+            out.push_str(line);
+            continue;
+        }
+        let indent_len = line.len() - line.trim_start().len();
+        let indent = &line[..indent_len];
+        let avail = width.saturating_sub(UnicodeWidthStr::width(indent)).max(1);
+        out.push_str(indent);
+        let mut cur_w = 0usize;
+        let mut started = false;
+        for word in line[indent_len..].split(' ') {
+            let word_w = UnicodeWidthStr::width(word);
+            if !started {
+                out.push_str(word);
+                cur_w = word_w;
+                started = true;
+            } else if cur_w > 0 && cur_w + 1 + word_w > avail {
+                out.push('\n');
+                out.push_str(indent);
+                out.push_str(word);
+                cur_w = word_w;
+            } else {
+                out.push(' ');
+                out.push_str(word);
+                cur_w += 1 + word_w;
+            }
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_lines)]
-fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
+fn format_issue_details(details: &IssueDetails, use_color: bool, wrap: bool) -> String {
     let mut output = String::new();
+    // `usize::MAX` makes `wrap_body` a no-op, so `--no-wrap` (or any caller that
+    // opts out) keeps the exact pre-#370 unwrapped output.
+    let wrap_width = if wrap {
+        compact_wrap_width()
+    } else {
+        usize::MAX
+    };
     let issue = &details.issue;
     let status_icon = format_status_icon_colored(&issue.status, use_color);
     let priority_label = format_priority_label(&issue.priority, use_color);
@@ -781,7 +1197,11 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
 
     if let Some(desc) = &issue.description {
         output.push('\n');
-        let _ = writeln!(output, "{}", sanitize_terminal_text(desc));
+        let _ = writeln!(
+            output,
+            "{}",
+            wrap_body(sanitize_terminal_text(desc).as_ref(), wrap_width)
+        );
     }
 
     if let Some(design) = &issue.design
@@ -789,7 +1209,11 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
     {
         output.push('\n');
         let _ = writeln!(output, "Design:");
-        let _ = writeln!(output, "{}", sanitize_terminal_text(design));
+        let _ = writeln!(
+            output,
+            "{}",
+            wrap_body(sanitize_terminal_text(design).as_ref(), wrap_width)
+        );
     }
 
     if let Some(ac) = &issue.acceptance_criteria
@@ -797,7 +1221,11 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
     {
         output.push('\n');
         let _ = writeln!(output, "Acceptance Criteria:");
-        let _ = writeln!(output, "{}", sanitize_terminal_text(ac));
+        let _ = writeln!(
+            output,
+            "{}",
+            wrap_body(sanitize_terminal_text(ac).as_ref(), wrap_width)
+        );
     }
 
     if let Some(notes) = &issue.notes
@@ -805,7 +1233,11 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
     {
         output.push('\n');
         let _ = writeln!(output, "Notes:");
-        let _ = writeln!(output, "{}", sanitize_terminal_text(notes));
+        let _ = writeln!(
+            output,
+            "{}",
+            wrap_body(sanitize_terminal_text(notes).as_ref(), wrap_width)
+        );
     }
 
     if !details.dependencies.is_empty() {
@@ -845,7 +1277,7 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
                 "  [{}] {}: {}",
                 comment.created_at.format("%Y-%m-%d %H:%M UTC"),
                 sanitize_terminal_inline(&comment.author),
-                sanitize_terminal_text(&comment.body)
+                wrap_body(sanitize_terminal_text(&comment.body).as_ref(), wrap_width)
             );
         }
     }
@@ -857,7 +1289,7 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
 mod tests {
     use super::{
         apply_external_dependency_metadata, build_issue_details_from_jsonl, format_issue_details,
-        reorder_details_by_requested_inputs,
+        load_issue_details_from_jsonl, reorder_details_by_requested_inputs,
     };
     use crate::format::{IssueDetails, IssueWithDependencyMetadata};
     use crate::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
@@ -865,6 +1297,7 @@ mod tests {
     use crate::util::id::{IdResolver, ResolverConfig};
     use chrono::{TimeZone, Utc};
     use std::collections::HashMap;
+    use std::io::Write;
     use tracing::info;
 
     fn init_logging() {
@@ -897,6 +1330,8 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -1105,7 +1540,7 @@ mod tests {
             events: Vec::new(),
             parent: None,
         };
-        let output = format_issue_details(&details, false);
+        let output = format_issue_details(&details, false, false);
         assert!(output.contains("Dependencies:"));
         assert!(output.contains("-> bd-002 (blocks) - Dep"));
         assert!(output.contains("Comments:"));
@@ -1141,7 +1576,7 @@ mod tests {
             parent: None,
         };
 
-        let output = format_issue_details(&details, false);
+        let output = format_issue_details(&details, false, false);
 
         assert!(!output.contains('\x1b'));
         assert!(!output.contains('\x07'));
@@ -1223,6 +1658,77 @@ mod tests {
         assert_eq!(parent_details.dependents[0].dep_type, "parent-child");
         info!(
             "test_build_issue_details_from_jsonl_derives_parent_and_dependents: assertions passed"
+        );
+    }
+
+    #[test]
+    fn test_load_issue_details_from_jsonl_exact_streaming_matches_materialized() {
+        init_logging();
+        info!("test_load_issue_details_from_jsonl_exact_streaming_matches_materialized: starting");
+
+        let mut dependency = make_test_issue("bd-dep01", "Dependency");
+        dependency.priority = Priority::HIGH;
+
+        let mut target = make_test_issue("bd-target", "Target");
+        target.dependencies.push(Dependency {
+            issue_id: target.id.clone(),
+            depends_on_id: dependency.id.clone(),
+            dep_type: DependencyType::Blocks,
+            created_at: target.created_at,
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        });
+
+        let mut dependent = make_test_issue("bd-dependent", "Dependent");
+        dependent.priority = Priority::CRITICAL;
+        dependent.dependencies.push(Dependency {
+            issue_id: dependent.id.clone(),
+            depends_on_id: target.id.clone(),
+            dep_type: DependencyType::Related,
+            created_at: dependent.created_at,
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        });
+
+        let issues_by_id = HashMap::from([
+            (dependency.id.clone(), dependency.clone()),
+            (target.id.clone(), target.clone()),
+            (dependent.id.clone(), dependent.clone()),
+        ]);
+        let expected = build_issue_details_from_jsonl(&target, &issues_by_id).unwrap();
+
+        let mut jsonl = tempfile::NamedTempFile::new().unwrap();
+        for issue in [&dependency, &target, &dependent] {
+            writeln!(jsonl, "{}", serde_json::to_string(issue).unwrap()).unwrap();
+        }
+
+        let resolver = IdResolver::new(ResolverConfig::with_prefix("bd"));
+        let actual = load_issue_details_from_jsonl(
+            &[target.id.clone()],
+            &resolver,
+            jsonl.path(),
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&actual).unwrap(),
+            serde_json::to_value(vec![expected]).unwrap()
+        );
+        info!(
+            "test_load_issue_details_from_jsonl_exact_streaming_matches_materialized: assertions passed"
+        );
+    }
+
+    #[test]
+    fn test_exact_jsonl_show_capacity_is_capped_for_sparse_or_huge_files() {
+        assert_eq!(super::estimated_jsonl_show_capacity(0), 0);
+        assert_eq!(super::estimated_jsonl_show_capacity(12_500), 25);
+        assert_eq!(
+            super::estimated_jsonl_show_capacity(u64::MAX),
+            super::MAX_EXACT_JSONL_SHOW_INITIAL_CAPACITY
         );
     }
 

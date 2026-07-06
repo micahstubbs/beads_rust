@@ -51,6 +51,21 @@ pub struct IdGenerator {
     config: IdConfig,
 }
 
+/// Issue content used to derive a stable, content-addressed issue ID.
+#[derive(Debug, Clone, Copy)]
+pub struct IdGenerationInput<'a> {
+    /// Issue title.
+    pub title: &'a str,
+    /// Optional issue description/body.
+    pub description: Option<&'a str>,
+    /// Optional actor used as the issue creator.
+    pub creator: Option<&'a str>,
+    /// Creation timestamp included in the hash seed.
+    pub created_at: DateTime<Utc>,
+    /// Current issue count, used to choose an adaptive hash length.
+    pub issue_count: usize,
+}
+
 impl IdGenerator {
     /// Create a new ID generator with the given config.
     #[must_use]
@@ -109,6 +124,71 @@ impl IdGenerator {
         let seed = generate_id_seed(title, description, creator, created_at, nonce);
         let hash_str = compute_id_hash(&seed, hash_length);
         format!("{}-{hash_str}", self.config.prefix)
+    }
+
+    /// Generate an ID with a user-supplied slug embedded between the prefix
+    /// and the uniquifying hash, e.g. `br-survey-my-thing-8cda`.
+    ///
+    /// The slug is normalized via [`normalize_slug`] (lowercase ASCII
+    /// alphanumerics and single hyphens, capped at 48 chars). If the input
+    /// slug normalizes to an empty string, this falls back to the regular
+    /// hash-only ID generator. The hash suffix is always appended to keep
+    /// IDs unique even when two issues use the same slug.
+    pub fn generate_with_slug<F>(
+        &self,
+        input: IdGenerationInput<'_>,
+        slug: &str,
+        exists: F,
+    ) -> String
+    where
+        F: Fn(&str) -> bool,
+    {
+        let normalized = normalize_slug_for_prefix(slug, &self.config.prefix);
+        if normalized.is_empty() {
+            return self.generate(
+                input.title,
+                input.description,
+                input.creator,
+                input.created_at,
+                input.issue_count,
+                exists,
+            );
+        }
+
+        let mut length = self.optimal_length(input.issue_count);
+        // Cap how much we extend the hash before we fall back to the
+        // hash-only path; max_hash_length is bounded by parser limits.
+        loop {
+            for nonce in 0..10 {
+                let seed = generate_id_seed(
+                    input.title,
+                    input.description,
+                    input.creator,
+                    input.created_at,
+                    nonce,
+                );
+                let hash_str = compute_id_hash(&seed, length);
+                let id = format!("{}-{normalized}-{hash_str}", self.config.prefix);
+                if !exists(&id) {
+                    return id;
+                }
+            }
+            if length < self.config.max_hash_length {
+                length += 1;
+            } else {
+                // Saturated the hash length budget for the slug path. Drop
+                // the slug (preserves uniqueness via the standard fallback)
+                // rather than producing an oversized prefix.
+                return self.generate(
+                    input.title,
+                    input.description,
+                    input.creator,
+                    input.created_at,
+                    input.issue_count,
+                    exists,
+                );
+            }
+        }
     }
 
     /// Generate an ID, checking for collisions with the provided checker.
@@ -516,6 +596,67 @@ pub fn normalize_prefix(prefix: &str) -> String {
     } else {
         normalized
     }
+}
+
+/// Maximum length of a normalized slug (the user-supplied human-readable
+/// segment of an ID). Capped well below `MAX_ID_PREFIX_LEN` so the
+/// `<prefix>-<slug>` portion still fits within the parser's prefix budget.
+pub const MAX_SLUG_LEN: usize = 48;
+
+/// Normalize a user-supplied slug for embedding in an issue ID.
+///
+/// The output is lowercase ASCII alphanumerics and hyphens only. Runs of
+/// any other characters collapse to a single hyphen. Leading and trailing
+/// hyphens are stripped. The result is capped at [`MAX_SLUG_LEN`] characters
+/// and then re-trimmed of any trailing hyphen the cap may have left behind.
+///
+/// Returns an empty string if no usable characters remain — callers must
+/// fall back to the hash-only ID path in that case.
+#[must_use]
+pub fn normalize_slug(slug: &str) -> String {
+    let mut out = String::with_capacity(slug.len());
+    let mut prev_was_hyphen = false;
+    for c in slug.chars() {
+        let lc = c.to_ascii_lowercase();
+        if lc.is_ascii_lowercase() || lc.is_ascii_digit() {
+            out.push(lc);
+            prev_was_hyphen = false;
+        } else if !prev_was_hyphen && !out.is_empty() {
+            out.push('-');
+            prev_was_hyphen = true;
+        }
+    }
+
+    // Trim trailing hyphen that any final non-alphanumeric run may have
+    // appended, and cap length.
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.len() > MAX_SLUG_LEN {
+        out.truncate(MAX_SLUG_LEN);
+        while out.ends_with('-') {
+            out.pop();
+        }
+    }
+    out
+}
+
+fn normalize_slug_for_prefix(slug: &str, prefix: &str) -> String {
+    let mut normalized = normalize_slug(slug);
+    let Some(max_len) = MAX_ID_PREFIX_LEN
+        .checked_sub(prefix.len())
+        .and_then(|remaining| remaining.checked_sub(1))
+    else {
+        return String::new();
+    };
+
+    if normalized.len() > max_len {
+        normalized.truncate(max_len);
+        while normalized.ends_with('-') {
+            normalized.pop();
+        }
+    }
+    normalized
 }
 
 /// Abbreviate a long auto-derived issue ID prefix.
@@ -1366,5 +1507,258 @@ mod tests {
             parse_id(&good_id).is_ok(),
             "Fixed fallback format should parse correctly"
         );
+    }
+
+    #[test]
+    fn test_normalize_slug_basic() {
+        assert_eq!(normalize_slug("survey-my-thing"), "survey-my-thing");
+        assert_eq!(normalize_slug("Survey My Thing"), "survey-my-thing");
+        assert_eq!(normalize_slug("---survey---"), "survey");
+        assert_eq!(normalize_slug("a/b/c"), "a-b-c");
+        assert_eq!(normalize_slug("a   b   c"), "a-b-c");
+        assert_eq!(normalize_slug(""), "");
+        assert_eq!(normalize_slug("!!!"), "");
+        assert_eq!(normalize_slug("!@#$abc"), "abc");
+    }
+
+    #[test]
+    fn test_normalize_slug_collapses_unicode_and_caps_length() {
+        // Non-ASCII characters are dropped (not transliterated). Long inputs
+        // are capped at MAX_SLUG_LEN with no trailing hyphen.
+        assert_eq!(normalize_slug("café-résumé"), "caf-r-sum");
+        let long = "a".repeat(100);
+        let out = normalize_slug(&long);
+        assert_eq!(out.len(), MAX_SLUG_LEN);
+        assert!(!out.ends_with('-'));
+    }
+
+    #[test]
+    fn test_id_generator_generate_with_slug() {
+        let id_gen = IdGenerator::new(IdConfig::default());
+        let now = Utc::now();
+        let input = IdGenerationInput {
+            title: "title",
+            description: None,
+            creator: None,
+            created_at: now,
+            issue_count: 10,
+        };
+
+        // Slug present → ID embeds the slug between prefix and hash.
+        let id = id_gen.generate_with_slug(input, "survey-my-thing", |_| false);
+        assert!(
+            id.starts_with("br-survey-my-thing-"),
+            "expected prefix br-survey-my-thing-, got {id}"
+        );
+        let parsed = parse_id(&id).expect("slug-shaped ID should parse");
+        assert_eq!(parsed.prefix, "br-survey-my-thing");
+        assert!(!parsed.hash.is_empty(), "hash suffix must be present");
+
+        // Empty slug → falls back to hash-only generation.
+        let id = id_gen.generate_with_slug(input, "", |_| false);
+        let parsed = parse_id(&id).expect("hash-only ID should parse");
+        assert_eq!(parsed.prefix, "br");
+
+        // Slug-only collision falls through hash-extension. Force exactly the
+        // very first candidate to "exist" and confirm the generator still
+        // produces a slug-shaped ID by retrying with a different nonce.
+        let calls = std::cell::Cell::new(0u32);
+        let id = id_gen.generate_with_slug(input, "survey-my-thing", |_candidate| {
+            let n = calls.get();
+            calls.set(n + 1);
+            n == 0
+        });
+        assert!(id.starts_with("br-survey-my-thing-"));
+    }
+
+    #[test]
+    fn test_id_generator_generate_with_slug_respects_prefix_budget() {
+        let prefix = "p".repeat(MAX_ID_PREFIX_LEN - 4);
+        let id_gen = IdGenerator::new(IdConfig {
+            prefix: prefix.clone(),
+            ..IdConfig::default()
+        });
+        let id = id_gen.generate_with_slug(
+            IdGenerationInput {
+                title: "title",
+                description: None,
+                creator: None,
+                created_at: Utc::now(),
+                issue_count: 10,
+            },
+            "abcd-efgh",
+            |_| false,
+        );
+
+        let parsed = parse_id(&id).expect("slug-shaped ID should stay parseable");
+        assert_eq!(parsed.prefix, format!("{prefix}-abc"));
+        assert!(parsed.prefix.len() <= MAX_ID_PREFIX_LEN);
+    }
+
+    #[test]
+    fn test_id_generator_generate_with_slug_falls_back_without_prefix_budget() {
+        let prefix = "p".repeat(MAX_ID_PREFIX_LEN);
+        let id_gen = IdGenerator::new(IdConfig {
+            prefix: prefix.clone(),
+            ..IdConfig::default()
+        });
+        let id = id_gen.generate_with_slug(
+            IdGenerationInput {
+                title: "title",
+                description: None,
+                creator: None,
+                created_at: Utc::now(),
+                issue_count: 10,
+            },
+            "slug",
+            |_| false,
+        );
+
+        let parsed = parse_id(&id).expect("fallback ID should stay parseable");
+        assert_eq!(parsed.prefix, prefix);
+    }
+
+    // ========================================================================
+    // beads_rust-l6xl: post-`--slug` audit unit tests (added 2026-05-09)
+    // Per the bead's required NEW unit tests.
+    // ========================================================================
+
+    /// l6xl AC: `--slug "Hello World!"` → `<prefix>-hello-world-<hash>`.
+    /// Asserts case-folding, single-hyphen collapsing, leading/trailing
+    /// non-ASCII strip, and that the hash suffix is always present.
+    #[test]
+    fn create_with_slug_normalizes_to_ascii_lowercase_hyphenated() {
+        let id_gen = IdGenerator::new(IdConfig::default());
+        let input = IdGenerationInput {
+            title: "Whatever",
+            description: None,
+            creator: None,
+            created_at: Utc::now(),
+            issue_count: 10,
+        };
+
+        // Mixed-case + spaces + punctuation → lowercased, single-hyphenated
+        let id = id_gen.generate_with_slug(input, "Hello World!", |_| false);
+        assert!(
+            id.starts_with("br-hello-world-"),
+            "expected prefix 'br-hello-world-', got {id}"
+        );
+        let parsed = parse_id(&id).expect("must parse");
+        assert_eq!(parsed.prefix, "br-hello-world");
+        assert!(!parsed.hash.is_empty(), "hash suffix must be present");
+
+        // Multiple non-alphanumeric runs collapse to a single hyphen
+        let id2 = id_gen.generate_with_slug(input, "a   b/c.d!!e", |_| false);
+        assert!(
+            id2.starts_with("br-a-b-c-d-e-"),
+            "expected b-c-d-e collapsed; got {id2}"
+        );
+
+        // Pure-Unicode (non-ASCII) characters strip out
+        let id3 = id_gen.generate_with_slug(input, "café-résumé", |_| false);
+        // After normalize_slug: "caf-r-sum" (drops é, kept letters around hyphens)
+        assert!(id3.starts_with("br-caf-r-sum-"), "got {id3}");
+    }
+
+    /// l6xl AC: a slug longer than `MAX_SLUG_LEN` (48 chars after
+    /// normalization) is truncated, then any trailing hyphen is trimmed.
+    #[test]
+    fn create_with_slug_caps_at_48_chars_after_normalization() {
+        let id_gen = IdGenerator::new(IdConfig::default());
+        let input = IdGenerationInput {
+            title: "Whatever",
+            description: None,
+            creator: None,
+            created_at: Utc::now(),
+            issue_count: 10,
+        };
+
+        // 60-char input → 48-char normalized cap (not counting prefix/hash)
+        let long_slug = "a".repeat(60);
+        let id = id_gen.generate_with_slug(input, &long_slug, |_| false);
+        let parsed = parse_id(&id).expect("must parse");
+        let slug_part = parsed.prefix.strip_prefix("br-").unwrap_or(&parsed.prefix);
+        assert!(
+            slug_part.len() <= MAX_SLUG_LEN,
+            "slug {slug_part} exceeded MAX_SLUG_LEN ({MAX_SLUG_LEN}); got len={}",
+            slug_part.len()
+        );
+
+        // Slug that ends with a hyphen due to truncation must have it stripped
+        let trailing_hyphen_slug = format!("{}!!!", "x".repeat(MAX_SLUG_LEN - 2)); // becomes 48 chars then trailing hyphen risk
+        let id2 = id_gen.generate_with_slug(input, &trailing_hyphen_slug, |_| false);
+        assert!(!id2.starts_with("br--"), "double-hyphen leak in {id2}");
+        // Find the slug portion: between "br-" and the last "-<hash>" segment
+        let parsed2 = parse_id(&id2).expect("must parse");
+        let slug2 = parsed2
+            .prefix
+            .strip_prefix("br-")
+            .unwrap_or(&parsed2.prefix);
+        assert!(
+            !slug2.ends_with('-'),
+            "slug retained trailing hyphen: {slug2}"
+        );
+    }
+
+    /// l6xl AC: the configured prefix is preserved AND the hash suffix is
+    /// always appended. Round-trips through `parse_id`.
+    #[test]
+    fn create_with_slug_preserves_configured_prefix_and_hash_suffix() {
+        let id_gen = IdGenerator::new(IdConfig {
+            prefix: "myproj".to_string(),
+            ..IdConfig::default()
+        });
+        let input = IdGenerationInput {
+            title: "Whatever",
+            description: None,
+            creator: None,
+            created_at: Utc::now(),
+            issue_count: 5,
+        };
+
+        let id = id_gen.generate_with_slug(input, "feature-x", |_| false);
+        assert!(
+            id.starts_with("myproj-feature-x-"),
+            "expected configured prefix preserved; got {id}"
+        );
+        let parsed = parse_id(&id).expect("must parse");
+        assert_eq!(parsed.prefix, "myproj-feature-x");
+        assert!(!parsed.hash.is_empty(), "hash suffix must be present");
+        // Hash suffix grows with issue_count; at least 3 chars at issue_count=5
+        // (per IdGenerator::optimal_length)
+        assert!(
+            parsed.hash.len() >= 3,
+            "hash suffix too short: {} (expected >= 3)",
+            parsed.hash.len()
+        );
+    }
+
+    /// l6xl AC: a slug like "!!!" or "...." that normalizes to empty
+    /// MUST fall back to the hash-only ID path; it must NOT panic, error,
+    /// or produce a malformed ID.
+    #[test]
+    fn create_with_slug_rejects_empty_after_normalization() {
+        let id_gen = IdGenerator::new(IdConfig::default());
+        let input = IdGenerationInput {
+            title: "Title from fallback",
+            description: None,
+            creator: None,
+            created_at: Utc::now(),
+            issue_count: 10,
+        };
+
+        // Various inputs that all normalize to empty
+        for empty_yielding in ["!!!", "...", "   ", "$%^&*()", "", "/\\/\\"] {
+            let id = id_gen.generate_with_slug(input, empty_yielding, |_| false);
+            let parsed = parse_id(&id).expect("must parse hash-only fallback");
+            assert_eq!(
+                parsed.prefix, "br",
+                "empty-normalizing slug {empty_yielding:?} should fall back to hash-only; got {id}"
+            );
+            assert!(
+                !parsed.hash.is_empty(),
+                "hash-only fallback must include hash; got {id}"
+            );
+        }
     }
 }

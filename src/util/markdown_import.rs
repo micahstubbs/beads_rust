@@ -8,7 +8,7 @@
 //! - Per-issue sections are H3 lines: `### Section Name`
 //! - Recognized sections (case-insensitive):
 //!   - ID, Priority, Type, Description, Design, Acceptance Criteria (alias Acceptance),
-//!     Assignee, Labels, Dependencies (alias Deps)
+//!     Assignee, Labels, Dependencies (alias Deps), Agent Context (alias Agent-Context)
 //! - Unknown sections are ignored
 //!
 //! # Intra-file Dependency References
@@ -29,8 +29,12 @@
 use crate::error::{BeadsError, Result};
 use crate::model::DependencyType;
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path};
 use std::str::FromStr;
+
+const MAX_MARKDOWN_IMPORT_BYTES: usize = 10 * 1024 * 1024;
+const MAX_MARKDOWN_IMPORT_BYTES_U64: u64 = 10 * 1024 * 1024;
 
 /// A parsed issue from the markdown file.
 #[derive(Debug, Default, Clone)]
@@ -59,6 +63,9 @@ pub struct ParsedIssue {
     pub labels: Vec<String>,
     /// Dependencies list (format: "type:id" or "id").
     pub dependencies: Vec<String>,
+    /// Agent-context governance text (opaque, same semantics as
+    /// `br update --agent-context`). beads_rust#304.
+    pub agent_context: Option<String>,
 }
 
 /// Section types recognized in the markdown.
@@ -76,6 +83,7 @@ enum Section {
     Assignee,
     Labels,
     Dependencies,
+    AgentContext,
     Unknown,
 }
 
@@ -93,6 +101,7 @@ impl Section {
             "assignee" => Self::Assignee,
             "labels" => Self::Labels,
             "dependencies" | "deps" => Self::Dependencies,
+            "agent context" | "agent-context" | "agent_context" => Self::AgentContext,
             _ => Self::Unknown,
         }
     }
@@ -157,11 +166,35 @@ pub fn parse_markdown_file(path: &Path) -> Result<Vec<ParsedIssue>> {
         return Err(BeadsError::validation("file", "must be a regular file"));
     }
 
-    // Read file content
-    let content = fs::read_to_string(path)
-        .map_err(|e| BeadsError::validation("file", format!("cannot read file: {e}")))?;
+    let content = read_markdown_file_limited(path, &metadata)?;
 
     parse_markdown_content(&content)
+}
+
+fn read_markdown_file_limited(path: &Path, metadata: &fs::Metadata) -> Result<String> {
+    if metadata.len() > MAX_MARKDOWN_IMPORT_BYTES_U64 {
+        return Err(BeadsError::validation(
+            "file",
+            format!("markdown import exceeds maximum size of {MAX_MARKDOWN_IMPORT_BYTES} bytes"),
+        ));
+    }
+
+    let file = fs::File::open(path)
+        .map_err(|e| BeadsError::validation("file", format!("cannot read file: {e}")))?;
+    let mut reader = file.take(MAX_MARKDOWN_IMPORT_BYTES_U64.saturating_add(1));
+    let mut content = Vec::new();
+    reader
+        .read_to_end(&mut content)
+        .map_err(|e| BeadsError::validation("file", format!("cannot read file: {e}")))?;
+    if content.len() > MAX_MARKDOWN_IMPORT_BYTES {
+        return Err(BeadsError::validation(
+            "file",
+            format!("markdown import exceeds maximum size of {MAX_MARKDOWN_IMPORT_BYTES} bytes"),
+        ));
+    }
+
+    String::from_utf8(content)
+        .map_err(|e| BeadsError::validation("file", format!("markdown must be valid UTF-8: {e}")))
 }
 
 /// Parse markdown content string into a list of issues.
@@ -181,7 +214,7 @@ pub fn parse_markdown_content(content: &str) -> Result<Vec<ParsedIssue>> {
 
     for line in content.lines() {
         // Check for H2 (new issue)
-        if line.starts_with("## ") && !line.starts_with("### ") {
+        if let Some(stripped) = line.strip_prefix("## ") {
             // Save previous issue
             if let Some(mut issue) = current_issue.take() {
                 apply_section_to_issue(&mut issue, current_section, &section_lines);
@@ -189,7 +222,7 @@ pub fn parse_markdown_content(content: &str) -> Result<Vec<ParsedIssue>> {
             }
 
             // Start new issue
-            let title = line[3..].trim().to_string();
+            let title = stripped.trim().to_string();
             current_issue = Some(ParsedIssue {
                 title,
                 ..Default::default()
@@ -245,13 +278,7 @@ pub fn parse_markdown_content(content: &str) -> Result<Vec<ParsedIssue>> {
 
 /// Apply collected section content to an issue.
 fn apply_section_to_issue(issue: &mut ParsedIssue, section: Section, lines: &[String]) {
-    let content = lines
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_string();
+    let content = lines.join("\n").trim().to_string();
 
     if content.is_empty() {
         return;
@@ -293,6 +320,10 @@ fn apply_section_to_issue(issue: &mut ParsedIssue, section: Section, lines: &[St
         }
         Section::Dependencies => {
             issue.dependencies = split_dependency_content(&content);
+        }
+        Section::AgentContext => {
+            // Opaque text, same semantics as `br update --agent-context`.
+            issue.agent_context = Some(content);
         }
         Section::Unknown => {
             // Ignore unknown sections
@@ -713,6 +744,51 @@ This is the actual description.
     }
 
     #[test]
+    fn test_parse_markdown_file_rejects_oversized_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("issues.md");
+        fs::write(&path, "## Imported\n").unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(MAX_MARKDOWN_IMPORT_BYTES_U64 + 1).unwrap();
+
+        let err = parse_markdown_file(&path).unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Validation { field, reason } if field == "file" && reason.contains("maximum size"))
+        );
+    }
+
+    #[test]
+    fn test_read_markdown_file_limited_checks_size_before_utf8_decode() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("issues.md");
+        fs::write(&path, "## Imported\n").unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        let mut payload = vec![b'a'; MAX_MARKDOWN_IMPORT_BYTES];
+        payload.push(0xc3);
+        fs::write(&path, payload).unwrap();
+
+        let err = read_markdown_file_limited(&path, &metadata).unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Validation { field, reason } if field == "file" && reason.contains("maximum size"))
+        );
+    }
+
+    #[test]
+    fn test_parse_markdown_file_rejects_invalid_utf8() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("issues.md");
+        fs::write(&path, [0xff]).unwrap();
+
+        let err = parse_markdown_file(&path).unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Validation { field, reason } if field == "file" && reason.contains("valid UTF-8"))
+        );
+    }
+
+    #[test]
     fn test_parse_markdown_content_rejects_non_empty_content_without_issue_headers() {
         let err = parse_markdown_content("### Description\nNo issue header here.\n").unwrap_err();
         assert!(matches!(err, BeadsError::Validation { field, .. } if field == "file"));
@@ -812,6 +888,79 @@ Explicit description content
             issues[0].description,
             Some("Explicit description content".to_string())
         );
+    }
+
+    #[test]
+    fn test_agent_context_section_parsing() {
+        let content = r"## Epic With Context
+### Agent Context
+Use the porting-to-rust skill. Constraints: no rusqlite; fsqlite only.
+### Type
+epic
+";
+        let issues = parse_markdown_content(content).unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(
+            issues[0].agent_context.as_deref(),
+            Some("Use the porting-to-rust skill. Constraints: no rusqlite; fsqlite only.")
+        );
+    }
+
+    #[test]
+    fn test_agent_context_section_is_opaque_multiline() {
+        let content = r#"## Issue
+### Agent Context
+{"skills": ["porting-to-rust"], "constraints": ["no rusqlite"]}
+second line of opaque text
+"#;
+        let issues = parse_markdown_content(content).unwrap();
+        let ctx = issues[0].agent_context.as_deref().unwrap();
+        assert!(ctx.contains("porting-to-rust"));
+        assert!(ctx.contains("second line of opaque text"));
+    }
+
+    #[test]
+    fn test_agent_context_aliases() {
+        for header in [
+            "Agent Context",
+            "agent-context",
+            "AGENT CONTEXT",
+            "agent_context",
+        ] {
+            let content = format!("## Issue\n### {header}\nopaque body\n");
+            let issues = parse_markdown_content(&content).unwrap();
+            assert_eq!(
+                issues[0].agent_context.as_deref(),
+                Some("opaque body"),
+                "header `{header}` should map to agent_context"
+            );
+        }
+    }
+
+    #[test]
+    fn test_agent_context_absent_when_section_missing() {
+        let content = r"## Issue
+### Description
+just a description
+";
+        let issues = parse_markdown_content(content).unwrap();
+        assert_eq!(issues[0].agent_context, None);
+        assert_eq!(issues[0].description.as_deref(), Some("just a description"));
+    }
+
+    #[test]
+    fn test_unknown_h3_section_still_ignored_alongside_agent_context() {
+        let content = r"## Issue
+### Totally Unknown Section
+ignored content
+### Agent Context
+kept content
+";
+        let issues = parse_markdown_content(content).unwrap();
+        assert_eq!(issues[0].agent_context.as_deref(), Some("kept content"));
+        // The unknown section did not leak into any recognized field.
+        assert_eq!(issues[0].description, None);
+        assert_eq!(issues[0].design, None);
     }
 
     #[test]

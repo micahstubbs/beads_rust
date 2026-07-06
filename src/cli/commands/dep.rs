@@ -2,23 +2,26 @@
 
 use super::{
     RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
-    auto_import_storage_ctx_if_stale, report_auto_flush_failure, resolve_issue_id,
-    retry_mutation_with_jsonl_recovery,
+    auto_import_storage_ctx_if_stale, cli_for_routed_workspace,
+    external_project_db_paths_after_auto_import_if_needed, finalize_batched_blocked_cache_refresh,
+    report_auto_flush_failure, resolve_issue_id, retry_mutation_with_jsonl_recovery,
 };
 use crate::cli::{
-    DepAddArgs, DepCommands, DepCyclesArgs, DepDirection, DepListArgs, DepRemoveArgs, DepTreeArgs,
-    OutputFormat, resolve_output_format_basic_with_outer_mode,
+    DepAddArgs, DepCommands, DepCyclesArgs, DepDirection, DepImportArgs, DepListArgs,
+    DepRemoveArgs, DepTreeArgs, OutputFormat, resolve_output_format_basic_with_outer_mode,
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{sanitize_terminal_inline, truncate_title};
 use crate::model::DependencyType;
 use crate::output::{OutputContext, OutputMode, Theme};
-use crate::storage::SqliteStorage;
+use crate::storage::{BulkDependencyInsert, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use rich_rust::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 /// Execute the dep command.
@@ -35,6 +38,7 @@ pub fn execute(
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     match command {
         DepCommands::Add(args) => execute_dep_add(args, json, cli, ctx, &beads_dir),
+        DepCommands::Import(args) => execute_dep_import(args, json, cli, ctx, &beads_dir),
         DepCommands::Remove(args) => execute_dep_remove(args, json, cli, ctx, &beads_dir),
         DepCommands::List(args) => execute_dep_list(args, cli, ctx, &beads_dir),
         DepCommands::Tree(args) => execute_dep_tree(args, json, cli, ctx, &beads_dir),
@@ -42,6 +46,36 @@ pub fn execute(
             let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
             dep_cycles(args, &storage_ctx.storage, json, ctx)
         }
+    }
+}
+
+/// Execute a read-only dep command using storage that was already opened by the caller.
+///
+/// Returns `Ok(false)` when the command needs the normal routed or mutating path.
+///
+/// # Errors
+///
+/// Returns an error if database operations fail or if inputs are invalid.
+pub fn execute_with_storage_ctx(
+    command: &DepCommands,
+    json: bool,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    local_beads_dir: &Path,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<bool> {
+    match command {
+        DepCommands::List(args) => {
+            execute_local_dep_list_with_storage_ctx(args, cli, ctx, local_beads_dir, storage_ctx)
+        }
+        DepCommands::Tree(args) => {
+            execute_local_dep_tree_with_storage_ctx(args, cli, ctx, local_beads_dir, storage_ctx)
+        }
+        DepCommands::Cycles(args) => {
+            dep_cycles(args, &storage_ctx.storage, json, ctx)?;
+            Ok(true)
+        }
+        DepCommands::Add(_) | DepCommands::Import(_) | DepCommands::Remove(_) => Ok(false),
     }
 }
 
@@ -95,6 +129,21 @@ fn execute_dep_remove(
     )
 }
 
+fn execute_dep_import(
+    args: &DepImportArgs,
+    _json: bool,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    local_beads_dir: &Path,
+) -> Result<()> {
+    let mut storage_ctx = config::open_storage_with_cli(local_beads_dir, cli)?;
+    auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
+    let config_layer = storage_ctx.load_config(cli)?;
+    let actor = config::resolve_actor(&config_layer);
+    let dependencies = read_dependency_imports(&args.path)?;
+    dep_import(args, &dependencies, &mut storage_ctx, &actor, ctx)
+}
+
 fn execute_dep_list(
     args: &DepListArgs,
     cli: &config::CliOverrides,
@@ -108,8 +157,12 @@ fn execute_dep_list(
     let quiet = route_cli.quiet.unwrap_or(false);
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let external_db_paths =
-        config::external_project_db_paths(&config_layer, &storage_ctx.paths.beads_dir);
+    let external_db_paths = external_project_db_paths_after_auto_import_if_needed(
+        &storage_ctx.storage,
+        &config_layer,
+        &storage_ctx.paths.beads_dir,
+        &route_cli,
+    )?;
 
     dep_list(
         args,
@@ -120,6 +173,41 @@ fn execute_dep_list(
         quiet,
         !use_color,
     )
+}
+
+fn execute_local_dep_list_with_storage_ctx(
+    args: &DepListArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    local_beads_dir: &Path,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<bool> {
+    if config::routing::resolve_route(&args.issue, local_beads_dir)?.is_external {
+        return Ok(false);
+    }
+
+    let config_layer = storage_ctx.load_config(cli)?;
+    let use_color = config::should_use_color(&config_layer);
+    let quiet = cli.quiet.unwrap_or(false);
+    let id_config = config::id_config_from_layer(&config_layer);
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let external_db_paths = external_project_db_paths_after_auto_import_if_needed(
+        &storage_ctx.storage,
+        &config_layer,
+        &storage_ctx.paths.beads_dir,
+        cli,
+    )?;
+
+    dep_list(
+        args,
+        &storage_ctx.storage,
+        &resolver,
+        &external_db_paths,
+        ctx,
+        quiet,
+        !use_color,
+    )?;
+    Ok(true)
 }
 
 fn execute_dep_tree(
@@ -134,8 +222,12 @@ fn execute_dep_tree(
     let config_layer = storage_ctx.load_config(&route_cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let external_db_paths =
-        config::external_project_db_paths(&config_layer, &storage_ctx.paths.beads_dir);
+    let external_db_paths = external_project_db_paths_after_auto_import_if_needed(
+        &storage_ctx.storage,
+        &config_layer,
+        &storage_ctx.paths.beads_dir,
+        &route_cli,
+    )?;
 
     dep_tree(
         args,
@@ -145,6 +237,38 @@ fn execute_dep_tree(
         false,
         ctx,
     )
+}
+
+fn execute_local_dep_tree_with_storage_ctx(
+    args: &DepTreeArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    local_beads_dir: &Path,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<bool> {
+    if config::routing::resolve_route(&args.issue, local_beads_dir)?.is_external {
+        return Ok(false);
+    }
+
+    let config_layer = storage_ctx.load_config(cli)?;
+    let id_config = config::id_config_from_layer(&config_layer);
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let external_db_paths = external_project_db_paths_after_auto_import_if_needed(
+        &storage_ctx.storage,
+        &config_layer,
+        &storage_ctx.paths.beads_dir,
+        cli,
+    )?;
+
+    dep_tree(
+        args,
+        &storage_ctx.storage,
+        &resolver,
+        &external_db_paths,
+        false,
+        ctx,
+    )?;
+    Ok(true)
 }
 
 fn open_routed_storage_for_input(
@@ -158,12 +282,13 @@ fn open_routed_storage_for_input(
     RoutedWorkspaceWriteLock,
 )> {
     let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
-    let mut route_cli = cli.clone();
-    if route.is_external {
-        route_cli.db = None;
-    }
-    let routed_write_lock =
-        acquire_routed_workspace_write_lock(&route.beads_dir, route.is_external)?;
+    let mut route_cli = cli_for_routed_workspace(cli, route.is_external);
+    let routed_write_lock = acquire_routed_workspace_write_lock(
+        &route.beads_dir,
+        route.is_external,
+        route_cli.lock_timeout,
+    )?;
+    routed_write_lock.mark_cli_write_lock_held(&mut route_cli);
     let mut storage_ctx = config::open_storage_with_cli(&route.beads_dir, &route_cli)?;
     auto_import_storage_ctx_if_stale(&mut storage_ctx, &route_cli)?;
     Ok((storage_ctx, route_cli, route.is_external, routed_write_lock))
@@ -204,6 +329,166 @@ struct DepActionResult {
     action: String,
 }
 
+/// JSON output for dep import operations.
+#[derive(Serialize)]
+struct DepImportResult {
+    status: String,
+    input_path: String,
+    imported: usize,
+    skipped: usize,
+    total_edges: usize,
+    action: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DepImportLine {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    issue_id: Option<String>,
+    #[serde(default)]
+    depends_on_id: Option<String>,
+    #[serde(default, rename = "type", alias = "dep_type")]
+    dep_type: Option<String>,
+    #[serde(default)]
+    dependencies: Vec<DepImportNestedDependency>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DepImportNestedDependency {
+    #[serde(default)]
+    issue_id: Option<String>,
+    depends_on_id: String,
+    #[serde(default, rename = "type", alias = "dep_type")]
+    dep_type: Option<String>,
+}
+
+fn read_dependency_imports(path: &Path) -> Result<Vec<BulkDependencyInsert>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut dependencies = Vec::new();
+
+    for (line_index, line) in reader.lines().enumerate() {
+        let line_number = line_index + 1;
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        dependencies.extend(parse_dependency_import_line(&line, line_number)?);
+    }
+
+    if dependencies.is_empty() {
+        return Err(BeadsError::validation(
+            "path",
+            format!(
+                "dependency import file '{}' did not contain any dependency edges",
+                path.display()
+            ),
+        ));
+    }
+
+    Ok(dependencies)
+}
+
+fn parse_dependency_import_line(
+    line: &str,
+    line_number: usize,
+) -> Result<Vec<BulkDependencyInsert>> {
+    let record: DepImportLine = serde_json::from_str(line).map_err(|err| {
+        BeadsError::validation(
+            "jsonl",
+            format!("invalid dependency JSONL at line {line_number}: {err}"),
+        )
+    })?;
+
+    let mut dependencies = Vec::new();
+
+    if let (Some(issue_id), Some(depends_on_id)) = (&record.issue_id, &record.depends_on_id) {
+        dependencies.push(build_bulk_dependency_insert(
+            issue_id,
+            depends_on_id,
+            record.dep_type.as_deref(),
+            line_number,
+        )?);
+    }
+
+    if !record.dependencies.is_empty() {
+        let parent_issue_id = record.id.as_deref().or(record.issue_id.as_deref()).ok_or_else(|| {
+            BeadsError::validation(
+                "issue_id",
+                format!(
+                    "dependency JSONL line {line_number} has a dependencies array but no id or issue_id"
+                ),
+            )
+        })?;
+
+        for dep in &record.dependencies {
+            let issue_id = dep.issue_id.as_deref().unwrap_or(parent_issue_id);
+            dependencies.push(build_bulk_dependency_insert(
+                issue_id,
+                &dep.depends_on_id,
+                dep.dep_type.as_deref(),
+                line_number,
+            )?);
+        }
+    }
+
+    if dependencies.is_empty() {
+        if record.id.is_some() {
+            return Ok(dependencies);
+        }
+
+        return Err(BeadsError::validation(
+            "jsonl",
+            format!(
+                "dependency JSONL line {line_number} must contain either issue_id + depends_on_id or an issue record with dependencies"
+            ),
+        ));
+    }
+
+    Ok(dependencies)
+}
+
+fn build_bulk_dependency_insert(
+    issue_id: &str,
+    depends_on_id: &str,
+    dep_type: Option<&str>,
+    line_number: usize,
+) -> Result<BulkDependencyInsert> {
+    let issue_id = issue_id.trim();
+    let depends_on_id = depends_on_id.trim();
+    if issue_id.is_empty() || depends_on_id.is_empty() {
+        return Err(BeadsError::validation(
+            "jsonl",
+            format!("dependency JSONL line {line_number} contains an empty issue id"),
+        ));
+    }
+
+    let dep_type = dep_type.unwrap_or("blocks").trim();
+    let dep_type = parse_dependency_type(dep_type)
+        .map_err(|err| BeadsError::WithContext {
+            context: format!("dependency JSONL line {line_number} has an invalid type"),
+            source: Box::new(err),
+        })?
+        .as_str()
+        .to_string();
+
+    Ok(BulkDependencyInsert {
+        issue_id: issue_id.to_string(),
+        depends_on_id: depends_on_id.to_string(),
+        dep_type,
+    })
+}
+
+fn finalize_dep_mutation(
+    storage_ctx: &mut config::OpenStorageResult,
+    cache_dirty: bool,
+    command: &str,
+) -> Result<()> {
+    finalize_batched_blocked_cache_refresh(&mut storage_ctx.storage, cache_dirty, command)?;
+    storage_ctx.flush_no_db_if_dirty()
+}
+
 /// JSON output for dep list
 #[derive(Serialize)]
 struct DepListItem {
@@ -237,6 +522,16 @@ struct TreeNode {
 struct CyclesResult {
     cycles: Vec<Vec<String>>,
     count: usize,
+    active_count: usize,
+    archived_closed_count: usize,
+    total_count: usize,
+    blocking_only: bool,
+    include_closed: bool,
+    scope: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    active_cycles: Vec<Vec<String>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    archived_closed_cycles: Vec<Vec<String>>,
 }
 
 fn dep_add(
@@ -264,18 +559,6 @@ fn dep_add(
         return Err(BeadsError::SelfDependency { id: issue_id });
     }
 
-    // Cycle check for blocking types only
-    if dep_type.is_blocking()
-        && !depends_on_id.starts_with("external:")
-        && storage_ctx
-            .storage
-            .would_create_cycle(&issue_id, &depends_on_id, true)?
-    {
-        return Err(BeadsError::DependencyCycle {
-            path: format!("{issue_id} -> {depends_on_id}"),
-        });
-    }
-
     let added = retry_mutation_with_jsonl_recovery(
         storage_ctx,
         true,
@@ -292,7 +575,7 @@ fn dep_add(
         },
     )?;
 
-    storage_ctx.flush_no_db_if_dirty()?;
+    finalize_dep_mutation(storage_ctx, added, "dep add")?;
     if auto_flush_external && let Err(error) = storage_ctx.auto_flush_if_enabled() {
         report_auto_flush_failure(
             ctx,
@@ -362,6 +645,61 @@ fn dep_add(
     Ok(())
 }
 
+fn dep_import(
+    args: &DepImportArgs,
+    dependencies: &[BulkDependencyInsert],
+    storage_ctx: &mut config::OpenStorageResult,
+    actor: &str,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let total_edges = dependencies.len();
+    let probe_issue_id = dependencies.first().map(|dep| dep.issue_id.as_str());
+    let imported = retry_mutation_with_jsonl_recovery(
+        storage_ctx,
+        true,
+        "dep import",
+        probe_issue_id,
+        |storage| storage.add_dependencies_bulk_for_import(dependencies, actor),
+    )?;
+
+    finalize_dep_mutation(storage_ctx, imported > 0, "dep import")?;
+    if let Err(error) = storage_ctx.auto_flush_if_enabled() {
+        report_auto_flush_failure(
+            ctx,
+            &storage_ctx.paths.beads_dir,
+            &storage_ctx.paths.jsonl_path,
+            &error,
+        );
+    }
+
+    if ctx.is_json() || ctx.is_toon() {
+        let result = DepImportResult {
+            status: "ok".to_string(),
+            input_path: args.path.display().to_string(),
+            imported,
+            skipped: total_edges.saturating_sub(imported),
+            total_edges,
+            action: "imported".to_string(),
+        };
+        if ctx.is_toon() {
+            ctx.toon(&result);
+        } else {
+            ctx.json_pretty(&result);
+        }
+    } else if matches!(ctx.mode(), OutputMode::Quiet) {
+        return Ok(());
+    } else {
+        ctx.success(&format!(
+            "Imported {} dependencies from {} ({} skipped)",
+            imported,
+            dep_display_text(&args.path.display().to_string()),
+            total_edges.saturating_sub(imported)
+        ));
+    }
+
+    Ok(())
+}
+
 fn dep_remove(
     args: &DepRemoveArgs,
     storage_ctx: &mut config::OpenStorageResult,
@@ -390,7 +728,7 @@ fn dep_remove(
         |storage| storage.remove_dependency(&issue_id, &depends_on_id, actor),
     )?;
 
-    storage_ctx.flush_no_db_if_dirty()?;
+    finalize_dep_mutation(storage_ctx, removed, "dep remove")?;
     if auto_flush_external && let Err(error) = storage_ctx.auto_flush_if_enabled() {
         report_auto_flush_failure(
             ctx,
@@ -861,42 +1199,159 @@ fn dep_tree_truncated(depth: usize, max_depth: usize, dependency_count: usize) -
     depth >= max_depth && dependency_count > 0
 }
 
-#[allow(clippy::too_many_lines)]
-fn dep_tree(
-    args: &DepTreeArgs,
-    storage: &SqliteStorage,
-    resolver: &IdResolver,
-    external_db_paths: &HashMap<String, PathBuf>,
-    _json: bool,
-    ctx: &OutputContext,
-) -> Result<()> {
-    let root_id = resolve_issue_id(storage, resolver, &args.issue)?;
-    let root_issue = storage
-        .get_issue(&root_id)?
-        .ok_or_else(|| BeadsError::IssueNotFound {
-            id: root_id.clone(),
-        })?;
+type DepTreeAdjacency = HashMap<String, Vec<String>>;
+type DepTreeMetadataCache = HashMap<String, (String, i32, String)>;
 
-    // Helper struct for BFS
-    #[allow(clippy::items_after_statements)]
-    struct QueueItem {
-        id: String,
-        depth: usize,
-        parent_id: Option<String>,
-        parent_key: Option<String>,
-        path: Vec<String>,
+const LOCAL_DEP_TREE_NODE_LIMIT: usize = 256;
+
+fn load_dep_tree_adjacency(
+    storage: &SqliteStorage,
+) -> Result<(DepTreeAdjacency, DepTreeAdjacency)> {
+    let dependency_records = storage.get_all_dependency_records()?;
+    let mut dependencies_by_issue: DepTreeAdjacency =
+        HashMap::with_capacity(dependency_records.len());
+    let mut dependents_by_issue: HashMap<String, Vec<String>> = HashMap::new();
+
+    for (issue_id, dependencies) in dependency_records {
+        let dependency_ids = dependencies_by_issue.entry(issue_id.clone()).or_default();
+        for dependency in dependencies {
+            dependency_ids.push(dependency.depends_on_id.clone());
+            dependents_by_issue
+                .entry(dependency.depends_on_id)
+                .or_default()
+                .push(issue_id.clone());
+        }
     }
 
-    let external_statuses =
-        storage.resolve_external_dependency_statuses(external_db_paths, false)?;
+    for dependency_ids in dependencies_by_issue.values_mut() {
+        dependency_ids.sort();
+        dependency_ids.dedup();
+    }
+    for dependent_ids in dependents_by_issue.values_mut() {
+        dependent_ids.sort();
+        dependent_ids.dedup();
+    }
 
-    // Optimization: Prefetch all active issue metadata to avoid N+1 queries during traversal
-    let metadata_cache = storage.get_active_issues_metadata()?;
+    Ok((dependencies_by_issue, dependents_by_issue))
+}
+
+fn dep_tree_neighbors(
+    direction: DepDirection,
+    issue_id: &str,
+    dependencies_by_issue: &DepTreeAdjacency,
+    dependents_by_issue: &DepTreeAdjacency,
+) -> Vec<String> {
+    match direction {
+        DepDirection::Down => dependencies_by_issue
+            .get(issue_id)
+            .map_or_else(Vec::new, Clone::clone),
+        DepDirection::Up => dependents_by_issue
+            .get(issue_id)
+            .map_or_else(Vec::new, Clone::clone),
+        DepDirection::Both => {
+            let mut neighbors = dependencies_by_issue
+                .get(issue_id)
+                .map_or_else(Vec::new, Clone::clone);
+            if let Some(dependents) = dependents_by_issue.get(issue_id) {
+                neighbors.extend(dependents.iter().cloned());
+            }
+            neighbors.sort();
+            neighbors.dedup();
+            neighbors
+        }
+    }
+}
+
+fn dep_tree_neighbors_from_storage(
+    storage: &SqliteStorage,
+    direction: DepDirection,
+    issue_id: &str,
+) -> Result<Vec<String>> {
+    let mut neighbors = match direction {
+        DepDirection::Down => storage.get_dependencies(issue_id)?,
+        DepDirection::Up => storage.get_dependents(issue_id)?,
+        DepDirection::Both => {
+            let mut neighbors = storage.get_dependencies(issue_id)?;
+            neighbors.extend(storage.get_dependents(issue_id)?);
+            neighbors
+        }
+    };
+    neighbors.sort();
+    neighbors.dedup();
+    Ok(neighbors)
+}
+
+fn dep_tree_metadata_for_node(
+    storage: &SqliteStorage,
+    root_id: &str,
+    root_issue: &crate::model::Issue,
+    node_id: &str,
+    external_statuses: &HashMap<String, bool>,
+    metadata_cache: &mut DepTreeMetadataCache,
+) -> Result<(String, i32, String)> {
+    if let Some(metadata) = metadata_cache.get(node_id) {
+        return Ok(metadata.clone());
+    }
+
+    let metadata =
+        resolve_dep_tree_node_metadata(storage, root_id, root_issue, node_id, external_statuses)?;
+    metadata_cache.insert(node_id.to_string(), metadata.clone());
+    Ok(metadata)
+}
+
+fn hydrate_dep_tree_metadata_for_ids(
+    storage: &SqliteStorage,
+    root_id: &str,
+    root_issue: &crate::model::Issue,
+    issue_ids: &[String],
+    external_statuses: &HashMap<String, bool>,
+    metadata_cache: &mut DepTreeMetadataCache,
+) -> Result<()> {
+    for issue_id in issue_ids {
+        dep_tree_metadata_for_node(
+            storage,
+            root_id,
+            root_issue,
+            issue_id,
+            external_statuses,
+            metadata_cache,
+        )?;
+    }
+    Ok(())
+}
+
+struct DepTreeQueueItem {
+    id: String,
+    depth: usize,
+    parent_id: Option<String>,
+    parent_key: Option<String>,
+    path: Vec<String>,
+}
+
+fn dep_tree_root_metadata(root_issue: &crate::model::Issue) -> (String, i32, String) {
+    (
+        root_issue.title.clone(),
+        root_issue.priority.0,
+        root_issue.status.as_str().to_string(),
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_dep_tree_nodes_global(
+    args: &DepTreeArgs,
+    storage: &SqliteStorage,
+    root_id: &str,
+    root_issue: &crate::model::Issue,
+    external_statuses: &HashMap<String, bool>,
+) -> Result<Vec<TreeNode>> {
+    let mut metadata_cache = storage.get_active_issues_metadata()?;
+    metadata_cache.insert(root_id.to_string(), dep_tree_root_metadata(root_issue));
+    let (dependencies_by_issue, dependents_by_issue) = load_dep_tree_adjacency(storage)?;
 
     let mut nodes = Vec::new();
 
-    let mut queue = vec![QueueItem {
-        id: root_id.clone(),
+    let mut queue = vec![DepTreeQueueItem {
+        id: root_id.to_string(),
         depth: 0,
         parent_id: None,
         parent_key: None,
@@ -913,34 +1368,25 @@ fn dep_tree(
         let node_key = format!("n{next_node_key}");
         next_node_key += 1;
 
-        let (title, priority, status) = if let Some(meta) = metadata_cache.get(&item.id) {
-            meta.clone()
-        } else {
-            resolve_dep_tree_node_metadata(
-                storage,
-                &root_id,
-                &root_issue,
-                &item.id,
-                &external_statuses,
-            )?
-        };
+        let (title, priority, status) = dep_tree_metadata_for_node(
+            storage,
+            root_id,
+            root_issue,
+            &item.id,
+            external_statuses,
+            &mut metadata_cache,
+        )?;
 
         let mut dependencies = Vec::new();
         let truncated = if item.id.starts_with("external:") {
             false
         } else {
-            dependencies = match args.direction {
-                DepDirection::Down => storage.get_dependencies(&item.id)?,
-                DepDirection::Up => storage.get_dependents(&item.id)?,
-                DepDirection::Both => {
-                    let mut all = storage.get_dependencies(&item.id)?;
-                    let mut up = storage.get_dependents(&item.id)?;
-                    all.append(&mut up);
-                    all.sort();
-                    all.dedup();
-                    all
-                }
-            };
+            dependencies = dep_tree_neighbors(
+                args.direction,
+                &item.id,
+                &dependencies_by_issue,
+                &dependents_by_issue,
+            );
             dep_tree_truncated(item.depth, args.max_depth, dependencies.len())
         };
 
@@ -961,11 +1407,19 @@ fn dep_tree(
             let mut new_path = item.path.clone();
             new_path.push(item.id.clone());
 
+            hydrate_dep_tree_metadata_for_ids(
+                storage,
+                root_id,
+                root_issue,
+                &dependencies,
+                external_statuses,
+                &mut metadata_cache,
+            )?;
             sort_dep_tree_siblings(&mut dependencies, &metadata_cache);
             // Push in reverse order so first sorted item pops first.
             for dep_id in dependencies.into_iter().rev() {
                 // No global visited check here
-                queue.push(QueueItem {
+                queue.push(DepTreeQueueItem {
                     id: dep_id,
                     depth: item.depth + 1,
                     parent_id: Some(item.id.clone()),
@@ -975,6 +1429,135 @@ fn dep_tree(
             }
         }
     }
+
+    Ok(nodes)
+}
+
+#[allow(clippy::too_many_lines)]
+fn try_build_dep_tree_nodes_local(
+    args: &DepTreeArgs,
+    storage: &SqliteStorage,
+    root_id: &str,
+    root_issue: &crate::model::Issue,
+    external_statuses: &HashMap<String, bool>,
+) -> Result<Option<Vec<TreeNode>>> {
+    let mut metadata_cache = DepTreeMetadataCache::new();
+    metadata_cache.insert(root_id.to_string(), dep_tree_root_metadata(root_issue));
+
+    let mut nodes = Vec::new();
+    let mut queue = vec![DepTreeQueueItem {
+        id: root_id.to_string(),
+        depth: 0,
+        parent_id: None,
+        parent_key: None,
+        path: Vec::new(),
+    }];
+    let mut next_node_key = 0usize;
+
+    while let Some(item) = queue.pop() {
+        if nodes.len() >= LOCAL_DEP_TREE_NODE_LIMIT {
+            return Ok(None);
+        }
+
+        if item.path.contains(&item.id) {
+            continue;
+        }
+
+        let node_key = format!("n{next_node_key}");
+        next_node_key += 1;
+
+        let (title, priority, status) = dep_tree_metadata_for_node(
+            storage,
+            root_id,
+            root_issue,
+            &item.id,
+            external_statuses,
+            &mut metadata_cache,
+        )?;
+
+        let mut dependencies = Vec::new();
+        let truncated = if item.id.starts_with("external:") {
+            false
+        } else {
+            dependencies = dep_tree_neighbors_from_storage(storage, args.direction, &item.id)?;
+            dep_tree_truncated(item.depth, args.max_depth, dependencies.len())
+        };
+
+        nodes.push(TreeNode {
+            node_key: node_key.clone(),
+            id: item.id.clone(),
+            title,
+            depth: item.depth,
+            parent_id: item.parent_id.clone(),
+            parent_key: item.parent_key.clone(),
+            priority,
+            status,
+            truncated,
+        });
+
+        if item.depth < args.max_depth && !item.id.starts_with("external:") {
+            if nodes.len().saturating_add(dependencies.len()) > LOCAL_DEP_TREE_NODE_LIMIT {
+                return Ok(None);
+            }
+
+            let mut new_path = item.path.clone();
+            new_path.push(item.id.clone());
+
+            hydrate_dep_tree_metadata_for_ids(
+                storage,
+                root_id,
+                root_issue,
+                &dependencies,
+                external_statuses,
+                &mut metadata_cache,
+            )?;
+            sort_dep_tree_siblings(&mut dependencies, &metadata_cache);
+
+            for dep_id in dependencies.into_iter().rev() {
+                queue.push(DepTreeQueueItem {
+                    id: dep_id,
+                    depth: item.depth + 1,
+                    parent_id: Some(item.id.clone()),
+                    parent_key: Some(node_key.clone()),
+                    path: new_path.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(Some(nodes))
+}
+
+#[allow(clippy::too_many_lines)]
+fn dep_tree(
+    args: &DepTreeArgs,
+    storage: &SqliteStorage,
+    resolver: &IdResolver,
+    external_db_paths: &HashMap<String, PathBuf>,
+    _json: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let root_id = resolve_issue_id(storage, resolver, &args.issue)?;
+    let root_issue = storage
+        .get_issue(&root_id)?
+        .ok_or_else(|| BeadsError::IssueNotFound {
+            id: root_id.clone(),
+        })?;
+
+    let external_statuses =
+        storage.resolve_external_dependency_statuses(external_db_paths, false)?;
+    let nodes = match try_build_dep_tree_nodes_local(
+        args,
+        storage,
+        &root_id,
+        &root_issue,
+        &external_statuses,
+    )? {
+        Some(nodes) => nodes,
+        None => {
+            build_dep_tree_nodes_global(args, storage, &root_id, &root_issue, &external_statuses)?
+        }
+    };
 
     if ctx.is_json() || ctx.is_toon() {
         if ctx.is_toon() {
@@ -1205,16 +1788,56 @@ fn parse_external_dep_id(dep_id: &str) -> Option<(String, String)> {
 }
 
 fn dep_cycles(
-    _args: &DepCyclesArgs,
+    args: &DepCyclesArgs,
     storage: &SqliteStorage,
     _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let cycles = storage.detect_all_cycles()?;
+    let report = storage.detect_dependency_cycle_report(args.blocking_only)?;
+    let active_count = report.active_cycles.len();
+    let archived_closed_count = report.archived_closed_cycles.len();
+    let total_count = active_count + archived_closed_count;
+
+    // #368: An active dependency cycle is a machine-actionable condition, so a
+    // scripted/robot caller gating on the exit code must be able to see it. We
+    // still emit the full, data-carrying output on every surface below (text,
+    // rich, JSON `count`, TOON) — the exit code is recorded here and applied by
+    // `main` after output completes, so the JSON/TOON stream stays a single
+    // clean object. Archived-closed-only cycles are historical and never flip
+    // the exit code, even under `--include-closed`.
+    if active_count > 0 {
+        crate::output::record_pending_exit_code(crate::error::ErrorCode::CycleDetected.exit_code());
+    }
+    let mut cycles = report.active_cycles.clone();
+    let mut active_cycles = Vec::new();
+    let mut archived_closed_cycles = Vec::new();
+
+    if args.include_closed {
+        active_cycles.clone_from(&report.active_cycles);
+        archived_closed_cycles.clone_from(&report.archived_closed_cycles);
+        cycles.extend(report.archived_closed_cycles.clone());
+        cycles.sort();
+    }
     let count = cycles.len();
+    let scope = if args.include_closed {
+        "active_and_archived"
+    } else {
+        "active"
+    };
 
     if ctx.is_json() || ctx.is_toon() {
-        let result = CyclesResult { cycles, count };
+        let result = CyclesResult {
+            cycles,
+            count,
+            active_count,
+            archived_closed_count,
+            total_count,
+            blocking_only: args.blocking_only,
+            include_closed: args.include_closed,
+            scope,
+            active_cycles,
+            archived_closed_cycles,
+        };
         if ctx.is_toon() {
             ctx.toon(&result);
         } else {
@@ -1227,14 +1850,21 @@ fn dep_cycles(
         return Ok(());
     }
 
+    let cycle_scope = cycle_scope_label(args.blocking_only);
     if count == 0 {
-        ctx.success("No dependency cycles detected.");
+        if archived_closed_count > 0 && !args.include_closed {
+            ctx.success(&format!(
+                "No active {cycle_scope} cycles detected. {archived_closed_count} archived closed-only cycle(s) hidden; rerun with --include-closed to inspect them."
+            ));
+        } else {
+            ctx.success(&format!("No {cycle_scope} cycles detected."));
+        }
     } else if ctx.is_rich() {
         // Rich mode: Show cycles with red highlighting in a panel
-        render_cycles_rich(ctx, &cycles, count);
+        render_cycles_rich(ctx, &cycles, count, args.blocking_only);
     } else {
         // Plain mode: Simple text output
-        ctx.warning(&format!("Found {count} dependency cycle(s):"));
+        ctx.warning(&format!("Found {count} {cycle_scope} cycle(s):"));
         for (i, cycle) in cycles.iter().enumerate() {
             ctx.print_line(&format!("  {}. {}", i + 1, format_cycle_plain(cycle)));
         }
@@ -1244,20 +1874,44 @@ fn dep_cycles(
 }
 
 /// Render cycles in rich mode with red highlighting
-fn render_cycles_rich(ctx: &OutputContext, cycles: &[Vec<String>], count: usize) {
+fn render_cycles_rich(
+    ctx: &OutputContext,
+    cycles: &[Vec<String>],
+    count: usize,
+    blocking_only: bool,
+) {
     let theme = ctx.theme();
-    let content = build_cycles_rich_text(cycles, count, theme);
+    let content = build_cycles_rich_text(cycles, count, theme, blocking_only);
+    let title = if blocking_only {
+        "Blocking Dependency Cycles"
+    } else {
+        "Dependency Cycles"
+    };
     let panel = Panel::from_rich_text(&content, ctx.width())
-        .title(Text::new("Dependency Cycles"))
+        .title(Text::new(title))
         .border_style(theme.error.clone());
 
     ctx.render(&panel);
 }
 
-fn build_cycles_rich_text(cycles: &[Vec<String>], count: usize, theme: &Theme) -> Text {
+fn cycle_scope_label(blocking_only: bool) -> &'static str {
+    if blocking_only {
+        "blocking dependency"
+    } else {
+        "dependency"
+    }
+}
+
+fn build_cycles_rich_text(
+    cycles: &[Vec<String>],
+    count: usize,
+    theme: &Theme,
+    blocking_only: bool,
+) -> Text {
     let mut content = Text::new("");
+    let cycle_scope = cycle_scope_label(blocking_only);
     content.append_styled(
-        &format!("⚠ {count} dependency cycle(s) detected:\n\n"),
+        &format!("⚠ {count} {cycle_scope} cycle(s) detected:\n\n"),
         theme.error.clone().bold(),
     );
 
@@ -1340,6 +1994,8 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -1416,6 +2072,163 @@ mod tests {
     fn test_normalize_dep_type_filter_rejects_unknown_types() {
         let err = normalize_dep_type_filter("parent_child").unwrap_err();
         assert!(matches!(err, BeadsError::Validation { field, .. } if field == "type"));
+    }
+
+    #[test]
+    fn test_parse_dependency_import_line_accepts_edge_jsonl() {
+        let deps = parse_dependency_import_line(
+            r#"{"issue_id":"bd-a","depends_on_id":"bd-b","type":"parent-child"}"#,
+            7,
+        )
+        .unwrap();
+
+        assert_eq!(
+            deps,
+            vec![BulkDependencyInsert {
+                issue_id: "bd-a".to_string(),
+                depends_on_id: "bd-b".to_string(),
+                dep_type: "parent-child".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_parse_dependency_import_line_accepts_issue_jsonl_dependencies() {
+        let deps = parse_dependency_import_line(
+            r#"{"id":"bd-a","dependencies":[{"depends_on_id":"bd-b","type":"blocks"},{"issue_id":"bd-c","depends_on_id":"bd-d","dep_type":"waits-for"}]}"#,
+            11,
+        )
+        .unwrap();
+
+        assert_eq!(
+            deps,
+            vec![
+                BulkDependencyInsert {
+                    issue_id: "bd-a".to_string(),
+                    depends_on_id: "bd-b".to_string(),
+                    dep_type: "blocks".to_string(),
+                },
+                BulkDependencyInsert {
+                    issue_id: "bd-c".to_string(),
+                    depends_on_id: "bd-d".to_string(),
+                    dep_type: "waits-for".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_dependency_import_line_skips_issue_record_without_dependencies() {
+        let deps = parse_dependency_import_line(
+            r#"{"id":"bd-no-deps","title":"plain issue record","status":"open"}"#,
+            13,
+        )
+        .unwrap();
+
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_parse_dependency_import_line_rejects_dependency_array_without_owner() {
+        let error = parse_dependency_import_line(
+            r#"{"dependencies":[{"depends_on_id":"bd-target","type":"blocks"}]}"#,
+            17,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, BeadsError::Validation { field, .. } if field == "issue_id"),
+            "unexpected missing-owner error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_dependency_import_line_rejects_empty_edge_ids() {
+        let error = parse_dependency_import_line(
+            r#"{"issue_id":"  ","depends_on_id":"bd-target","type":"blocks"}"#,
+            19,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, BeadsError::Validation { field, .. } if field == "jsonl"),
+            "unexpected empty-id error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_dep_import_bulk_storage_path_inserts_parent_child_batch() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for id in ["bd-parent", "bd-child-a", "bd-child-b"] {
+            storage
+                .create_issue(&make_test_issue(id, id), "tester")
+                .unwrap();
+        }
+
+        let inserted = storage
+            .add_dependencies_bulk_for_import(
+                &[
+                    BulkDependencyInsert {
+                        issue_id: "bd-child-a".to_string(),
+                        depends_on_id: "bd-parent".to_string(),
+                        dep_type: "parent-child".to_string(),
+                    },
+                    BulkDependencyInsert {
+                        issue_id: "bd-child-b".to_string(),
+                        depends_on_id: "bd-parent".to_string(),
+                        dep_type: "parent-child".to_string(),
+                    },
+                ],
+                "tester",
+            )
+            .unwrap();
+
+        assert_eq!(inserted, 2);
+        assert_eq!(
+            storage.get_dependencies("bd-child-a").unwrap(),
+            vec!["bd-parent".to_string()]
+        );
+        assert_eq!(
+            storage.get_dependencies("bd-child-b").unwrap(),
+            vec!["bd-parent".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_dep_import_bulk_storage_path_skips_type_distinct_duplicate_pairs() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for id in ["bd-source", "bd-target"] {
+            storage
+                .create_issue(&make_test_issue(id, id), "tester")
+                .unwrap();
+        }
+
+        let inserted = storage
+            .add_dependencies_bulk_for_import(
+                &[
+                    BulkDependencyInsert {
+                        issue_id: "bd-source".to_string(),
+                        depends_on_id: "bd-target".to_string(),
+                        dep_type: "blocks".to_string(),
+                    },
+                    BulkDependencyInsert {
+                        issue_id: "bd-source".to_string(),
+                        depends_on_id: "bd-target".to_string(),
+                        dep_type: "related".to_string(),
+                    },
+                ],
+                "tester",
+            )
+            .unwrap();
+
+        assert_eq!(inserted, 1);
+        let dep_types: Vec<String> = storage
+            .get_dependencies_full("bd-source")
+            .unwrap()
+            .into_iter()
+            .map(|dep| dep.dep_type.as_str().to_string())
+            .collect();
+        assert_eq!(dep_types, vec!["blocks".to_string()]);
     }
 
     #[test]
@@ -1525,6 +2338,198 @@ mod tests {
         assert!(dependents.contains(&"bd-002".to_string()));
         assert!(dependents.contains(&"bd-003".to_string()));
         info!("test_get_dependents: assertions passed");
+    }
+
+    #[test]
+    fn test_dep_tree_adjacency_prefetch_matches_direct_queries() {
+        init_test_logging();
+        info!("test_dep_tree_adjacency_prefetch_matches_direct_queries: starting");
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        for issue in [
+            make_test_issue("bd-001", "Issue 1"),
+            make_test_issue("bd-002", "Issue 2"),
+            make_test_issue("bd-003", "Issue 3"),
+            make_test_issue("bd-004", "Issue 4"),
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        storage
+            .add_dependency("bd-001", "bd-002", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-001", "bd-003", "related", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-004", "bd-001", "blocks", "tester")
+            .unwrap();
+
+        let (dependencies_by_issue, dependents_by_issue) =
+            load_dep_tree_adjacency(&storage).unwrap();
+
+        let mut direct_down = storage.get_dependencies("bd-001").unwrap();
+        direct_down.sort();
+        let down = dep_tree_neighbors(
+            DepDirection::Down,
+            "bd-001",
+            &dependencies_by_issue,
+            &dependents_by_issue,
+        );
+        assert_eq!(down, direct_down);
+
+        let mut direct_up = storage.get_dependents("bd-001").unwrap();
+        direct_up.sort();
+        let up = dep_tree_neighbors(
+            DepDirection::Up,
+            "bd-001",
+            &dependencies_by_issue,
+            &dependents_by_issue,
+        );
+        assert_eq!(up, direct_up);
+
+        let both = dep_tree_neighbors(
+            DepDirection::Both,
+            "bd-001",
+            &dependencies_by_issue,
+            &dependents_by_issue,
+        );
+        assert_eq!(
+            both,
+            vec![
+                "bd-002".to_string(),
+                "bd-003".to_string(),
+                "bd-004".to_string(),
+            ]
+        );
+        info!("test_dep_tree_adjacency_prefetch_matches_direct_queries: assertions passed");
+    }
+
+    fn dep_tree_test_args(issue: &str, direction: DepDirection, max_depth: usize) -> DepTreeArgs {
+        DepTreeArgs {
+            issue: issue.to_string(),
+            direction,
+            max_depth,
+            format: "text".to_string(),
+        }
+    }
+
+    type TreeNodeProjection = (
+        String,
+        String,
+        String,
+        usize,
+        Option<String>,
+        Option<String>,
+        i32,
+        String,
+        bool,
+    );
+
+    fn tree_node_projection(nodes: &[TreeNode]) -> Vec<TreeNodeProjection> {
+        nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.node_key.clone(),
+                    node.id.clone(),
+                    node.title.clone(),
+                    node.depth,
+                    node.parent_id.clone(),
+                    node.parent_key.clone(),
+                    node.priority,
+                    node.status.clone(),
+                    node.truncated,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_dep_tree_local_traversal_matches_global_nodes() {
+        init_test_logging();
+        info!("test_dep_tree_local_traversal_matches_global_nodes: starting");
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        for issue in [
+            make_test_issue("bd-001", "Issue 1"),
+            make_test_issue("bd-002", "Issue 2"),
+            make_test_issue("bd-003", "Issue 3"),
+            make_test_issue("bd-004", "Issue 4"),
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        let mut low_priority = make_test_issue("bd-005", "Issue 5");
+        low_priority.priority = Priority(3);
+        storage.create_issue(&low_priority, "tester").unwrap();
+
+        storage
+            .add_dependency("bd-001", "bd-002", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-001", "bd-003", "related", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-001", "bd-005", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-001", "external:ext:cap", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-004", "bd-001", "blocks", "tester")
+            .unwrap();
+
+        let args = dep_tree_test_args("bd-001", DepDirection::Both, 2);
+        let root_issue = storage.get_issue("bd-001").unwrap().unwrap();
+        let external_statuses = HashMap::new();
+        let local = try_build_dep_tree_nodes_local(
+            &args,
+            &storage,
+            "bd-001",
+            &root_issue,
+            &external_statuses,
+        )
+        .unwrap()
+        .expect("small tree should use local traversal");
+        let global =
+            build_dep_tree_nodes_global(&args, &storage, "bd-001", &root_issue, &external_statuses)
+                .unwrap();
+
+        assert_eq!(tree_node_projection(&local), tree_node_projection(&global));
+        info!("test_dep_tree_local_traversal_matches_global_nodes: assertions passed");
+    }
+
+    #[test]
+    fn test_dep_tree_local_traversal_falls_back_for_wide_roots() {
+        init_test_logging();
+        info!("test_dep_tree_local_traversal_falls_back_for_wide_roots: starting");
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let root = make_test_issue("bd-root", "Root");
+        storage.create_issue(&root, "tester").unwrap();
+        for index in 0..LOCAL_DEP_TREE_NODE_LIMIT {
+            let child_id = format!("bd-child-{index:03}");
+            let child = make_test_issue(&child_id, &format!("Child {index:03}"));
+            storage.create_issue(&child, "tester").unwrap();
+            storage
+                .add_dependency("bd-root", &child_id, "blocks", "tester")
+                .unwrap();
+        }
+
+        let args = dep_tree_test_args("bd-root", DepDirection::Down, 10);
+        let root_issue = storage.get_issue("bd-root").unwrap().unwrap();
+        let external_statuses = HashMap::new();
+        let local = try_build_dep_tree_nodes_local(
+            &args,
+            &storage,
+            "bd-root",
+            &root_issue,
+            &external_statuses,
+        )
+        .unwrap();
+
+        assert!(local.is_none());
+        info!("test_dep_tree_local_traversal_falls_back_for_wide_roots: assertions passed");
     }
 
     #[test]
@@ -1704,6 +2709,14 @@ mod tests {
                 ],
             ],
             count: 2,
+            active_count: 2,
+            archived_closed_count: 0,
+            total_count: 2,
+            blocking_only: false,
+            include_closed: false,
+            scope: "active",
+            active_cycles: Vec::new(),
+            archived_closed_cycles: Vec::new(),
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -1722,7 +2735,7 @@ mod tests {
         assert!(plain.contains("bd-a\\u{1b}[2J -> bd-b\\u{7}bell"));
 
         let theme = Theme::default();
-        let rich_text = build_cycles_rich_text(&cycles, 1, &theme);
+        let rich_text = build_cycles_rich_text(&cycles, 1, &theme, false);
         let rendered = Panel::from_rich_text(&rich_text, 100).render_plain(100);
 
         assert!(!rendered.contains("[bold"));
@@ -1733,6 +2746,11 @@ mod tests {
         assert!(rendered.contains("bd-a\\u{1b}[2J"));
         assert!(rendered.contains("bd-b\\u{7}bell"));
         assert!(rich_text.spans().len() > 1, "rich text should carry styles");
+
+        let blocking_rich_text = build_cycles_rich_text(&cycles, 1, &theme, true);
+        let blocking_rendered = Panel::from_rich_text(&blocking_rich_text, 100).render_plain(100);
+
+        assert!(blocking_rendered.contains("blocking dependency cycle(s)"));
     }
 
     #[test]

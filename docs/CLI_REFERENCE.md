@@ -34,10 +34,13 @@ Comprehensive reference for all `br` (beads_rust) commands.
   - [defer / undefer](#defer--undefer)
   - [orphans](#orphans)
   - [query (saved queries)](#query-saved-queries)
+  - [gate](#gate)
 - [Sync & Config](#sync--config)
   - [sync](#sync)
   - [config](#config)
 - [Agent Integration](#agent-integration)
+  - [capabilities](#capabilities)
+  - [robot-docs](#robot-docs)
   - [serve](#serve)
 - [Diagnostics & Info](#diagnostics--info)
   - [agents](#agents)
@@ -179,6 +182,7 @@ br create [OPTIONS] [TITLE]
 | `-t, --type <TYPE>` | Issue type (task, bug, feature, epic, chore, docs, question) |
 | `-p, --priority <PRIORITY>` | Priority (0-4 or P0-P4, where 0=critical) |
 | `-d, --description <TEXT>` | Issue description |
+| `--slug <SLUG>` | Human-readable slug embedded in the generated ID (lowercase ASCII alphanumerics + single hyphens, capped at 48 chars; see [Slug normalization](#slug-normalization)) |
 | `-a, --assignee <NAME>` | Assign to person |
 | `--owner <EMAIL>` | Set owner email |
 | `-l, --labels <LABELS>` | Labels (comma-separated) |
@@ -210,7 +214,44 @@ br create "Deploy to production" --due "+3d"
 
 # Bulk import from markdown
 br create -f issues.md
+
+# Human-readable slug embedded in the ID
+br create "Fix login bug on mobile" --slug "fix-login-mobile"
+# → Created: <prefix>-fix-login-mobile-<hash>  (e.g., br-fix-login-mobile-8cda)
 ```
+
+#### Slug normalization
+
+The `--slug` flag embeds a normalized slug between the configured prefix and
+the uniquifying hash suffix. Normalization rules (implemented in
+`src/util/id.rs::normalize_slug`):
+
+- Lowercased ASCII alphanumeric characters are kept.
+- Runs of any other character (whitespace, punctuation, Unicode) collapse to a
+  single hyphen.
+- Leading and trailing hyphens are stripped.
+- Length is capped at **48 characters** after normalization; if the cap leaves
+  a trailing hyphen, that hyphen is also stripped.
+- A slug that normalizes to an empty string falls back to the standard
+  hash-only ID (no slug embedded).
+
+Examples:
+
+| Input | Normalized output | Resulting ID shape |
+|-------|-------------------|--------------------|
+| `"Fix Login Bug"` | `fix-login-bug` | `<prefix>-fix-login-bug-<hash>` |
+| `"a/b/c"` | `a-b-c` | `<prefix>-a-b-c-<hash>` |
+| `"café-résumé"` | `caf-r-sum` (Unicode dropped) | `<prefix>-caf-r-sum-<hash>` |
+| `"!!!"` | `` (empty → fallback) | `<prefix>-<hash>` |
+
+#### Downstream `--slug` integration
+
+Three commits made `--slug` end-to-end:
+- [`5c0af3d4`](https://github.com/Dicklesworthstone/beads_rust/commit/5c0af3d4) `feat(create): --slug for human-readable issue IDs (#283)` — the feature itself.
+- [`f454486f`](https://github.com/Dicklesworthstone/beads_rust/commit/f454486f) `fix(sync): accept slugged IDs in prefix guard` — sync's prefix guard now tolerates slugged IDs during import/export.
+- [`52ff1722`](https://github.com/Dicklesworthstone/beads_rust/commit/52ff1722) `feat(orphans): scan all candidate-issue prefixes when finding commit refs` — `br orphans` finds commit references to slugged IDs.
+
+The full lifecycle round-trip (create with slug → show → update → close → orphans references) is verified by `tests/e2e_scripts/slug_round_trip.sh` (added by `beads_rust-l6xl`).
 
 ---
 
@@ -264,7 +305,7 @@ br list [OPTIONS]
 **Output Options:**
 | Option | Description |
 |--------|-------------|
-| `--limit <N>` | Maximum results (0=unlimited, default: 50) |
+| `--limit <N>` | Maximum results (0=unlimited; default: unlimited — the full work surface). Pass `--limit N` to cap. |
 | `--sort <FIELD>` | Sort by: priority, created_at, updated_at, title |
 | `-r, --reverse` | Reverse sort order |
 | `--long` | Long output format |
@@ -456,7 +497,7 @@ br ready [OPTIONS]
 **Options:**
 | Option | Description |
 |--------|-------------|
-| `--limit <N>` | Maximum results (default: 20) |
+| `--limit <N>` | Maximum results (0=unlimited; default: unlimited — the full ready set). Pass `--limit N` to cap. |
 | `--assignee <NAME>` | Filter by assignee |
 | `--unassigned` | Show only unassigned |
 | `-l, --label <LABEL>` | Filter by label (AND logic) |
@@ -482,6 +523,132 @@ br ready --unassigned -p 0 -p 1
 
 # JSON for agent integration
 br ready --json --limit 10
+```
+
+**Configurable ready status group (`.beads/policy.yaml`):**
+
+By default, `br ready` treats only `open` issues as actionable. Projects with a
+review workflow can widen what "ready" means — so review-returned work (e.g.
+`rework`) resurfaces through the same `br ready --json` entrypoint instead of
+forcing workflow knowledge into every agent prompt:
+
+```yaml
+workflow:
+  status_groups:
+    ready:
+      - open
+      - rework
+```
+
+Semantics:
+- **Default:** when `workflow.status_groups.ready` is absent (or empty), the
+  group is `[open]` — exactly the pre-#354 behavior (zero change for existing
+  repos).
+- **Status preserved:** returned issues keep their real status, so a `rework`
+  item still emits `{"status":"rework"}` in `--json`/`--format toon`/`--robot`.
+- **Validation:** when `workflow.strict: true` (and `workflow.statuses` is set),
+  every member of the ready group must be in `workflow.statuses`; an
+  out-of-vocabulary member is rejected with a clear error. Without `strict`, the
+  group is accepted as-is.
+- **Deferred interaction:** the `defer_until` time-gate still applies to every
+  non-`deferred` member of the group, so a configured member with a future
+  `defer_until` stays out of `br ready` until it elapses. `--include-deferred`
+  additionally surfaces `deferred` work and drops the time-gate, without
+  double-counting `deferred` if it is also listed in the group.
+- **Scope:** `br ready`, `br ready --json`, `br ready --robot`,
+  `br ready --format toon`, and `br scheduler` all use the same ready group.
+
+---
+
+### scheduler
+
+Rank ready work for agent swarms with explainable evidence.
+
+```bash
+br scheduler [OPTIONS]
+br schedule [OPTIONS]   # alias
+```
+
+`scheduler` starts from the same ready-work definition as `ready`, then scores a
+bounded candidate set with deterministic evidence terms for priority,
+dependency impact, stale claims, fairness, and domain contention. JSON and TOON
+output include `schema: "br.scheduler.v1"` plus a fallback policy so agents can
+parse the result safely and preserve conservative ordering when evidence ties.
+The `evidence.stale_claim` object uses the shared coordination policy with
+`reservation_status: "no_snapshot"` because `scheduler` does not parse Agent
+Mail snapshots. A stale assigned row can therefore recommend `inspect_mail`, but
+it is not proof that the claim is abandoned; run `br coordination status` with
+reservation evidence before reclaiming ownership.
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--limit <N>` | Maximum recommendations (0=unlimited; default: unlimited — every scored recommendation) |
+| `--candidate-limit <N>` | Maximum ready candidates to score (default: 512, 0=unlimited) |
+| `--stale-claim-hours <N>` | Non-negative claim age threshold for stale-claim evidence (default: 2) |
+| `--format <FMT>` | Output format: text, json, toon |
+| `--stats` | Show token savings stats when using TOON output |
+| `--robot` | Machine-readable output |
+
+**Examples:**
+```bash
+# Top swarm recommendations with evidence
+br scheduler --json --limit 10
+
+# Token-efficient parseable output
+br scheduler --format toon --stats
+```
+
+---
+
+### coordination status
+
+Diagnose hidden `in_progress` claims without mutating ownership.
+
+```bash
+br coordination status [OPTIONS]
+```
+
+`coordination status` emits the `br.coordination.v1` evidence envelope used to
+spot stale claims, missing Agent Mail evidence, and active reservation matches.
+The command is read-only: it never calls Agent Mail directly and never changes
+issue status or assignee.
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--owner-kind <KIND>` | Fallback ownership policy: swarm-agent, human, or unknown |
+| `--comments <N>` | Latest comments to include per claim (default: 2) |
+| `--reservations <PATH>` | Offline Agent Mail reservation snapshot (JSON array, wrapper object, or JSONL) |
+| `--agents <PATH>` | Offline Agent Mail agent snapshot (JSON array, wrapper object, or JSONL) |
+| `--format <FMT>` | Output format: text, json, toon |
+| `--stats` | Show token savings stats when using TOON output |
+| `--robot` | Machine-readable output |
+
+JSON/TOON claim rows include advisory fields:
+`reclaim_allowed_by_policy`, `required_human_confirmation`,
+`evidence_summary`, and `suggested_commands`. Suggested commands are emitted
+only when the policy has enough evidence to propose the documented audit-comment
+plus `br update --claim` sequence. Fresh claims, active reservations, missing or
+invalid snapshots, and human/unknown ownership do not emit reclaim commands.
+
+**Examples:**
+```bash
+# Inspect current in-progress claims
+br coordination status --json
+
+# Queue-dry diagnosis: ready work may be hidden behind old claims
+br ready --json
+bv --robot-next
+br list --status in_progress --json
+br coordination status --json
+
+# Use offline Agent Mail snapshots without requiring a live MCP service
+br coordination status --reservations reservations.json --agents agents.jsonl --json
+
+# Review advisory reclaim output before copying any suggested command
+br coordination status --reservations reservations.json --agents agents.jsonl --json \
+  | jq '.claims[] | {id: .issue.id, reclaim_allowed_by_policy, required_human_confirmation, suggested_commands}'
 ```
 
 ---
@@ -519,7 +686,10 @@ Full-text search across issues.
 br search <QUERY> [OPTIONS]
 ```
 
-Supports all filter options from `list`.
+Supports all filter options from `list`. Unlike `list`/`ready` (which are
+complete by default), `search` results are **capped at 50 by default**
+(`--limit <N>`, `0`=unlimited) — a broad text query can match a large fraction
+of the corpus, so a bounded, relevance-ordered result set is the default.
 
 **Examples:**
 ```bash
@@ -674,6 +844,7 @@ br graph [OPTIONS] [ISSUE]
 |--------|-------------|
 | `--all` | Show graph for all open, in-progress, and blocked issues |
 | `--compact` | Print one line per issue |
+| `--dot` | Emit Graphviz DOT notation (e.g. `br graph bd-1 --dot \| dot -Tsvg > graph.svg`) |
 
 ---
 
@@ -794,6 +965,63 @@ no free-form query string argument.
 
 ---
 
+### gate
+
+Record and inspect workflow gate results (issue #312, layer 2). Gates are
+conditions a project can require before a status transition is allowed, defined
+in `.beads/policy.yaml` under `workflow.gates` as a map of `"from -> to"`
+transitions to required gate conditions. Enforcement happens at the
+close/transition chokepoint: a move into a gated state is rejected until every
+required gate passes. Gate results are project-local metadata and are not synced
+through JSONL.
+
+```bash
+br gate report <ID> --gate <NAME> --provider <NAME> --status pass|fail [OPTIONS]
+br gate list <ID> [OPTIONS]
+```
+
+**Subcommands:**
+| Command | Description |
+|---------|-------------|
+| `report <ID> --gate <NAME> --provider <NAME> --status pass\|fail` | Record a gate result (external systems / reviewers report here) |
+| `list <ID>` | List recorded gate results and the computed required-gate status for the issue's next transitions |
+
+**`report` options:**
+| Option | Description |
+|--------|-------------|
+| `--gate <NAME>` | Gate name (e.g. `ci_green`, `security_sign_off`, `min_reviewers`) |
+| `--provider <NAME>` | Reporting provider (e.g. `ci`, `security`, `reviewer:alice`) |
+| `--status <pass\|fail>` | Result status |
+| `--note <TEXT>` | Optional free-form note recorded with the result |
+| `--robot` | Machine-readable JSON output |
+
+**`list` options:**
+| Option | Description |
+|--------|-------------|
+| `--robot` | Machine-readable JSON output |
+
+A re-report from the same provider for the same gate overwrites the prior
+verdict. The built-in `min_reviewers` gate is satisfied by at least N distinct
+reviewer providers (provider name `reviewer`, or namespaced `reviewer:<who>` /
+`reviewer-<who>`) reporting `pass`. Example policy:
+
+```yaml
+workflow:
+  strict: true
+  gates:
+    "in_review -> closed":
+      require_all:
+        - ci_green
+        - min_reviewers: 1
+      require_if:
+        - label: security-sensitive
+          gate: security_sign_off
+        - priority: [0, 1]
+          gate: security_sign_off
+```
+
+---
+
 ## Sync & Config
 
 ### sync
@@ -839,9 +1067,9 @@ br sync [OPTIONS]
 - `--force-db`, `--force-jsonl`, and `--force` are mutually exclusive for `--merge`.
 
 **Rebuild semantics:**
-- `--rebuild` is valid only with import mode: `br sync --rebuild` or `br sync --import-only --rebuild`.
+- `--rebuild` is valid only with explicit import mode: `br sync --import-only --rebuild`.
 - JSONL is authoritative. After import, entries present only in SQLite are removed; deletion tombstones are preserved when applicable.
-- `--rebuild` is rejected with `--flush-only` and `--merge`.
+- `--rebuild` is rejected with every non-import mode, including `--flush-only`, `--merge`, `--status`, and `--witness`.
 - Recovery artifacts are preserved under `.beads/.br_recovery/` when br has to move aside a damaged SQLite family before rebuilding.
 - If open-time recovery rebuilt the database before a semantic import flag such as `--rename-prefix` could apply, br prints a rerun command that includes the needed flags.
 
@@ -914,6 +1142,68 @@ br config edit
 
 ## Agent Integration
 
+### capabilities
+
+Describe br's machine-readable command contracts, safety guarantees, supported
+output formats, exit-code categories, and environment variables.
+
+```bash
+br capabilities [OPTIONS]
+```
+
+Use this as the first discovery call in automation:
+
+```bash
+br capabilities --format json
+br capabilities --format json --command "create"
+br capabilities --format json --command "comments add"
+br capabilities --format json --command "dep add"
+br capabilities --format json --command "query save"
+br capabilities --format json --command "update"
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--command <COMMAND_PATH>` | Include detailed metadata for one command path, e.g. `create` or `comments add` |
+| `--format <FMT>` | Output format: text, json, toon |
+| `--stats` | Show token savings stats when using TOON output |
+
+JSON and TOON output include `contract_version`,
+`recommended_entrypoints`, `features`, `commands`, `global_flags`,
+`exit_codes`, `env_vars`, and `safety`. When `--command` is supplied, output
+also includes `command_detail` with canonical path, aliases, subcommands,
+positionals, options, defaults, possible values, examples, command-specific
+safety notes, and workspace/safety contract metadata.
+
+---
+
+### robot-docs
+
+Print concise in-tool documentation for automation agents.
+
+```bash
+br robot-docs guide [OPTIONS]
+```
+
+Text mode prints a short handbook under 80 lines. JSON and TOON modes wrap the
+same guide with `contract_version`, `line_count`, and canonical commands.
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--format <FMT>` | Output format: text, json, toon |
+| `--stats` | Show token savings stats when using TOON output |
+
+**Example:**
+
+```bash
+br robot-docs guide
+br robot-docs guide --format json
+```
+
+---
+
 ### serve
 
 Start an MCP (Model Context Protocol) server on stdio.
@@ -944,14 +1234,17 @@ network listener.
 **Resources:** `beads://project/info`, `beads://issues/{id}`,
 `beads://schema`, `beads://labels`, `beads://issues/ready`,
 `beads://issues/blocked`, `beads://issues/in_progress`,
-`beads://issues/deferred`, `beads://issues/bottlenecks`,
-`beads://graph/health`, `beads://events/recent`.
+`beads://coordination/status`, `beads://issues/deferred`,
+`beads://issues/bottlenecks`, `beads://graph/health`,
+`beads://events/recent`.
 
 **Prompts:** `triage`, `status_report`, `plan_next_work`, `polish_backlog`.
 
 **Safety:** MCP mutations use the same local storage, audit trail, `.write.lock`,
 and JSONL auto-flush behavior as CLI mutations. The server never runs git and
-does not synchronize repositories.
+does not synchronize repositories. `beads://coordination/status` is read-only
+and does not call Agent Mail; use `br coordination status --reservations
+<PATH> --agents <PATH> --json` when reservation evidence is required.
 
 **Example MCP client entry:**
 
@@ -1099,6 +1392,44 @@ br audit [OPTIONS]
 ```
 
 Appends to `.beads/interactions.jsonl`.
+
+**Subcommands:**
+| Command | Description |
+|---------|-------------|
+| `record` | Append one interaction entry |
+| `coordination` | Record coordination status rows as audit interactions |
+| `label` | Label a prior interaction entry |
+| `log` | View audit entries for an issue |
+| `summary` | Summarize interaction counts |
+
+#### audit coordination
+
+`audit coordination` turns a `br coordination status` snapshot into durable
+`coordination_incident` rows in the existing `.beads/interactions.jsonl` audit
+log. It does not create a second coordination datastore.
+
+```bash
+br coordination status --json \
+  | br audit coordination --stdin --command "br coordination status --json" --json
+```
+
+Input may be a `br.coordination.v1` status object with `claims`, a JSON array,
+or JSONL rows where each row is either a claim or a wrapper with `claims`.
+Each recorded row stores bounded normalized fields in `extra`: `command`,
+`issue_id`, `classification`, `evidence_summary`, `snapshot_hash`, and
+`suggested_action`. The snapshot hash is computed from stable JSON with object
+keys normalized, so equivalent key order produces the same hash.
+
+The text output prints one interaction id per recorded claim. JSON and TOON
+output return:
+
+```json
+{
+  "recorded": 1,
+  "snapshot_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "ids": ["int-..."]
+}
+```
 
 ---
 

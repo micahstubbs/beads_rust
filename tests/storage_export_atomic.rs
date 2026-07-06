@@ -42,7 +42,19 @@ fn create_test_issue(id: &str, title: &str) -> Issue {
 }
 
 fn export_temp_path_for_test(output_path: &Path) -> std::path::PathBuf {
-    output_path.with_extension(format!("jsonl.{}.tmp", std::process::id()))
+    export_temp_path_attempt_for_test(output_path, 0)
+}
+
+fn export_temp_path_attempt_for_test(output_path: &Path, attempt: u32) -> std::path::PathBuf {
+    let pid = std::process::id();
+    if attempt == 0 {
+        return output_path.with_extension(format!("jsonl.{pid}.tmp"));
+    }
+
+    let retry_suffix = u64::from(pid)
+        .saturating_mul(100)
+        .saturating_add(u64::from(attempt));
+    output_path.with_extension(format!("jsonl.{retry_suffix}.tmp"))
 }
 
 fn setup_storage_with_issues(count: usize) -> SqliteStorage {
@@ -113,7 +125,7 @@ fn concurrent_exports_no_corruption() {
 
     for handle in handles {
         let (path, result) = handle.join().unwrap();
-        let export = result.unwrap_or_else(|e| panic!("Export to {path:?} failed: {e}"));
+        let export = result.expect("export should succeed");
         assert_eq!(export.exported_count, 5, "Each export should have 5 issues");
 
         // Verify the output is valid JSONL
@@ -122,7 +134,7 @@ fn concurrent_exports_no_corruption() {
         assert_eq!(lines.len(), 5);
         for line in &lines {
             let _: serde_json::Value =
-                serde_json::from_str(line).unwrap_or_else(|e| panic!("Invalid JSON line: {e}"));
+                serde_json::from_str(line).expect("line should be valid JSON");
         }
     }
 }
@@ -355,7 +367,7 @@ fn export_produces_valid_jsonl_per_line() {
     for (i, line) in lines.iter().enumerate() {
         // Each line must be valid JSON
         let parsed: serde_json::Value =
-            serde_json::from_str(line).unwrap_or_else(|e| panic!("Line {i} invalid JSON: {e}"));
+            serde_json::from_str(line).expect("line should be valid JSON");
 
         // Must have id field
         assert!(parsed.get("id").is_some(), "Line {i} missing 'id' field");
@@ -441,6 +453,39 @@ fn export_rejects_existing_temp_symlink_and_preserves_live_jsonl() {
     assert!(
         !outside.path().join("captured.jsonl").exists(),
         "Temp symlink should not receive exported data"
+    );
+}
+
+#[test]
+fn export_skips_stale_regular_temp_file_and_preserves_it() {
+    let _log = common::test_log("export_skips_stale_regular_temp_file_and_preserves_it");
+
+    let storage = setup_storage_with_issues(1);
+    let temp = TempDir::new().unwrap();
+    let beads_dir = setup_beads_dir(&temp);
+    let jsonl_path = beads_dir.join("issues.jsonl");
+    let stale_temp_path = export_temp_path_for_test(&jsonl_path);
+    let retry_temp_path = export_temp_path_attempt_for_test(&jsonl_path, 1);
+    fs::write(&stale_temp_path, "stale temp").unwrap();
+
+    let config = default_config(&beads_dir);
+    let result = export_to_jsonl(&storage, &jsonl_path, &config).unwrap();
+
+    assert_eq!(result.exported_count, 1);
+    assert!(
+        fs::read_to_string(&jsonl_path)
+            .unwrap()
+            .contains("\"id\":\"test-0000\""),
+        "export should succeed through a retry temp path"
+    );
+    assert_eq!(
+        fs::read_to_string(&stale_temp_path).unwrap(),
+        "stale temp",
+        "regular stale temp collision should be left untouched"
+    );
+    assert!(
+        !retry_temp_path.exists(),
+        "successful rename should not leave the retry temp file behind"
     );
 }
 

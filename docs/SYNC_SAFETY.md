@@ -130,12 +130,11 @@ Use `--rebuild` only when JSONL is the source of truth and the SQLite database
 should be made to match it:
 
 ```bash
-# Equivalent forms
-br sync --rebuild
 br sync --import-only --rebuild
 ```
 
-`--rebuild` is import-only. It is rejected with `--flush-only` and `--merge`.
+`--rebuild` is import-only. It is rejected with every non-import mode,
+including `--flush-only`, `--merge`, `--status`, and `--witness`.
 After importing JSONL, br removes database entries absent from JSONL and
 preserves deletion tombstones when they are still needed for sync safety.
 
@@ -170,6 +169,10 @@ Paths outside `.beads/` require the explicit `--allow-external-jsonl` opt-in.
 **Safety notes:**
 - External paths bypass the default confinement
 - Symlinks pointing outside `.beads/` are rejected
+- If import preflight rejects a path, it stops before opening or parsing that path
+- Automatic flush validates the JSONL target before inspecting an existing file
+- Startup auto-import and no-db prefix inference validate existing JSONL targets before hashing or reading them
+- `br sync --allow-external-jsonl` carries that path policy through startup recovery, config loading, and no-db startup imports
 - Paths are canonicalized before use
 
 ---

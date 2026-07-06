@@ -65,6 +65,8 @@ pub struct SavedFilters {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub reverse: bool,
@@ -98,6 +100,7 @@ impl From<&ListArgs> for SavedFilters {
             notes_contains: args.notes_contains.clone(),
             all: args.all,
             limit: args.limit,
+            offset: args.offset,
             sort: args.sort.clone(),
             reverse: args.reverse,
             deferred: args.deferred,
@@ -126,7 +129,7 @@ impl SavedFilters {
             notes_contains: self.notes_contains.clone(),
             all: self.all,
             limit: self.limit,
-            offset: Some(0),
+            offset: self.offset,
             sort: self.sort.clone(),
             reverse: self.reverse,
             deferred: self.deferred,
@@ -248,11 +251,25 @@ pub fn execute(
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    ensure_query_storage_available(&storage_ctx)?;
+    execute_with_storage_ctx(command, cli, ctx, &mut storage_ctx)
+}
+
+/// Execute the query command using storage already opened by the caller.
+///
+/// # Errors
+///
+/// Returns an error if database operations fail or if inputs are invalid.
+pub fn execute_with_storage_ctx(
+    command: &QueryCommands,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    storage_ctx: &mut config::OpenStorageResult,
+) -> Result<()> {
+    ensure_query_storage_available(storage_ctx)?;
 
     match command {
         QueryCommands::Save(args) => query_save(args, &mut storage_ctx.storage, ctx),
-        QueryCommands::Run(args) => query_run(args, &storage_ctx.storage, cli, ctx),
+        QueryCommands::Run(args) => query_run(args, storage_ctx, cli, ctx),
         QueryCommands::List => query_list(&storage_ctx.storage, ctx),
         QueryCommands::Delete(args) => query_delete(args, &mut storage_ctx.storage, ctx),
     }
@@ -343,14 +360,15 @@ fn query_save(
 
 fn query_run(
     args: &QueryRunArgs,
-    storage: &crate::storage::SqliteStorage,
+    storage_ctx: &config::OpenStorageResult,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
     let name = args.name.trim();
     let key = format!("{QUERY_KEY_PREFIX}{name}");
 
-    let value = storage
+    let value = storage_ctx
+        .storage
         .get_config(&key)?
         .ok_or_else(|| BeadsError::validation("query", format_query_not_found_message(name)))?;
 
@@ -366,8 +384,7 @@ fn query_run(
     debug!(?merged_args, "Merged filters");
 
     // Execute list command with merged args
-    // We call the list execute function directly
-    super::list::execute(&merged_args, ctx.is_json(), cli, ctx)
+    super::list::execute_with_storage(&merged_args, cli, ctx, storage_ctx)
 }
 
 fn query_list(storage: &crate::storage::SqliteStorage, ctx: &OutputContext) -> Result<()> {
@@ -401,11 +418,7 @@ fn query_list(storage: &crate::storage::SqliteStorage, ctx: &OutputContext) -> R
     }
 
     if ctx.is_json() {
-        let output = QueryListOutput {
-            count: queries.len(),
-            queries,
-        };
-        ctx.json_pretty(&output);
+        ctx.json_array_count("queries", queries.iter(), "count", queries.len());
     } else if ctx.is_toon() {
         let output = QueryListOutput {
             count: queries.len(),
@@ -605,7 +618,7 @@ fn render_query_delete_rich(name: &str, ctx: &OutputContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::OutputFormat;
+    use crate::cli::{DEFAULT_LIST_LIMIT, OutputFormat};
     use crate::storage::SqliteStorage;
 
     #[test]
@@ -615,6 +628,7 @@ mod tests {
             type_: vec!["bug".to_string()],
             assignee: Some("alice".to_string()),
             priority: vec!["1".to_string(), "2".to_string()],
+            offset: Some(3),
             ..Default::default()
         };
 
@@ -623,6 +637,7 @@ mod tests {
         assert_eq!(filters.type_, vec!["bug"]);
         assert_eq!(filters.assignee, Some("alice".to_string()));
         assert_eq!(filters.priority, vec!["1", "2"]);
+        assert_eq!(filters.offset, Some(3));
     }
 
     #[test]
@@ -631,6 +646,7 @@ mod tests {
             status: vec!["open".to_string()],
             assignee: Some("bob".to_string()),
             all: true,
+            offset: Some(3),
             ..Default::default()
         };
 
@@ -638,6 +654,7 @@ mod tests {
         assert_eq!(args.status, vec!["open"]);
         assert_eq!(args.assignee, Some("bob".to_string()));
         assert!(args.all);
+        assert_eq!(args.offset, Some(3));
     }
 
     #[test]
@@ -660,6 +677,56 @@ mod tests {
         assert_eq!(merged.status, vec!["closed"]); // CLI wins
         assert_eq!(merged.assignee, Some("alice".to_string())); // Saved retained
         assert_eq!(merged.limit, Some(20)); // CLI wins
+    }
+
+    #[test]
+    fn test_merge_preserves_saved_limit_when_cli_limit_absent() {
+        let saved = SavedFilters {
+            limit: Some(10),
+            ..Default::default()
+        };
+
+        let cli = ListArgs::default();
+
+        let merged = saved.merge_with_cli(&cli);
+        assert_eq!(merged.limit, Some(10));
+    }
+
+    #[test]
+    fn test_merge_preserves_saved_unlimited_limit_when_cli_limit_absent() {
+        let saved = SavedFilters {
+            limit: Some(0),
+            ..Default::default()
+        };
+
+        let cli = ListArgs::default();
+
+        let merged = saved.merge_with_cli(&cli);
+        assert_eq!(merged.limit, Some(0));
+    }
+
+    #[test]
+    fn test_merge_keeps_limit_absent_when_saved_and_cli_omit_limit() {
+        let saved = SavedFilters::default();
+        let cli = ListArgs::default();
+
+        let merged = saved.merge_with_cli(&cli);
+        assert_eq!(merged.limit, None);
+    }
+
+    #[test]
+    fn test_merge_cli_limit_can_override_saved_with_default_limit_value() {
+        let saved = SavedFilters {
+            limit: Some(10),
+            ..Default::default()
+        };
+        let cli = ListArgs {
+            limit: Some(DEFAULT_LIST_LIMIT),
+            ..Default::default()
+        };
+
+        let merged = saved.merge_with_cli(&cli);
+        assert_eq!(merged.limit, Some(DEFAULT_LIST_LIMIT));
     }
 
     #[test]
@@ -750,6 +817,7 @@ mod tests {
         assert!(filters.notes_contains.is_none());
         assert!(!filters.all);
         assert!(filters.limit.is_none());
+        assert!(filters.offset.is_none());
         assert!(filters.sort.is_none());
         assert!(!filters.reverse);
         assert!(!filters.deferred);
@@ -904,6 +972,7 @@ mod tests {
             desc_contains: Some("error".to_string()),
             notes_contains: Some("important".to_string()),
             limit: Some(100),
+            offset: Some(5),
             sort: Some("priority".to_string()),
             ..Default::default()
         };
@@ -918,6 +987,7 @@ mod tests {
         assert_eq!(merged.desc_contains, Some("error".to_string()));
         assert_eq!(merged.notes_contains, Some("important".to_string()));
         assert_eq!(merged.limit, Some(100));
+        assert_eq!(merged.offset, Some(5));
         assert_eq!(merged.sort, Some("priority".to_string()));
 
         // CLI with Some values - cli wins
@@ -929,6 +999,7 @@ mod tests {
             desc_contains: Some("new".to_string()),
             notes_contains: Some("todo".to_string()),
             limit: Some(50),
+            offset: Some(2),
             sort: Some("updated".to_string()),
             ..Default::default()
         };
@@ -940,6 +1011,7 @@ mod tests {
         assert_eq!(merged2.desc_contains, Some("new".to_string()));
         assert_eq!(merged2.notes_contains, Some("todo".to_string()));
         assert_eq!(merged2.limit, Some(50));
+        assert_eq!(merged2.offset, Some(2));
         assert_eq!(merged2.sort, Some("updated".to_string()));
     }
 
@@ -996,6 +1068,7 @@ mod tests {
             notes_contains: Some("notes search".to_string()),
             all: true,
             limit: Some(25),
+            offset: Some(5),
             sort: Some("created".to_string()),
             reverse: true,
             deferred: true,
@@ -1020,6 +1093,7 @@ mod tests {
         assert_eq!(parsed.notes_contains, filters.notes_contains);
         assert_eq!(parsed.all, filters.all);
         assert_eq!(parsed.limit, filters.limit);
+        assert_eq!(parsed.offset, filters.offset);
         assert_eq!(parsed.sort, filters.sort);
         assert_eq!(parsed.reverse, filters.reverse);
         assert_eq!(parsed.deferred, filters.deferred);

@@ -2,7 +2,9 @@
 
 use crate::error::{BeadsError, Result};
 use crate::format::{IssueDetails, IssueWithDependencyMetadata};
-use crate::model::{Comment, DependencyType, Event, EventType, Issue, IssueType, Priority, Status};
+use crate::model::{
+    Comment, Dependency, DependencyType, Event, EventType, Issue, IssueType, Priority, Status,
+};
 use crate::storage::events::get_events;
 use crate::storage::schema::CURRENT_SCHEMA_VERSION;
 use crate::storage::schema::{
@@ -14,16 +16,17 @@ use crate::sync::{
     METADATA_LAST_EXPORT_TIME, METADATA_LAST_IMPORT_TIME,
 };
 use crate::util::id::{normalize_prefix, parse_id};
-use crate::validation::{CommentValidator, IssueValidator};
-use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use crate::validation::{CommentValidator, ISSUE_LABEL_MAX_COUNT, IssueValidator, LabelValidator};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use fsqlite::Connection;
 use fsqlite::compat::{OpenFlags, open_with_flags};
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration;
 
 /// Number of mutations between WAL checkpoint attempts.
@@ -38,6 +41,8 @@ const WAL_CHECKPOINT_INTERVAL: u32 = 50;
 /// jittered exponential backoff via thread::sleep) to provide proper
 /// desynchronization. This is critical for multi-agent concurrent access.
 const DEFAULT_BUSY_TIMEOUT_MS: u64 = 0;
+const SQLITE_VAR_LIMIT: usize = 900;
+const REDUNDANT_LABEL_COVERAGE_MIN_CANDIDATES: usize = 8_192;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ListRelationMetadata {
@@ -46,22 +51,135 @@ pub(crate) struct ListRelationMetadata {
     pub(crate) dependent_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChangelogIssueRow {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) priority: Priority,
+    pub(crate) issue_type: IssueType,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) closed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DependencyCycleReport {
+    pub active_cycles: Vec<Vec<String>>,
+    pub archived_closed_cycles: Vec<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BulkDependencyInsert {
+    pub(crate) issue_id: String,
+    pub(crate) depends_on_id: String,
+    pub(crate) dep_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlockedCacheProjectionHealth {
+    pub(crate) parity_status: String,
+    pub(crate) direct_blocked_rows: Option<usize>,
+    pub(crate) cached_missing_rows: Option<usize>,
+    pub(crate) cached_extra_rows: Option<usize>,
+    pub(crate) cached_mismatched_rows: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadyProjectionHealth {
+    pub(crate) parity_status: String,
+    pub(crate) cached_ready_rows: Option<usize>,
+    pub(crate) direct_ready_rows: Option<usize>,
+    pub(crate) cached_ready_missing_rows: Option<usize>,
+    pub(crate) cached_ready_extra_rows: Option<usize>,
+}
+
+impl BlockedCacheProjectionHealth {
+    fn unavailable(direct_blocked_rows: Option<usize>) -> Self {
+        Self {
+            parity_status: "unavailable".to_string(),
+            direct_blocked_rows,
+            cached_missing_rows: None,
+            cached_extra_rows: None,
+            cached_mismatched_rows: None,
+        }
+    }
+
+    pub(crate) fn has_mismatch(&self) -> bool {
+        [
+            self.cached_missing_rows,
+            self.cached_extra_rows,
+            self.cached_mismatched_rows,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|count| count > 0)
+    }
+}
+
+impl ReadyProjectionHealth {
+    fn unavailable(cached_ready_rows: Option<usize>, direct_ready_rows: Option<usize>) -> Self {
+        Self {
+            parity_status: "unavailable".to_string(),
+            cached_ready_rows,
+            direct_ready_rows,
+            cached_ready_missing_rows: None,
+            cached_ready_extra_rows: None,
+        }
+    }
+
+    pub(crate) fn has_mismatch(&self) -> bool {
+        [self.cached_ready_missing_rows, self.cached_ready_extra_rows]
+            .into_iter()
+            .flatten()
+            .any(|count| count > 0)
+    }
+}
+
+fn unique_label_refs(labels: &[String]) -> Vec<&String> {
+    let mut unique_labels = Vec::with_capacity(labels.len());
+    let mut seen_labels = HashSet::with_capacity(labels.len());
+    for label in labels {
+        if seen_labels.insert(label.as_str()) {
+            unique_labels.push(label);
+        }
+    }
+    unique_labels
+}
+
 fn append_label_membership_filters(
     sql: &mut String,
     params: &mut Vec<SqliteValue>,
     labels_and: &[String],
     labels_or: &[String],
 ) {
-    // Use EXISTS uniformly for both single- and multi-label cases. The IN
-    // (SELECT ...) form returns empty when combined with another IN (?)
-    // predicate (e.g. issue_type IN (?)) under fsqlite's query planner — the
-    // EXISTS form sidesteps the planner bug. See test
-    // test_list_issues_combined_type_and_label_filters for the regression.
-    for label in labels_and {
-        sql.push_str(
-            " AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label = ?)",
-        );
-        params.push(SqliteValue::from(label.as_str()));
+    let unique_labels_and = unique_label_refs(labels_and);
+
+    match unique_labels_and.as_slice() {
+        [] => {}
+        [label] => {
+            sql.push_str(" AND issues.id IN (SELECT issue_id FROM labels WHERE label = ?)");
+            params.push(SqliteValue::from(label.as_str()));
+        }
+        _ => {
+            let placeholders: Vec<String> =
+                unique_labels_and.iter().map(|_| "?".to_string()).collect();
+            let _ = write!(
+                sql,
+                " AND issues.id IN (
+                    SELECT issue_id
+                    FROM labels
+                    WHERE label IN ({})
+                    GROUP BY issue_id
+                    HAVING COUNT(DISTINCT label) = ?
+                )",
+                placeholders.join(",")
+            );
+            for label in &unique_labels_and {
+                params.push(SqliteValue::from(label.as_str()));
+            }
+            params.push(SqliteValue::from(
+                i64::try_from(unique_labels_and.len()).unwrap_or(i64::MAX),
+            ));
+        }
     }
 
     if !labels_or.is_empty() {
@@ -76,6 +194,82 @@ fn append_label_membership_filters(
         }
     }
 }
+
+fn append_issue_source_with_label_and_joins(
+    sql: &mut String,
+    params: &mut Vec<SqliteValue>,
+    labels_and: &[String],
+) {
+    let unique_labels_and = unique_label_refs(labels_and);
+
+    let Some((first_label, remaining_labels)) = unique_labels_and.split_first() else {
+        sql.push_str(" FROM issues");
+        return;
+    };
+
+    sql.push_str(
+        " FROM labels AS labels_and_1
+          JOIN issues
+            ON issues.id = labels_and_1.issue_id
+           AND labels_and_1.label = ?",
+    );
+    params.push(SqliteValue::from(first_label.as_str()));
+
+    for (index, label) in remaining_labels.iter().enumerate() {
+        let alias_number = index + 2;
+        let _ = write!(
+            sql,
+            " JOIN labels AS labels_and_{alias_number}
+                ON labels_and_{alias_number}.issue_id = issues.id
+               AND labels_and_{alias_number}.label = ?"
+        );
+        params.push(SqliteValue::from(label.as_str()));
+    }
+}
+
+fn append_issue_id_membership_filter(
+    sql: &mut String,
+    params: &mut Vec<SqliteValue>,
+    issue_ids: &[String],
+) {
+    sql.push_str(" AND (");
+    for (index, chunk) in issue_ids.chunks(SQLITE_VAR_LIMIT).enumerate() {
+        if index > 0 {
+            sql.push_str(" OR ");
+        }
+        let placeholders: Vec<String> = chunk.iter().map(|_| "?".to_string()).collect();
+        let _ = write!(sql, "id IN ({})", placeholders.join(","));
+        for issue_id in chunk {
+            params.push(SqliteValue::from(issue_id.as_str()));
+        }
+    }
+    sql.push(')');
+}
+
+fn append_label_or_membership_exists(
+    sql: &mut String,
+    params: &mut Vec<SqliteValue>,
+    labels_or: &[String],
+) {
+    if labels_or.is_empty() {
+        return;
+    }
+
+    let placeholders: Vec<String> = labels_or.iter().map(|_| "?".to_string()).collect();
+    let _ = write!(
+        sql,
+        " AND EXISTS (
+            SELECT 1
+            FROM labels
+            WHERE labels.issue_id = issues.id
+              AND labels.label IN ({})
+        )",
+        placeholders.join(",")
+    );
+    for label in labels_or {
+        params.push(SqliteValue::from(label.as_str()));
+    }
+}
 // `fsqlite` starts returning false PRIMARY KEY conflicts when we rewrite
 // existing `export_hashes` rows with a single multi-values INSERT. Batch the
 // DELETE side for efficiency, but re-insert one row at a time for correctness.
@@ -85,11 +279,34 @@ const EXPORT_HASH_CHUNK_SIZE: usize = 32;
 // the delete batched/full-table, but re-insert rows individually.
 const BLOCKED_CACHE_DELETE_CHUNK_SIZE: usize = 400;
 const DIRTY_ISSUE_CHUNK_SIZE: usize = 900;
-const IMPORT_LABEL_CHUNK_SIZE: usize = 400;
+const BLOCKS_DEP_EDGE_FILTER_LIMIT: usize = 400;
 const IMPORT_DEPENDENCY_CHUNK_SIZE: usize = 140;
 const DEPENDENCY_TRAVERSAL_MAX_DEPTH: usize = 500;
 const BLOCKED_CACHE_STATE_KEY: &str = "blocked_cache_state";
 const BLOCKED_CACHE_STATE_STALE: &str = "stale";
+/// Annotation suffix appended to a blocker ref when an epic is "blocked" purely
+/// because it still has an open child (e.g. `bd-42:child-open`).
+///
+/// This is a **close-ordering** marker — an epic should not be *closed* while it
+/// has open children — and must never prevent the epic from being *started*
+/// (claimed / moved to `in_progress`). The producer queries embed this suffix in
+/// `blocked_issues_cache`; [`SqliteStorage::get_start_blockers`] filters it back
+/// out so claim/start guards ignore it (#315).
+const CHILD_OPEN_BLOCKER_SUFFIX: &str = ":child-open";
+/// Suffix marking a blocker ref produced by propagating an *already-blocked*
+/// parent down onto its children (e.g. `bd-3n73:parent-blocked`).
+///
+/// This is an advisory **readiness** marker used to rank a child of a blocked
+/// epic below truly-ready work in `br ready`. It is hierarchy, not a
+/// prerequisite edge from the parent to the child, so it must never act as a
+/// *hard* gate: a finished child must be *closable* (#355) and an actionable
+/// child must be *claimable / startable* (#357) even while its parent epic is
+/// blocked. The producer
+/// ([`SqliteStorage::propagate_blocked_parents`]) embeds this suffix in
+/// `blocked_issues_cache`; both [`SqliteStorage::get_close_blockers`] and
+/// [`SqliteStorage::get_start_blockers`] filter it back out so neither the close
+/// gate nor the start/claim gate treats it as a real blocker.
+const PARENT_BLOCKED_SUFFIX: &str = ":parent-blocked";
 const NEEDS_FLUSH_KEY: &str = "needs_flush";
 const METADATA_EMPTY_VALUE: &str = "";
 const METADATA_FALSE_VALUE: &str = "false";
@@ -109,12 +326,71 @@ pub struct SqliteStorage {
     conn: Connection,
     /// Track mutations to trigger periodic WAL checkpoints.
     mutation_count: u32,
+    /// When set, this storage owns an ephemeral on-disk temp database (created
+    /// by [`SqliteStorage::open_memory`]) that must be unlinked — together with
+    /// its WAL/SHM/journal sidecars — when the connection is dropped. FrankenSQLite
+    /// requires real file paths for WAL and schema operations, so the "in-memory"
+    /// path is backed by a real temp file rather than `:memory:`; without this
+    /// cleanup the files accumulate in `TMPDIR` (#299). `None` for persistent
+    /// databases, which must never be deleted on drop.
+    temp_db_path: Option<PathBuf>,
+    /// Tier 1 attribution to stamp onto the audit events of the NEXT mutation
+    /// (issue #312, Layer 3 capture-only). Set via
+    /// [`SqliteStorage::set_pending_event_attribution`] immediately before a
+    /// `create`/`update` call so the command layer can attach self-reported
+    /// agent identity without threading it through every storage signature.
+    /// Consumed by exactly one COMMITTING `mutate()` (cleared only after the
+    /// write transaction commits, so a JSONL-recovery retry can still stamp it),
+    /// or cleared by any staged-mutation entry point that returns without
+    /// committing (e.g. an empty-`updates` no-op). It therefore never leaks into
+    /// an unrelated subsequent operation. Capture-only — never used for gating.
+    pending_event_attribution: Option<EventAttribution>,
 }
 
 /// Context for a mutation operation, tracking side effects.
+/// Tier 1 attribution captured on status-mutating commands (issue #312,
+/// Layer 3 capture-only). Self-reported agent/harness/model identity that is
+/// recorded onto emitted audit events as a trail ONLY — it is never gated or
+/// enforced on. Empty/whitespace-only inputs are coerced to `None` so absent
+/// attribution never produces blank-string noise in the audit log.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventAttribution {
+    pub agent_name: Option<String>,
+    pub harness: Option<String>,
+    pub model: Option<String>,
+}
+
+impl EventAttribution {
+    /// Build attribution from raw CLI/env inputs, normalizing empty or
+    /// whitespace-only values to `None`.
+    #[must_use]
+    pub fn new(agent_name: Option<&str>, harness: Option<&str>, model: Option<&str>) -> Self {
+        let norm = |v: Option<&str>| {
+            v.map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+        };
+        Self {
+            agent_name: norm(agent_name),
+            harness: norm(harness),
+            model: norm(model),
+        }
+    }
+
+    /// True when no attribution value was supplied.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.agent_name.is_none() && self.harness.is_none() && self.model.is_none()
+    }
+}
+
 pub struct MutationContext {
     pub op_name: String,
     pub actor: String,
+    /// Attribution stamped onto every event this context records (issue #312,
+    /// Layer 3 capture-only). Defaults to empty; set per-command before the
+    /// mutation runs. Capture-only — never used for gating.
+    pub attribution: EventAttribution,
     pub events: Vec<Event>,
     pub dirty_ids: HashSet<String>,
     pub invalidate_blocked_cache: bool,
@@ -122,10 +398,9 @@ pub struct MutationContext {
     /// descendants) need their blocked-cache entries recomputed.  If `None`
     /// while `invalidate_blocked_cache` is true, the entire cache is rebuilt.
     pub cache_affected_ids: Option<HashSet<String>>,
-    /// When true, skip the eager post-commit cache refresh.  Reads will
-    /// compute blocked state in-memory until the next non-deferred write
-    /// rebuilds the cache.  This reduces DB write-lock contention for
-    /// high-frequency mutations like dep add/remove.
+    /// When true, skip the storage-layer post-commit cache refresh.  Command
+    /// callers that already hold `.write.lock` can finalize the cache once per
+    /// batch; direct reads compute blocked state in-memory if the marker remains.
     pub defer_cache_refresh: bool,
     pub force_flush: bool,
 }
@@ -134,10 +409,10 @@ pub struct MutationContext {
 enum BlockedCacheRefreshPlan {
     Full,
     Incremental(HashSet<String>),
-    /// The stale marker has been set inside the transaction; skip the eager
-    /// post-commit rebuild.  Reads will compute blocked state in-memory
-    /// until the next non-deferred write rebuilds the cache.  Eliminates a
-    /// second write transaction per dep add/remove.
+    /// The stale marker has been set inside the transaction; skip the
+    /// storage-layer post-commit rebuild.  Higher-level command batching can
+    /// refresh once after the batch, while direct reads compute in-memory if the
+    /// marker remains.
     Deferred,
 }
 
@@ -158,10 +433,28 @@ impl BlockedCacheRefreshPlan {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ReadyIssueProjection {
     Full,
     Command,
+    Summary,
+}
+
+#[derive(Clone, Copy)]
+enum SearchIssueProjection {
+    Full,
+    CommandText,
+}
+
+#[derive(Clone, Copy)]
+enum BlockedIssueProjection {
+    Full,
+    Command,
+}
+
+struct ReadyReadinessProbe {
+    has_candidate_status: bool,
+    blocked_cache_stale: bool,
 }
 
 struct IssueDetailRelationPresence {
@@ -206,12 +499,15 @@ impl ReadyIssueProjection {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template"
+                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context"
             }
             Self::Command => {
                 r"SELECT id, title, description, acceptance_criteria, notes, status, priority,
                          issue_type, assignee, owner, estimated_minutes, created_at, created_by,
                          updated_at"
+            }
+            Self::Summary => {
+                r"SELECT id, title, status, priority, issue_type, created_at, updated_at"
             }
         }
     }
@@ -220,6 +516,95 @@ impl ReadyIssueProjection {
         match self {
             Self::Full => SqliteStorage::issue_from_row(row),
             Self::Command => SqliteStorage::ready_issue_from_row(row),
+            Self::Summary => SqliteStorage::command_summary_issue_from_row(row),
+        }
+    }
+}
+
+impl SearchIssueProjection {
+    const fn select_clause(self) -> &'static str {
+        match self {
+            Self::Full => {
+                r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
+                         status, priority, issue_type, assignee, owner, estimated_minutes,
+                         created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
+                         due_at, defer_until, external_ref, source_system, source_repo,
+                         deleted_at, deleted_by, delete_reason, original_type,
+                         compaction_level, compacted_at, compacted_at_commit, original_size,
+                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context
+                  FROM issues
+                  WHERE 1=1"
+            }
+            Self::CommandText => {
+                r"SELECT id, title, description, status, priority, issue_type, assignee,
+                         created_at, updated_at
+                  FROM issues
+                  WHERE 1=1"
+            }
+        }
+    }
+
+    fn parse_issue(self, row: &fsqlite::Row) -> Result<Issue> {
+        match self {
+            Self::Full => SqliteStorage::issue_from_row(row),
+            Self::CommandText => SqliteStorage::search_command_issue_from_row(row),
+        }
+    }
+}
+
+impl BlockedIssueProjection {
+    const fn cached_select_clause(self) -> &'static str {
+        match self {
+            Self::Full => {
+                r"SELECT i.id, i.content_hash, i.title, i.description, i.design, i.acceptance_criteria, i.notes,
+                     i.status, i.priority, i.issue_type, i.assignee, i.owner, i.estimated_minutes,
+                     i.created_at, i.created_by, i.updated_at, i.closed_at, i.close_reason, i.closed_by_session,
+                     i.due_at, i.defer_until, i.external_ref, i.source_system, i.source_repo,
+                     i.deleted_at, i.deleted_by, i.delete_reason, i.original_type, i.compaction_level,
+                     i.compacted_at, i.compacted_at_commit, i.original_size, i.sender, i.ephemeral,
+                     i.pinned, i.is_template, i.source_repo_path, i.agent_context,
+                     bc.blocked_by"
+            }
+            Self::Command => {
+                r"SELECT i.id, i.title, i.description, i.status, i.priority, i.issue_type,
+                         i.created_at, i.created_by, i.updated_at, bc.blocked_by"
+            }
+        }
+    }
+
+    const fn map_select_clause(self) -> &'static str {
+        match self {
+            Self::Full => {
+                r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
+                     status, priority, issue_type, assignee, owner, estimated_minutes,
+                     created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
+                     due_at, defer_until, external_ref, source_system, source_repo,
+                     deleted_at, deleted_by, delete_reason, original_type, compaction_level,
+                     compacted_at, compacted_at_commit, original_size, sender, ephemeral,
+                     pinned, is_template, source_repo_path, agent_context"
+            }
+            Self::Command => {
+                r"SELECT id, title, description, status, priority, issue_type,
+                         created_at, created_by, updated_at"
+            }
+        }
+    }
+
+    const fn cached_blocked_by_index(self) -> usize {
+        match self {
+            // Bumped from 37 → 38 after `agent_context` was appended
+            // to the Full SELECT at position 37 (beads_rust#297).
+            // Source_repo_path is at 36, agent_context is at 37, so
+            // bc.blocked_by lands at 38 in the joined projection.
+            Self::Full => 38,
+            Self::Command => 9,
+        }
+    }
+
+    fn parse_issue(self, row: &fsqlite::Row) -> Result<Issue> {
+        match self {
+            Self::Full => SqliteStorage::issue_from_row(row),
+            Self::Command => SqliteStorage::blocked_command_issue_from_row(row),
         }
     }
 }
@@ -230,6 +615,7 @@ impl MutationContext {
         Self {
             op_name: op_name.to_string(),
             actor: actor.to_string(),
+            attribution: EventAttribution::default(),
             events: Vec::new(),
             dirty_ids: HashSet::new(),
             invalidate_blocked_cache: false,
@@ -249,6 +635,9 @@ impl MutationContext {
             new_value: None,
             comment: details,
             created_at: Utc::now(),
+            agent_name: self.attribution.agent_name.clone(),
+            harness: self.attribution.harness.clone(),
+            model: self.attribution.model.clone(),
         });
     }
 
@@ -270,6 +659,9 @@ impl MutationContext {
             new_value,
             comment,
             created_at: Utc::now(),
+            agent_name: self.attribution.agent_name.clone(),
+            harness: self.attribution.harness.clone(),
+            model: self.attribution.model.clone(),
         });
     }
 
@@ -295,13 +687,13 @@ impl MutationContext {
         }
     }
 
-    /// Mark the blocked-cache as needing invalidation but defer the actual
-    /// rebuild to the next non-deferred write (reads compute in-memory).
+    /// Mark the blocked-cache as needing invalidation but defer the storage-layer
+    /// rebuild.  Higher-level command batching can refresh once after the batch;
+    /// reads compute in-memory if the marker remains.
     ///
     /// Use this for high-frequency write operations (dep add/remove) where the
-    /// caller does not immediately read blocked state and where eliminating the
-    /// second post-commit write transaction reduces DB lock contention under
-    /// concurrent agents.
+    /// caller can reconcile the cache at a command boundary instead of inside
+    /// every individual storage mutation.
     pub fn invalidate_cache_deferred(&mut self) {
         self.invalidate_blocked_cache = true;
         self.defer_cache_refresh = true;
@@ -394,7 +786,7 @@ impl SqliteStorage {
                 SqliteValue::from(value),
             ],
         )?;
-        if updated == 0 && !Self::metadata_equals(conn, key, value)? {
+        if updated == 0 && !Self::metadata_key_exists(conn, key)? {
             conn.execute_with_params(
                 "INSERT INTO metadata (key, value) VALUES (?, ?)",
                 &[SqliteValue::from(key), SqliteValue::from(value)],
@@ -403,29 +795,45 @@ impl SqliteStorage {
         Ok(())
     }
 
+    fn insert_metadata_default_if_missing(
+        conn: &Connection,
+        key: &str,
+        default_value: &str,
+    ) -> Result<()> {
+        conn.execute_with_params(
+            "INSERT INTO metadata (key, value)
+             SELECT ?, ?
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM metadata WHERE key = ? LIMIT 1
+             )",
+            &[
+                SqliteValue::from(key),
+                SqliteValue::from(default_value),
+                SqliteValue::from(key),
+            ],
+        )?;
+        Ok(())
+    }
+
     fn ensure_known_metadata_defaults(conn: &Connection) -> Result<()> {
-        // Read-first, write-only-if-missing pattern (#243).  The read
-        // (`metadata_key_exists`) needs no write lock, so it works even when
-        // another process holds the WAL write lock.  If the key IS missing,
-        // the INSERT may fail with SQLITE_BUSY under concurrency; that's
-        // benign — the key either already exists from a racing writer or
-        // will be inserted on the next run.  This avoids the old explicit
-        // BEGIN IMMEDIATE wrapper that would block concurrent openers.
+        // Read-first, write-only-if-missing pattern (#243). The read
+        // (`metadata_key_exists`) needs no write lock, so ordinary opens do
+        // not contend with active writers. If a key is missing, the INSERT
+        // re-checks existence inside the statement because `metadata.key` is
+        // intentionally not unique; `INSERT OR IGNORE` would not protect
+        // against duplicate default rows.
         for (key, default_value) in KNOWN_METADATA_DEFAULTS {
             if Self::metadata_key_exists(conn, key)? {
                 continue;
             }
-            match conn.execute_with_params(
-                "INSERT OR IGNORE INTO metadata (key, value) VALUES (?, ?)",
-                &[SqliteValue::from(key), SqliteValue::from(default_value)],
-            ) {
-                Ok(_) => {}
+            match Self::insert_metadata_default_if_missing(conn, key, default_value) {
+                Ok(()) => {}
                 Err(e) if e.is_transient() => {
                     // BUSY — another writer is active. The default will be
                     // present once their transaction commits, or we'll seed
                     // it on the next open.
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e),
             }
         }
         Ok(())
@@ -433,13 +841,43 @@ impl SqliteStorage {
 
     fn metadata_equals(conn: &Connection, key: &str, expected: &str) -> Result<bool> {
         match conn.query_row_with_params(
-            "SELECT value FROM metadata WHERE key = ?",
+            "SELECT value FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1",
             &[SqliteValue::from(key)],
         ) {
             Ok(row) => Ok(row.get(0).and_then(SqliteValue::as_text) == Some(expected)),
             Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => Ok(false),
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn ready_readiness_probe(&self, include_deferred: bool) -> Result<ReadyReadinessProbe> {
+        let sql = if include_deferred {
+            "SELECT
+                EXISTS(SELECT 1 FROM issues WHERE status IN ('open', 'deferred') LIMIT 1),
+                COALESCE((SELECT value = ? FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1), 0)"
+        } else {
+            "SELECT
+                EXISTS(SELECT 1 FROM issues WHERE status = 'open' LIMIT 1),
+                COALESCE((SELECT value = ? FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1), 0)"
+        };
+        let row = self.conn.query_row_with_params(
+            sql,
+            &[
+                SqliteValue::from(BLOCKED_CACHE_STATE_STALE),
+                SqliteValue::from(BLOCKED_CACHE_STATE_KEY),
+            ],
+        )?;
+
+        Ok(ReadyReadinessProbe {
+            has_candidate_status: row
+                .get(0)
+                .and_then(SqliteValue::as_integer)
+                .is_some_and(|value| value != 0),
+            blocked_cache_stale: row
+                .get(1)
+                .and_then(SqliteValue::as_integer)
+                .is_some_and(|value| value != 0),
+        })
     }
 
     fn apply_blocked_cache_refresh_plan(
@@ -600,15 +1038,24 @@ impl SqliteStorage {
             conn.execute(&format!("PRAGMA busy_timeout={timeout_ms}"))?;
         }
 
-        if connection_user_version(&conn)
-            .is_some_and(|version| version >= u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0))
-        {
+        // Read the version through the connection, not the raw file header:
+        // header bytes miss WAL-resident values, and a stale read here caused
+        // spurious schema re-application against live databases under
+        // concurrent sessions (treasury-jqms).
+        let schema_current = connection_user_version(&conn)
+            .is_some_and(|version| version >= u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0));
+        let runtime_compatible = runtime_schema_compatible(&conn);
+
+        if schema_current && runtime_compatible {
             if issues_table_create_sql_preserves_if_not_exists(&conn) {
+                // bd-created DBs store `CREATE TABLE IF NOT EXISTS issues` DDL,
+                // which breaks bd's ALTER TABLE reparse; canonicalize via the
+                // compatible-schema path before taking the fast path.
                 apply_runtime_compatible_schema(&conn)?;
             } else {
                 crate::storage::schema::apply_runtime_pragmas(&conn)?;
             }
-        } else if runtime_schema_compatible(&conn) {
+        } else if runtime_compatible {
             apply_runtime_compatible_schema(&conn)?;
         } else {
             apply_schema(&conn)?;
@@ -617,6 +1064,8 @@ impl SqliteStorage {
         Ok(Self {
             conn,
             mutation_count: 0,
+            temp_db_path: None,
+            pending_event_attribution: None,
         })
     }
 
@@ -638,17 +1087,24 @@ impl SqliteStorage {
         {
             return Ok(None);
         }
-        if runtime_schema_compatible(&conn) {
-            return Ok(Some(Self {
-                conn,
-                mutation_count: 0,
-            }));
-        }
-
-        Ok(None)
+        Ok(Some(Self {
+            conn,
+            mutation_count: 0,
+            temp_db_path: None,
+            pending_event_attribution: None,
+        }))
     }
 
-    /// Open an in-memory database for testing.
+    /// Open an ephemeral, single-process scratch database.
+    ///
+    /// FrankenSQLite requires real file paths for WAL and schema operations, so
+    /// this cannot use `:memory:`; instead it opens a uniquely-named temp file
+    /// (`beads_mem_<pid>_<count>.db`) under [`std::env::temp_dir`]. The file —
+    /// and any `-wal`/`-shm`/`-journal` sidecars SQLite creates alongside it —
+    /// is unlinked when the returned [`SqliteStorage`] is dropped (#299), and
+    /// also if construction fails partway through, so no stale files are left in
+    /// `TMPDIR`. The path is unique per process, so it is never shared with
+    /// another process and is always safe to delete on teardown.
     ///
     /// # Errors
     ///
@@ -658,6 +1114,20 @@ impl SqliteStorage {
         let count = MEM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path =
             std::env::temp_dir().join(format!("beads_mem_{}_{}.db", std::process::id(), count));
+
+        // Build the storage on a fallible path so that any failure after the
+        // file has been created still removes it (the partial `Connection` /
+        // file would otherwise be orphaned without a live `Drop` to clean it).
+        match Self::build_memory(&path) {
+            Ok(storage) => Ok(storage),
+            Err(e) => {
+                remove_temp_db_files(&path);
+                Err(e)
+            }
+        }
+    }
+
+    fn build_memory(path: &Path) -> Result<Self> {
         let conn = Connection::open(path.to_string_lossy().into_owned())?;
 
         conn.execute(&format!("PRAGMA busy_timeout={DEFAULT_BUSY_TIMEOUT_MS}"))?;
@@ -669,6 +1139,8 @@ impl SqliteStorage {
         Ok(Self {
             conn,
             mutation_count: 0,
+            temp_db_path: Some(path.to_path_buf()),
+            pending_event_attribution: None,
         })
     }
 
@@ -864,10 +1336,10 @@ impl SqliteStorage {
                 "has_missing_issue_reference: disallowed table/column pair ({table}, {column})"
             )));
         }
-        let external_dependency_filter = if table == "dependencies" && column == "depends_on_id" {
-            " AND depends_on_id NOT LIKE 'external:%'"
-        } else {
-            ""
+        let external_dependency_filter = match (table, column) {
+            ("dependencies", "issue_id") => " AND issue_id NOT LIKE 'external:%'",
+            ("dependencies", "depends_on_id") => " AND depends_on_id NOT LIKE 'external:%'",
+            _ => "",
         };
         let row = self.conn.query_row(&format!(
             "SELECT COUNT(*) FROM {table} WHERE {column} NOT IN (SELECT id FROM issues){external_dependency_filter}"
@@ -877,8 +1349,9 @@ impl SqliteStorage {
 
     /// Return FK-like issue references that point at missing local issues.
     ///
-    /// External dependency targets are intentionally allowed because the
-    /// schema supports cross-project blockers through `external:*` IDs.
+    /// External dependency endpoints are intentionally allowed because the
+    /// schema supports cross-project blockers and external parent-child rows
+    /// through `external:*` IDs.
     ///
     /// # Errors
     ///
@@ -1091,6 +1564,41 @@ impl SqliteStorage {
         Ok(count)
     }
 
+    /// Insert export hashes after the caller has already cleared the table.
+    ///
+    /// Import starts by deleting all export hashes, so it does not need the
+    /// general setter's per-row delete safety path for existing rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub(crate) fn insert_export_hashes_after_clear_in_tx(
+        &self,
+        exports: &[(String, String)],
+    ) -> Result<usize> {
+        let unique_exports = Self::dedupe_export_hash_batch(exports);
+        if unique_exports.is_empty() {
+            return Ok(0);
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let mut count = 0;
+
+        for (issue_id, content_hash) in &unique_exports {
+            self.conn.execute_with_params(
+                "INSERT OR REPLACE INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
+                &[
+                    SqliteValue::from(issue_id.as_str()),
+                    SqliteValue::from(content_hash.as_str()),
+                    SqliteValue::from(now.as_str()),
+                ],
+            )?;
+            count += 1;
+        }
+
+        Ok(count)
+    }
+
     /// Set only export hashes whose content changed, using the caller's active transaction.
     ///
     /// # Errors
@@ -1105,13 +1613,18 @@ impl SqliteStorage {
             return Ok(0);
         }
 
+        let issue_ids = unique_exports
+            .iter()
+            .map(|(issue_id, _hash)| issue_id.clone())
+            .collect::<Vec<_>>();
+        let existing_hashes = self.get_export_hashes_for_ids_in_tx(&issue_ids)?;
         let now = Utc::now().to_rfc3339();
         let mut count = 0;
 
         for (issue_id, content_hash) in &unique_exports {
-            if self
-                .get_export_hash(issue_id)?
-                .is_some_and(|(existing_hash, _)| existing_hash == *content_hash)
+            if existing_hashes
+                .get(issue_id)
+                .is_some_and(|existing_hash| existing_hash == content_hash)
             {
                 continue;
             }
@@ -1134,13 +1647,53 @@ impl SqliteStorage {
         Ok(count)
     }
 
+    fn get_export_hashes_for_ids_in_tx(
+        &self,
+        issue_ids: &[String],
+    ) -> Result<HashMap<String, String>> {
+        if issue_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut hashes = HashMap::with_capacity(issue_ids.len());
+        for chunk in issue_ids.chunks(DIRTY_ISSUE_CHUNK_SIZE) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT issue_id, content_hash FROM export_hashes WHERE issue_id IN ({})",
+                placeholders
+            );
+            let params = chunk
+                .iter()
+                .map(|issue_id| SqliteValue::from(issue_id.as_str()))
+                .collect::<Vec<_>>();
+            let rows = self.conn.query_with_params(&sql, &params)?;
+
+            for row in &rows {
+                let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                let Some(content_hash) = row.get(1).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                hashes.insert(issue_id.to_string(), content_hash.to_string());
+            }
+        }
+
+        Ok(hashes)
+    }
+
     fn dedupe_export_hash_batch(exports: &[(String, String)]) -> Vec<(String, String)> {
         let mut deduped: Vec<(String, String)> = Vec::with_capacity(exports.len());
         let mut positions: HashMap<String, usize> = HashMap::with_capacity(exports.len());
 
         for (issue_id, content_hash) in exports {
             if let Some(position) = positions.get(issue_id).copied() {
-                deduped[position].1.clone_from(content_hash);
+                if let Some((_, stored_hash)) = deduped.get_mut(position) {
+                    stored_hash.clone_from(content_hash);
+                } else {
+                    positions.insert(issue_id.clone(), deduped.len());
+                    deduped.push((issue_id.clone(), content_hash.clone()));
+                }
             } else {
                 positions.insert(issue_id.clone(), deduped.len());
                 deduped.push((issue_id.clone(), content_hash.clone()));
@@ -1219,6 +1772,30 @@ impl SqliteStorage {
         Ok(())
     }
 
+    /// Run SQLite's native integrity probe and return its diagnostic rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pragma cannot be executed.
+    pub(crate) fn integrity_check_messages(&self) -> Result<Vec<String>> {
+        let rows = self.conn.query("PRAGMA integrity_check")?;
+        let mut messages = Vec::new();
+        for row in rows {
+            for value in row.values() {
+                if let Some(text) = value.as_text() {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        messages.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+        if messages.is_empty() {
+            messages.push("integrity_check returned no diagnostic rows".to_string());
+        }
+        Ok(messages)
+    }
+
     /// Get audit events for a specific issue.
     ///
     /// # Errors
@@ -1235,6 +1812,253 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn get_all_events(&self, limit: usize) -> Result<Vec<Event>> {
         crate::storage::events::get_all_events(&self.conn, limit)
+    }
+
+    /// Find the actor who most recently transitioned `issue_id` into the
+    /// `in_progress` state. Returns `None` when the issue never had such a
+    /// transition recorded — typical of issues that went from `open` to
+    /// `closed` without a claim step.
+    ///
+    /// Used by the closure-time `forbid_self_close_after_in_progress` policy
+    /// gate (issue #274 Phase 1).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying event query fails.
+    pub fn find_last_in_progress_actor(&self, issue_id: &str) -> Result<Option<String>> {
+        let events = crate::storage::events::get_events(&self.conn, issue_id, 0)?;
+        // get_events returns DESC ordering by created_at then id, so the first
+        // matching event is the most recent transition into in_progress.
+        for event in events {
+            if event.event_type == crate::model::EventType::StatusChanged
+                && event
+                    .new_value
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|v| v.eq_ignore_ascii_case("in_progress"))
+            {
+                let actor = event.actor.trim();
+                if actor.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(actor.to_string()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Persist closure-time policy metadata (issue #274 Phase 1) for `issue_id`.
+    ///
+    /// Inserts (or replaces) one row in the `close_metadata` table with the
+    /// supplied attribution + bypass auditing values. All fields are optional:
+    /// passing every-`None` still records a row that pins `bypassed_policy = 0`
+    /// for the close, which keeps the table strictly additive — every close
+    /// performed under an active policy is queryable later. Callers decide
+    /// whether policy metadata is active enough to warrant a row.
+    ///
+    /// `policy_gates_fired` is stored as the JSON serialisation of the gate
+    /// names that fired (or that were waived by `--bypass-policy`). An empty
+    /// slice serialises to `"[]"` so callers can always rely on JSON typing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database write fails or JSON serialisation of
+    /// `policy_gates_fired` fails.
+    pub fn record_close_metadata(
+        &self,
+        issue_id: &str,
+        attribution: &crate::close_policy::AttributionValues,
+        bypassed: bool,
+        bypass_reason: Option<&str>,
+        policy_gates_fired: &[String],
+    ) -> Result<()> {
+        let gates_json = serde_json::to_string(policy_gates_fired).map_err(BeadsError::from)?;
+
+        // INSERT OR REPLACE: a re-close (e.g. close → reopen → close) overwrites
+        // the prior row. If the project ever needs full history, querying the
+        // events table gives an audit trail; `close_metadata` is the
+        // currently-effective metadata for the most recent close.
+        self.conn.execute_with_params(
+            "INSERT OR REPLACE INTO close_metadata (
+                issue_id,
+                closed_by_agent_name,
+                closed_by_harness,
+                closed_by_model,
+                bypassed_policy,
+                bypass_reason,
+                policy_gates_fired,
+                recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            &[
+                SqliteValue::from(issue_id),
+                attribution
+                    .agent_name
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+                attribution
+                    .harness
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+                attribution
+                    .model
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+                SqliteValue::from(i64::from(bypassed)),
+                bypass_reason.map_or(SqliteValue::Null, SqliteValue::from),
+                SqliteValue::from(gates_json.as_str()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Read a previously-stored close-metadata row, or `None` when no policy
+    /// metadata was recorded for this close. Used by tests + future
+    /// observability commands.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_close_metadata(&self, issue_id: &str) -> Result<Option<CloseMetadataRow>> {
+        if !crate::storage::schema::table_exists(&self.conn, "close_metadata") {
+            return Ok(None);
+        }
+        let rows = self.conn.query_with_params(
+            "SELECT closed_by_agent_name, closed_by_harness, closed_by_model, \
+                    bypassed_policy, bypass_reason, policy_gates_fired, recorded_at \
+             FROM close_metadata WHERE issue_id = ?",
+            &[SqliteValue::from(issue_id)],
+        )?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let bypassed = row
+            .get(3)
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or_default()
+            != 0;
+        let gates_json: Option<String> =
+            row.get(5).and_then(SqliteValue::as_text).map(String::from);
+        let policy_gates_fired = match gates_json.as_deref() {
+            Some(json) if !json.is_empty() => {
+                serde_json::from_str::<Vec<String>>(json).map_err(BeadsError::from)?
+            }
+            _ => Vec::new(),
+        };
+        Ok(Some(CloseMetadataRow {
+            closed_by_agent_name: row.get(0).and_then(SqliteValue::as_text).map(String::from),
+            closed_by_harness: row.get(1).and_then(SqliteValue::as_text).map(String::from),
+            closed_by_model: row.get(2).and_then(SqliteValue::as_text).map(String::from),
+            bypassed_policy: bypassed,
+            bypass_reason: row.get(4).and_then(SqliteValue::as_text).map(String::from),
+            policy_gates_fired,
+            recorded_at: row
+                .get(6)
+                .and_then(SqliteValue::as_text)
+                .map(String::from)
+                .unwrap_or_default(),
+        }))
+    }
+
+    /// Record a workflow gate result (issue #312, layer 2 / beads_rust#319).
+    ///
+    /// Upserts one row per `(issue_id, gate, provider)`: a provider's
+    /// most-recent verdict for a named gate on an issue. A re-report from the
+    /// same provider for the same gate overwrites the prior verdict, so the
+    /// table always reflects the currently-effective gate state.
+    ///
+    /// Gate results are auxiliary, project-local metadata: like
+    /// `close_metadata`, they are not part of the JSONL sync surface (the
+    /// audit trail is the DB), so this writes directly rather than going
+    /// through the dirty-issue export path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database write fails.
+    pub fn record_gate_result(
+        &self,
+        issue_id: &str,
+        gate: &str,
+        provider: &str,
+        passed: bool,
+        note: Option<&str>,
+        recorded_by: &str,
+    ) -> Result<()> {
+        self.conn.execute_with_params(
+            "INSERT OR REPLACE INTO gate_results (
+                issue_id, gate, provider, passed, note, recorded_by, recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            &[
+                SqliteValue::from(issue_id),
+                SqliteValue::from(gate),
+                SqliteValue::from(provider),
+                SqliteValue::from(i64::from(passed)),
+                note.map_or(SqliteValue::Null, SqliteValue::from),
+                SqliteValue::from(recorded_by),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Read every recorded gate result for `issue_id`, ordered by gate then
+    /// provider for deterministic output. Returns an empty vec when the
+    /// `gate_results` table is absent (e.g. a database that predates the v12
+    /// migration and has not been reopened) or no results exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_gate_results(&self, issue_id: &str) -> Result<Vec<crate::close_policy::GateResult>> {
+        if !crate::storage::schema::table_exists(&self.conn, "gate_results") {
+            return Ok(Vec::new());
+        }
+        let rows = self.conn.query_with_params(
+            "SELECT gate, provider, passed, note FROM gate_results \
+             WHERE issue_id = ? ORDER BY gate, provider",
+            &[SqliteValue::from(issue_id)],
+        )?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                let gate = row.get(0).and_then(SqliteValue::as_text)?.to_string();
+                let provider = row.get(1).and_then(SqliteValue::as_text)?.to_string();
+                let passed = row
+                    .get(2)
+                    .and_then(SqliteValue::as_integer)
+                    .unwrap_or_default()
+                    != 0;
+                let note = row.get(3).and_then(SqliteValue::as_text).map(String::from);
+                Some(crate::close_policy::GateResult {
+                    gate,
+                    provider,
+                    passed,
+                    note,
+                })
+            })
+            .collect())
+    }
+
+    /// Stage Tier 1 attribution for the next mutation (issue #312, Layer 3
+    /// capture-only). The values are stamped onto every audit event produced by
+    /// the immediately following `create`/`update`/status-mutating call, then
+    /// cleared. Pass an empty [`EventAttribution`] (or never call this) to record
+    /// no attribution. This is a recorded audit trail only — it is never used to
+    /// gate, reject, or alter any transition.
+    pub fn set_pending_event_attribution(&mut self, attribution: EventAttribution) {
+        self.pending_event_attribution = if attribution.is_empty() {
+            None
+        } else {
+            Some(attribution)
+        };
+    }
+
+    /// Remove and return any staged Tier 1 attribution without consuming it via
+    /// a mutation (issue #312, Layer 3). Used by the JSONL-recovery path to
+    /// carry a not-yet-committed staged value across a storage rebuild so the
+    /// post-recovery retry can still stamp it (F1). Preserves the invariant that
+    /// pending attribution is consumed by exactly one committing mutation, or
+    /// transferred/cleared — it never leaks into an unrelated operation.
+    pub(crate) fn take_pending_event_attribution(&mut self) -> Option<EventAttribution> {
+        self.pending_event_attribution.take()
     }
 
     /// Execute a mutation with the 4-step transaction protocol.
@@ -1264,13 +2088,29 @@ impl SqliteStorage {
         // within the mutation closures.
         self.conn.execute("PRAGMA foreign_keys = OFF")?;
 
+        // Peek (clone) — do NOT take — the per-command attribution staged for
+        // this mutation. We must not permanently consume the staged value until
+        // the mutation is known to COMMIT: if `with_write_transaction` returns a
+        // recoverable `Database(_)` error, `retry_mutation_with_jsonl_recovery`
+        // re-invokes this `mutate()` after rebuilding the DB from JSONL, and the
+        // staged slot must still be present so the recovered write records the
+        // attribution (#312 hardening, F1). Cloning here also means the internal
+        // BUSY-retry loop inside `with_write_transaction` re-applies the SAME
+        // value on each attempt and stamps exactly once on the committing run.
+        //
+        // Invariant: pending attribution is consumed by exactly one committing
+        // mutation, or cleared — it never leaks into a later, unrelated
+        // operation. It is `.take()`n below only after a successful commit.
+        let pending_attribution = self.pending_event_attribution.clone().unwrap_or_default();
+
         let tx_result: Result<_> = self.with_write_transaction(|storage| {
             let mut ctx = MutationContext::new(op, actor);
+            ctx.attribution = pending_attribution.clone();
             let result = f(&storage.conn, &mut ctx)?;
 
             // Write events
             if !ctx.events.is_empty() {
-                let sql = "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)";
+                let sql = "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at, agent_name, harness, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
                 for event in &ctx.events {
                     let params = vec![
                         SqliteValue::from(event.issue_id.as_str()),
@@ -1289,6 +2129,18 @@ impl SqliteStorage {
                             .as_deref()
                             .map_or(SqliteValue::Null, SqliteValue::from),
                         SqliteValue::from(event.created_at.to_rfc3339()),
+                        event
+                            .agent_name
+                            .as_deref()
+                            .map_or(SqliteValue::Null, SqliteValue::from),
+                        event
+                            .harness
+                            .as_deref()
+                            .map_or(SqliteValue::Null, SqliteValue::from),
+                        event
+                            .model
+                            .as_deref()
+                            .map_or(SqliteValue::Null, SqliteValue::from),
                     ];
                     storage.conn.execute_with_params(sql, &params)?;
                 }
@@ -1338,6 +2190,13 @@ impl SqliteStorage {
             Ok((result, blocked_cache_plan))
         });
 
+        // Consume the staged attribution only now that the transaction has
+        // COMMITTED (#312 hardening, F1). On a recoverable error the slot is
+        // intentionally left intact so the JSONL-recovery retry can re-stamp it.
+        if tx_result.is_ok() {
+            self.pending_event_attribution = None;
+        }
+
         // Re-enable FK enforcement after the transaction completes
         // (regardless of success or failure).
         let (result, blocked_cache_plan) =
@@ -1373,6 +2232,7 @@ impl SqliteStorage {
     #[allow(clippy::too_many_lines)]
     pub fn create_issue(&mut self, issue: &Issue, actor: &str) -> Result<()> {
         IssueValidator::validate(issue).map_err(BeadsError::from_validation_errors)?;
+        validate_issue_comments_for_create(issue)?;
 
         self.mutate("create_issue", actor, |conn, ctx| {
             // Explicit duplicate check since fsqlite does not enforce
@@ -1396,8 +2256,8 @@ impl SqliteStorage {
                     "SELECT id FROM issues WHERE external_ref = ? LIMIT 1",
                     &[SqliteValue::from(ext_ref.as_str())],
                 )?;
-                if !existing_ext.is_empty() {
-                    let other_id = existing_ext[0]
+                if let Some(existing_row) = existing_ext.first() {
+                    let other_id = existing_row
                         .get(0)
                         .and_then(SqliteValue::as_text)
                         .unwrap_or_default()
@@ -1425,10 +2285,10 @@ impl SqliteStorage {
                     status, priority, issue_type, assignee, owner, estimated_minutes,
                     created_at, created_by, updated_at, closed_at, close_reason,
                     closed_by_session, due_at, defer_until, external_ref, source_system,
-                    source_repo, deleted_at, deleted_by, delete_reason, original_type,
+                    source_repo, source_repo_path, deleted_at, deleted_by, delete_reason, original_type,
                     compaction_level, compacted_at, compacted_at_commit, original_size,
-                    sender, ephemeral, pinned, is_template
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    sender, ephemeral, pinned, is_template, agent_context
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 &[
                     SqliteValue::from(issue.id.as_str()),
                     SqliteValue::from(content_hash.as_str()),
@@ -1454,6 +2314,7 @@ impl SqliteStorage {
                     issue.external_ref.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
                     SqliteValue::from(issue.source_system.as_deref().unwrap_or("")),
                     SqliteValue::from(issue.source_repo.as_deref().unwrap_or(".")),
+                    issue.source_repo_path.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
                     deleted_at_str.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
                     SqliteValue::from(issue.deleted_by.as_deref().unwrap_or("")),
                     SqliteValue::from(issue.delete_reason.as_deref().unwrap_or("")),
@@ -1466,6 +2327,7 @@ impl SqliteStorage {
                     SqliteValue::from(i64::from(i32::from(issue.ephemeral))),
                     SqliteValue::from(i64::from(i32::from(issue.pinned))),
                     SqliteValue::from(i64::from(i32::from(issue.is_template))),
+                    issue.agent_context.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
                 ],
             )?;
 
@@ -1508,10 +2370,14 @@ impl SqliteStorage {
                     continue;
                 }
                 Self::ensure_dependency_target_exists_in_tx(conn, &dep.depends_on_id)?;
-                // Check cycle if blocking
-                if dep.dep_type.is_blocking()
-                    && Self::check_cycle(conn, &issue.id, &dep.depends_on_id, true)?
-                {
+                // Check cycle if blocking.
+                if Self::check_dependency_cycle_for_type(
+                    conn,
+                    &issue.id,
+                    &dep.depends_on_id,
+                    &dep.dep_type,
+                    true,
+                )? {
                     return Err(BeadsError::DependencyCycle {
                         path: format!(
                             "Adding dependency {} -> {} would create a cycle",
@@ -1657,6 +2523,34 @@ impl SqliteStorage {
         Ok(false)
     }
 
+    fn check_parent_child_cycle(
+        conn: &Connection,
+        child_id: &str,
+        parent_id: &str,
+        blocking_only: bool,
+    ) -> Result<bool> {
+        // Stored parent-child rows are child -> parent, but the blocker graph
+        // edge is parent -> child because parents wait for children.
+        Self::check_cycle(conn, parent_id, child_id, blocking_only)
+    }
+
+    fn check_dependency_cycle_for_type(
+        conn: &Connection,
+        issue_id: &str,
+        depends_on_id: &str,
+        dep_type: &DependencyType,
+        blocking_only: bool,
+    ) -> Result<bool> {
+        if !dep_type.is_blocking() {
+            return Ok(false);
+        }
+        if matches!(dep_type, DependencyType::ParentChild) {
+            Self::check_parent_child_cycle(conn, issue_id, depends_on_id, blocking_only)
+        } else {
+            Self::check_cycle(conn, issue_id, depends_on_id, blocking_only)
+        }
+    }
+
     /// Update an issue's fields.
     ///
     /// # Errors
@@ -1665,6 +2559,13 @@ impl SqliteStorage {
     #[allow(clippy::too_many_lines)]
     pub fn update_issue(&mut self, id: &str, updates: &IssueUpdate, actor: &str) -> Result<Issue> {
         if updates.is_empty() {
+            // No-op update: this path returns WITHOUT calling `mutate()`, so we
+            // must clear any staged attribution ourselves. Otherwise a value set
+            // by `set_pending_event_attribution` would survive onto the NEXT,
+            // unrelated `mutate()` (#312 hardening, F2). Invariant: pending
+            // attribution is consumed by exactly one committing mutation, or
+            // cleared.
+            self.pending_event_attribution = None;
             return self
                 .get_issue(id)?
                 .ok_or_else(|| BeadsError::IssueNotFound { id: id.to_string() });
@@ -1831,6 +2732,10 @@ impl SqliteStorage {
                 } else {
                     if was_terminal && !status.is_terminal() {
                         ctx.record_event(EventType::Reopened, id, None);
+                        conn.execute_with_params(
+                            "DELETE FROM close_metadata WHERE issue_id = ?",
+                            &[SqliteValue::from(id)],
+                        )?;
                     }
                     if issue.closed_at.is_some() && updates.closed_at.is_none() {
                         // Reopening (or fixing state): Clear closed_at if it was set
@@ -1920,8 +2825,8 @@ impl SqliteStorage {
                         "SELECT id FROM issues WHERE external_ref = ? AND id != ? LIMIT 1",
                         &[SqliteValue::from(ext_ref.as_str()), SqliteValue::from(id)],
                     )?;
-                    if !existing_ext.is_empty() {
-                        let other_id = existing_ext[0]
+                    if let Some(existing_row) = existing_ext.first() {
+                        let other_id = existing_row
                             .get(0)
                             .and_then(SqliteValue::as_text)
                             .unwrap_or_default()
@@ -1935,6 +2840,28 @@ impl SqliteStorage {
                 issue.external_ref.clone_from(val);
                 add_update(
                     "external_ref",
+                    val.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                );
+            }
+            if let Some(ref val) = updates.source_repo {
+                // `source_repo` is NOT NULL DEFAULT '.' so an explicit clear
+                // must fall back to "." rather than SQL NULL — otherwise the
+                // schema's NOT NULL constraint rejects the write.
+                let next = val.clone().unwrap_or_else(|| ".".to_string());
+                issue.source_repo = Some(next.clone());
+                add_update("source_repo", SqliteValue::from(next.as_str()));
+            }
+            if let Some(ref val) = updates.source_repo_path {
+                issue.source_repo_path.clone_from(val);
+                add_update(
+                    "source_repo_path",
+                    val.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                );
+            }
+            if let Some(ref val) = updates.agent_context {
+                issue.agent_context.clone_from(val);
+                add_update(
+                    "agent_context",
                     val.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
                 );
             }
@@ -2128,6 +3055,10 @@ impl SqliteStorage {
                     SqliteValue::from(id),
                 ],
             )?;
+            conn.execute_with_params(
+                "DELETE FROM close_metadata WHERE issue_id = ?",
+                &[SqliteValue::from(id)],
+            )?;
 
             if !was_terminal {
                 ctx.record_event(
@@ -2204,6 +3135,27 @@ impl SqliteStorage {
 
             Ok(())
         })
+    }
+
+    /// List the IDs of all tombstoned (soft-deleted) issues, sorted.
+    ///
+    /// Used by `br delete --hard` (invoked with no explicit IDs) to purge every
+    /// tombstone from the store in one pass (#367).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn list_tombstone_ids(&self) -> Result<Vec<String>> {
+        let rows = self
+            .conn
+            .query("SELECT id FROM issues WHERE status = 'tombstone' ORDER BY id")?;
+        let mut ids = Vec::with_capacity(rows.len());
+        for row in &rows {
+            if let Some(id) = row.get(0).and_then(SqliteValue::as_text) {
+                ids.push(id.to_string());
+            }
+        }
+        Ok(ids)
     }
 
     /// Get an issue by ID.
@@ -2284,7 +3236,7 @@ impl SqliteStorage {
                    due_at, defer_until, external_ref, source_system, source_repo,
                    deleted_at, deleted_by, delete_reason, original_type,
                    compaction_level, compacted_at, compacted_at_commit, original_size,
-                   sender, ephemeral, pinned, is_template
+                   sender, ephemeral, pinned, is_template, source_repo_path, agent_context
             FROM issues
             WHERE id = ?
         ";
@@ -2309,8 +3261,6 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_issues_by_ids(&self, ids: &[String]) -> Result<Vec<Issue>> {
-        const SQLITE_VAR_LIMIT: usize = 900;
-
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -2326,7 +3276,7 @@ impl SqliteStorage {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template
+                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context
                   FROM issues WHERE id IN ({})",
                 placeholders.join(",")
             );
@@ -2345,6 +3295,104 @@ impl SqliteStorage {
         Ok(issues)
     }
 
+    fn label_filter_candidate_ids(
+        &self,
+        labels_and: &[String],
+        labels_or: &[String],
+    ) -> Result<Option<Vec<String>>> {
+        let all_label_ids = self.query_issue_ids_with_all_labels(labels_and)?;
+        let any_label_ids = self.query_issue_ids_with_any_label(labels_or)?;
+
+        let ids = match (all_label_ids, any_label_ids) {
+            (None, None) => return Ok(None),
+            (Some(ids), None) | (None, Some(ids)) => ids,
+            (Some(all_ids), Some(any_ids)) => {
+                let any_id_set: HashSet<&str> = any_ids.iter().map(String::as_str).collect();
+                all_ids
+                    .into_iter()
+                    .filter(|issue_id| any_id_set.contains(issue_id.as_str()))
+                    .collect()
+            }
+        };
+
+        Ok(Some(ids))
+    }
+
+    fn query_issue_ids_with_all_labels(&self, labels: &[String]) -> Result<Option<Vec<String>>> {
+        let unique_labels = unique_label_refs(labels);
+        let ids = match unique_labels.as_slice() {
+            [] => return Ok(None),
+            [label] => self.query_issue_ids_from_label_sql(
+                "SELECT issue_id FROM labels WHERE label = ? ORDER BY issue_id",
+                &[SqliteValue::from(label.as_str())],
+            )?,
+            _ => {
+                let placeholders: Vec<String> =
+                    unique_labels.iter().map(|_| "?".to_string()).collect();
+                let sql = format!(
+                    "SELECT issue_id
+                     FROM labels
+                     WHERE label IN ({})
+                     GROUP BY issue_id
+                     HAVING COUNT(DISTINCT label) = ?
+                     ORDER BY issue_id",
+                    placeholders.join(",")
+                );
+                let unique_label_count = unique_labels.len();
+                let mut params = Vec::with_capacity(unique_labels.len() + 1);
+                for label in unique_labels {
+                    params.push(SqliteValue::from(label.as_str()));
+                }
+                params.push(SqliteValue::from(
+                    i64::try_from(unique_label_count).unwrap_or(i64::MAX),
+                ));
+                self.query_issue_ids_from_label_sql(&sql, &params)?
+            }
+        };
+
+        Ok(Some(ids))
+    }
+
+    fn query_issue_ids_with_any_label(&self, labels: &[String]) -> Result<Option<Vec<String>>> {
+        if labels.is_empty() {
+            return Ok(None);
+        }
+
+        let placeholders: Vec<String> = labels.iter().map(|_| "?".to_string()).collect();
+        let sql = format!(
+            "SELECT DISTINCT issue_id
+             FROM labels
+             WHERE label IN ({})
+             ORDER BY issue_id",
+            placeholders.join(",")
+        );
+        let params: Vec<SqliteValue> = labels
+            .iter()
+            .map(|label| SqliteValue::from(label.as_str()))
+            .collect();
+        Ok(Some(self.query_issue_ids_from_label_sql(&sql, &params)?))
+    }
+
+    fn query_issue_ids_from_label_sql(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<Vec<String>> {
+        self.query_issue_ids_from_sql(sql, params)
+    }
+
+    fn query_issue_ids_from_sql(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<String>> {
+        let rows = self.conn.query_with_params(sql, params)?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                row.get(0)
+                    .and_then(SqliteValue::as_text)
+                    .map(str::to_string)
+            })
+            .collect())
+    }
+
     /// List issues with optional filters.
     ///
     /// # Errors
@@ -2352,6 +3400,11 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     #[allow(clippy::too_many_lines)]
     pub fn list_issues(&self, filters: &ListFilters) -> Result<Vec<Issue>> {
+        if let Some(limit) = default_visible_limited_page_limit(filters) {
+            return self.list_default_visible_limited_page(filters.include_deferred, limit);
+        }
+
+        let sort_default_in_rust = should_sort_list_default_in_rust(filters);
         let mut sql = String::from(
             r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                      status, priority, issue_type, assignee, owner, estimated_minutes,
@@ -2359,19 +3412,33 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type,
                      compaction_level, compacted_at, compacted_at_commit, original_size,
-                     sender, ephemeral, pinned, is_template
-              FROM issues
-              WHERE 1=1",
+                     sender, ephemeral, pinned, is_template, source_repo_path, agent_context",
         );
 
         let mut params: Vec<SqliteValue> = Vec::new();
 
-        append_label_membership_filters(
-            &mut sql,
-            &mut params,
-            filters.labels.as_deref().unwrap_or(&[]),
-            filters.labels_or.as_deref().unwrap_or(&[]),
-        );
+        let labels_and = filters.labels.as_deref().unwrap_or(&[]);
+        let labels_or = filters.labels_or.as_deref().unwrap_or(&[]);
+        let label_candidate_ids = if labels_and.is_empty() && labels_or.is_empty() {
+            None
+        } else {
+            self.label_filter_candidate_ids(labels_and, labels_or)?
+        };
+        if label_candidate_ids.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(Vec::new());
+        }
+        if self.redundant_default_visible_single_label_filter(
+            filters,
+            label_candidate_ids.as_deref(),
+        )? {
+            let mut filters_without_redundant_label = filters.clone();
+            filters_without_redundant_label.labels = None;
+            return self.list_issues(&filters_without_redundant_label);
+        }
+        sql.push_str(" FROM issues WHERE 1=1");
+        if let Some(ref issue_ids) = label_candidate_ids {
+            append_issue_id_membership_filter(&mut sql, &mut params, issue_ids);
+        }
 
         if let Some(ref statuses) = filters.statuses
             && !statuses.is_empty()
@@ -2444,40 +3511,42 @@ impl SqliteStorage {
             params.push(SqliteValue::from(ts.to_rfc3339()));
         }
 
-        // Apply custom sort if provided
-        if let Some(ref sort_field) = filters.sort {
-            let order = if filters.reverse { "DESC" } else { "ASC" };
-            // Simple validation to prevent injection (though params should handle it,
-            // column names can't be parameterized)
-            match sort_field.as_str() {
-                "priority" => {
-                    let secondary_order = if filters.reverse { "ASC" } else { "DESC" };
-                    let _ = write!(
-                        sql,
-                        " ORDER BY priority {order}, created_at {secondary_order}"
-                    );
+        if !sort_default_in_rust {
+            // Apply custom sort if provided
+            if let Some(ref sort_field) = filters.sort {
+                let order = if filters.reverse { "DESC" } else { "ASC" };
+                // Simple validation to prevent injection (though params should handle it,
+                // column names can't be parameterized)
+                match sort_field.as_str() {
+                    "priority" => {
+                        let secondary_order = if filters.reverse { "ASC" } else { "DESC" };
+                        let _ = write!(
+                            sql,
+                            " ORDER BY priority {order}, created_at {secondary_order}, id ASC"
+                        );
+                    }
+                    "created_at" | "created" => {
+                        let order = if filters.reverse { "ASC" } else { "DESC" };
+                        let _ = write!(sql, " ORDER BY created_at {order}, id ASC");
+                    }
+                    "updated_at" | "updated" => {
+                        let order = if filters.reverse { "ASC" } else { "DESC" };
+                        let _ = write!(sql, " ORDER BY updated_at {order}, id ASC");
+                    }
+                    "title" => {
+                        // Case-insensitive sort for title
+                        let _ = write!(sql, " ORDER BY title COLLATE NOCASE {order}, id ASC");
+                    }
+                    _ => {
+                        // Default fallback
+                        sql.push_str(" ORDER BY priority ASC, created_at DESC, id ASC");
+                    }
                 }
-                "created_at" | "created" => {
-                    let order = if filters.reverse { "ASC" } else { "DESC" };
-                    let _ = write!(sql, " ORDER BY created_at {order}");
-                }
-                "updated_at" | "updated" => {
-                    let order = if filters.reverse { "ASC" } else { "DESC" };
-                    let _ = write!(sql, " ORDER BY updated_at {order}");
-                }
-                "title" => {
-                    // Case-insensitive sort for title
-                    let _ = write!(sql, " ORDER BY title COLLATE NOCASE {order}");
-                }
-                _ => {
-                    // Default fallback
-                    sql.push_str(" ORDER BY priority ASC, created_at DESC");
-                }
+            } else if filters.reverse {
+                sql.push_str(" ORDER BY priority DESC, created_at ASC, id ASC");
+            } else {
+                sql.push_str(" ORDER BY priority ASC, created_at DESC, id ASC");
             }
-        } else if filters.reverse {
-            sql.push_str(" ORDER BY priority DESC, created_at ASC");
-        } else {
-            sql.push_str(" ORDER BY priority ASC, created_at DESC");
         }
 
         match (filters.limit, filters.offset) {
@@ -2500,7 +3569,483 @@ impl SqliteStorage {
         for row in &rows {
             issues.push(Self::issue_from_row(row)?);
         }
+        if sort_default_in_rust {
+            sort_list_default(&mut issues);
+        }
 
+        Ok(issues)
+    }
+
+    fn list_default_visible_limited_page(
+        &self,
+        include_deferred: bool,
+        limit: usize,
+    ) -> Result<Vec<Issue>> {
+        let status_filter = if include_deferred {
+            "status NOT IN ('closed', 'tombstone')"
+        } else {
+            "status NOT IN ('closed', 'tombstone', 'deferred')"
+        };
+        let mut issues = Vec::with_capacity(limit);
+
+        for priority in Priority::CRITICAL.0..=Priority::BACKLOG.0 {
+            let remaining = limit.saturating_sub(issues.len());
+            if remaining == 0 {
+                break;
+            }
+
+            let sql = format!(
+                r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
+                         status, priority, issue_type, assignee, owner, estimated_minutes,
+                         created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
+                         due_at, defer_until, external_ref, source_system, source_repo,
+                         deleted_at, deleted_by, delete_reason, original_type,
+                         compaction_level, compacted_at, compacted_at_commit, original_size,
+                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context
+                  FROM issues
+                  WHERE {status_filter}
+                    AND (is_template = 0 OR is_template IS NULL)
+                    AND priority = ?
+                  ORDER BY created_at DESC, id ASC
+                  LIMIT {remaining}"
+            );
+            let rows = self
+                .conn
+                .query_with_params(&sql, &[SqliteValue::from(i64::from(priority))])?;
+            for row in &rows {
+                issues.push(Self::issue_from_row(row)?);
+            }
+        }
+
+        Ok(issues)
+    }
+
+    /// List short text/table command issues without hydrating fields the renderer never inspects.
+    ///
+    /// This is intentionally narrow and falls back to `list_issues` if the
+    /// filter shape expands beyond the unlimited default short text path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn list_text_issues_for_command_output(&self, filters: &ListFilters) -> Result<Vec<Issue>> {
+        let unsupported_filter = filters
+            .statuses
+            .as_ref()
+            .is_some_and(|statuses| !statuses.is_empty())
+            || filters
+                .labels
+                .as_ref()
+                .is_some_and(|labels| !labels.is_empty())
+            || filters
+                .labels_or
+                .as_ref()
+                .is_some_and(|labels| !labels.is_empty())
+            || filters
+                .types
+                .as_ref()
+                .is_some_and(|types| !types.is_empty())
+            || filters
+                .priorities
+                .as_ref()
+                .is_some_and(|priorities| !priorities.is_empty())
+            || filters.assignee.is_some()
+            || filters.unassigned
+            || filters.include_closed
+            || !filters.include_deferred
+            || filters.include_templates
+            || filters.title_contains.is_some()
+            || filters.updated_before.is_some()
+            || filters.updated_after.is_some()
+            || filters.sort.is_some()
+            || filters.reverse;
+        if unsupported_filter {
+            return self.list_issues(filters);
+        }
+
+        if let Some(limit) = filters.limit
+            && limit > 0
+        {
+            return self.list_text_issues_by_priority_window(filters, limit);
+        }
+
+        let mut sql = String::from(
+            "SELECT id, title, status, priority, issue_type, created_at, updated_at
+             FROM issues
+             WHERE status NOT IN ('closed', 'tombstone')
+               AND (is_template = 0 OR is_template IS NULL)
+             ORDER BY COALESCE(priority, 2) ASC, created_at DESC, id ASC",
+        );
+        match (filters.limit, filters.offset) {
+            (Some(limit), offset) if limit > 0 => {
+                let _ = write!(sql, " LIMIT {limit}");
+                if let Some(offset) = offset
+                    && offset > 0
+                {
+                    let _ = write!(sql, " OFFSET {offset}");
+                }
+            }
+            (_, Some(offset)) if offset > 0 => {
+                let _ = write!(sql, " LIMIT -1 OFFSET {offset}");
+            }
+            _ => {}
+        }
+        let rows = self.conn.query(&sql)?;
+        let mut issues = Vec::with_capacity(rows.len());
+        for row in &rows {
+            issues.push(Self::command_summary_issue_from_row(row)?);
+        }
+        Ok(issues)
+    }
+
+    fn list_text_issues_by_priority_window(
+        &self,
+        filters: &ListFilters,
+        limit: usize,
+    ) -> Result<Vec<Issue>> {
+        let mut offset = filters.offset.unwrap_or(0);
+        let mut issues = Vec::with_capacity(limit);
+        for priority in Priority::CRITICAL.0..=Priority::BACKLOG.0 {
+            let remaining = limit - issues.len();
+            if remaining == 0 {
+                break;
+            }
+
+            let query_limit = remaining.saturating_add(offset);
+            let rows = self.conn.query_with_params(
+                "SELECT id, title, status, priority, issue_type, created_at, updated_at
+                 FROM issues INDEXED BY idx_issues_list_active_order
+                 WHERE status NOT IN ('closed', 'tombstone')
+                   AND (is_template = 0 OR is_template IS NULL)
+                   AND priority = ?
+                 ORDER BY created_at DESC, id ASC
+                 LIMIT ?",
+                &[
+                    SqliteValue::from(i64::from(priority)),
+                    SqliteValue::from(i64::try_from(query_limit).unwrap_or(i64::MAX)),
+                ],
+            )?;
+
+            if offset >= rows.len() {
+                offset -= rows.len();
+                continue;
+            }
+
+            for row in rows.iter().skip(offset) {
+                if issues.len() == limit {
+                    break;
+                }
+                issues.push(Self::command_summary_issue_from_row(row)?);
+            }
+            offset = 0;
+        }
+        Ok(issues)
+    }
+
+    /// List stale command issues without hydrating fields stale output never renders.
+    ///
+    /// This is intentionally narrow and falls back to `list_issues` if the
+    /// filter shape expands beyond what `br stale` currently uses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn list_stale_issues_for_command_output(
+        &self,
+        filters: &ListFilters,
+    ) -> Result<Vec<Issue>> {
+        let unsupported_filter = filters
+            .labels
+            .as_ref()
+            .is_some_and(|labels| !labels.is_empty())
+            || filters
+                .labels_or
+                .as_ref()
+                .is_some_and(|labels| !labels.is_empty())
+            || filters
+                .types
+                .as_ref()
+                .is_some_and(|types| !types.is_empty())
+            || filters
+                .priorities
+                .as_ref()
+                .is_some_and(|priorities| !priorities.is_empty())
+            || filters.assignee.is_some()
+            || filters.unassigned
+            || filters.title_contains.is_some()
+            || filters.updated_after.is_some()
+            || filters.sort.as_deref() != Some("updated_at")
+            || !filters.reverse;
+        if unsupported_filter {
+            return self.list_issues(filters);
+        }
+
+        let mut sql = String::from(
+            "SELECT id, title, status, priority, issue_type, assignee, created_at, updated_at
+             FROM issues WHERE 1=1",
+        );
+        let mut params = Vec::new();
+
+        if let Some(ref statuses) = filters.statuses
+            && !statuses.is_empty()
+        {
+            let placeholders: Vec<String> = statuses.iter().map(|_| "?".to_string()).collect();
+            let _ = write!(sql, " AND status IN ({}) ", placeholders.join(","));
+            for status in statuses {
+                params.push(SqliteValue::from(status.as_str()));
+            }
+        }
+
+        if !filters.include_closed {
+            if filters.include_deferred {
+                sql.push_str(" AND status NOT IN ('closed', 'tombstone')");
+            } else {
+                sql.push_str(" AND status NOT IN ('closed', 'tombstone', 'deferred')");
+            }
+        } else if filters.statuses.as_ref().is_none_or(Vec::is_empty) {
+            sql.push_str(" AND status != 'tombstone'");
+        }
+
+        if !filters.include_templates {
+            sql.push_str(" AND (is_template = 0 OR is_template IS NULL)");
+        }
+
+        if let Some(updated_before) = filters.updated_before {
+            sql.push_str(" AND updated_at <= ?");
+            params.push(SqliteValue::from(updated_before.to_rfc3339()));
+        }
+
+        sql.push_str(" ORDER BY updated_at ASC, id ASC");
+
+        match (filters.limit, filters.offset) {
+            (Some(limit), offset) if limit > 0 => {
+                let _ = write!(sql, " LIMIT {limit}");
+                if let Some(offset) = offset
+                    && offset > 0
+                {
+                    let _ = write!(sql, " OFFSET {offset}");
+                }
+            }
+            (_, Some(offset)) if offset > 0 => {
+                let _ = write!(sql, " LIMIT -1 OFFSET {offset}");
+            }
+            _ => {}
+        }
+
+        let rows = self.conn.query_with_params(&sql, &params)?;
+        let mut issues = Vec::with_capacity(rows.len());
+        for row in &rows {
+            issues.push(Self::stale_command_issue_from_row(row)?);
+        }
+        Ok(issues)
+    }
+
+    /// List lint command issues without hydrating fields lint never inspects.
+    ///
+    /// This is intentionally narrow and falls back to `list_issues` if the
+    /// filter shape expands beyond what `br lint` currently uses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn list_lint_issues_for_command_output(&self, filters: &ListFilters) -> Result<Vec<Issue>> {
+        let unsupported_filter = filters
+            .labels
+            .as_ref()
+            .is_some_and(|labels| !labels.is_empty())
+            || filters
+                .labels_or
+                .as_ref()
+                .is_some_and(|labels| !labels.is_empty())
+            || filters
+                .priorities
+                .as_ref()
+                .is_some_and(|priorities| !priorities.is_empty())
+            || filters.assignee.is_some()
+            || filters.unassigned
+            || filters.title_contains.is_some()
+            || filters.updated_before.is_some()
+            || filters.updated_after.is_some()
+            || filters.limit.is_some()
+            || filters.offset.is_some()
+            || filters.sort.is_some()
+            || filters.reverse;
+        if unsupported_filter {
+            return self.list_issues(filters);
+        }
+
+        let mut sql = String::from(
+            "SELECT id, title, description, status, issue_type, created_at, updated_at
+             FROM issues WHERE 1=1",
+        );
+        let mut params = Vec::new();
+
+        if let Some(ref statuses) = filters.statuses
+            && !statuses.is_empty()
+        {
+            let placeholders: Vec<String> = statuses.iter().map(|_| "?".to_string()).collect();
+            let _ = write!(sql, " AND status IN ({}) ", placeholders.join(","));
+            for status in statuses {
+                params.push(SqliteValue::from(status.as_str()));
+            }
+        }
+
+        if let Some(ref types) = filters.types
+            && !types.is_empty()
+        {
+            let placeholders: Vec<String> = types.iter().map(|_| "?".to_string()).collect();
+            let _ = write!(sql, " AND issue_type IN ({}) ", placeholders.join(","));
+            for issue_type in types {
+                params.push(SqliteValue::from(issue_type.as_str()));
+            }
+        }
+
+        if !filters.include_closed {
+            if filters.include_deferred {
+                sql.push_str(" AND status NOT IN ('closed', 'tombstone')");
+            } else {
+                sql.push_str(" AND status NOT IN ('closed', 'tombstone', 'deferred')");
+            }
+        } else if filters.statuses.as_ref().is_none_or(Vec::is_empty) {
+            sql.push_str(" AND status != 'tombstone'");
+        }
+
+        if !filters.include_templates {
+            sql.push_str(" AND (is_template = 0 OR is_template IS NULL)");
+        }
+
+        sql.push_str(" ORDER BY priority ASC, created_at DESC, id ASC");
+
+        let rows = self.conn.query_with_params(&sql, &params)?;
+        let mut issues = Vec::with_capacity(rows.len());
+        for row in &rows {
+            issues.push(Self::lint_command_issue_from_row(row)?);
+        }
+        Ok(issues)
+    }
+
+    /// List orphan-scan candidate issues without hydrating unused full issue fields.
+    ///
+    /// This is intentionally narrow and falls back to `list_issues` if the
+    /// filter shape expands beyond what `br orphans` currently uses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn list_orphan_candidate_issues_for_command_output(
+        &self,
+        filters: &ListFilters,
+    ) -> Result<Vec<Issue>> {
+        let expected_statuses = matches!(
+            filters.statuses.as_deref(),
+            Some([Status::Open, Status::InProgress])
+        );
+        let unsupported_filter = !expected_statuses
+            || filters
+                .labels
+                .as_ref()
+                .is_some_and(|labels| !labels.is_empty())
+            || filters
+                .labels_or
+                .as_ref()
+                .is_some_and(|labels| !labels.is_empty())
+            || filters
+                .types
+                .as_ref()
+                .is_some_and(|types| !types.is_empty())
+            || filters
+                .priorities
+                .as_ref()
+                .is_some_and(|priorities| !priorities.is_empty())
+            || filters.assignee.is_some()
+            || filters.unassigned
+            || filters.include_closed
+            || filters.include_deferred
+            || filters.include_templates
+            || filters.title_contains.is_some()
+            || filters.updated_before.is_some()
+            || filters.updated_after.is_some()
+            || filters.limit.is_some()
+            || filters.offset.is_some()
+            || filters.sort.is_some()
+            || filters.reverse;
+        if unsupported_filter {
+            return self.list_issues(filters);
+        }
+
+        let rows = self.conn.query(
+            "SELECT id, title, status, priority, issue_type, created_at, updated_at
+             FROM issues
+             WHERE status IN ('open', 'in_progress')
+               AND (is_template = 0 OR is_template IS NULL)
+             ORDER BY COALESCE(priority, 2) ASC, created_at DESC, id ASC",
+        )?;
+        let mut issues = Vec::with_capacity(rows.len());
+        for row in &rows {
+            issues.push(Self::command_summary_issue_from_row(row)?);
+        }
+        Ok(issues)
+    }
+
+    /// List graph command issues without hydrating fields graph rendering never inspects.
+    ///
+    /// This is intentionally narrow and falls back to `list_issues` if the
+    /// filter shape expands beyond what `br graph --all` currently uses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn list_graph_issues_for_command_output(
+        &self,
+        filters: &ListFilters,
+    ) -> Result<Vec<Issue>> {
+        let unsupported_filter = filters
+            .statuses
+            .as_ref()
+            .is_some_and(|statuses| !statuses.is_empty())
+            || filters
+                .labels
+                .as_ref()
+                .is_some_and(|labels| !labels.is_empty())
+            || filters
+                .labels_or
+                .as_ref()
+                .is_some_and(|labels| !labels.is_empty())
+            || filters
+                .types
+                .as_ref()
+                .is_some_and(|types| !types.is_empty())
+            || filters
+                .priorities
+                .as_ref()
+                .is_some_and(|priorities| !priorities.is_empty())
+            || filters.assignee.is_some()
+            || filters.unassigned
+            || filters.include_closed
+            || !filters.include_deferred
+            || filters.include_templates
+            || filters.title_contains.is_some()
+            || filters.updated_before.is_some()
+            || filters.updated_after.is_some()
+            || filters.limit.is_some()
+            || filters.offset.is_some()
+            || filters.sort.is_some()
+            || filters.reverse;
+        if unsupported_filter {
+            return self.list_issues(filters);
+        }
+
+        let rows = self.conn.query(
+            "SELECT id, title, status, priority, issue_type, created_at, updated_at
+             FROM issues
+             WHERE status NOT IN ('closed', 'tombstone')
+               AND (is_template = 0 OR is_template IS NULL)
+             ORDER BY COALESCE(priority, 2) ASC, created_at DESC, id ASC",
+        )?;
+        let mut issues = Vec::with_capacity(rows.len());
+        for row in &rows {
+            issues.push(Self::command_summary_issue_from_row(row)?);
+        }
         Ok(issues)
     }
 
@@ -2522,6 +4067,49 @@ impl SqliteStorage {
         Ok(issues)
     }
 
+    /// Get the narrowest issue rows needed for stats summary computation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn list_stats_summary_issues(&self) -> Result<Vec<StatsIssueRow>> {
+        let rows = self.conn.query(
+            r"SELECT id, status, issue_type, created_at, closed_at,
+                     defer_until, ephemeral, pinned, is_template
+              FROM issues",
+        )?;
+        let mut issues = Vec::with_capacity(rows.len());
+        for row in &rows {
+            issues.push(Self::stats_summary_issue_from_row(row)?);
+        }
+        Ok(issues)
+    }
+
+    /// Get lean closed issue rows for changelog rendering.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails or a stored timestamp is invalid.
+    pub(crate) fn list_changelog_issues(&self) -> Result<Vec<ChangelogIssueRow>> {
+        let rows = self.conn.query(
+            r"SELECT id, title, priority, issue_type, created_at, closed_at
+              FROM issues
+              WHERE status = 'closed'
+                AND (is_template = 0 OR is_template IS NULL)",
+        )?;
+        let mut issues = Vec::with_capacity(rows.len());
+        for row in &rows {
+            issues.push(Self::changelog_issue_from_row(row)?);
+        }
+        issues.sort_unstable_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then_with(|| right.created_at.cmp(&left.created_at))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(issues)
+    }
+
     /// Count issues matching the given filters (no LIMIT/OFFSET applied).
     ///
     /// Runs a `SELECT COUNT(*)` using the same WHERE conditions as [`list_issues`],
@@ -2532,16 +4120,38 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     #[allow(clippy::too_many_lines)]
     pub fn count_issues_with_filters(&self, filters: &ListFilters) -> Result<usize> {
-        let mut sql = String::from("SELECT COUNT(*) FROM issues WHERE 1=1");
+        if let Some(label) = default_visible_single_label_count_filter(filters) {
+            return self.count_default_visible_single_label(filters.include_deferred, label);
+        }
+
+        let mut sql = String::from("SELECT COUNT(*)");
 
         let mut params: Vec<SqliteValue> = Vec::new();
 
-        append_label_membership_filters(
-            &mut sql,
-            &mut params,
-            filters.labels.as_deref().unwrap_or(&[]),
-            filters.labels_or.as_deref().unwrap_or(&[]),
-        );
+        let labels_and = filters.labels.as_deref().unwrap_or(&[]);
+        let labels_or = filters.labels_or.as_deref().unwrap_or(&[]);
+        let label_filters_can_use_uncorrelated_in =
+            filters.statuses.as_ref().is_none_or(Vec::is_empty)
+                && filters.types.as_ref().is_none_or(Vec::is_empty)
+                && filters.priorities.as_ref().is_none_or(Vec::is_empty)
+                && filters.assignee.is_none()
+                && filters.title_contains.is_none()
+                && filters.updated_before.is_none()
+                && filters.updated_after.is_none();
+        let label_candidate_ids = if label_filters_can_use_uncorrelated_in {
+            None
+        } else {
+            self.label_filter_candidate_ids(labels_and, labels_or)?
+        };
+        if label_candidate_ids.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(0);
+        }
+        sql.push_str(" FROM issues WHERE 1=1");
+        if label_filters_can_use_uncorrelated_in {
+            append_label_membership_filters(&mut sql, &mut params, labels_and, labels_or);
+        } else if let Some(ref issue_ids) = label_candidate_ids {
+            append_issue_id_membership_filter(&mut sql, &mut params, issue_ids);
+        }
 
         if let Some(ref statuses) = filters.statuses
             && !statuses.is_empty()
@@ -2617,59 +4227,450 @@ impl SqliteStorage {
         Ok(usize::try_from(count).unwrap_or(0))
     }
 
-    /// Search issues by query with optional filters.
+    fn count_default_visible_single_label(
+        &self,
+        include_deferred: bool,
+        label: &str,
+    ) -> Result<usize> {
+        let status_filter = if include_deferred {
+            "status NOT IN ('closed', 'tombstone')"
+        } else {
+            "status NOT IN ('closed', 'tombstone', 'deferred')"
+        };
+        let issue_rows = self.conn.query(&format!(
+            "SELECT id
+             FROM issues
+             WHERE {status_filter}
+               AND (is_template = 0 OR is_template IS NULL)"
+        ))?;
+        if issue_rows.is_empty() {
+            return Ok(0);
+        }
+
+        let mut visible_ids = HashSet::with_capacity(issue_rows.len());
+        for row in &issue_rows {
+            let issue_id = row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string();
+            if !issue_id.is_empty() {
+                visible_ids.insert(issue_id);
+            }
+        }
+
+        let label_rows = self.conn.query_with_params(
+            "SELECT issue_id FROM labels WHERE label = ?",
+            &[SqliteValue::from(label)],
+        )?;
+        Ok(label_rows
+            .iter()
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text))
+            .filter(|issue_id| visible_ids.contains(*issue_id))
+            .count())
+    }
+
+    fn single_label_covers_default_visible_issues(
+        &self,
+        include_deferred: bool,
+        label: &str,
+    ) -> Result<bool> {
+        let total = self.count_default_visible_issues(include_deferred)?;
+        let labeled = self.count_default_visible_single_label(include_deferred, label)?;
+        Ok(labeled == total)
+    }
+
+    fn count_default_visible_issues(&self, include_deferred: bool) -> Result<usize> {
+        let status_filter = if include_deferred {
+            "status NOT IN ('closed', 'tombstone')"
+        } else {
+            "status NOT IN ('closed', 'tombstone', 'deferred')"
+        };
+        let row = self.conn.query_row(&format!(
+            "SELECT COUNT(*)
+             FROM issues
+             WHERE {status_filter}
+               AND (is_template = 0 OR is_template IS NULL)"
+        ))?;
+        let count = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
+    fn redundant_default_visible_single_label_filter(
+        &self,
+        filters: &ListFilters,
+        label_candidate_ids: Option<&[String]>,
+    ) -> Result<bool> {
+        let Some(label) = default_visible_single_label_count_filter(filters) else {
+            return Ok(false);
+        };
+        let Some(issue_ids) = label_candidate_ids else {
+            return Ok(false);
+        };
+        if issue_ids.len() < REDUNDANT_LABEL_COVERAGE_MIN_CANDIDATES {
+            return Ok(false);
+        }
+        self.single_label_covers_default_visible_issues(filters.include_deferred, label)
+    }
+
+    /// Count default-visible issues grouped by status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn count_default_visible_statuses(&self) -> Result<Vec<(String, usize)>> {
+        self.count_default_visible_text_groups("status", "status")
+    }
+
+    /// Count default-visible issues grouped by issue type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn count_default_visible_types(&self) -> Result<Vec<(String, usize)>> {
+        self.count_default_visible_text_groups("issue_type", "issue_type")
+    }
+
+    /// Count default-visible issues grouped by assignee.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn count_default_visible_assignees(&self) -> Result<Vec<(String, usize)>> {
+        self.count_default_visible_text_groups(
+            "COALESCE(NULLIF(assignee, ''), '(unassigned)')",
+            "COALESCE(NULLIF(assignee, ''), '(unassigned)')",
+        )
+    }
+
+    /// Count default-visible issues grouped by priority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn count_default_visible_priorities(&self) -> Result<Vec<(String, usize)>> {
+        let rows = self.conn.query(
+            "SELECT priority, COUNT(*)
+             FROM issues
+             WHERE status NOT IN ('closed', 'tombstone', 'deferred')
+               AND (is_template = 0 OR is_template IS NULL)
+             GROUP BY priority
+             ORDER BY priority",
+        )?;
+        rows.iter()
+            .map(|row| {
+                let priority = row
+                    .get(0)
+                    .and_then(SqliteValue::as_integer)
+                    .and_then(|value| i32::try_from(value).ok())
+                    .map(Priority)
+                    .unwrap_or_default();
+                let count = row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0);
+                Ok((priority.to_string(), usize::try_from(count).unwrap_or(0)))
+            })
+            .collect()
+    }
+
+    /// Count default-visible issues grouped by label.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn count_default_visible_labels(&self) -> Result<(usize, Vec<(String, usize)>)> {
+        let issue_rows = self.conn.query(
+            "SELECT id
+             FROM issues
+             WHERE status NOT IN ('closed', 'tombstone', 'deferred')
+               AND (is_template = 0 OR is_template IS NULL)",
+        )?;
+
+        let total = issue_rows.len();
+        if total == 0 {
+            return Ok((0, Vec::new()));
+        }
+
+        let mut visible_ids = HashSet::with_capacity(total);
+        for row in &issue_rows {
+            let issue_id = row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string();
+            if !issue_id.is_empty() {
+                visible_ids.insert(issue_id);
+            }
+        }
+
+        let label_rows = self
+            .conn
+            .query("SELECT issue_id, label FROM labels ORDER BY issue_id, label")?;
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut labeled_visible_issues = 0usize;
+        let mut last_labeled_issue_id = String::new();
+
+        for row in &label_rows {
+            let issue_id = row.get(0).and_then(SqliteValue::as_text).unwrap_or("");
+            if !visible_ids.contains(issue_id) {
+                continue;
+            }
+
+            if issue_id != last_labeled_issue_id {
+                labeled_visible_issues += 1;
+                last_labeled_issue_id.clear();
+                last_labeled_issue_id.push_str(issue_id);
+            }
+
+            let label = row
+                .get(1)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string();
+            *counts.entry(label).or_insert(0) += 1;
+        }
+
+        let unlabeled = total.saturating_sub(labeled_visible_issues);
+        if unlabeled > 0 {
+            counts.insert("(no labels)".to_string(), unlabeled);
+        }
+
+        Ok((total, counts.into_iter().collect()))
+    }
+
+    fn count_default_visible_text_groups(
+        &self,
+        select_expr: &str,
+        order_expr: &str,
+    ) -> Result<Vec<(String, usize)>> {
+        let sql = format!(
+            "SELECT {select_expr}, COUNT(*)
+             FROM issues
+             WHERE status NOT IN ('closed', 'tombstone', 'deferred')
+               AND (is_template = 0 OR is_template IS NULL)
+             GROUP BY {select_expr}
+             ORDER BY {order_expr}"
+        );
+        let rows = self.conn.query(&sql)?;
+        rows.iter()
+            .map(|row| {
+                let group = row
+                    .get(0)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or("")
+                    .to_string();
+                let count = row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0);
+                Ok((group, usize::try_from(count).unwrap_or(0)))
+            })
+            .collect()
+    }
+
+    /// Count label buckets for issues matching the given filters.
+    ///
+    /// This mirrors the label grouping semantics used by `br count --by label`:
+    /// each labeled issue contributes once per label, and unlabeled issues
+    /// contribute to the synthetic `(no labels)` bucket.
     ///
     /// # Errors
     ///
     /// Returns an error if the database query fails.
     #[allow(clippy::too_many_lines)]
+    pub fn count_labels_with_filters(&self, filters: &ListFilters) -> Result<Vec<(String, usize)>> {
+        let mut sql = String::from(
+            "SELECT labels.label, COUNT(*)
+             FROM issues
+             LEFT JOIN labels ON labels.issue_id = issues.id
+             WHERE 1=1",
+        );
+        let mut params: Vec<SqliteValue> = Vec::new();
+
+        let label_filters_can_use_uncorrelated_in =
+            filters.statuses.as_ref().is_none_or(Vec::is_empty)
+                && filters.types.as_ref().is_none_or(Vec::is_empty)
+                && filters.priorities.as_ref().is_none_or(Vec::is_empty)
+                && filters.assignee.is_none()
+                && filters.title_contains.is_none()
+                && filters.updated_before.is_none()
+                && filters.updated_after.is_none();
+        let label_candidate_ids = if label_filters_can_use_uncorrelated_in {
+            None
+        } else {
+            self.label_filter_candidate_ids(
+                filters.labels.as_deref().unwrap_or(&[]),
+                filters.labels_or.as_deref().unwrap_or(&[]),
+            )?
+        };
+        if label_candidate_ids.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(Vec::new());
+        }
+        if label_filters_can_use_uncorrelated_in {
+            append_label_membership_filters(
+                &mut sql,
+                &mut params,
+                filters.labels.as_deref().unwrap_or(&[]),
+                filters.labels_or.as_deref().unwrap_or(&[]),
+            );
+        } else if let Some(ref issue_ids) = label_candidate_ids {
+            append_issue_id_membership_filter(&mut sql, &mut params, issue_ids);
+        }
+
+        if let Some(ref statuses) = filters.statuses
+            && !statuses.is_empty()
+        {
+            let placeholders: Vec<String> = statuses.iter().map(|_| "?".to_string()).collect();
+            let _ = write!(sql, " AND status IN ({}) ", placeholders.join(","));
+            for s in statuses {
+                params.push(SqliteValue::from(s.as_str()));
+            }
+        }
+
+        if let Some(ref types) = filters.types
+            && !types.is_empty()
+        {
+            let placeholders: Vec<String> = types.iter().map(|_| "?".to_string()).collect();
+            let _ = write!(sql, " AND issue_type IN ({}) ", placeholders.join(","));
+            for t in types {
+                params.push(SqliteValue::from(t.as_str()));
+            }
+        }
+
+        if let Some(ref priorities) = filters.priorities
+            && !priorities.is_empty()
+        {
+            let placeholders: Vec<String> = priorities.iter().map(|_| "?".to_string()).collect();
+            let _ = write!(sql, " AND priority IN ({}) ", placeholders.join(","));
+            for p in priorities {
+                params.push(SqliteValue::from(i64::from(p.0)));
+            }
+        }
+
+        if let Some(ref assignee) = filters.assignee {
+            sql.push_str(" AND assignee = ?");
+            params.push(SqliteValue::from(assignee.as_str()));
+        }
+
+        if filters.unassigned {
+            sql.push_str(" AND (assignee IS NULL OR assignee = '')");
+        }
+
+        if !filters.include_closed {
+            if filters.include_deferred {
+                sql.push_str(" AND status NOT IN ('closed', 'tombstone')");
+            } else {
+                sql.push_str(" AND status NOT IN ('closed', 'tombstone', 'deferred')");
+            }
+        } else if filters.statuses.as_ref().is_none_or(Vec::is_empty) {
+            sql.push_str(" AND status != 'tombstone'");
+        }
+
+        if !filters.include_templates {
+            sql.push_str(" AND (is_template = 0 OR is_template IS NULL)");
+        }
+
+        if let Some(ref title_contains) = filters.title_contains {
+            sql.push_str(" AND title LIKE ? ESCAPE '\\'");
+            let escaped = escape_like_pattern(title_contains);
+            params.push(SqliteValue::from(format!("%{escaped}%")));
+        }
+
+        if let Some(ts) = filters.updated_before {
+            sql.push_str(" AND updated_at <= ?");
+            params.push(SqliteValue::from(ts.to_rfc3339()));
+        }
+
+        if let Some(ts) = filters.updated_after {
+            sql.push_str(" AND updated_at >= ?");
+            params.push(SqliteValue::from(ts.to_rfc3339()));
+        }
+
+        sql.push_str(" GROUP BY labels.label ORDER BY labels.label");
+
+        let rows = self.conn.query_with_params(&sql, &params)?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                let label = row
+                    .get(0)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or("(no labels)")
+                    .to_string();
+                let count = row.get(1).and_then(SqliteValue::as_integer)?;
+                Some((label, usize::try_from(count).unwrap_or(0)))
+            })
+            .collect())
+    }
+
+    /// Search issues by query with optional filters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
     pub fn search_issues(&self, query: &str, filters: &ListFilters) -> Result<Vec<Issue>> {
+        self.search_issues_with_projection(query, filters, SearchIssueProjection::Full)
+    }
+
+    /// Search command issues without hydrating fields text/rich search output never renders.
+    ///
+    /// This keeps `description` for rich context snippets while omitting large
+    /// structured fields used only by JSON/TOON/CSV or client-side filters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn search_issues_for_command_output(
+        &self,
+        query: &str,
+        filters: &ListFilters,
+    ) -> Result<Vec<Issue>> {
+        self.search_issues_with_projection(query, filters, SearchIssueProjection::CommandText)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn search_issues_with_projection(
+        &self,
+        query: &str,
+        filters: &ListFilters,
+        projection: SearchIssueProjection,
+    ) -> Result<Vec<Issue>> {
         let trimmed = query.trim();
         if trimmed.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut sql = String::from(
-            r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
-                     status, priority, issue_type, assignee, owner, estimated_minutes,
-                     created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
-                     due_at, defer_until, external_ref, source_system, source_repo,
-                     deleted_at, deleted_by, delete_reason, original_type,
-                     compaction_level, compacted_at, compacted_at_commit, original_size,
-                     sender, ephemeral, pinned, is_template
-              FROM issues
-              WHERE 1=1",
-        );
-
-        let mut params: Vec<SqliteValue> = Vec::new();
-
-        sql.push_str(
-            " AND (instr(lower(title), ?) > 0 OR instr(lower(description), ?) > 0 OR instr(lower(id), ?) > 0)",
-        );
-        let needle = trimmed.to_ascii_lowercase();
-        params.push(SqliteValue::from(needle.as_str()));
-        params.push(SqliteValue::from(needle.as_str()));
-        params.push(SqliteValue::from(needle));
-
-        if let Some(ref labels) = filters.labels {
-            for label in labels {
-                sql.push_str(" AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label = ?)");
-                params.push(SqliteValue::from(label.as_str()));
-            }
+        if let Some(limit) = default_visible_limited_page_limit(filters) {
+            return self.search_default_visible_limited_page(
+                trimmed,
+                filters.include_deferred,
+                limit,
+                projection,
+            );
         }
 
-        if let Some(ref labels_or) = filters.labels_or
-            && !labels_or.is_empty()
-        {
-            let placeholders: Vec<String> = labels_or.iter().map(|_| "?".to_string()).collect();
-            let _ = write!(
-                sql,
-                " AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label IN ({}))",
-                placeholders.join(",")
+        let mut sql = String::from(projection.select_clause());
+        let mut params: Vec<SqliteValue> = Vec::new();
+
+        let labels_and = filters.labels.as_deref().unwrap_or(&[]);
+        let labels_or = filters.labels_or.as_deref().unwrap_or(&[]);
+        let label_candidate_ids = if labels_and.is_empty() && labels_or.is_empty() {
+            None
+        } else {
+            self.label_filter_candidate_ids(labels_and, labels_or)?
+        };
+        if label_candidate_ids.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(Vec::new());
+        }
+        if self.redundant_default_visible_single_label_filter(
+            filters,
+            label_candidate_ids.as_deref(),
+        )? {
+            let mut filters_without_redundant_label = filters.clone();
+            filters_without_redundant_label.labels = None;
+            return self.search_issues_with_projection(
+                trimmed,
+                &filters_without_redundant_label,
+                projection,
             );
-            for label in labels_or {
-                params.push(SqliteValue::from(label.as_str()));
-            }
+        }
+        if let Some(ref issue_ids) = label_candidate_ids {
+            append_issue_id_membership_filter(&mut sql, &mut params, issue_ids);
         }
 
         if let Some(ref statuses) = filters.statuses
@@ -2743,6 +4744,14 @@ impl SqliteStorage {
             params.push(SqliteValue::from(ts.to_rfc3339()));
         }
 
+        sql.push_str(
+            " AND (instr(lower(title), ?) > 0 OR instr(lower(description), ?) > 0 OR instr(lower(id), ?) > 0)",
+        );
+        let needle = trimmed.to_ascii_lowercase();
+        params.push(SqliteValue::from(needle.as_str()));
+        params.push(SqliteValue::from(needle.as_str()));
+        params.push(SqliteValue::from(needle));
+
         if let Some(ref sort_field) = filters.sort {
             let order = if filters.reverse { "DESC" } else { "ASC" };
             match sort_field.as_str() {
@@ -2750,32 +4759,32 @@ impl SqliteStorage {
                     let secondary_order = if filters.reverse { "ASC" } else { "DESC" };
                     let _ = write!(
                         sql,
-                        " ORDER BY priority {order}, created_at {secondary_order}"
+                        " ORDER BY priority {order}, created_at {secondary_order}, id ASC"
                     );
                 }
                 "created_at" | "created" => {
                     let order = if filters.reverse { "ASC" } else { "DESC" };
-                    let _ = write!(sql, " ORDER BY created_at {order}");
+                    let _ = write!(sql, " ORDER BY created_at {order}, id ASC");
                 }
                 "updated_at" | "updated" => {
                     let order = if filters.reverse { "ASC" } else { "DESC" };
-                    let _ = write!(sql, " ORDER BY updated_at {order}");
+                    let _ = write!(sql, " ORDER BY updated_at {order}, id ASC");
                 }
                 "title" => {
-                    let _ = write!(sql, " ORDER BY title COLLATE NOCASE {order}");
+                    let _ = write!(sql, " ORDER BY title COLLATE NOCASE {order}, id ASC");
                 }
                 _ => {
                     if filters.reverse {
-                        sql.push_str(" ORDER BY priority DESC, created_at ASC");
+                        sql.push_str(" ORDER BY priority DESC, created_at ASC, id ASC");
                     } else {
-                        sql.push_str(" ORDER BY priority ASC, created_at DESC");
+                        sql.push_str(" ORDER BY priority ASC, created_at DESC, id ASC");
                     }
                 }
             }
         } else if filters.reverse {
-            sql.push_str(" ORDER BY priority DESC, created_at ASC");
+            sql.push_str(" ORDER BY priority DESC, created_at ASC, id ASC");
         } else {
-            sql.push_str(" ORDER BY priority ASC, created_at DESC");
+            sql.push_str(" ORDER BY priority ASC, created_at DESC, id ASC");
         }
 
         match (filters.limit, filters.offset) {
@@ -2796,9 +4805,108 @@ impl SqliteStorage {
         let rows = self.conn.query_with_params(&sql, &params)?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            issues.push(Self::issue_from_row(row)?);
+            issues.push(projection.parse_issue(row)?);
         }
 
+        Ok(issues)
+    }
+
+    fn search_default_visible_limited_page(
+        &self,
+        query: &str,
+        include_deferred: bool,
+        limit: usize,
+        projection: SearchIssueProjection,
+    ) -> Result<Vec<Issue>> {
+        let status_filter = if include_deferred {
+            "status NOT IN ('closed', 'tombstone')"
+        } else {
+            "status NOT IN ('closed', 'tombstone', 'deferred')"
+        };
+        let needle = query.to_ascii_lowercase();
+        if !self.search_default_visible_has_match(status_filter, &needle)? {
+            return Ok(Vec::new());
+        }
+
+        let mut issues = self.search_default_visible_priority_window(
+            status_filter,
+            &needle,
+            projection,
+            "priority = ?",
+            Priority::CRITICAL.0,
+            "created_at DESC, id ASC",
+            limit,
+        )?;
+
+        let remaining = limit.saturating_sub(issues.len());
+        if remaining > 0 {
+            issues.extend(self.search_default_visible_priority_window(
+                status_filter,
+                &needle,
+                projection,
+                "priority > ?",
+                Priority::CRITICAL.0,
+                "priority ASC, created_at DESC, id ASC",
+                remaining,
+            )?);
+        }
+
+        Ok(issues)
+    }
+
+    fn search_default_visible_has_match(&self, status_filter: &str, needle: &str) -> Result<bool> {
+        let sql = format!(
+            "SELECT 1 FROM issues
+             WHERE {status_filter}
+               AND (is_template = 0 OR is_template IS NULL)
+               AND (instr(lower(title), ?) > 0 OR instr(lower(description), ?) > 0 OR instr(lower(id), ?) > 0)
+             LIMIT 1"
+        );
+        let rows = self.conn.query_with_params(
+            &sql,
+            &[
+                SqliteValue::from(needle),
+                SqliteValue::from(needle),
+                SqliteValue::from(needle),
+            ],
+        )?;
+        Ok(!rows.is_empty())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_default_visible_priority_window(
+        &self,
+        status_filter: &str,
+        needle: &str,
+        projection: SearchIssueProjection,
+        priority_predicate: &str,
+        priority_value: i32,
+        order_by: &str,
+        limit: usize,
+    ) -> Result<Vec<Issue>> {
+        let sql = format!(
+            r"{}
+              AND {status_filter}
+              AND (is_template = 0 OR is_template IS NULL)
+              AND {priority_predicate}
+              AND (instr(lower(title), ?) > 0 OR instr(lower(description), ?) > 0 OR instr(lower(id), ?) > 0)
+              ORDER BY {order_by}
+              LIMIT {limit}",
+            projection.select_clause()
+        );
+        let rows = self.conn.query_with_params(
+            &sql,
+            &[
+                SqliteValue::from(i64::from(priority_value)),
+                SqliteValue::from(needle),
+                SqliteValue::from(needle),
+                SqliteValue::from(needle),
+            ],
+        )?;
+        let mut issues = Vec::with_capacity(rows.len());
+        for row in &rows {
+            issues.push(projection.parse_issue(row)?);
+        }
         Ok(issues)
     }
 
@@ -2840,15 +4948,55 @@ impl SqliteStorage {
         self.get_ready_issues_with_projection(filters, sort, ReadyIssueProjection::Command)
     }
 
+    /// Get ready issues optimized for compact text command rendering.
+    ///
+    /// Hydrates only the columns read by ready text/table output and ordering.
+    /// Structured JSON/TOON callers should use
+    /// [`Self::get_ready_issues_for_command_output`] to preserve the existing
+    /// schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_ready_summary_issues_for_command_output(
+        &self,
+        filters: &ReadyFilters,
+        sort: ReadySortPolicy,
+    ) -> Result<Vec<Issue>> {
+        self.get_ready_issues_with_projection(filters, sort, ReadyIssueProjection::Summary)
+    }
+
     fn get_ready_issues_with_projection(
         &self,
         filters: &ReadyFilters,
         sort: ReadySortPolicy,
         projection: ReadyIssueProjection,
     ) -> Result<Vec<Issue>> {
+        let readiness = self.ready_readiness_probe(filters.include_deferred)?;
+        if !readiness.has_candidate_status {
+            return Ok(Vec::new());
+        }
+
+        // Resolve `--parent` membership in Rust so the candidate query filters
+        // on a plain `id IN (...)` list rather than an `IN (subquery)` /
+        // recursive CTE (see `ReadyFilters::parent_member_ids`). Skip the work
+        // when membership has already been resolved by the caller.
+        let resolved_filters;
+        let filters = if filters.parent.is_some() && filters.parent_member_ids.is_none() {
+            let mut owned = filters.clone();
+            owned.parent_member_ids = Some(self.resolve_ready_parent_member_ids(
+                owned.parent.as_deref().unwrap_or_default(),
+                owned.recursive,
+            )?);
+            resolved_filters = owned;
+            &resolved_filters
+        } else {
+            filters
+        };
+
         // Read-only path: if the cache is stale, compute blocked IDs in memory
         // instead of persisting (issue #216 — read ops must not write).
-        if self.blocked_cache_marked_stale()? {
+        if readiness.blocked_cache_stale {
             let blocked_ids = match Self::compute_blocked_issues_map_impl(&self.conn) {
                 Ok(map) => map.into_keys().collect(),
                 Err(error) => self.recover_blocked_ids("ready_issues_stale", &error)?,
@@ -2877,6 +5025,49 @@ impl SqliteStorage {
         }
     }
 
+    /// Resolve the set of issue IDs matched by a `--parent` filter on `ready`.
+    ///
+    /// Returns the direct children of `parent_id`, or — when `recursive` — all
+    /// transitive parent-child descendants. Traversal is an iterative BFS with a
+    /// visited-set, so it terminates in bounded time even if the parent-child
+    /// graph contains a cycle (the embedded SQLite backend mishandles recursive
+    /// CTEs referenced from a correlated `EXISTS`, which previously surfaced as a
+    /// hang/error — #308).
+    fn resolve_ready_parent_member_ids(
+        &self,
+        parent_id: &str,
+        recursive: bool,
+    ) -> Result<Vec<String>> {
+        let children_by_parent = Self::load_local_parent_child_edges_impl(&self.conn)?;
+
+        let mut members: Vec<String> = Vec::new();
+        let mut visited: HashSet<String> = HashSet::new();
+        visited.insert(parent_id.to_string());
+
+        if recursive {
+            let mut queue: VecDeque<String> = VecDeque::new();
+            queue.push_back(parent_id.to_string());
+            while let Some(current) = queue.pop_front() {
+                if let Some(children) = children_by_parent.get(&current) {
+                    for child in children {
+                        if visited.insert(child.clone()) {
+                            members.push(child.clone());
+                            queue.push_back(child.clone());
+                        }
+                    }
+                }
+            }
+        } else if let Some(children) = children_by_parent.get(parent_id) {
+            for child in children {
+                if visited.insert(child.clone()) {
+                    members.push(child.clone());
+                }
+            }
+        }
+
+        Ok(members)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn build_ready_issue_candidates_query(
         filters: &ReadyFilters,
@@ -2887,22 +5078,60 @@ impl SqliteStorage {
         apply_ordering: bool,
     ) -> (String, Vec<SqliteValue>) {
         let mut sql = String::from(projection.select_clause());
-        sql.push_str(" FROM issues WHERE 1=1");
         let mut params: Vec<SqliteValue> = Vec::new();
 
-        append_label_membership_filters(
-            &mut sql,
-            &mut params,
-            &filters.labels_and,
-            &filters.labels_or,
-        );
-
-        // Ready condition 1: only `open` issues are "ready" (in_progress means
-        // already claimed). Optionally include deferred issues when requested.
-        if filters.include_deferred {
-            sql.push_str(" AND status IN ('open', 'deferred')");
+        let label_filters_can_use_uncorrelated_in =
+            filters.types.as_ref().is_none_or(Vec::is_empty)
+                && filters.priorities.as_ref().is_none_or(Vec::is_empty)
+                && filters.assignee.is_none()
+                && filters.parent.is_none();
+        if label_filters_can_use_uncorrelated_in {
+            sql.push_str(" FROM issues WHERE 1=1");
+            append_label_membership_filters(
+                &mut sql,
+                &mut params,
+                &filters.labels_and,
+                &filters.labels_or,
+            );
         } else {
-            sql.push_str(" AND status = 'open'");
+            append_issue_source_with_label_and_joins(&mut sql, &mut params, &filters.labels_and);
+            sql.push_str(" WHERE 1=1");
+            append_label_or_membership_exists(&mut sql, &mut params, &filters.labels_or);
+        }
+
+        // Ready condition 1: the configured ready status group is "ready"
+        // (issue #354). The default group is `[open]`, matching pre-#354
+        // behavior (in_progress means already claimed). `--include-deferred`
+        // additionally folds in `deferred` without double-counting it if the
+        // configured group already lists it.
+        let mut ready_statuses: Vec<String> = if filters.ready_statuses.is_empty() {
+            vec!["open".to_string()]
+        } else {
+            filters.ready_statuses.clone()
+        };
+        if filters.include_deferred
+            && !ready_statuses
+                .iter()
+                .any(|status| status.eq_ignore_ascii_case("deferred"))
+        {
+            ready_statuses.push("deferred".to_string());
+        }
+        // The status list is inlined as SQL string literals rather than bound
+        // `?` params. Status values are internal, validated, lowercased policy
+        // names (never raw user input reaching SQL), and the embedded fsqlite
+        // planner mishandles a bound `IN (?)` predicate when it sits alongside a
+        // correlated/grouped `id IN (SELECT ... HAVING ...)` label subquery —
+        // the same engine class of limitation documented on
+        // `ReadyFilters::parent_member_ids` (#307/#308). Inlining keeps the
+        // single-`open` case byte-identical to the pre-#354 literal and keeps
+        // widened groups index-coverable. Single quotes are still escaped
+        // defensively in case a project configures an exotic custom status.
+        {
+            let escaped: Vec<String> = ready_statuses
+                .iter()
+                .map(|status| format!("'{}'", status.replace('\'', "''")))
+                .collect();
+            let _ = write!(sql, " AND status IN ({})", escaped.join(","));
         }
 
         // Ready condition 2: blocked issues are filtered in SQL when the cache
@@ -2962,31 +5191,25 @@ impl SqliteStorage {
             sql.push_str(" AND (assignee IS NULL OR assignee = '')");
         }
 
-        // Filter by parent (--parent flag)
-        let mut cte_prefix = String::new();
-        if let Some(ref parent_id) = filters.parent {
-            if filters.recursive {
-                cte_prefix = String::from(
-                    "WITH RECURSIVE _descendants(did) AS (\
-                        SELECT issue_id FROM dependencies WHERE depends_on_id = ? AND type = 'parent-child' \
-                        UNION \
-                        SELECT d.issue_id FROM dependencies d \
-                        JOIN _descendants ON d.depends_on_id = _descendants.did \
-                        WHERE d.type = 'parent-child'\
-                    ) ",
-                );
-                // The CTE is prepended to the SQL, so its ? appears first.
-                // Insert the parent_id param at position 0 to match.
-                params.insert(0, SqliteValue::from(parent_id.as_str()));
-                sql.push_str(" AND id IN (SELECT did FROM _descendants)");
-            } else {
-                sql.push_str(
-                    " AND id IN (
-                        SELECT issue_id FROM dependencies
-                        WHERE depends_on_id = ? AND type = 'parent-child'
-                    )",
-                );
-                params.push(SqliteValue::from(parent_id.as_str()));
+        // Filter by parent (--parent flag).
+        //
+        // Membership is resolved in Rust (see `resolve_ready_parent_member_ids`)
+        // and passed as `parent_member_ids`, so we filter with a plain
+        // `id IN (...)` list rather than an `IN (subquery)` / recursive CTE. This
+        // avoids embedded-SQLite planner bugs around `IN (subquery)` under
+        // multi-table joins (#307) and recursive CTEs referenced from a
+        // correlated `EXISTS` (#308).
+        let cte_prefix = String::new();
+        if filters.parent.is_some() {
+            match filters.parent_member_ids.as_deref() {
+                Some([]) | None => {
+                    // Parent has no matching descendants (or membership was not
+                    // resolved): force an empty result without scanning.
+                    sql.push_str(" AND 1=0");
+                }
+                Some(member_ids) => {
+                    append_issue_id_membership_filter(&mut sql, &mut params, member_ids);
+                }
             }
         }
 
@@ -2994,14 +5217,16 @@ impl SqliteStorage {
             match sort {
                 ReadySortPolicy::Hybrid => {
                     sql.push_str(
-                        " ORDER BY CASE WHEN priority <= 1 THEN 0 ELSE 1 END, created_at ASC",
+                        " ORDER BY CASE WHEN issues.priority <= 1 THEN 0 ELSE 1 END, issues.created_at ASC, issues.id ASC",
                     );
                 }
                 ReadySortPolicy::Priority => {
-                    sql.push_str(" ORDER BY priority ASC, created_at ASC");
+                    sql.push_str(
+                        " ORDER BY issues.priority ASC, issues.created_at ASC, issues.id ASC",
+                    );
                 }
                 ReadySortPolicy::Oldest => {
-                    sql.push_str(" ORDER BY created_at ASC");
+                    sql.push_str(" ORDER BY issues.created_at ASC, issues.id ASC");
                 }
             }
         }
@@ -3030,6 +5255,17 @@ impl SqliteStorage {
         apply_limit: bool,
         projection: ReadyIssueProjection,
     ) -> Result<Vec<Issue>> {
+        if sort == ReadySortPolicy::Hybrid
+            && apply_limit
+            && let Some(issues) = self.query_limited_ready_hybrid_high_bucket(
+                filters,
+                exclude_blocked_in_sql,
+                projection,
+            )?
+        {
+            return Ok(issues);
+        }
+
         let sort_hybrid_in_rust = sort == ReadySortPolicy::Hybrid && filters.limit.is_none();
         let (sql, params) = Self::build_ready_issue_candidates_query(
             filters,
@@ -3046,6 +5282,101 @@ impl SqliteStorage {
         }
         if sort_hybrid_in_rust {
             sort_ready_hybrid(&mut issues);
+        }
+
+        Ok(issues)
+    }
+
+    fn query_limited_ready_hybrid_high_bucket(
+        &self,
+        filters: &ReadyFilters,
+        exclude_blocked_in_sql: bool,
+        projection: ReadyIssueProjection,
+    ) -> Result<Option<Vec<Issue>>> {
+        let Some(limit) = filters.limit.filter(|limit| *limit > 0) else {
+            return Ok(None);
+        };
+
+        let priorities = ready_hybrid_high_bucket_priorities(filters.priorities.as_deref());
+        if priorities.is_empty() {
+            return Ok(None);
+        }
+
+        let mut high_bucket_filters = filters.clone();
+        high_bucket_filters.priorities = Some(priorities);
+        high_bucket_filters.limit = Some(limit);
+
+        if exclude_blocked_in_sql {
+            let issues = self.query_ready_issue_candidates_with_projection(
+                &high_bucket_filters,
+                ReadySortPolicy::Oldest,
+                true,
+                true,
+                projection,
+            )?;
+            return Ok((issues.len() >= limit).then_some(issues));
+        }
+
+        let mut summary_issues = self.query_ready_issue_candidates_with_projection(
+            &high_bucket_filters,
+            ReadySortPolicy::Oldest,
+            false,
+            false,
+            ReadyIssueProjection::Summary,
+        )?;
+        if exclude_blocked_in_sql {
+            let blocked_ids = self.get_blocked_ids()?;
+            summary_issues.retain(|issue| !blocked_ids.contains(issue.id.as_str()));
+        }
+
+        if summary_issues.len() >= limit {
+            summary_issues.truncate(limit);
+            if projection == ReadyIssueProjection::Summary {
+                return Ok(Some(summary_issues));
+            }
+
+            let ids: Vec<String> = summary_issues.into_iter().map(|issue| issue.id).collect();
+            Ok(Some(self.get_ready_issues_by_ids_with_projection(
+                &ids, projection,
+            )?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn get_ready_issues_by_ids_with_projection(
+        &self,
+        ids: &[String],
+        projection: ReadyIssueProjection,
+    ) -> Result<Vec<Issue>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut by_id = HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(SQLITE_VAR_LIMIT) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "{} FROM issues WHERE id IN ({})",
+                projection.select_clause(),
+                placeholders.join(",")
+            );
+            let params: Vec<SqliteValue> = chunk
+                .iter()
+                .map(|id| SqliteValue::from(id.as_str()))
+                .collect();
+            let rows = self.conn.query_with_params(&sql, &params)?;
+            for row in &rows {
+                let issue = projection.parse_row(row)?;
+                by_id.insert(issue.id.clone(), issue);
+            }
+        }
+
+        let mut issues = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(issue) = by_id.remove(id) {
+                issues.push(issue);
+            }
         }
 
         Ok(issues)
@@ -3076,11 +5407,19 @@ impl SqliteStorage {
         stage: &'static str,
         error: &dyn std::fmt::Display,
     ) -> Result<HashMap<String, Vec<String>>> {
-        tracing::warn!(
-            stage,
-            %error,
-            "Blocked cache unavailable; computing blocker graph directly"
-        );
+        if is_transient_wal_tail_read_error(error) {
+            tracing::trace!(
+                stage,
+                %error,
+                "Blocked cache unavailable during transient WAL tail read; computing blocker graph directly"
+            );
+        } else {
+            tracing::warn!(
+                stage,
+                %error,
+                "Blocked cache unavailable; computing blocker graph directly"
+            );
+        }
         Self::compute_blocked_issues_map_impl(&self.conn)
     }
 
@@ -3163,6 +5502,71 @@ impl SqliteStorage {
         Ok(edges)
     }
 
+    /// Get raw blocking dependency edges whose endpoints are in `issue_ids`.
+    ///
+    /// Returns `(issue_id, depends_on_id)` pairs, matching [`Self::get_blocks_dep_edges`].
+    /// For large active sets, falls back to the full edge scan to stay below
+    /// SQLite's parameter limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_blocks_dep_edges_for_issue_ids(
+        &self,
+        issue_ids: &[&str],
+    ) -> Result<Vec<(String, String)>> {
+        if issue_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if issue_ids.len() > BLOCKS_DEP_EDGE_FILTER_LIMIT {
+            return self.get_blocks_dep_edges();
+        }
+
+        let mut edges = Vec::new();
+        let placeholders: Vec<&str> = issue_ids.iter().map(|_| "?").collect();
+        let placeholders = placeholders.join(", ");
+
+        let mut params = Vec::with_capacity(issue_ids.len() * 2);
+        for issue_id in issue_ids {
+            params.push(SqliteValue::from(*issue_id));
+        }
+        for issue_id in issue_ids {
+            params.push(SqliteValue::from(*issue_id));
+        }
+
+        let standard_sql = format!(
+            "SELECT issue_id, depends_on_id FROM dependencies \
+             WHERE type IN ('blocks', 'conditional-blocks', 'waits-for') \
+               AND issue_id IN ({placeholders}) \
+               AND depends_on_id IN ({placeholders})"
+        );
+        let rows1 = self.conn.query_with_params(&standard_sql, &params)?;
+        for row in &rows1 {
+            if let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text)
+                && let Some(depends_on) = row.get(1).and_then(SqliteValue::as_text)
+            {
+                edges.push((issue_id.to_string(), depends_on.to_string()));
+            }
+        }
+
+        let parent_child_sql = format!(
+            "SELECT depends_on_id, issue_id FROM dependencies \
+             WHERE type = 'parent-child' \
+               AND depends_on_id IN ({placeholders}) \
+               AND issue_id IN ({placeholders})"
+        );
+        let rows2 = self.conn.query_with_params(&parent_child_sql, &params)?;
+        for row in &rows2 {
+            if let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text)
+                && let Some(depends_on) = row.get(1).and_then(SqliteValue::as_text)
+            {
+                edges.push((issue_id.to_string(), depends_on.to_string()));
+            }
+        }
+
+        Ok(edges)
+    }
+
     /// Check if an issue is blocked (in the blocked cache).
     ///
     /// # Errors
@@ -3201,6 +5605,78 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_blockers(&self, issue_id: &str) -> Result<Vec<String>> {
+        Ok(Self::blocker_refs_to_issue_ids(
+            &self.get_blocker_refs(issue_id)?,
+        ))
+    }
+
+    /// Get the blockers that prevent *starting* work on an issue (claiming it or
+    /// moving it to `in_progress`).
+    ///
+    /// This is [`get_blockers`](Self::get_blockers) minus two *rollup* markers
+    /// that are not real prerequisite edges on the issue itself:
+    ///
+    /// - `:child-open` — a *close-ordering* constraint (an epic should not be
+    ///   *closed* while it still has open children). It must NOT prevent the
+    ///   epic from being claimed and worked on (#315).
+    /// - `:parent-blocked` — propagated down onto a child from an
+    ///   *already-blocked* parent epic. `parent-child` is hierarchy, not a
+    ///   prerequisite edge from the parent to the child, so a child that has no
+    ///   real blocker of its own must remain claimable even while its parent
+    ///   epic is blocked (#357 — the start-path counterpart of #355, which
+    ///   stripped the same marker on the *close* path). The actionable children
+    ///   of a blocked epic are frequently exactly the work that unblocks it.
+    ///
+    /// Real start-blocking edges on the child itself (`blocks`,
+    /// `conditional-blocks`, `waits-for`) do not carry either suffix and are
+    /// retained — a child with a *direct* prerequisite still cannot be started.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_start_blockers(&self, issue_id: &str) -> Result<Vec<String>> {
+        let start_blocker_refs: Vec<String> = self
+            .get_blocker_refs(issue_id)?
+            .into_iter()
+            .filter(|blocker| {
+                !blocker.ends_with(CHILD_OPEN_BLOCKER_SUFFIX)
+                    && !blocker.ends_with(PARENT_BLOCKED_SUFFIX)
+            })
+            .collect();
+        Ok(Self::blocker_refs_to_issue_ids(&start_blocker_refs))
+    }
+
+    /// Get the blockers that prevent *closing* an issue.
+    ///
+    /// This is [`get_blockers`](Self::get_blockers) minus the
+    /// `:parent-blocked` rollup markers. Those markers encode a *readiness*
+    /// constraint propagated from an already-blocked parent epic down onto its
+    /// children — a child of a blocked epic is not "ready" to be *started* —
+    /// but `parent-child` is hierarchy, not a prerequisite edge from the parent
+    /// to the child. A finished child must be closable even while its parent
+    /// epic remains blocked or open (#355). Real prerequisite edges on the
+    /// child itself (`blocks`, `conditional-blocks`, `waits-for`) and the
+    /// `:child-open` close-ordering rollup (so an epic still can't close over
+    /// open children) are retained.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_close_blockers(&self, issue_id: &str) -> Result<Vec<String>> {
+        let close_blocker_refs: Vec<String> = self
+            .get_blocker_refs(issue_id)?
+            .into_iter()
+            .filter(|blocker| !blocker.ends_with(PARENT_BLOCKED_SUFFIX))
+            .collect();
+        Ok(Self::blocker_refs_to_issue_ids(&close_blocker_refs))
+    }
+
+    /// Return the raw, annotation-bearing blocker refs for an issue (e.g.
+    /// `bd-123:open`, `bd-456:parent-blocked`, `bd-789:child-open`), or an empty
+    /// vec if the issue is not blocked. Callers that only need issue IDs should
+    /// use [`get_blockers`](Self::get_blockers); callers enforcing start/claim
+    /// ordering should use [`get_start_blockers`](Self::get_start_blockers).
+    fn get_blocker_refs(&self, issue_id: &str) -> Result<Vec<String>> {
         // Read-only path: if the cache is stale, compute in memory instead of
         // persisting (issue #216 — read ops must not write).
         if self.blocked_cache_marked_stale()? {
@@ -3208,11 +5684,9 @@ impl SqliteStorage {
                 Ok(map) => map,
                 Err(error) => self.recover_blocked_issues_map("get_blockers_stale", &error)?,
             };
-            return Ok(Self::blocker_refs_to_issue_ids(
-                blocked_issues_map
-                    .get(issue_id)
-                    .map_or(&[][..], Vec::as_slice),
-            ));
+            return Ok(blocked_issues_map
+                .get(issue_id)
+                .map_or_else(Vec::new, Clone::clone));
         }
         let rows = match self.conn.query_with_params(
             "SELECT blocked_by FROM blocked_issues_cache WHERE issue_id = ?",
@@ -3222,11 +5696,9 @@ impl SqliteStorage {
             Err(error) => {
                 let blocked_issues_map =
                     self.recover_blocked_issues_map("get_blockers_query", &error)?;
-                return Ok(Self::blocker_refs_to_issue_ids(
-                    blocked_issues_map
-                        .get(issue_id)
-                        .map_or(&[][..], Vec::as_slice),
-                ));
+                return Ok(blocked_issues_map
+                    .get(issue_id)
+                    .map_or_else(Vec::new, Clone::clone));
             }
         };
         let Some(row) = rows.first() else {
@@ -3234,15 +5706,13 @@ impl SqliteStorage {
         };
 
         match parse_blocked_by_json(issue_id, row.get(0).and_then(SqliteValue::as_text)) {
-            Ok(blockers) => Ok(Self::blocker_refs_to_issue_ids(&blockers)),
+            Ok(blockers) => Ok(blockers),
             Err(error) => {
                 let blocked_issues_map =
                     self.recover_blocked_issues_map("get_blockers_parse", &error)?;
-                Ok(Self::blocker_refs_to_issue_ids(
-                    blocked_issues_map
-                        .get(issue_id)
-                        .map_or(&[][..], Vec::as_slice),
-                ))
+                Ok(blocked_issues_map
+                    .get(issue_id)
+                    .map_or_else(Vec::new, Clone::clone))
             }
         }
     }
@@ -3400,6 +5870,131 @@ impl SqliteStorage {
         Ok(blocked_issues_map)
     }
 
+    pub(crate) fn blocked_cache_projection_health(
+        conn: &Connection,
+    ) -> BlockedCacheProjectionHealth {
+        let direct_map = Self::compute_blocked_issues_map_impl(conn).ok();
+        let cached_map = Self::load_blocked_cache_projection_map(conn).ok();
+        Self::compare_blocked_cache_projection(cached_map.as_ref(), direct_map.as_ref())
+    }
+
+    pub(crate) fn ready_projection_health(conn: &Connection) -> ReadyProjectionHealth {
+        let cached_ready_ids = Self::query_ready_projection_ids(conn, None, true).ok();
+        let direct_blocked_ids = Self::compute_blocked_issues_map_impl(conn)
+            .ok()
+            .map(|map| map.into_keys().collect::<HashSet<_>>());
+        let direct_ready_ids = direct_blocked_ids.as_ref().and_then(|blocked_ids| {
+            Self::query_ready_projection_ids(conn, Some(blocked_ids), false).ok()
+        });
+        Self::compare_ready_projection(cached_ready_ids.as_ref(), direct_ready_ids.as_ref())
+    }
+
+    fn compare_blocked_cache_projection(
+        cached: Option<&HashMap<String, Vec<String>>>,
+        direct: Option<&HashMap<String, Vec<String>>>,
+    ) -> BlockedCacheProjectionHealth {
+        let direct_blocked_rows = direct.map(HashMap::len);
+        let (Some(cached), Some(direct)) = (cached, direct) else {
+            return BlockedCacheProjectionHealth::unavailable(direct_blocked_rows);
+        };
+
+        let missing_rows = direct.keys().filter(|id| !cached.contains_key(*id)).count();
+        let extra_rows = cached.keys().filter(|id| !direct.contains_key(*id)).count();
+        let mismatched_rows = direct
+            .iter()
+            .filter(|(id, blockers)| {
+                cached
+                    .get(id.as_str())
+                    .is_some_and(|cached_blockers| cached_blockers != *blockers)
+            })
+            .count();
+        let parity_status = if missing_rows == 0 && extra_rows == 0 && mismatched_rows == 0 {
+            "matches"
+        } else {
+            "mismatch"
+        };
+
+        BlockedCacheProjectionHealth {
+            parity_status: parity_status.to_string(),
+            direct_blocked_rows,
+            cached_missing_rows: Some(missing_rows),
+            cached_extra_rows: Some(extra_rows),
+            cached_mismatched_rows: Some(mismatched_rows),
+        }
+    }
+
+    fn load_blocked_cache_projection_map(
+        conn: &Connection,
+    ) -> Result<HashMap<String, Vec<String>>> {
+        let rows = conn.query("SELECT issue_id, blocked_by FROM blocked_issues_cache")?;
+        let mut cached_map = HashMap::new();
+        for row in &rows {
+            let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let mut blockers =
+                parse_blocked_by_json(issue_id, row.get(1).and_then(SqliteValue::as_text))?;
+            blockers.sort();
+            blockers.dedup();
+            cached_map.insert(issue_id.to_string(), blockers);
+        }
+        Ok(cached_map)
+    }
+
+    fn compare_ready_projection(
+        cached: Option<&HashSet<String>>,
+        direct: Option<&HashSet<String>>,
+    ) -> ReadyProjectionHealth {
+        let cached_ready_rows = cached.map(HashSet::len);
+        let direct_ready_rows = direct.map(HashSet::len);
+        let (Some(cached), Some(direct)) = (cached, direct) else {
+            return ReadyProjectionHealth::unavailable(cached_ready_rows, direct_ready_rows);
+        };
+
+        let missing_rows = direct.difference(cached).count();
+        let extra_rows = cached.difference(direct).count();
+        let parity_status = if missing_rows == 0 && extra_rows == 0 {
+            "matches"
+        } else {
+            "mismatch"
+        };
+
+        ReadyProjectionHealth {
+            parity_status: parity_status.to_string(),
+            cached_ready_rows,
+            direct_ready_rows,
+            cached_ready_missing_rows: Some(missing_rows),
+            cached_ready_extra_rows: Some(extra_rows),
+        }
+    }
+
+    fn query_ready_projection_ids(
+        conn: &Connection,
+        direct_blocked_ids: Option<&HashSet<String>>,
+        exclude_blocked_in_sql: bool,
+    ) -> Result<HashSet<String>> {
+        let (sql, params) = Self::build_ready_issue_candidates_query(
+            &ReadyFilters::default(),
+            ReadySortPolicy::Priority,
+            exclude_blocked_in_sql,
+            false,
+            ReadyIssueProjection::Command,
+            false,
+        );
+        let rows = conn.query_with_params(&sql, &params)?;
+        let mut ready_ids = HashSet::with_capacity(rows.len());
+        for row in &rows {
+            let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            if direct_blocked_ids.is_some_and(|blocked_ids| blocked_ids.contains(issue_id)) {
+                continue;
+            }
+            ready_ids.insert(issue_id.to_string());
+        }
+        Ok(ready_ids)
+    }
+
     fn blocker_refs_to_issue_ids(blockers: &[String]) -> Vec<String> {
         blockers
             .iter()
@@ -3413,30 +6008,26 @@ impl SqliteStorage {
             .collect()
     }
 
-    fn load_blocked_issues_from_map(
+    fn load_blocked_issues_from_map_with_projection(
         &self,
         blocked_issues_map: &HashMap<String, Vec<String>>,
+        projection: BlockedIssueProjection,
     ) -> Result<Vec<(Issue, Vec<String>)>> {
         if blocked_issues_map.is_empty() {
             return Ok(Vec::new());
         }
 
-        let rows = self.conn.query(
-            r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
-                     status, priority, issue_type, assignee, owner, estimated_minutes,
-                     created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
-                     due_at, defer_until, external_ref, source_system, source_repo,
-                     deleted_at, deleted_by, delete_reason, original_type, compaction_level,
-                     compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                     pinned, is_template
-              FROM issues
-              WHERE status NOT IN ('closed', 'tombstone')
-              ORDER BY priority ASC, created_at DESC",
-        )?;
+        let sql = format!(
+            "{} FROM issues
+             WHERE status NOT IN ('closed', 'tombstone')
+             ORDER BY priority ASC, created_at DESC, id ASC",
+            projection.map_select_clause()
+        );
+        let rows = self.conn.query(&sql)?;
 
         let mut blocked_issues = Vec::new();
         for row in &rows {
-            let issue = Self::issue_from_row(row)?;
+            let issue = projection.parse_issue(row)?;
             if let Some(blockers) = blocked_issues_map.get(issue.id.as_str()) {
                 blocked_issues.push((issue, blockers.clone()));
             }
@@ -3815,8 +6406,8 @@ impl SqliteStorage {
         // dangling rows can accumulate.  Without this guard the subsequent
         // INSERT into `blocked_issues_cache` (which *does* have a FK on
         // `issue_id`) fails with "FOREIGN KEY constraint failed" (#215).
-        let rows = conn.query(
-            "SELECT DISTINCT d.depends_on_id as parent_id, d.issue_id || ':child-open' as blocker
+        let rows = conn.query(&format!(
+            "SELECT DISTINCT d.depends_on_id as parent_id, d.issue_id || '{CHILD_OPEN_BLOCKER_SUFFIX}' as blocker
              FROM dependencies d
              JOIN issues i ON d.issue_id = i.id
              JOIN issues p ON d.depends_on_id = p.id
@@ -3826,7 +6417,7 @@ impl SqliteStorage {
                AND (i.is_template = 0 OR i.is_template IS NULL)
                AND d.depends_on_id NOT LIKE 'external:%'
                AND d.issue_id NOT LIKE 'external:%'",
-        )?;
+        ))?;
         let mut map: HashMap<String, Vec<String>> = HashMap::new();
         for row in &rows {
             let Some(parent_id) = row.get(0).and_then(SqliteValue::as_text) else {
@@ -3864,7 +6455,7 @@ impl SqliteStorage {
             // blocked by open children" rollup is epic-specific, not a
             // property of every parent-child edge.
             let sql = format!(
-                "SELECT DISTINCT d.depends_on_id as parent_id, d.issue_id || ':child-open' as blocker
+                "SELECT DISTINCT d.depends_on_id as parent_id, d.issue_id || '{CHILD_OPEN_BLOCKER_SUFFIX}' as blocker
                  FROM dependencies d
                  JOIN issues i ON d.issue_id = i.id
                  JOIN issues p ON d.depends_on_id = p.id
@@ -3937,6 +6528,26 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_blocked_issues(&self) -> Result<Vec<(Issue, Vec<String>)>> {
+        self.get_blocked_issues_with_projection(BlockedIssueProjection::Full)
+    }
+
+    /// Get blocked issues optimized for `blocked` command rendering.
+    ///
+    /// Hydrates only the issue columns consumed by blocked JSON/TOON/text
+    /// output, avoiding large overflow-page reads for fields that never reach
+    /// the user-facing result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_blocked_issues_for_command_output(&self) -> Result<Vec<(Issue, Vec<String>)>> {
+        self.get_blocked_issues_with_projection(BlockedIssueProjection::Command)
+    }
+
+    fn get_blocked_issues_with_projection(
+        &self,
+        projection: BlockedIssueProjection,
+    ) -> Result<Vec<(Issue, Vec<String>)>> {
         // Read-only path: if the cache is stale, compute in memory instead of
         // persisting (issue #216 — read ops must not write).
         if self.blocked_cache_marked_stale()? {
@@ -3946,42 +6557,42 @@ impl SqliteStorage {
                     self.recover_blocked_issues_map("get_blocked_issues_stale", &error)?
                 }
             };
-            return self.load_blocked_issues_from_map(&blocked_issues_map);
+            return self
+                .load_blocked_issues_from_map_with_projection(&blocked_issues_map, projection);
         }
-        let rows = match self.conn.query(
-            r"SELECT i.id, i.content_hash, i.title, i.description, i.design, i.acceptance_criteria, i.notes,
-                     i.status, i.priority, i.issue_type, i.assignee, i.owner, i.estimated_minutes,
-                     i.created_at, i.created_by, i.updated_at, i.closed_at, i.close_reason, i.closed_by_session,
-                     i.due_at, i.defer_until, i.external_ref, i.source_system, i.source_repo,
-                     i.deleted_at, i.deleted_by, i.delete_reason, i.original_type, i.compaction_level,
-                     i.compacted_at, i.compacted_at_commit, i.original_size, i.sender, i.ephemeral,
-                     i.pinned, i.is_template,
-                     bc.blocked_by
-              FROM issues i
-              INNER JOIN blocked_issues_cache bc ON i.id = bc.issue_id
-              WHERE i.status NOT IN ('closed', 'tombstone')
-              ORDER BY i.priority ASC, i.created_at DESC",
-        ) {
+        let sql = format!(
+            "{} FROM issues i
+             INNER JOIN blocked_issues_cache bc ON i.id = bc.issue_id
+             WHERE i.status NOT IN ('closed', 'tombstone')
+             ORDER BY i.priority ASC, i.created_at DESC, i.id ASC",
+            projection.cached_select_clause()
+        );
+        let rows = match self.conn.query(&sql) {
             Ok(rows) => rows,
             Err(error) => {
                 let blocked_issues_map =
                     self.recover_blocked_issues_map("get_blocked_issues_query", &error)?;
-                return self.load_blocked_issues_from_map(&blocked_issues_map);
+                return self
+                    .load_blocked_issues_from_map_with_projection(&blocked_issues_map, projection);
             }
         };
 
         let mut blocked_issues = Vec::new();
         for row in &rows {
-            let issue = Self::issue_from_row(row)?;
+            let issue = projection.parse_issue(row)?;
             let blockers = match parse_blocked_by_json(
                 &issue.id,
-                row.get(36).and_then(SqliteValue::as_text),
+                row.get(projection.cached_blocked_by_index())
+                    .and_then(SqliteValue::as_text),
             ) {
                 Ok(blockers) => blockers,
                 Err(error) => {
                     let blocked_issues_map =
                         self.recover_blocked_issues_map("get_blocked_issues_parse", &error)?;
-                    return self.load_blocked_issues_from_map(&blocked_issues_map);
+                    return self.load_blocked_issues_from_map_with_projection(
+                        &blocked_issues_map,
+                        projection,
+                    );
                 }
             };
             blocked_issues.push((issue, blockers));
@@ -3990,27 +6601,108 @@ impl SqliteStorage {
         Ok(blocked_issues)
     }
 
+    /// Return true unless the blocked command can safely emit an empty result.
+    ///
+    /// The false result is deliberately narrow: the blocked cache must be fresh,
+    /// there must be no cached local blockers, and there must be no external
+    /// blocking dependencies that could create command-only blocked rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blocked-cache stale marker cannot be read.
+    pub fn may_have_blocked_command_results(&self) -> Result<bool> {
+        if self.blocked_cache_marked_stale()? {
+            return Ok(true);
+        }
+
+        let rows = match self.conn.query(
+            "SELECT
+                 EXISTS(SELECT 1 FROM blocked_issues_cache LIMIT 1),
+                 EXISTS(
+                     SELECT 1
+                     FROM dependencies INDEXED BY idx_dependencies_depends_on
+                     WHERE depends_on_id >= 'external:'
+                       AND depends_on_id < 'external;'
+                       AND type IN ('blocks', 'conditional-blocks', 'waits-for')
+                     LIMIT 1
+                 ),
+                 EXISTS(
+                     SELECT 1
+                     FROM dependencies d INDEXED BY idx_dependencies_issue
+                     JOIN issues p ON d.depends_on_id = p.id
+                     WHERE d.issue_id >= 'external:'
+                       AND d.issue_id < 'external;'
+                       AND d.type = 'parent-child'
+                       AND p.issue_type = 'epic'
+                     LIMIT 1
+                 )",
+        ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "Blocked command candidate probe failed; falling back to full query"
+                );
+                return Ok(true);
+            }
+        };
+
+        let Some(row) = rows.first() else {
+            return Ok(true);
+        };
+        Ok(
+            row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0) != 0
+                || row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0) != 0
+                || row.get(2).and_then(SqliteValue::as_integer).unwrap_or(0) != 0,
+        )
+    }
+
     /// Check if the project has any external dependencies.
     ///
     /// # Errors
     ///
     /// Returns an error if the dependency probe query fails.
     pub fn has_external_dependencies(&self, blocking_only: bool) -> Result<bool> {
-        let sql = if blocking_only {
+        // `external;` is the next ASCII boundary after the `external:` prefix,
+        // making the range equivalent to LIKE 'external:%' under SQLite's
+        // default binary TEXT collation while staying index-friendly.
+        let target_sql = if blocking_only {
             "SELECT 1
-             FROM dependencies
-             WHERE (depends_on_id LIKE 'external:%'
-                    AND type IN ('blocks', 'conditional-blocks', 'waits-for'))
-                OR (issue_id LIKE 'external:%' AND type = 'parent-child')
+             FROM dependencies INDEXED BY idx_dependencies_depends_on
+             WHERE depends_on_id >= 'external:'
+               AND depends_on_id < 'external;'
+               AND type IN ('blocks', 'conditional-blocks', 'waits-for')
              LIMIT 1"
         } else {
             "SELECT 1
-             FROM dependencies
-             WHERE depends_on_id LIKE 'external:%'
-                OR (issue_id LIKE 'external:%' AND type = 'parent-child')
+             FROM dependencies INDEXED BY idx_dependencies_depends_on
+             WHERE depends_on_id >= 'external:'
+               AND depends_on_id < 'external;'
              LIMIT 1"
         };
-        let rows = self.conn.query(sql)?;
+        let rows = self.conn.query(target_sql)?;
+        if !rows.is_empty() {
+            return Ok(true);
+        }
+
+        let parent_sql = if blocking_only {
+            "SELECT 1
+             FROM dependencies d INDEXED BY idx_dependencies_issue
+             JOIN issues p ON d.depends_on_id = p.id
+             WHERE d.issue_id >= 'external:'
+               AND d.issue_id < 'external;'
+               AND d.type = 'parent-child'
+               AND p.issue_type = 'epic'
+             LIMIT 1"
+        } else {
+            "SELECT 1
+             FROM dependencies INDEXED BY idx_dependencies_issue
+             WHERE issue_id >= 'external:'
+               AND issue_id < 'external;'
+               AND type = 'parent-child'
+             LIMIT 1"
+        };
+        let rows = self.conn.query(parent_sql)?;
         Ok(!rows.is_empty())
     }
 
@@ -4133,12 +6825,16 @@ impl SqliteStorage {
             }
         }
 
-        // 2. Local parents blocked by external children
+        // 2. Local epic parents blocked by external children. This mirrors
+        // `load_local_open_child_blockers_impl`: child-open rollup is an epic
+        // aggregation rule, not a property of every parent-child edge.
         let rows = self.conn.query(
-            "SELECT depends_on_id, issue_id
-             FROM dependencies
-             WHERE issue_id LIKE 'external:%'
-               AND type = 'parent-child'",
+            "SELECT d.depends_on_id, d.issue_id
+             FROM dependencies d
+             JOIN issues p ON d.depends_on_id = p.id
+             WHERE d.issue_id LIKE 'external:%'
+               AND d.type = 'parent-child'
+               AND p.issue_type = 'epic'",
         )?;
 
         for row in &rows {
@@ -4197,10 +6893,12 @@ impl SqliteStorage {
             }
         }
 
-        Ok(blockers
-            .into_iter()
-            .map(|(k, v)| (k, v.into_iter().collect()))
-            .collect())
+        for refs in blockers.values_mut() {
+            refs.sort();
+            refs.dedup();
+        }
+
+        Ok(blockers)
     }
 
     fn list_external_dependency_ids(&self, blocking_only: bool) -> Result<HashSet<String>> {
@@ -4211,10 +6909,12 @@ impl SqliteStorage {
              WHERE depends_on_id LIKE 'external:%'
                AND type IN ('blocks', 'conditional-blocks', 'waits-for')
              UNION
-             SELECT DISTINCT issue_id
-             FROM dependencies
-             WHERE issue_id LIKE 'external:%'
-               AND type = 'parent-child'"
+             SELECT DISTINCT d.issue_id
+             FROM dependencies d
+             JOIN issues p ON d.depends_on_id = p.id
+             WHERE d.issue_id LIKE 'external:%'
+               AND d.type = 'parent-child'
+               AND p.issue_type = 'epic'"
         } else {
             "SELECT DISTINCT depends_on_id
              FROM dependencies
@@ -4313,6 +7013,82 @@ impl SqliteStorage {
         }
 
         Ok(())
+    }
+
+    fn canonical_standard_dependency_type(dep_type: &str) -> Option<&'static str> {
+        match dep_type.to_ascii_lowercase().as_str() {
+            "blocks" => Some("blocks"),
+            "parent-child" => Some("parent-child"),
+            "conditional-blocks" => Some("conditional-blocks"),
+            "waits-for" => Some("waits-for"),
+            "related" => Some("related"),
+            "discovered-from" => Some("discovered-from"),
+            "replies-to" => Some("replies-to"),
+            "relates-to" => Some("relates-to"),
+            "duplicates" => Some("duplicates"),
+            "supersedes" => Some("supersedes"),
+            "caused-by" => Some("caused-by"),
+            _ => None,
+        }
+    }
+
+    fn validate_new_parent_child_parent_in_tx(
+        conn: &Connection,
+        issue_id: &str,
+        depends_on_id: &str,
+    ) -> Result<bool> {
+        let existing_parent = conn
+            .query_with_params(
+                "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type COLLATE NOCASE = 'parent-child' ORDER BY rowid ASC LIMIT 1",
+                &[SqliteValue::from(issue_id)],
+            )?
+            .first()
+            .and_then(|row| row.get(0).and_then(SqliteValue::as_text))
+            .map(str::to_string);
+
+        match existing_parent {
+            Some(existing_parent) if existing_parent == depends_on_id => Ok(false),
+            Some(existing_parent) => Err(BeadsError::Validation {
+                field: "depends_on_id".to_string(),
+                reason: format!(
+                    "issue {issue_id} already has parent {existing_parent}; clear or replace the existing parent before adding {depends_on_id}"
+                ),
+            }),
+            None => Ok(true),
+        }
+    }
+
+    fn existing_dependency_targets_for_issue_ids(
+        conn: &Connection,
+        issue_ids: &[&str],
+    ) -> Result<HashMap<String, HashSet<String>>> {
+        let mut targets_by_issue_id: HashMap<String, HashSet<String>> = HashMap::new();
+        for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "SELECT issue_id, depends_on_id FROM dependencies WHERE issue_id IN ({})",
+                placeholders.join(",")
+            );
+            let params: Vec<SqliteValue> = chunk
+                .iter()
+                .map(|issue_id| SqliteValue::from(*issue_id))
+                .collect();
+            let rows = conn.query_with_params(&sql, &params)?;
+            for row in &rows {
+                let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                let Some(depends_on_id) = row.get(1).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                targets_by_issue_id
+                    .entry(issue_id.to_string())
+                    .or_default()
+                    .insert(depends_on_id.to_string());
+            }
+        }
+
+        Ok(targets_by_issue_id)
     }
 
     /// Find issue IDs that end with the given hash substring.
@@ -4465,17 +7241,26 @@ impl SqliteStorage {
             });
         }
 
-        let metadata = if let Some(metadata) = metadata {
-            serde_json::from_str::<serde_json::Value>(metadata).map_err(|err| {
-                BeadsError::Validation {
-                    field: "metadata".to_string(),
-                    reason: format!("dependency metadata must be valid JSON: {err}"),
-                }
-            })?;
-            metadata
-        } else {
-            "{}"
+        // Tolerate a degenerate empty/whitespace-only metadata string the same
+        // way JSONL deserialization does: treat it as absent rather than
+        // rejecting it as invalid JSON.
+        let metadata = match metadata {
+            Some(metadata) if !metadata.trim().is_empty() => {
+                serde_json::from_str::<serde_json::Value>(metadata).map_err(|err| {
+                    BeadsError::Validation {
+                        field: "metadata".to_string(),
+                        reason: format!(
+                            "dependency metadata must be valid JSON for {issue_id} -> \
+                             {depends_on_id} (type={dep_type}); found {metadata:?}: {err}"
+                        ),
+                    }
+                })?;
+                metadata
+            }
+            _ => "{}",
         };
+
+        let dep_type = Self::canonical_standard_dependency_type(dep_type).unwrap_or(dep_type);
 
         Self::validate_parent_child_endpoints(issue_id, depends_on_id, dep_type)?;
 
@@ -4496,18 +7281,10 @@ impl SqliteStorage {
             }
             Self::ensure_dependency_target_exists_in_tx(conn, depends_on_id)?;
 
-            // Cycle check runs INSIDE the transaction (BEGIN IMMEDIATE) to
-            // prevent TOCTOU races where a concurrent writer could insert an
-            // edge between our check and our INSERT.
-            if let Ok(dt) = dep_type.parse::<DependencyType>()
-                && dt.is_blocking()
-                && Self::check_cycle(conn, issue_id, depends_on_id, true)?
+            if dep_type == "parent-child"
+                && !Self::validate_new_parent_child_parent_in_tx(conn, issue_id, depends_on_id)?
             {
-                return Err(BeadsError::DependencyCycle {
-                    path: format!(
-                        "Adding dependency {issue_id} -> {depends_on_id} would create a cycle"
-                    ),
-                });
+                return Ok(false);
             }
 
             let existing = conn.query_with_params(
@@ -4519,6 +7296,25 @@ impl SqliteStorage {
             )?;
             if !existing.is_empty() {
                 return Ok(false);
+            }
+
+            // Cycle check runs INSIDE the transaction (BEGIN IMMEDIATE) to
+            // prevent TOCTOU races where a concurrent writer could insert an
+            // edge between our check and our INSERT.
+            if let Ok(dt) = dep_type.parse::<DependencyType>()
+                && Self::check_dependency_cycle_for_type(
+                    conn,
+                    issue_id,
+                    depends_on_id,
+                    &dt,
+                    true,
+                )?
+            {
+                return Err(BeadsError::DependencyCycle {
+                    path: format!(
+                        "Adding dependency {issue_id} -> {depends_on_id} would create a cycle"
+                    ),
+                });
             }
 
             let inserted = conn.execute_with_params(
@@ -4560,6 +7356,195 @@ impl SqliteStorage {
             ctx.invalidate_cache_deferred();
 
             Ok(true)
+        })
+    }
+
+    /// Add already-resolved import dependencies in one storage mutation.
+    ///
+    /// This is intentionally narrower than the interactive `dep add` path:
+    /// callers must have resolved user-facing references and must not attach
+    /// metadata. The method still validates endpoints, parent-child uniqueness,
+    /// and the complete proposed blocking graph before inserting anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any dependency is invalid, would create a cycle, or
+    /// the database update fails.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn add_dependencies_bulk_for_import(
+        &mut self,
+        dependencies: &[BulkDependencyInsert],
+        actor: &str,
+    ) -> Result<usize> {
+        if dependencies.is_empty() {
+            return Ok(0);
+        }
+
+        self.mutate("add_dependencies_bulk_for_import", actor, |conn, ctx| {
+            let mut unique_dependencies: Vec<(&BulkDependencyInsert, String)> = Vec::new();
+            let mut seen_edges = HashSet::new();
+            let mut proposed_parents: HashMap<&str, &str> = HashMap::new();
+            let mut source_issue_ids: Vec<&str> = dependencies
+                .iter()
+                .map(|dep| dep.issue_id.as_str())
+                .collect();
+            source_issue_ids.sort_unstable();
+            source_issue_ids.dedup();
+            let existing_targets =
+                Self::existing_dependency_targets_for_issue_ids(conn, &source_issue_ids)?;
+
+            for dep in dependencies {
+                if dep.issue_id == dep.depends_on_id {
+                    return Err(BeadsError::SelfDependency {
+                        id: dep.issue_id.clone(),
+                    });
+                }
+
+                let dep_type = Self::canonical_standard_dependency_type(&dep.dep_type)
+                    .unwrap_or(dep.dep_type.as_str())
+                    .to_string();
+                Self::validate_parent_child_endpoints(
+                    &dep.issue_id,
+                    &dep.depends_on_id,
+                    &dep_type,
+                )?;
+
+                match Self::issue_status_in_tx(conn, &dep.issue_id)? {
+                    Some(Status::Tombstone) => {
+                        return Err(BeadsError::Validation {
+                            field: "issue_id".to_string(),
+                            reason: format!(
+                                "cannot add dependency from tombstone issue: {}",
+                                dep.issue_id
+                            ),
+                        });
+                    }
+                    Some(_) => {}
+                    None => {
+                        return Err(BeadsError::IssueNotFound {
+                            id: dep.issue_id.clone(),
+                        });
+                    }
+                }
+                Self::ensure_dependency_target_exists_in_tx(conn, &dep.depends_on_id)?;
+
+                if existing_targets
+                    .get(dep.issue_id.as_str())
+                    .is_some_and(|targets| targets.contains(dep.depends_on_id.as_str()))
+                {
+                    continue;
+                }
+
+                if dep_type == "parent-child" {
+                    match proposed_parents.get(dep.issue_id.as_str()) {
+                        Some(existing_parent)
+                            if *existing_parent != dep.depends_on_id.as_str() =>
+                        {
+                            return Err(BeadsError::Validation {
+                                field: "depends_on_id".to_string(),
+                                reason: format!(
+                                    "issue {} has multiple imported parents: {existing_parent} and {}",
+                                    dep.issue_id, dep.depends_on_id
+                                ),
+                            });
+                        }
+                        Some(_) => {}
+                        None => {
+                            proposed_parents
+                                .insert(dep.issue_id.as_str(), dep.depends_on_id.as_str());
+                        }
+                    }
+                    if !Self::validate_new_parent_child_parent_in_tx(
+                        conn,
+                        &dep.issue_id,
+                        &dep.depends_on_id,
+                    )? {
+                        continue;
+                    }
+                }
+
+                if seen_edges.insert((dep.issue_id.clone(), dep.depends_on_id.clone())) {
+                    unique_dependencies.push((dep, dep_type));
+                }
+            }
+
+            let mut graph = Self::load_dependency_cycle_graph_from_conn(conn, true)?;
+            for (dep, dep_type) in &unique_dependencies {
+                let Ok(parsed_type) = dep_type.parse::<DependencyType>() else {
+                    continue;
+                };
+                if !parsed_type.is_blocking() {
+                    continue;
+                }
+
+                let (from, to) = if dep_type == "parent-child" {
+                    (dep.depends_on_id.clone(), dep.issue_id.clone())
+                } else {
+                    (dep.issue_id.clone(), dep.depends_on_id.clone())
+                };
+                graph.entry(to.clone()).or_default();
+                graph.entry(from).or_default().push(to);
+            }
+            for neighbors in graph.values_mut() {
+                neighbors.sort();
+                neighbors.dedup();
+            }
+            if let Some(cycle) = Self::cycle_witnesses_from_graph(&graph).into_iter().next() {
+                return Err(BeadsError::DependencyCycle {
+                    path: cycle.join(" -> "),
+                });
+            }
+
+            let now = Utc::now().to_rfc3339();
+            let mut inserted_count = 0;
+            let mut touched_issue_ids = HashSet::new();
+
+            for (dep, dep_type) in unique_dependencies {
+                let inserted = conn.execute_with_params(
+                    "INSERT OR IGNORE INTO dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata)
+                     VALUES (?, ?, ?, ?, ?, ?)",
+                    &[
+                        SqliteValue::from(dep.issue_id.as_str()),
+                        SqliteValue::from(dep.depends_on_id.as_str()),
+                        SqliteValue::from(dep_type.as_str()),
+                        SqliteValue::from(now.as_str()),
+                        SqliteValue::from(actor),
+                        SqliteValue::from("{}"),
+                    ],
+                )?;
+
+                if inserted == 0 {
+                    continue;
+                }
+
+                inserted_count += 1;
+                touched_issue_ids.insert(dep.issue_id.clone());
+                ctx.record_event(
+                    EventType::DependencyAdded,
+                    &dep.issue_id,
+                    Some(format!(
+                        "Added dependency on {} ({})",
+                        dep.depends_on_id, dep_type
+                    )),
+                );
+                ctx.mark_dirty(&dep.issue_id);
+            }
+
+            for issue_id in &touched_issue_ids {
+                conn.execute_with_params(
+                    "UPDATE issues SET updated_at = ? WHERE id = ?",
+                    &[
+                        SqliteValue::from(now.as_str()),
+                        SqliteValue::from(issue_id.as_str()),
+                    ],
+                )?;
+            }
+
+            if inserted_count > 0 {
+                ctx.invalidate_cache_deferred();
+            }
+
+            Ok(inserted_count)
         })
     }
 
@@ -4680,14 +7665,17 @@ impl SqliteStorage {
     /// Returns an error if the database update fails.
     pub fn remove_parent(&mut self, issue_id: &str, actor: &str) -> Result<bool> {
         self.mutate("remove_parent", actor, |conn, ctx| {
-            let previous_parent = conn
-                .query_with_params(
-                    "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type = 'parent-child' LIMIT 1",
-                    &[SqliteValue::from(issue_id)],
-                )?
-                .first()
-                .and_then(|row| row.get(0).and_then(SqliteValue::as_text))
-                .map(str::to_string);
+            Self::ensure_issue_mutable_in_tx(conn, issue_id, "clear parent from")?;
+
+            let previous_parent_rows = conn.query_with_params(
+                "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type = 'parent-child' ORDER BY rowid ASC",
+                &[SqliteValue::from(issue_id)],
+            )?;
+            let previous_parents = previous_parent_rows
+                .iter()
+                .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_string))
+                .collect::<Vec<_>>();
+
             let rows = conn.execute_with_params(
                 "DELETE FROM dependencies WHERE issue_id = ? AND type = 'parent-child'",
                 &[SqliteValue::from(issue_id)],
@@ -4709,8 +7697,11 @@ impl SqliteStorage {
                 );
                 ctx.mark_dirty(issue_id);
                 let mut cache_ids = vec![issue_id];
-                if let Some(parent_id) = previous_parent.as_deref() {
-                    cache_ids.push(parent_id);
+                for previous_parent in &previous_parents {
+                    let previous_parent = previous_parent.as_str();
+                    if !cache_ids.contains(&previous_parent) {
+                        cache_ids.push(previous_parent);
+                    }
                 }
                 ctx.invalidate_cache_for(&cache_ids);
             }
@@ -4753,14 +7744,21 @@ impl SqliteStorage {
             };
             Self::ensure_issue_mutable_in_tx(conn, issue_id, action)?;
 
-            let previous_parent = conn
-                .query_with_params(
-                    "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type = 'parent-child' LIMIT 1",
-                    &[SqliteValue::from(issue_id)],
-                )?
-                .first()
-                .and_then(|row| row.get(0).and_then(SqliteValue::as_text))
-                .map(str::to_string);
+            let previous_parent_rows = conn.query_with_params(
+                "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type = 'parent-child' ORDER BY rowid ASC",
+                &[SqliteValue::from(issue_id)],
+            )?;
+            let previous_parents = previous_parent_rows
+                .iter()
+                .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_string))
+                .collect::<Vec<_>>();
+
+            if previous_parents.len() == usize::from(parent_id.is_some())
+                && previous_parents.first().map(String::as_str) == parent_id
+            {
+                return Ok(());
+            }
+
             // Remove existing parent
             conn.execute_with_params(
                 "DELETE FROM dependencies WHERE issue_id = ? AND type = 'parent-child'",
@@ -4777,7 +7775,7 @@ impl SqliteStorage {
                 Self::validate_parent_child_endpoints(issue_id, pid, "parent-child")?;
                 Self::ensure_dependency_target_exists_in_tx(conn, pid)?;
 
-                if Self::check_cycle(conn, issue_id, pid, true)? {
+                if Self::check_parent_child_cycle(conn, issue_id, pid, true)? {
                     return Err(BeadsError::DependencyCycle {
                         path: format!("Setting parent of {issue_id} to {pid} would create a cycle"),
                     });
@@ -4820,10 +7818,15 @@ impl SqliteStorage {
                 ctx.invalidate_cache_deferred();
             } else {
                 let mut cache_ids = vec![issue_id];
-                if let Some(parent_id) = previous_parent.as_deref() {
-                    cache_ids.push(parent_id);
+                for previous_parent in &previous_parents {
+                    let previous_parent = previous_parent.as_str();
+                    if !cache_ids.contains(&previous_parent) {
+                        cache_ids.push(previous_parent);
+                    }
                 }
-                if let Some(parent_id) = parent_id {
+                if let Some(parent_id) = parent_id
+                    && !cache_ids.contains(&parent_id)
+                {
                     cache_ids.push(parent_id);
                 }
                 ctx.invalidate_cache_for(&cache_ids);
@@ -4838,6 +7841,8 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn add_label(&mut self, issue_id: &str, label: &str, actor: &str) -> Result<bool> {
+        validate_storage_label(label)?;
+
         self.mutate("add_label", actor, |conn, ctx| {
             match Self::issue_status_in_tx(conn, issue_id)? {
                 Some(Status::Tombstone) => {
@@ -4864,6 +7869,19 @@ impl SqliteStorage {
                 return Ok(false);
             }
 
+            let row = conn.query_row_with_params(
+                "SELECT count(*) FROM labels WHERE issue_id = ?",
+                &[SqliteValue::from(issue_id)],
+            )?;
+            let label_count = row
+                .get(0)
+                .and_then(SqliteValue::as_integer)
+                .and_then(|count| usize::try_from(count).ok())
+                .unwrap_or(usize::MAX);
+            if label_count >= ISSUE_LABEL_MAX_COUNT {
+                return Err(label_count_error());
+            }
+
             conn.execute_with_params(
                 "INSERT INTO labels (issue_id, label) VALUES (?, ?)",
                 &[SqliteValue::from(issue_id), SqliteValue::from(label)],
@@ -4888,12 +7906,207 @@ impl SqliteStorage {
         })
     }
 
+    /// Add one label to many issues in a single storage mutation.
+    ///
+    /// Returns the set of issue IDs that actually gained the label. IDs that
+    /// already had the label remain idempotent no-ops, matching [`Self::add_label`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any target issue is missing, tombstoned, or would
+    /// exceed the per-issue label limit.
+    #[allow(clippy::too_many_lines)]
+    pub fn add_label_to_issues_bulk(
+        &mut self,
+        issue_ids: &[String],
+        label: &str,
+        actor: &str,
+    ) -> Result<HashSet<String>> {
+        validate_storage_label(label)?;
+        if issue_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let unique_issue_ids = dedupe_preserving_order(issue_ids);
+
+        self.mutate("add_label_to_issues_bulk", actor, |conn, ctx| {
+            let mut changed_ids = HashSet::new();
+            let now_str = Utc::now().to_rfc3339();
+
+            // The existing-label probe binds one label plus every issue id, so
+            // reserve one parameter slot for the label value.
+            for chunk in unique_issue_ids.chunks(SQLITE_VAR_LIMIT - 1) {
+                let placeholders = vec!["?"; chunk.len()];
+                let params = chunk
+                    .iter()
+                    .map(|id| SqliteValue::from(id.as_str()))
+                    .collect::<Vec<_>>();
+                let rows = conn.query_with_params(
+                    &format!(
+                        "SELECT id, status FROM issues WHERE id IN ({})",
+                        placeholders.join(",")
+                    ),
+                    &params,
+                )?;
+                let mut statuses = HashMap::with_capacity(rows.len());
+                for row in &rows {
+                    let id = row
+                        .get(0)
+                        .and_then(SqliteValue::as_text)
+                        .ok_or_else(|| {
+                            BeadsError::Config(
+                                "issues row missing id during bulk label add".to_string(),
+                            )
+                        })?
+                        .to_string();
+                    let status = row
+                        .get(1)
+                        .and_then(SqliteValue::as_text)
+                        .ok_or_else(|| {
+                            BeadsError::Config(format!(
+                                "issues row missing status during bulk label add for {id}"
+                            ))
+                        })?;
+                    statuses.insert(id, Status::from_str(status)?);
+                }
+
+                for issue_id in chunk {
+                    match statuses.get(issue_id) {
+                        Some(Status::Tombstone) => {
+                            return Err(BeadsError::Validation {
+                                field: "issue_id".to_string(),
+                                reason: format!(
+                                    "cannot add label to tombstone issue: {issue_id}"
+                                ),
+                            });
+                        }
+                        Some(_) => {}
+                        None => {
+                            return Err(BeadsError::IssueNotFound {
+                                id: issue_id.clone(),
+                            });
+                        }
+                    }
+                }
+
+                let mut label_params = Vec::with_capacity(chunk.len() + 1);
+                label_params.push(SqliteValue::from(label));
+                label_params.extend(chunk.iter().map(|id| SqliteValue::from(id.as_str())));
+                let existing_rows = conn.query_with_params(
+                    &format!(
+                        "SELECT issue_id FROM labels WHERE label = ? AND issue_id IN ({})",
+                        placeholders.join(",")
+                    ),
+                    &label_params,
+                )?;
+                let existing_ids = existing_rows
+                    .iter()
+                    .filter_map(|row| {
+                        row.get(0)
+                            .and_then(SqliteValue::as_text)
+                            .map(ToString::to_string)
+                    })
+                    .collect::<HashSet<_>>();
+                let missing_ids = chunk
+                    .iter()
+                    .filter(|issue_id| !existing_ids.contains(issue_id.as_str()))
+                    .collect::<Vec<_>>();
+
+                if missing_ids.is_empty() {
+                    continue;
+                }
+
+                let missing_placeholders = vec!["?"; missing_ids.len()];
+                let missing_params = missing_ids
+                    .iter()
+                    .map(|id| SqliteValue::from(id.as_str()))
+                    .collect::<Vec<_>>();
+                let count_rows = conn.query_with_params(
+                    &format!(
+                        "SELECT issue_id, COUNT(*) FROM labels WHERE issue_id IN ({}) GROUP BY issue_id",
+                        missing_placeholders.join(",")
+                    ),
+                    &missing_params,
+                )?;
+                let mut label_counts = HashMap::with_capacity(count_rows.len());
+                for row in &count_rows {
+                    let issue_id = row
+                        .get(0)
+                        .and_then(SqliteValue::as_text)
+                        .ok_or_else(|| {
+                            BeadsError::Config(
+                                "labels row missing issue_id during bulk label add".to_string(),
+                            )
+                        })?
+                        .to_string();
+                    let count = row
+                        .get(1)
+                        .and_then(SqliteValue::as_integer)
+                        .and_then(|count| usize::try_from(count).ok())
+                        .unwrap_or(0);
+                    label_counts.insert(issue_id, count);
+                }
+
+                for issue_id in &missing_ids {
+                    if label_counts
+                        .get(issue_id.as_str())
+                        .copied()
+                        .unwrap_or(0)
+                        >= ISSUE_LABEL_MAX_COUNT
+                    {
+                        return Err(label_count_error());
+                    }
+                }
+
+                for issue_id in &missing_ids {
+                    conn.execute_with_params(
+                        "INSERT INTO labels (issue_id, label) VALUES (?, ?)",
+                        &[
+                            SqliteValue::from(issue_id.as_str()),
+                            SqliteValue::from(label),
+                        ],
+                    )?;
+
+                    ctx.record_event(
+                        EventType::LabelAdded,
+                        issue_id,
+                        Some(format!("Added label {label}")),
+                    );
+                    ctx.mark_dirty(issue_id);
+                    changed_ids.insert((*issue_id).clone());
+                }
+
+                for update_chunk in missing_ids.chunks(SQLITE_VAR_LIMIT - 1) {
+                    let update_placeholders = vec!["?"; update_chunk.len()];
+                    let mut update_params = Vec::with_capacity(update_chunk.len() + 1);
+                    update_params.push(SqliteValue::from(now_str.as_str()));
+                    update_params.extend(
+                        update_chunk
+                            .iter()
+                            .map(|issue_id| SqliteValue::from(issue_id.as_str())),
+                    );
+                    conn.execute_with_params(
+                        &format!(
+                            "UPDATE issues SET updated_at = ? WHERE id IN ({})",
+                            update_placeholders.join(",")
+                        ),
+                        &update_params,
+                    )?;
+                }
+            }
+
+            Ok(changed_ids)
+        })
+    }
+
     /// Remove a label from an issue.
     ///
     /// # Errors
     ///
     /// Returns an error if the database update fails.
     pub fn remove_label(&mut self, issue_id: &str, label: &str, actor: &str) -> Result<bool> {
+        validate_storage_label(label)?;
+
         self.mutate("remove_label", actor, |conn, ctx| {
             match Self::issue_status_in_tx(conn, issue_id)? {
                 Some(Status::Tombstone) => {
@@ -4933,6 +8146,161 @@ impl SqliteStorage {
             }
 
             Ok(rows > 0)
+        })
+    }
+
+    /// Remove one label from many issues in a single storage mutation.
+    ///
+    /// Returns the set of issue IDs that actually lost the label. IDs that did
+    /// not have the label remain idempotent no-ops, matching [`Self::remove_label`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any target issue is missing or tombstoned.
+    #[allow(clippy::too_many_lines)]
+    pub fn remove_label_from_issues_bulk(
+        &mut self,
+        issue_ids: &[String],
+        label: &str,
+        actor: &str,
+    ) -> Result<HashSet<String>> {
+        validate_storage_label(label)?;
+        if issue_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let unique_issue_ids = dedupe_preserving_order(issue_ids);
+
+        self.mutate("remove_label_from_issues_bulk", actor, |conn, ctx| {
+            let mut changed_ids = HashSet::new();
+            let now_str = Utc::now().to_rfc3339();
+
+            // Label lookups/deletes bind one label plus every issue id, so
+            // reserve one parameter slot for the label value.
+            for chunk in unique_issue_ids.chunks(SQLITE_VAR_LIMIT - 1) {
+                let placeholders = vec!["?"; chunk.len()];
+                let params = chunk
+                    .iter()
+                    .map(|id| SqliteValue::from(id.as_str()))
+                    .collect::<Vec<_>>();
+                let rows = conn.query_with_params(
+                    &format!(
+                        "SELECT id, status FROM issues WHERE id IN ({})",
+                        placeholders.join(",")
+                    ),
+                    &params,
+                )?;
+                let mut statuses = HashMap::with_capacity(rows.len());
+                for row in &rows {
+                    let id = row
+                        .get(0)
+                        .and_then(SqliteValue::as_text)
+                        .ok_or_else(|| {
+                            BeadsError::Config(
+                                "issues row missing id during bulk label remove".to_string(),
+                            )
+                        })?
+                        .to_string();
+                    let status = row.get(1).and_then(SqliteValue::as_text).ok_or_else(|| {
+                        BeadsError::Config(format!(
+                            "issues row missing status during bulk label remove for {id}"
+                        ))
+                    })?;
+                    statuses.insert(id, Status::from_str(status)?);
+                }
+
+                for issue_id in chunk {
+                    match statuses.get(issue_id) {
+                        Some(Status::Tombstone) => {
+                            return Err(BeadsError::Validation {
+                                field: "issue_id".to_string(),
+                                reason: format!(
+                                    "cannot remove label from tombstone issue: {issue_id}"
+                                ),
+                            });
+                        }
+                        Some(_) => {}
+                        None => {
+                            return Err(BeadsError::IssueNotFound {
+                                id: issue_id.clone(),
+                            });
+                        }
+                    }
+                }
+
+                let mut label_params = Vec::with_capacity(chunk.len() + 1);
+                label_params.push(SqliteValue::from(label));
+                label_params.extend(chunk.iter().map(|id| SqliteValue::from(id.as_str())));
+                let existing_rows = conn.query_with_params(
+                    &format!(
+                        "SELECT issue_id FROM labels WHERE label = ? AND issue_id IN ({})",
+                        placeholders.join(",")
+                    ),
+                    &label_params,
+                )?;
+                let removable_ids = existing_rows
+                    .iter()
+                    .filter_map(|row| {
+                        row.get(0)
+                            .and_then(SqliteValue::as_text)
+                            .map(ToString::to_string)
+                    })
+                    .collect::<HashSet<_>>();
+
+                if removable_ids.is_empty() {
+                    continue;
+                }
+
+                let removable_ids = chunk
+                    .iter()
+                    .filter(|issue_id| removable_ids.contains(issue_id.as_str()))
+                    .collect::<Vec<_>>();
+                let remove_placeholders = vec!["?"; removable_ids.len()];
+                let mut remove_params = Vec::with_capacity(removable_ids.len() + 1);
+                remove_params.push(SqliteValue::from(label));
+                remove_params.extend(
+                    removable_ids
+                        .iter()
+                        .map(|issue_id| SqliteValue::from(issue_id.as_str())),
+                );
+                conn.execute_with_params(
+                    &format!(
+                        "DELETE FROM labels WHERE label = ? AND issue_id IN ({})",
+                        remove_placeholders.join(",")
+                    ),
+                    &remove_params,
+                )?;
+
+                for issue_id in &removable_ids {
+                    ctx.record_event(
+                        EventType::LabelRemoved,
+                        issue_id,
+                        Some(format!("Removed label {label}")),
+                    );
+                    ctx.mark_dirty(issue_id);
+                    changed_ids.insert((*issue_id).clone());
+                }
+
+                for update_chunk in removable_ids.chunks(SQLITE_VAR_LIMIT - 1) {
+                    let update_placeholders = vec!["?"; update_chunk.len()];
+                    let mut update_params = Vec::with_capacity(update_chunk.len() + 1);
+                    update_params.push(SqliteValue::from(now_str.as_str()));
+                    update_params.extend(
+                        update_chunk
+                            .iter()
+                            .map(|issue_id| SqliteValue::from(issue_id.as_str())),
+                    );
+                    conn.execute_with_params(
+                        &format!(
+                            "UPDATE issues SET updated_at = ? WHERE id IN ({})",
+                            update_placeholders.join(",")
+                        ),
+                        &update_params,
+                    )?;
+                }
+            }
+
+            Ok(changed_ids)
         })
     }
 
@@ -4990,6 +8358,7 @@ impl SqliteStorage {
                 .collect();
             let old_labels = dedupe_preserving_order(&old_labels_raw);
             let desired_labels = dedupe_preserving_order(labels);
+            validate_storage_labels(&desired_labels)?;
 
             let old_matches_desired = old_labels.len() == desired_labels.len()
                 && old_labels
@@ -5100,9 +8469,9 @@ impl SqliteStorage {
         &self,
         issue_ids: &[String],
     ) -> Result<HashMap<String, Vec<String>>> {
-        // Keep chunks small to avoid fsqlite MemDatabase root-page collisions
-        // when ephemeral tables from earlier chunks conflict with real pager pages.
-        const SQLITE_VAR_LIMIT: usize = 200;
+        // Stay below SQLite's common 999-variable ceiling while keeping the
+        // default scheduler candidate window to one evidence-loading round trip.
+        const SQLITE_VAR_LIMIT: usize = 900;
 
         if issue_ids.is_empty() {
             return Ok(HashMap::new());
@@ -5171,6 +8540,33 @@ impl SqliteStorage {
         Ok(map)
     }
 
+    /// Get all raw label rows without ordering or grouping.
+    ///
+    /// Use this for aggregate callers that do their own counting and do not
+    /// need export-stable ordering.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub(crate) fn list_label_pairs_unordered(&self) -> Result<Vec<(String, String)>> {
+        let rows = self.conn.query("SELECT issue_id, label FROM labels")?;
+        let mut pairs = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let issue_id = row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string();
+            let label = row
+                .get(1)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string();
+            pairs.push((issue_id, label));
+        }
+        Ok(pairs)
+    }
+
     /// Get labels plus dependency/dependent counts for every issue that has any
     /// list relation metadata.
     ///
@@ -5189,15 +8585,11 @@ impl SqliteStorage {
             .query("SELECT issue_id, label FROM labels ORDER BY issue_id, label")?;
         let dependency_rows = self
             .conn
-            .query("SELECT issue_id, COUNT(*) FROM dependencies GROUP BY issue_id")?;
-        let dependent_rows = self
-            .conn
-            .query("SELECT depends_on_id, COUNT(*) FROM dependencies GROUP BY depends_on_id")?;
+            .query("SELECT issue_id, depends_on_id FROM dependencies")?;
 
         let capacity = label_rows
             .len()
-            .saturating_add(dependency_rows.len())
-            .saturating_add(dependent_rows.len());
+            .saturating_add(dependency_rows.len().saturating_mul(2));
         let mut map: HashMap<String, ListRelationMetadata> = HashMap::with_capacity(capacity);
 
         for row in &label_rows {
@@ -5220,23 +8612,16 @@ impl SqliteStorage {
                 .and_then(SqliteValue::as_text)
                 .unwrap_or("")
                 .to_string();
-            let count = row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0);
-            if count > 0 {
-                map.entry(issue_id).or_default().dependency_count =
-                    usize::try_from(count).unwrap_or(0);
-            }
-        }
-
-        for row in &dependent_rows {
-            let issue_id = row
-                .get(0)
+            let depends_on_id = row
+                .get(1)
                 .and_then(SqliteValue::as_text)
                 .unwrap_or("")
                 .to_string();
-            let count = row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0);
-            if count > 0 {
-                map.entry(issue_id).or_default().dependent_count =
-                    usize::try_from(count).unwrap_or(0);
+            if !issue_id.is_empty() {
+                map.entry(issue_id).or_default().dependency_count += 1;
+            }
+            if !depends_on_id.is_empty() {
+                map.entry(depends_on_id).or_default().dependent_count += 1;
             }
         }
 
@@ -5287,22 +8672,32 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_unique_labels_with_counts(&self) -> Result<Vec<(String, i64)>> {
-        let rows = self.conn.query(
-            r"SELECT l.label, COUNT(*) as count
-              FROM labels l
-              JOIN issues i ON l.issue_id = i.id
-              WHERE i.status != 'tombstone'
-              GROUP BY l.label
-              ORDER BY l.label",
-        )?;
-        Ok(rows
+        let tombstone_rows = self
+            .conn
+            .query("SELECT id FROM issues WHERE status = 'tombstone'")?;
+        let tombstone_ids: HashSet<String> = tombstone_rows
             .iter()
-            .filter_map(|r| {
-                let label = r.get(0).and_then(SqliteValue::as_text)?.to_string();
-                let count = r.get(1).and_then(SqliteValue::as_integer)?;
-                Some((label, count))
-            })
-            .collect())
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_owned))
+            .collect();
+
+        let rows = self.conn.query("SELECT label, issue_id FROM labels")?;
+        let mut counts = BTreeMap::new();
+
+        for row in &rows {
+            let Some(label) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let Some(issue_id) = row.get(1).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            if tombstone_ids.contains(issue_id) {
+                continue;
+            }
+
+            *counts.entry(label.to_string()).or_insert(0) += 1;
+        }
+
+        Ok(counts.into_iter().collect())
     }
 
     /// Rename a label across all issues.
@@ -5313,6 +8708,9 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn rename_label(&mut self, old_name: &str, new_name: &str, actor: &str) -> Result<usize> {
+        validate_storage_label(old_name)?;
+        validate_storage_label(new_name)?;
+
         if old_name == new_name {
             return Ok(0);
         }
@@ -5447,6 +8845,66 @@ impl SqliteStorage {
         Ok(map)
     }
 
+    /// Get the latest comments for multiple issues in batch.
+    ///
+    /// Rows are returned in ascending timestamp order within each issue so
+    /// callers can reuse the same presentation logic as [`Self::get_comments`]
+    /// without materializing older comments they will discard.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_latest_comments_for_issues(
+        &self,
+        issue_ids: &[String],
+        limit: usize,
+    ) -> Result<std::collections::HashMap<String, Vec<Comment>>> {
+        const SQLITE_VAR_LIMIT: usize = 899;
+        let mut map: std::collections::HashMap<String, Vec<Comment>> =
+            std::collections::HashMap::new();
+
+        if issue_ids.is_empty() || limit == 0 {
+            return Ok(map);
+        }
+
+        let row_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "SELECT id, issue_id, author, text, created_at
+                 FROM (
+                     SELECT id, issue_id, author, text, created_at,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY issue_id
+                                ORDER BY created_at DESC, id DESC
+                            ) AS row_number
+                     FROM comments
+                     WHERE issue_id IN ({})
+                 )
+                 WHERE row_number <= ?
+                 ORDER BY issue_id ASC, created_at ASC, id ASC",
+                placeholders.join(",")
+            );
+
+            let mut params: Vec<SqliteValue> = chunk
+                .iter()
+                .map(|id| SqliteValue::from(id.as_str()))
+                .collect();
+            params.push(SqliteValue::from(row_limit));
+
+            let rows = self.conn.query_with_params(&sql, &params)?;
+
+            for row in &rows {
+                let comment = comment_from_row(row)?;
+                map.entry(comment.issue_id.clone())
+                    .or_default()
+                    .push(comment);
+            }
+        }
+
+        Ok(map)
+    }
+
     /// Count how many audit events belong to an issue.
     ///
     /// # Errors
@@ -5507,7 +8965,7 @@ impl SqliteStorage {
              FROM dependencies d
              LEFT JOIN issues i ON d.depends_on_id = i.id
              WHERE d.issue_id = ?
-            ORDER BY i.priority ASC, i.created_at DESC",
+            ORDER BY COALESCE(i.priority, 2) ASC, i.created_at DESC, d.depends_on_id ASC",
             &[SqliteValue::from(issue_id)],
         )?;
 
@@ -5530,7 +8988,7 @@ impl SqliteStorage {
              FROM dependencies d
              LEFT JOIN issues i ON d.issue_id = i.id
              WHERE d.depends_on_id = ?
-            ORDER BY i.priority ASC, i.created_at DESC",
+            ORDER BY COALESCE(i.priority, 2) ASC, i.created_at DESC, d.issue_id ASC",
             &[SqliteValue::from(issue_id)],
         )?;
 
@@ -5552,7 +9010,7 @@ impl SqliteStorage {
              FROM dependencies d
              LEFT JOIN issues i ON d.issue_id = i.id
              WHERE d.type IN ('blocks', 'conditional-blocks', 'waits-for', 'parent-child')
-             ORDER BY i.priority ASC, i.created_at DESC",
+             ORDER BY COALESCE(i.priority, 2) ASC, i.created_at DESC, d.issue_id ASC",
         )?;
 
         let mut map: HashMap<String, Vec<IssueWithDependencyMetadata>> = HashMap::new();
@@ -5855,6 +9313,110 @@ impl SqliteStorage {
         Ok(map)
     }
 
+    /// Fetch reverse-dependency edges for a bounded set of blocking roots.
+    ///
+    /// Returns a map from blocker-graph root ID to dependents. Standard
+    /// dependency rows use `depends_on_id` as the root; `parent-child` rows are
+    /// reversed because parents are blocked by children.
+    /// Unlike [`Self::prefetch_blocking_dependents`], this keeps focused graph
+    /// traversals from hydrating the entire workspace dependency graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_blocking_dependents_for_issue_ids(
+        &self,
+        issue_ids: &[String],
+    ) -> Result<HashMap<String, Vec<IssueWithDependencyMetadata>>> {
+        if issue_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut map: HashMap<String, Vec<IssueWithDependencyMetadata>> = HashMap::new();
+        let chunk_size = SQLITE_VAR_LIMIT.saturating_div(2).max(1);
+        for chunk in issue_ids.chunks(chunk_size) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "SELECT root_id, dependent_id, title, status, priority, type
+                 FROM (
+                     SELECT d.depends_on_id AS root_id,
+                            d.issue_id AS dependent_id,
+                            i.title AS title,
+                            i.status AS status,
+                            i.priority AS priority,
+                            i.created_at AS created_at,
+                            d.type AS type
+                       FROM dependencies d
+                       LEFT JOIN issues i ON d.issue_id = i.id
+                      WHERE d.depends_on_id IN ({placeholders})
+                        AND d.type IN ('blocks', 'conditional-blocks', 'waits-for')
+                     UNION ALL
+                     SELECT d.issue_id AS root_id,
+                            d.depends_on_id AS dependent_id,
+                            i.title AS title,
+                            i.status AS status,
+                            i.priority AS priority,
+                            i.created_at AS created_at,
+                            d.type AS type
+                       FROM dependencies d
+                       LEFT JOIN issues i ON d.depends_on_id = i.id
+                      WHERE d.issue_id IN ({placeholders})
+                        AND d.type = 'parent-child'
+                 )
+                 ORDER BY COALESCE(priority, 2) ASC, created_at DESC, dependent_id ASC",
+                placeholders = placeholders.join(",")
+            );
+            let mut params: Vec<SqliteValue> = chunk
+                .iter()
+                .map(|issue_id| SqliteValue::from(issue_id.as_str()))
+                .collect();
+            params.extend(
+                chunk
+                    .iter()
+                    .map(|issue_id| SqliteValue::from(issue_id.as_str())),
+            );
+            let rows = self.conn.query_with_params(&sql, &params)?;
+
+            for row in &rows {
+                let Some(root_id) = row.get(0).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                let Some(dependent_id) = row.get(1).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                let dep_type = row
+                    .get(5)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or("blocks")
+                    .to_string();
+                let title = row.get(2).and_then(SqliteValue::as_text);
+                let status = row.get(3).and_then(SqliteValue::as_text);
+                let priority = row.get(4).and_then(SqliteValue::as_integer);
+
+                let meta = match (title, status, priority) {
+                    (Some(title), Some(status), Some(priority)) => IssueWithDependencyMetadata {
+                        id: dependent_id.to_string(),
+                        title: title.to_string(),
+                        status: parse_status(Some(status)),
+                        priority: Priority(i32::try_from(priority).unwrap_or(2)),
+                        dep_type,
+                    },
+                    _ => IssueWithDependencyMetadata {
+                        id: dependent_id.to_string(),
+                        title: format!("[missing issue: {dependent_id}]"),
+                        status: Status::Tombstone,
+                        priority: Priority::MEDIUM,
+                        dep_type,
+                    },
+                };
+
+                map.entry(root_id.to_string()).or_default().push(meta);
+            }
+        }
+
+        Ok(map)
+    }
+
     /// Count dependencies and dependents for multiple issues with one round-trip per chunk.
     ///
     /// # Errors
@@ -5864,10 +9426,11 @@ impl SqliteStorage {
         &self,
         issue_ids: &[String],
     ) -> Result<(HashMap<String, usize>, HashMap<String, usize>)> {
-        // Keep chunks small to avoid fsqlite MemDatabase root-page collisions
-        // when ephemeral tables from earlier chunks conflict with real pager pages.
-        // Also avoid CTE VALUES materialization which is the primary collision trigger.
-        const SQLITE_VAR_LIMIT: usize = 200;
+        // Stay below SQLite's common 999-variable ceiling while keeping the
+        // default scheduler candidate window to one evidence-loading round trip.
+        // Avoid CTE VALUES materialization, which is the primary root-page
+        // collision trigger for fsqlite's MemDatabase.
+        const SQLITE_VAR_LIMIT: usize = 900;
 
         if issue_ids.is_empty() {
             return Ok((HashMap::new(), HashMap::new()));
@@ -6118,7 +9681,7 @@ impl SqliteStorage {
                            due_at, defer_until, external_ref, source_system, source_repo,
                            deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                            compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                           pinned, is_template
+                           pinned, is_template, source_repo_path, agent_context
                     FROM issues
                     WHERE (ephemeral = 0 OR ephemeral IS NULL)
                       AND id NOT LIKE '%-wisp-%'
@@ -6534,7 +10097,7 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn get_metadata(&self, key: &str) -> Result<Option<String>> {
         match self.conn.query_row_with_params(
-            "SELECT value FROM metadata WHERE key = ?",
+            "SELECT value FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1",
             &[SqliteValue::from(key)],
         ) {
             Ok(row) => Ok(row
@@ -6612,6 +10175,23 @@ impl SqliteStorage {
             include_deferred: true,
             ..ListFilters::default()
         })
+    }
+
+    /// Check whether the project has any active issues using default
+    /// user-facing visibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn has_active_issues(&self) -> Result<bool> {
+        let rows = self.conn.query(
+            "SELECT 1
+             FROM issues
+             WHERE status NOT IN ('closed', 'tombstone')
+               AND (is_template = 0 OR is_template IS NULL)
+             LIMIT 1",
+        )?;
+        Ok(!rows.is_empty())
     }
 
     /// Get full issue details.
@@ -6765,6 +10345,13 @@ impl SqliteStorage {
             ephemeral: get_bool(33),
             pinned: get_bool(34),
             is_template: get_bool(35),
+            // Position 36 lands after `is_template` in the Full SELECT
+            // and before `bc.blocked_by` in the BlockedIssue::Full
+            // variant; the cached_blocked_by_index was bumped to 37
+            // in lock-step so the projection-specific blocked-by
+            // accessor still finds the right column.
+            source_repo_path: get_non_empty_str(36),
+            agent_context: get_non_empty_str(37),
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
@@ -6816,6 +10403,321 @@ impl SqliteStorage {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
+            deleted_at: None,
+            deleted_by: None,
+            delete_reason: None,
+            original_type: None,
+            compaction_level: None,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: None,
+            sender: None,
+            ephemeral: false,
+            pinned: false,
+            is_template: false,
+            labels: vec![],
+            dependencies: vec![],
+            comments: vec![],
+        })
+    }
+
+    fn blocked_command_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+        let get_str = |idx: usize| -> String {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string()
+        };
+        let get_non_empty_str = |idx: usize| -> Option<String> {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let get_opt_i32 = |idx: usize| -> Option<i32> {
+            row.get(idx)
+                .and_then(SqliteValue::as_integer)
+                .map(|value| value as i32)
+        };
+
+        Ok(Issue {
+            id: get_str(0),
+            content_hash: None,
+            title: get_str(1),
+            description: get_non_empty_str(2),
+            design: None,
+            acceptance_criteria: None,
+            notes: None,
+            status: parse_status(row.get(3).and_then(SqliteValue::as_text)),
+            priority: Priority(get_opt_i32(4).unwrap_or_else(|| Priority::default().0)),
+            issue_type: parse_issue_type(row.get(5).and_then(SqliteValue::as_text)),
+            assignee: None,
+            owner: None,
+            estimated_minutes: None,
+            created_at: parse_datetime_value(row.get(6))?,
+            created_by: get_non_empty_str(7),
+            updated_at: parse_datetime_value(row.get(8))?,
+            closed_at: None,
+            close_reason: None,
+            closed_by_session: None,
+            due_at: None,
+            defer_until: None,
+            external_ref: None,
+            source_system: None,
+            source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
+            deleted_at: None,
+            deleted_by: None,
+            delete_reason: None,
+            original_type: None,
+            compaction_level: None,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: None,
+            sender: None,
+            ephemeral: false,
+            pinned: false,
+            is_template: false,
+            labels: vec![],
+            dependencies: vec![],
+            comments: vec![],
+        })
+    }
+
+    fn stale_command_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+        let get_str = |idx: usize| -> String {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string()
+        };
+        let get_non_empty_str = |idx: usize| -> Option<String> {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let get_opt_i32 = |idx: usize| -> Option<i32> {
+            row.get(idx)
+                .and_then(SqliteValue::as_integer)
+                .map(|value| value as i32)
+        };
+
+        Ok(Issue {
+            id: get_str(0),
+            content_hash: None,
+            title: get_str(1),
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            notes: None,
+            status: parse_status(row.get(2).and_then(SqliteValue::as_text)),
+            priority: Priority(get_opt_i32(3).unwrap_or_else(|| Priority::default().0)),
+            issue_type: parse_issue_type(row.get(4).and_then(SqliteValue::as_text)),
+            assignee: get_non_empty_str(5),
+            owner: None,
+            estimated_minutes: None,
+            created_at: parse_datetime_value(row.get(6))?,
+            created_by: None,
+            updated_at: parse_datetime_value(row.get(7))?,
+            closed_at: None,
+            close_reason: None,
+            closed_by_session: None,
+            due_at: None,
+            defer_until: None,
+            external_ref: None,
+            source_system: None,
+            source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
+            deleted_at: None,
+            deleted_by: None,
+            delete_reason: None,
+            original_type: None,
+            compaction_level: None,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: None,
+            sender: None,
+            ephemeral: false,
+            pinned: false,
+            is_template: false,
+            labels: vec![],
+            dependencies: vec![],
+            comments: vec![],
+        })
+    }
+
+    fn lint_command_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+        let get_str = |idx: usize| -> String {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string()
+        };
+        let get_non_empty_str = |idx: usize| -> Option<String> {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+
+        Ok(Issue {
+            id: get_str(0),
+            content_hash: None,
+            title: get_str(1),
+            description: get_non_empty_str(2),
+            design: None,
+            acceptance_criteria: None,
+            notes: None,
+            status: parse_status(row.get(3).and_then(SqliteValue::as_text)),
+            priority: Priority::default(),
+            issue_type: parse_issue_type(row.get(4).and_then(SqliteValue::as_text)),
+            assignee: None,
+            owner: None,
+            estimated_minutes: None,
+            created_at: parse_datetime_value(row.get(5))?,
+            created_by: None,
+            updated_at: parse_datetime_value(row.get(6))?,
+            closed_at: None,
+            close_reason: None,
+            closed_by_session: None,
+            due_at: None,
+            defer_until: None,
+            external_ref: None,
+            source_system: None,
+            source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
+            deleted_at: None,
+            deleted_by: None,
+            delete_reason: None,
+            original_type: None,
+            compaction_level: None,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: None,
+            sender: None,
+            ephemeral: false,
+            pinned: false,
+            is_template: false,
+            labels: vec![],
+            dependencies: vec![],
+            comments: vec![],
+        })
+    }
+
+    fn search_command_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+        let get_str = |idx: usize| -> String {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string()
+        };
+        let get_non_empty_str = |idx: usize| -> Option<String> {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let get_opt_i32 = |idx: usize| -> Option<i32> {
+            row.get(idx)
+                .and_then(SqliteValue::as_integer)
+                .map(|value| value as i32)
+        };
+
+        Ok(Issue {
+            id: get_str(0),
+            content_hash: None,
+            title: get_str(1),
+            description: get_non_empty_str(2),
+            design: None,
+            acceptance_criteria: None,
+            notes: None,
+            status: parse_status(row.get(3).and_then(SqliteValue::as_text)),
+            priority: Priority(get_opt_i32(4).unwrap_or_else(|| Priority::default().0)),
+            issue_type: parse_issue_type(row.get(5).and_then(SqliteValue::as_text)),
+            assignee: get_non_empty_str(6),
+            owner: None,
+            estimated_minutes: None,
+            created_at: parse_datetime_value(row.get(7))?,
+            created_by: None,
+            updated_at: parse_datetime_value(row.get(8))?,
+            closed_at: None,
+            close_reason: None,
+            closed_by_session: None,
+            due_at: None,
+            defer_until: None,
+            external_ref: None,
+            source_system: None,
+            source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
+            deleted_at: None,
+            deleted_by: None,
+            delete_reason: None,
+            original_type: None,
+            compaction_level: None,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: None,
+            sender: None,
+            ephemeral: false,
+            pinned: false,
+            is_template: false,
+            labels: vec![],
+            dependencies: vec![],
+            comments: vec![],
+        })
+    }
+
+    fn command_summary_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+        let get_str = |idx: usize| -> String {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string()
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let get_opt_i32 = |idx: usize| -> Option<i32> {
+            row.get(idx)
+                .and_then(SqliteValue::as_integer)
+                .map(|value| value as i32)
+        };
+
+        Ok(Issue {
+            id: get_str(0),
+            content_hash: None,
+            title: get_str(1),
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            notes: None,
+            status: parse_status(row.get(2).and_then(SqliteValue::as_text)),
+            priority: Priority(get_opt_i32(3).unwrap_or_else(|| Priority::default().0)),
+            issue_type: parse_issue_type(row.get(4).and_then(SqliteValue::as_text)),
+            assignee: None,
+            owner: None,
+            estimated_minutes: None,
+            created_at: parse_datetime_value(row.get(5))?,
+            created_by: None,
+            updated_at: parse_datetime_value(row.get(6))?,
+            closed_at: None,
+            close_reason: None,
+            closed_by_session: None,
+            due_at: None,
+            defer_until: None,
+            external_ref: None,
+            source_system: None,
+            source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -6872,6 +10774,59 @@ impl SqliteStorage {
             ephemeral: get_bool(8),
             pinned: get_bool(9),
             is_template: get_bool(10),
+        })
+    }
+
+    fn stats_summary_issue_from_row(row: &fsqlite::Row) -> Result<StatsIssueRow> {
+        let get_str = |idx: usize| -> String {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string()
+        };
+        let get_bool = |idx: usize| -> bool {
+            row.get(idx).and_then(SqliteValue::as_integer).unwrap_or(0) != 0
+        };
+        let get_opt_datetime = |idx: usize| -> Result<Option<DateTime<Utc>>> {
+            parse_opt_datetime_value(row.get(idx))
+        };
+
+        Ok(StatsIssueRow {
+            id: get_str(0),
+            status: parse_status(row.get(1).and_then(SqliteValue::as_text)),
+            priority: Priority::default(),
+            issue_type: parse_issue_type(row.get(2).and_then(SqliteValue::as_text)),
+            assignee: None,
+            created_at: parse_datetime_value(row.get(3))?,
+            closed_at: get_opt_datetime(4)?,
+            defer_until: get_opt_datetime(5)?,
+            ephemeral: get_bool(6),
+            pinned: get_bool(7),
+            is_template: get_bool(8),
+        })
+    }
+
+    fn changelog_issue_from_row(row: &fsqlite::Row) -> Result<ChangelogIssueRow> {
+        let get_str = |idx: usize| -> String {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string()
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let get_opt_i32 = |idx: usize| -> Option<i32> {
+            row.get(idx)
+                .and_then(SqliteValue::as_integer)
+                .map(|value| value as i32)
+        };
+
+        Ok(ChangelogIssueRow {
+            id: get_str(0),
+            title: get_str(1),
+            priority: Priority(get_opt_i32(2).unwrap_or_else(|| Priority::default().0)),
+            issue_type: parse_issue_type(row.get(3).and_then(SqliteValue::as_text)),
+            created_at: parse_datetime_value(row.get(4))?,
+            closed_at: parse_opt_datetime_value(row.get(5))?,
         })
     }
 
@@ -6981,6 +10936,28 @@ fn connection_user_version(conn: &Connection) -> Option<u32> {
     let row = conn.query_row("PRAGMA user_version").ok()?;
     let value = row.get(0).and_then(SqliteValue::as_integer)?;
     u32::try_from(value).ok()
+/// Best-effort removal of an ephemeral temp database and its SQLite sidecars.
+///
+/// SQLite may create `-wal`, `-shm`, and `-journal` files next to the main
+/// database file; all of them must go so nothing is left in `TMPDIR` (#299).
+/// Missing files are ignored; this is invoked on teardown and on a failed
+/// open, so errors are intentionally swallowed (logged at debug level).
+fn remove_temp_db_files(path: &Path) {
+    let mut targets = vec![path.to_path_buf()];
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            targets.push(path.with_file_name(format!("{name}{suffix}")));
+        }
+    }
+    for target in targets {
+        match std::fs::remove_file(&target) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::debug!(path = %target.display(), error = %e, "failed to remove temp db file");
+            }
+        }
+    }
 }
 
 fn database_header_user_version(path: &Path) -> Option<u32> {
@@ -6998,6 +10975,12 @@ fn database_header_user_version(path: &Path) -> Option<u32> {
     Some(u32::from_be_bytes([
         header[60], header[61], header[62], header[63],
     ]))
+}
+
+fn is_transient_wal_tail_read_error(error: &dyn std::fmt::Display) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("wal file is corrupt")
+        && (message.contains("short read") || message.contains("short header read"))
 }
 
 /// Filter options for listing issues.
@@ -7028,6 +11011,25 @@ pub struct ListFilters {
     pub updated_before: Option<DateTime<Utc>>,
     /// Filter by `updated_at` >= timestamp
     pub updated_after: Option<DateTime<Utc>>,
+}
+
+/// Closure-time policy metadata row (issue #274 Phase 1).
+///
+/// One row per terminal close that carried any opt-in policy data — Tier 1
+/// attribution, a `--bypass-policy` waiver, or the list of gates that fired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseMetadataRow {
+    pub closed_by_agent_name: Option<String>,
+    pub closed_by_harness: Option<String>,
+    pub closed_by_model: Option<String>,
+    pub bypassed_policy: bool,
+    pub bypass_reason: Option<String>,
+    /// Names of gates that fired during evaluation. Always serialised as a
+    /// JSON array on disk; empty when no gates fired (e.g. clean Tier 1
+    /// capture, or a successful close on a project with no `policy.yaml`).
+    pub policy_gates_fired: Vec<String>,
+    /// Timestamp the metadata row was recorded, in ISO 8601 / RFC 3339.
+    pub recorded_at: String,
 }
 
 /// Lean issue row used by the stats command.
@@ -7063,6 +11065,19 @@ pub struct IssueUpdate {
     pub due_at: Option<Option<DateTime<Utc>>>,
     pub defer_until: Option<Option<DateTime<Utc>>>,
     pub external_ref: Option<Option<String>>,
+    /// Override the source-repo display name (typically the repo basename).
+    /// `Some(Some(s))` sets it to `s`; `Some(None)` resets it to the
+    /// schema default "." because the column is `NOT NULL`.
+    pub source_repo: Option<Option<String>>,
+    /// Override the canonical filesystem path of the repo containing `.beads`.
+    /// See #289. Use `update --source-repo-path` for ad-hoc repair after a
+    /// repo is moved/copied to a new machine.
+    pub source_repo_path: Option<Option<String>>,
+    /// Set inherited governing-instructions JSON (beads_rust#297).
+    /// `Some(Some(s))` writes the JSON string `s`; `Some(None)` clears
+    /// the field back to `NULL`. `None` means "do not touch this field".
+    /// Validation happens at the CLI boundary; storage is opaque TEXT.
+    pub agent_context: Option<Option<String>>,
     pub closed_at: Option<Option<DateTime<Utc>>>,
     pub close_reason: Option<Option<String>>,
     pub closed_by_session: Option<Option<String>>,
@@ -7098,6 +11113,9 @@ impl IssueUpdate {
             && self.due_at.is_none()
             && self.defer_until.is_none()
             && self.external_ref.is_none()
+            && self.source_repo.is_none()
+            && self.source_repo_path.is_none()
+            && self.agent_context.is_none()
             && self.closed_at.is_none()
             && self.close_reason.is_none()
             && self.closed_by_session.is_none()
@@ -7118,11 +11136,32 @@ pub struct ReadyFilters {
     pub types: Option<Vec<IssueType>>,
     pub priorities: Option<Vec<Priority>>,
     pub include_deferred: bool,
+    /// The status group treated as "ready" (issue #354). Each entry is a
+    /// canonical-or-custom status string (already lowercased by the caller).
+    /// Empty means "use the default `[open]` group", which preserves pre-#354
+    /// behavior exactly. The CLI layer resolves this from
+    /// `workflow.status_groups.ready` in `.beads/policy.yaml`.
+    pub ready_statuses: Vec<String>,
     pub limit: Option<usize>,
     /// Filter to children of this parent issue ID.
     pub parent: Option<String>,
     /// Include all descendants (grandchildren, etc.) not just direct children.
     pub recursive: bool,
+    /// Pre-resolved parent membership IDs.
+    ///
+    /// When `parent` is set, the query layer resolves the matching issue IDs in
+    /// Rust (direct children, or all transitive descendants when `recursive`)
+    /// and stores them here before building the SQL. The candidate query then
+    /// filters with a plain `id IN (...)` list instead of a correlated
+    /// subquery / recursive CTE. This sidesteps engine limitations in the
+    /// embedded SQLite backend with `IN (subquery)` under multi-table joins
+    /// (#307) and recursive CTEs referenced from a correlated `EXISTS` (#308),
+    /// and guarantees bounded traversal via a visited-set BFS even when the
+    /// parent-child graph contains cycles.
+    ///
+    /// `Some(empty)` means "parent is set but has no matching descendants" → the
+    /// candidate query must return no rows. `None` means no parent filter.
+    pub parent_member_ids: Option<Vec<String>>,
 }
 
 /// Minimal metadata needed for fast collision detection during sync.
@@ -7148,15 +11187,91 @@ pub enum ReadySortPolicy {
 }
 
 fn sort_ready_hybrid(issues: &mut [Issue]) {
-    issues.sort_by(|left, right| {
+    issues.sort_unstable_by(|left, right| {
         ready_hybrid_bucket(left.priority)
             .cmp(&ready_hybrid_bucket(right.priority))
             .then_with(|| left.created_at.cmp(&right.created_at))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+}
+
+fn should_sort_list_default_in_rust(filters: &ListFilters) -> bool {
+    filters.sort.is_none()
+        && !filters.reverse
+        && filters.offset.is_none_or(|offset| offset == 0)
+        && filters.limit.is_none_or(|limit| limit == 0)
+}
+
+fn default_visible_limited_page_limit(filters: &ListFilters) -> Option<usize> {
+    let limit = filters.limit?;
+    if limit == 0 || filters.offset.is_some_and(|offset| offset > 0) {
+        return None;
+    }
+
+    let is_default_visible = filters.statuses.as_ref().is_none_or(Vec::is_empty)
+        && filters.types.as_ref().is_none_or(Vec::is_empty)
+        && filters.priorities.as_ref().is_none_or(Vec::is_empty)
+        && filters.assignee.is_none()
+        && !filters.unassigned
+        && !filters.include_closed
+        && !filters.include_templates
+        && filters.title_contains.is_none()
+        && filters.sort.is_none()
+        && !filters.reverse
+        && filters.labels.as_ref().is_none_or(Vec::is_empty)
+        && filters.labels_or.as_ref().is_none_or(Vec::is_empty)
+        && filters.updated_before.is_none()
+        && filters.updated_after.is_none();
+
+    is_default_visible.then_some(limit)
+}
+
+fn default_visible_single_label_count_filter(filters: &ListFilters) -> Option<&str> {
+    let labels = filters.labels.as_deref()?;
+    let unique_labels = unique_label_refs(labels);
+    let [label] = unique_labels.as_slice() else {
+        return None;
+    };
+
+    let is_default_visible = filters.statuses.as_ref().is_none_or(Vec::is_empty)
+        && filters.types.as_ref().is_none_or(Vec::is_empty)
+        && filters.priorities.as_ref().is_none_or(Vec::is_empty)
+        && filters.assignee.is_none()
+        && !filters.unassigned
+        && !filters.include_closed
+        && !filters.include_templates
+        && filters.title_contains.is_none()
+        && filters.labels_or.as_ref().is_none_or(Vec::is_empty)
+        && filters.updated_before.is_none()
+        && filters.updated_after.is_none();
+
+    is_default_visible.then_some(label.as_str())
+}
+
+fn sort_list_default(issues: &mut [Issue]) {
+    issues.sort_unstable_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| right.created_at.cmp(&left.created_at))
+            .then_with(|| left.id.cmp(&right.id))
     });
 }
 
 const fn ready_hybrid_bucket(priority: Priority) -> i32 {
     if priority.0 <= 1 { 0 } else { 1 }
+}
+
+fn ready_hybrid_high_bucket_priorities(priorities: Option<&[Priority]>) -> Vec<Priority> {
+    priorities.map_or_else(
+        || vec![Priority::CRITICAL, Priority::HIGH],
+        |values| {
+            values
+                .iter()
+                .copied()
+                .filter(|priority| ready_hybrid_bucket(*priority) == 0)
+                .collect()
+        },
+    )
 }
 
 fn parse_status(s: Option<&str>) -> Status {
@@ -7254,17 +11369,82 @@ fn parse_external_dependency(dep_id: &str) -> Option<(String, String)> {
     Some((project, capability))
 }
 
+fn cycle_endpoint(value: Option<&SqliteValue>) -> String {
+    value
+        .and_then(SqliteValue::as_text)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn component_is_closed_only(component: &[String], statuses: &BTreeMap<String, Status>) -> bool {
+    !component.is_empty()
+        && component
+            .iter()
+            .all(|id| statuses.get(id).is_some_and(Status::is_terminal))
+}
+
+fn reverse_cycle_graph(graph: &BTreeMap<String, Vec<String>>) -> BTreeMap<String, Vec<String>> {
+    let mut reverse_graph: BTreeMap<String, Vec<String>> = graph
+        .keys()
+        .map(|node| (node.clone(), Vec::new()))
+        .collect();
+
+    for (from, neighbors) in graph {
+        for to in neighbors {
+            reverse_graph
+                .entry(to.clone())
+                .or_default()
+                .push(from.clone());
+        }
+    }
+
+    for neighbors in reverse_graph.values_mut() {
+        neighbors.sort();
+        neighbors.dedup();
+    }
+
+    reverse_graph
+}
+
+fn find_cycle_graph_path(
+    graph: &BTreeMap<String, Vec<String>>,
+    start: &str,
+    target: &str,
+    component: &HashSet<&str>,
+) -> Option<Vec<String>> {
+    let mut visited = HashSet::new();
+    let mut stack = vec![(start.to_string(), vec![start.to_string()])];
+
+    while let Some((node, path)) = stack.pop() {
+        if node == target {
+            return Some(path);
+        }
+        if !visited.insert(node.clone()) {
+            continue;
+        }
+        if let Some(neighbors) = graph.get(&node) {
+            for neighbor in neighbors.iter().rev() {
+                if component.contains(neighbor.as_str()) && !visited.contains(neighbor) {
+                    let mut next_path = path.clone();
+                    next_path.push(neighbor.clone());
+                    stack.push((neighbor.clone(), next_path));
+                }
+            }
+        }
+    }
+
+    None
+}
+
 fn query_external_project_capabilities(
     db_path: &Path,
     capabilities: &HashSet<String>,
 ) -> Result<HashSet<String>> {
-    const SQLITE_VAR_LIMIT: usize = 900;
-
     if capabilities.is_empty() {
         return Ok(HashSet::new());
     }
 
-    let conn = Connection::open(db_path.to_string_lossy().into_owned())?;
+    let conn = open_existing_read_only_connection(db_path)?;
     let labels: Vec<String> = capabilities
         .iter()
         .map(|cap| format!("provides:{cap}"))
@@ -7349,11 +11529,30 @@ fn query_external_project_capabilities(
     Ok(satisfied)
 }
 
+fn open_existing_read_only_connection(path: &Path) -> Result<Connection> {
+    if !path.is_file() {
+        return Err(BeadsError::Config(format!(
+            "external project database not found: {}",
+            path.display()
+        )));
+    }
+
+    open_with_flags(
+        path.to_string_lossy().as_ref(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(Into::into)
+}
+
 fn parse_datetime(s: &str) -> Result<DateTime<Utc>> {
     if s.is_empty() {
         // NULL/empty datetime columns (common when migrating from bd/Go beads)
         // default to epoch rather than crashing the import.
         return Ok(DateTime::<Utc>::UNIX_EPOCH);
+    }
+
+    if let Some(dt) = parse_canonical_utc_datetime(s) {
+        return Ok(dt);
     }
 
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
@@ -7365,6 +11564,77 @@ fn parse_datetime(s: &str) -> Result<DateTime<Utc>> {
     }
 
     Err(BeadsError::Config(format!("unparseable datetime: {s}")))
+}
+
+fn parse_canonical_utc_datetime(s: &str) -> Option<DateTime<Utc>> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 20
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || !matches!(bytes.get(10), Some(b'T' | b't' | b' '))
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+    {
+        return None;
+    }
+
+    let year = i32::try_from(parse_fixed_digits(bytes, 0, 4)?).ok()?;
+    let month = parse_fixed_digits(bytes, 5, 2)?;
+    let day = parse_fixed_digits(bytes, 8, 2)?;
+    let hour = parse_fixed_digits(bytes, 11, 2)?;
+    let minute = parse_fixed_digits(bytes, 14, 2)?;
+    let second = parse_fixed_digits(bytes, 17, 2)?;
+
+    let mut index = 19;
+    let nanos = if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        let mut nanos = 0_u32;
+        let mut digits = 0_u32;
+        while let Some(&byte) = bytes.get(index) {
+            let Some(digit) = decimal_digit(byte) else {
+                break;
+            };
+            if digits == 9 {
+                return None;
+            }
+            nanos = nanos.saturating_mul(10).saturating_add(digit);
+            digits += 1;
+            index += 1;
+        }
+        if digits == 0 {
+            return None;
+        }
+        for _ in digits..9 {
+            nanos = nanos.saturating_mul(10);
+        }
+        nanos
+    } else {
+        0
+    };
+
+    match bytes.get(index..) {
+        Some(b"Z" | b"z" | b"+00:00") => {}
+        _ => return None,
+    }
+
+    let date = NaiveDate::from_ymd_opt(year, month, day)?;
+    let time = NaiveTime::from_hms_nano_opt(hour, minute, second, nanos)?;
+    Some(Utc.from_utc_datetime(&NaiveDateTime::new(date, time)))
+}
+
+fn parse_fixed_digits(bytes: &[u8], start: usize, len: usize) -> Option<u32> {
+    let mut value = 0_u32;
+    for &byte in bytes.get(start..start.checked_add(len)?)? {
+        value = value
+            .saturating_mul(10)
+            .saturating_add(decimal_digit(byte)?);
+    }
+    Some(value)
+}
+
+fn decimal_digit(byte: u8) -> Option<u32> {
+    byte.is_ascii_digit()
+        .then_some(u32::from(byte.saturating_sub(b'0')))
 }
 
 /// Decode a DATETIME column that may be stored as TEXT (canonical RFC 3339),
@@ -7415,13 +11685,13 @@ fn datetime_from_epoch_auto(n: i64) -> Result<DateTime<Utc>> {
     const NS_THRESHOLD: i64 = 10_000_000_000_000_000;
 
     let abs = n.unsigned_abs();
-    let (secs, sub_nanos): (i64, u32) = if abs < MS_THRESHOLD as u64 {
+    let (secs, sub_nanos): (i64, u32) = if abs <= MS_THRESHOLD as u64 {
         (n, 0)
-    } else if abs < US_THRESHOLD as u64 {
+    } else if abs <= US_THRESHOLD as u64 {
         let secs = n.div_euclid(1_000);
         let rem = epoch_remainder_u32(n, 1_000)?;
         (secs, rem * 1_000_000)
-    } else if abs < NS_THRESHOLD as u64 {
+    } else if abs <= NS_THRESHOLD as u64 {
         let secs = n.div_euclid(1_000_000);
         let rem = epoch_remainder_u32(n, 1_000_000)?;
         (secs, rem * 1_000)
@@ -7462,10 +11732,16 @@ fn datetime_from_epoch_seconds_f64(f: f64) -> Result<DateTime<Utc>> {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    let secs = floor_seconds as i64;
-    let nanos_f64 = ((f - floor_seconds) * 1_000_000_000.0)
-        .round()
-        .clamp(0.0, 999_999_999.0);
+    let mut secs = floor_seconds as i64;
+    let nanos_f64 = ((f - floor_seconds) * 1_000_000_000.0).round();
+    let nanos_f64 = if nanos_f64 >= 1_000_000_000.0 {
+        secs = secs.checked_add(1).ok_or_else(|| {
+            BeadsError::Config(format!("invalid epoch value in datetime column: {f}"))
+        })?;
+        0.0
+    } else {
+        nanos_f64.clamp(0.0, 999_999_999.0)
+    };
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let nanos = nanos_f64 as u32;
     DateTime::<Utc>::from_timestamp(secs, nanos)
@@ -7559,11 +11835,6 @@ impl SqliteStorage {
 
         let mut deps = Vec::with_capacity(rows.len());
         for row in &rows {
-            let created_at_str = row
-                .get(3)
-                .and_then(SqliteValue::as_text)
-                .unwrap_or("")
-                .to_string();
             deps.push(crate::model::Dependency {
                 issue_id: row
                     .get(0)
@@ -7580,7 +11851,7 @@ impl SqliteStorage {
                     .and_then(SqliteValue::as_text)
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(crate::model::DependencyType::Blocks),
-                created_at: parse_datetime(&created_at_str)?,
+                created_at: parse_datetime_value(row.get(3))?,
                 created_by: row
                     .get(4)
                     .and_then(SqliteValue::as_text)
@@ -7634,11 +11905,6 @@ impl SqliteStorage {
             let rows = self.conn.query_with_params(&sql, &params)?;
 
             for row in &rows {
-                let created_at_str = row
-                    .get(3)
-                    .and_then(SqliteValue::as_text)
-                    .unwrap_or("")
-                    .to_string();
                 let dep = crate::model::Dependency {
                     issue_id: row
                         .get(0)
@@ -7655,7 +11921,7 @@ impl SqliteStorage {
                         .and_then(SqliteValue::as_text)
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(crate::model::DependencyType::Blocks),
-                    created_at: parse_datetime(&created_at_str)?,
+                    created_at: parse_datetime_value(row.get(3))?,
                     created_by: row
                         .get(4)
                         .and_then(SqliteValue::as_text)
@@ -7754,10 +12020,12 @@ impl SqliteStorage {
         Ok(count > 0)
     }
 
-    /// Check if adding a dependency would create a cycle.
+    /// Check if adding a standard dependency edge would create a cycle.
     ///
-    /// If `blocking_only` is true, only considers blocking dependency types
-    /// ('blocks', 'parent-child', 'conditional-blocks') for cycle detection.
+    /// If `blocking_only` is true, only considers dependency types that affect ready-work
+    /// blocking: `blocks`, `conditional-blocks`, `waits-for`, and reversed `parent-child`.
+    /// Use [`Self::would_create_parent_child_cycle`] when validating a stored
+    /// `parent-child` row, because those rows are reversed in the blocker graph.
     ///
     /// # Errors
     ///
@@ -7771,88 +12039,265 @@ impl SqliteStorage {
         Self::check_cycle(&self.conn, issue_id, depends_on_id, blocking_only)
     }
 
+    /// Check if adding a `parent-child` row would create a cycle.
+    ///
+    /// Stored parent rows are `child -> parent`, while dependency graph cycle
+    /// detection represents them as `parent -> child`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn would_create_parent_child_cycle(
+        &self,
+        child_id: &str,
+        parent_id: &str,
+        blocking_only: bool,
+    ) -> Result<bool> {
+        Self::check_parent_child_cycle(&self.conn, child_id, parent_id, blocking_only)
+    }
+
     /// Detect all cycles in the dependency graph.
     ///
-    /// Returns a list of cycles, where each cycle is a vector of issue IDs.
-    /// Uses an iterative DFS to avoid stack overflow on deep graphs.
+    /// Returns deterministic cycle witnesses, where each cycle is a vector of
+    /// issue IDs ending with its starting ID. The implementation finds strongly
+    /// connected components first, then emits one witness per cyclic component.
     ///
     /// # Errors
     ///
     /// Returns an error if the database query fails.
     pub fn detect_all_cycles(&self) -> Result<Vec<Vec<String>>> {
-        use std::collections::{HashMap, HashSet};
+        self.detect_cycles(false)
+    }
 
-        // Get all dependencies, respecting parent-child direction (parent depends on child)
-        let mut graph: HashMap<String, Vec<String>> = HashMap::new();
+    /// Detect cycles in dependency types that affect ready-work blocking.
+    ///
+    /// This uses the same edge semantics as `would_create_cycle(..., true)`:
+    /// `blocks`, `conditional-blocks`, and `waits-for` point from dependent to blocker;
+    /// `parent-child` edges are reversed so parent/child hierarchy cycles are still reported.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn detect_blocking_cycles(&self) -> Result<Vec<Vec<String>>> {
+        self.detect_cycles(true)
+    }
 
-        let rows1 = self.conn.query(
-            "SELECT issue_id, depends_on_id FROM dependencies WHERE type != 'parent-child'",
-        )?;
+    fn detect_cycles(&self, blocking_only: bool) -> Result<Vec<Vec<String>>> {
+        let graph = self.load_dependency_cycle_graph(blocking_only)?;
+        Ok(Self::cycle_witnesses_from_graph(&graph))
+    }
+
+    /// Detect dependency cycles split into active and closed-only archive buckets.
+    ///
+    /// Active cycles include any component with at least one non-terminal issue
+    /// or a dependency endpoint missing from the local issue table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn detect_dependency_cycle_report(
+        &self,
+        blocking_only: bool,
+    ) -> Result<DependencyCycleReport> {
+        let graph = self.load_dependency_cycle_graph(blocking_only)?;
+        let statuses = self.load_dependency_cycle_issue_statuses()?;
+        let witnesses = Self::cycle_witnesses_with_components_from_graph(&graph);
+        let mut active_cycles = Vec::new();
+        let mut archived_closed_cycles = Vec::new();
+
+        for (component, cycle) in witnesses {
+            if component_is_closed_only(&component, &statuses) {
+                archived_closed_cycles.push(cycle);
+            } else {
+                active_cycles.push(cycle);
+            }
+        }
+
+        active_cycles.sort();
+        archived_closed_cycles.sort();
+        Ok(DependencyCycleReport {
+            active_cycles,
+            archived_closed_cycles,
+        })
+    }
+
+    fn load_dependency_cycle_graph(
+        &self,
+        blocking_only: bool,
+    ) -> Result<BTreeMap<String, Vec<String>>> {
+        Self::load_dependency_cycle_graph_from_conn(&self.conn, blocking_only)
+    }
+
+    fn load_dependency_cycle_graph_from_conn(
+        conn: &Connection,
+        blocking_only: bool,
+    ) -> Result<BTreeMap<String, Vec<String>>> {
+        let mut graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let standard_edge_sql = if blocking_only {
+            "SELECT issue_id, depends_on_id FROM dependencies \
+             WHERE type IN ('blocks', 'conditional-blocks', 'waits-for')"
+        } else {
+            "SELECT issue_id, depends_on_id FROM dependencies WHERE type != 'parent-child'"
+        };
+        let rows1 = conn.query(standard_edge_sql)?;
         for row in &rows1 {
-            let from = row
-                .get(0)
-                .and_then(SqliteValue::as_text)
-                .unwrap_or("")
-                .to_string();
-            let to = row
-                .get(1)
-                .and_then(SqliteValue::as_text)
-                .unwrap_or("")
-                .to_string();
+            let from = cycle_endpoint(row.get(0));
+            let to = cycle_endpoint(row.get(1));
+            graph.entry(to.clone()).or_default();
             graph.entry(from).or_default().push(to);
         }
 
-        let rows2 = self.conn.query(
+        let rows2 = conn.query(
             "SELECT depends_on_id, issue_id FROM dependencies WHERE type = 'parent-child'",
         )?;
         for row in &rows2 {
-            let from = row
-                .get(0)
-                .and_then(SqliteValue::as_text)
-                .unwrap_or("")
-                .to_string();
-            let to = row
-                .get(1)
-                .and_then(SqliteValue::as_text)
-                .unwrap_or("")
-                .to_string();
+            let from = cycle_endpoint(row.get(0));
+            let to = cycle_endpoint(row.get(1));
+            graph.entry(to.clone()).or_default();
             graph.entry(from).or_default().push(to);
         }
 
-        let mut unique_cycles = HashSet::new();
-        let mut keys: Vec<_> = graph.keys().cloned().collect();
-        keys.sort();
+        for neighbors in graph.values_mut() {
+            neighbors.sort();
+            neighbors.dedup();
+        }
 
-        // Enforce a sensible depth cap to prevent exponential blowup on dense/corrupted graphs
-        let max_depth = DEPENDENCY_TRAVERSAL_MAX_DEPTH.min(20);
+        Ok(graph)
+    }
 
-        for start_node in keys {
-            let mut stack = vec![(start_node.clone(), vec![start_node.clone()])];
+    fn load_dependency_cycle_issue_statuses(&self) -> Result<BTreeMap<String, Status>> {
+        let rows = self.conn.query("SELECT id, status FROM issues")?;
+        let mut statuses = BTreeMap::new();
+        for row in &rows {
+            let Some(id) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let status = parse_status(row.get(1).and_then(SqliteValue::as_text));
+            statuses.insert(id.to_string(), status);
+        }
+        Ok(statuses)
+    }
 
-            while let Some((u, path)) = stack.pop() {
-                if path.len() > max_depth {
+    fn cycle_witnesses_from_graph(graph: &BTreeMap<String, Vec<String>>) -> Vec<Vec<String>> {
+        Self::cycle_witnesses_with_components_from_graph(graph)
+            .into_iter()
+            .map(|(_component, cycle)| cycle)
+            .collect()
+    }
+
+    fn cycle_witnesses_with_components_from_graph(
+        graph: &BTreeMap<String, Vec<String>>,
+    ) -> Vec<(Vec<String>, Vec<String>)> {
+        let components = Self::strongly_connected_components(graph);
+        let mut cycles = Vec::new();
+
+        for component in components {
+            if component.len() == 1 {
+                let node = component[0].clone();
+                if graph
+                    .get(&node)
+                    .is_some_and(|neighbors| neighbors.binary_search(&node).is_ok())
+                {
+                    cycles.push((component, vec![node.clone(), node]));
+                }
+                continue;
+            }
+
+            if let Some(cycle) = Self::cycle_witness_for_component(graph, &component) {
+                cycles.push((component, cycle));
+            }
+        }
+
+        cycles.sort_by(|left, right| left.1.cmp(&right.1));
+        cycles
+    }
+
+    fn strongly_connected_components(graph: &BTreeMap<String, Vec<String>>) -> Vec<Vec<String>> {
+        let mut visited = HashSet::new();
+        let mut finish_order = Vec::with_capacity(graph.len());
+
+        for node in graph.keys() {
+            if visited.contains(node) {
+                continue;
+            }
+            Self::push_cycle_graph_finish_order(graph, node, &mut visited, &mut finish_order);
+        }
+
+        let reverse_graph = reverse_cycle_graph(graph);
+        let mut assigned = HashSet::new();
+        let mut components = Vec::new();
+
+        for node in finish_order.iter().rev() {
+            if assigned.contains(node) {
+                continue;
+            }
+
+            let mut component = Vec::new();
+            let mut stack = vec![node.clone()];
+            while let Some(current) = stack.pop() {
+                if !assigned.insert(current.clone()) {
                     continue;
                 }
-                if let Some(neighbors) = graph.get(&u) {
-                    for v in neighbors {
-                        // Only consider cycles where start_node is the strictly minimum node
-                        if v == &start_node {
-                            let mut cycle = path.clone();
-                            cycle.push(v.clone());
-                            unique_cycles.insert(cycle);
-                        } else if v > &start_node && !path.contains(v) {
-                            let mut new_path = path.clone();
-                            new_path.push(v.clone());
-                            stack.push((v.clone(), new_path));
+                component.push(current.clone());
+                if let Some(neighbors) = reverse_graph.get(&current) {
+                    for neighbor in neighbors.iter().rev() {
+                        if !assigned.contains(neighbor) {
+                            stack.push(neighbor.clone());
                         }
                     }
                 }
             }
+            component.sort();
+            components.push(component);
         }
 
-        let mut cycles: Vec<_> = unique_cycles.into_iter().collect();
-        cycles.sort();
-        Ok(cycles)
+        components.sort();
+        components
+    }
+
+    fn push_cycle_graph_finish_order(
+        graph: &BTreeMap<String, Vec<String>>,
+        start: &str,
+        visited: &mut HashSet<String>,
+        finish_order: &mut Vec<String>,
+    ) {
+        let mut stack = vec![(start.to_string(), false)];
+        while let Some((node, expanded)) = stack.pop() {
+            if expanded {
+                finish_order.push(node);
+                continue;
+            }
+            if !visited.insert(node.clone()) {
+                continue;
+            }
+
+            stack.push((node.clone(), true));
+            if let Some(neighbors) = graph.get(&node) {
+                for neighbor in neighbors.iter().rev() {
+                    if !visited.contains(neighbor) {
+                        stack.push((neighbor.clone(), false));
+                    }
+                }
+            }
+        }
+    }
+
+    fn cycle_witness_for_component(
+        graph: &BTreeMap<String, Vec<String>>,
+        component: &[String],
+    ) -> Option<Vec<String>> {
+        let start = component.first()?;
+        let component_set: HashSet<_> = component.iter().map(String::as_str).collect();
+        for neighbor in graph.get(start)?.iter().filter(|neighbor| {
+            neighbor.as_str() != start.as_str() && component_set.contains(neighbor.as_str())
+        }) {
+            if let Some(mut path) = find_cycle_graph_path(graph, neighbor, start, &component_set) {
+                let mut cycle = vec![start.clone()];
+                cycle.append(&mut path);
+                return Some(cycle);
+            }
+        }
+        None
     }
 
     // ===== Import Helper Methods =====
@@ -7870,7 +12315,7 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                      compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                     pinned, is_template
+                     pinned, is_template, source_repo_path, agent_context
                FROM issues WHERE external_ref = ?",
             &[SqliteValue::from(external_ref)],
         ) {
@@ -7893,7 +12338,7 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                      compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                     pinned, is_template
+                     pinned, is_template, source_repo_path, agent_context
                FROM issues WHERE content_hash = ?",
             &[SqliteValue::from(content_hash)],
         ) {
@@ -7966,6 +12411,10 @@ impl SqliteStorage {
                 .map_or(SqliteValue::Null, SqliteValue::from),
             SqliteValue::from(issue.source_system.as_deref().unwrap_or("")),
             SqliteValue::from(issue.source_repo.as_deref().unwrap_or(".")),
+            issue
+                .source_repo_path
+                .as_deref()
+                .map_or(SqliteValue::Null, SqliteValue::from),
             timestamps
                 .deleted_at
                 .as_deref()
@@ -7987,6 +12436,10 @@ impl SqliteStorage {
             SqliteValue::from(i64::from(i32::from(issue.ephemeral))),
             SqliteValue::from(i64::from(i32::from(issue.pinned))),
             SqliteValue::from(i64::from(i32::from(issue.is_template))),
+            issue
+                .agent_context
+                .as_deref()
+                .map_or(SqliteValue::Null, SqliteValue::from),
         ]
     }
 
@@ -7995,7 +12448,7 @@ impl SqliteStorage {
         issue: &Issue,
         timestamps: &ImportIssueTimestampStrings,
     ) -> Result<usize> {
-        let mut insert_params = Vec::with_capacity(36);
+        let mut insert_params = Vec::with_capacity(38);
         insert_params.push(SqliteValue::from(issue.id.as_str()));
         insert_params.extend(Self::import_issue_field_values(issue, timestamps));
 
@@ -8004,12 +12457,12 @@ impl SqliteStorage {
                 id, content_hash, title, description, design, acceptance_criteria, notes,
                 status, priority, issue_type, assignee, owner, estimated_minutes,
                 created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
-                due_at, defer_until, external_ref, source_system, source_repo,
+                due_at, defer_until, external_ref, source_system, source_repo, source_repo_path,
                 deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                 compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                pinned, is_template
+                pinned, is_template, agent_context
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )",
             &insert_params,
         )?;
@@ -8031,10 +12484,10 @@ impl SqliteStorage {
                 issue_type = ?, assignee = ?, owner = ?, estimated_minutes = ?,
                 created_at = ?, created_by = ?, updated_at = ?, closed_at = ?,
                 close_reason = ?, closed_by_session = ?, due_at = ?, defer_until = ?,
-                external_ref = ?, source_system = ?, source_repo = ?, deleted_at = ?,
-                deleted_by = ?, delete_reason = ?, original_type = ?, compaction_level = ?,
+                external_ref = ?, source_system = ?, source_repo = ?, source_repo_path = ?,
+                deleted_at = ?, deleted_by = ?, delete_reason = ?, original_type = ?, compaction_level = ?,
                 compacted_at = ?, compacted_at_commit = ?, original_size = ?, sender = ?,
-                ephemeral = ?, pinned = ?, is_template = ?
+                ephemeral = ?, pinned = ?, is_template = ?, agent_context = ?
               WHERE id = ?",
             &params,
         )?;
@@ -8100,6 +12553,32 @@ impl SqliteStorage {
         Ok(self.insert_issue_row_for_import(issue, &timestamps)? > 0)
     }
 
+    /// Check whether relation rows already exist for an imported issue ID.
+    ///
+    /// This is used to guard the insert-only relation fast path. A newly
+    /// inserted issue row can still attach to stale relation rows that were
+    /// already present with foreign keys disabled, so callers must verify this
+    /// before skipping relation deletes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub(crate) fn has_owned_relation_rows_for_import(&self, issue_id: &str) -> Result<bool> {
+        let row = self.conn.query_row_with_params(
+            "SELECT
+                 EXISTS(SELECT 1 FROM labels WHERE issue_id = ?)
+                 OR EXISTS(SELECT 1 FROM dependencies WHERE issue_id = ?)
+                 OR EXISTS(SELECT 1 FROM comments WHERE issue_id = ?)",
+            &[
+                SqliteValue::from(issue_id),
+                SqliteValue::from(issue_id),
+                SqliteValue::from(issue_id),
+            ],
+        )?;
+
+        Ok(row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0) != 0)
+    }
+
     /// Replace an issue's dirty marker inside the current write transaction.
     ///
     /// # Errors
@@ -8121,45 +12600,47 @@ impl SqliteStorage {
     ///
     /// # Errors
     ///
-    /// Returns an error if the database operation fails.
+    /// Returns an error if the label replacement is invalid or the database
+    /// operation fails.
     pub fn sync_labels_for_import(&self, issue_id: &str, labels: &[String]) -> Result<()> {
+        let unique_labels = unique_label_refs(labels);
+        validate_storage_label_refs(&unique_labels)?;
+
         // Remove existing labels
         self.conn.execute_with_params(
             "DELETE FROM labels WHERE issue_id = ?",
             &[SqliteValue::from(issue_id)],
         )?;
 
-        if labels.is_empty() {
-            return Ok(());
-        }
+        self.insert_label_refs_for_import(issue_id, &unique_labels)
+    }
 
-        // Add new labels
-        let mut seen_labels = HashSet::new();
-        let mut unique_labels = Vec::new();
-        for label in labels {
-            if seen_labels.insert(label.as_str()) {
-                unique_labels.push(label);
-            }
-        }
+    fn insert_labels_for_import(&self, issue_id: &str, labels: &[String]) -> Result<()> {
+        let unique_labels = unique_label_refs(labels);
+        validate_storage_label_refs(&unique_labels)?;
 
+        self.insert_label_refs_for_import(issue_id, &unique_labels)
+    }
+
+    fn insert_label_refs_for_import(
+        &self,
+        issue_id: &str,
+        unique_labels: &[&String],
+    ) -> Result<()> {
         if unique_labels.is_empty() {
             return Ok(());
         }
 
-        for chunk in unique_labels.chunks(IMPORT_LABEL_CHUNK_SIZE) {
-            let placeholders: Vec<String> = chunk.iter().map(|_| "(?, ?)".to_string()).collect();
-            let sql = format!(
-                "INSERT INTO labels (issue_id, label) VALUES {}",
-                placeholders.join(", ")
-            );
-
-            let mut params = Vec::with_capacity(chunk.len() * 2);
-            for label in chunk {
-                params.push(SqliteValue::from(issue_id));
-                params.push(SqliteValue::from(label.as_str()));
-            }
-
-            self.conn.execute_with_params(&sql, &params)?;
+        // Keep label inserts single-row: fsqlite can mis-handle multi-values
+        // inserts with repeated issue_id bindings on this primary key.
+        for label in unique_labels {
+            self.conn.execute_with_params(
+                "INSERT OR IGNORE INTO labels (issue_id, label) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(label.as_str()),
+                ],
+            )?;
         }
 
         Ok(())
@@ -8175,32 +12656,92 @@ impl SqliteStorage {
         issue_id: &str,
         dependencies: &[crate::model::Dependency],
     ) -> Result<()> {
+        let unique_deps = Self::validated_unique_import_dependencies(issue_id, dependencies)?;
+
         // Remove existing dependencies where this issue is the dependent
         self.conn.execute_with_params(
             "DELETE FROM dependencies WHERE issue_id = ?",
             &[SqliteValue::from(issue_id)],
         )?;
 
-        if dependencies.is_empty() {
-            return Ok(());
-        }
+        self.insert_dependency_refs_for_import(issue_id, &unique_deps)
+    }
 
-        // Add new dependencies
+    fn insert_dependencies_for_import(
+        &self,
+        issue_id: &str,
+        dependencies: &[crate::model::Dependency],
+    ) -> Result<()> {
+        let unique_deps = Self::validated_unique_import_dependencies(issue_id, dependencies)?;
+
+        self.insert_dependency_refs_for_import(issue_id, &unique_deps)
+    }
+
+    fn validated_unique_import_dependencies<'a>(
+        issue_id: &str,
+        dependencies: &'a [Dependency],
+    ) -> Result<Vec<&'a Dependency>> {
         let mut seen_deps = HashSet::new();
         let mut unique_deps = Vec::new();
-        for dep in dependencies {
+        for (dep_index, dep) in dependencies.iter().enumerate() {
+            if dep.issue_id != issue_id {
+                return Err(BeadsError::validation(
+                    "dependency.issue_id",
+                    format!(
+                        "dependency issue_id '{}' does not match import issue '{}'",
+                        dep.issue_id, issue_id
+                    ),
+                ));
+            }
+            if issue_id == dep.depends_on_id {
+                return Err(BeadsError::SelfDependency {
+                    id: issue_id.to_string(),
+                });
+            }
+            if let Some(metadata) = dep.metadata.as_deref() {
+                serde_json::from_str::<serde_json::Value>(metadata).map_err(|err| {
+                    BeadsError::Validation {
+                        field: format!("dependencies[{dep_index}].metadata"),
+                        reason: format!(
+                            "dependency metadata must be valid JSON for issue {issue_id} -> \
+                             {target} (type={dep_type}); found {value}: {err}{hint}",
+                            target = dep.depends_on_id,
+                            dep_type = dep.dep_type.as_str(),
+                            value = if metadata.is_empty() {
+                                "empty string".to_string()
+                            } else {
+                                format!("{metadata:?}")
+                            },
+                            hint = if metadata.trim().is_empty() {
+                                " (suggested fix: replace \"\" with \"{}\")"
+                            } else {
+                                ""
+                            },
+                        ),
+                    }
+                })?;
+            }
             Self::validate_parent_child_endpoints(
                 issue_id,
                 &dep.depends_on_id,
                 dep.dep_type.as_str(),
             )?;
-            // Deduplicate by (target, type) to allow multiple relationship types
-            // between the same issues while preventing identical duplicates.
-            if seen_deps.insert((dep.depends_on_id.as_str(), dep.dep_type.as_str())) {
+            // Deduplicate by target because the dependencies table is keyed by
+            // (issue_id, depends_on_id). Type-distinct duplicates would be
+            // ignored by insertion anyway.
+            if seen_deps.insert(dep.depends_on_id.as_str()) {
                 unique_deps.push(dep);
             }
         }
 
+        Ok(unique_deps)
+    }
+
+    fn insert_dependency_refs_for_import(
+        &self,
+        issue_id: &str,
+        unique_deps: &[&Dependency],
+    ) -> Result<()> {
         if unique_deps.is_empty() {
             return Ok(());
         }
@@ -8244,66 +12785,149 @@ impl SqliteStorage {
         issue_id: &str,
         comments: &[crate::model::Comment],
     ) -> Result<()> {
+        validate_import_comments_for_issue(issue_id, comments)?;
+
         // Remove existing comments
         self.conn.execute_with_params(
             "DELETE FROM comments WHERE issue_id = ?",
             &[SqliteValue::from(issue_id)],
         )?;
 
+        self.insert_comment_rows_for_import(issue_id, comments)
+    }
+
+    /// Insert relation rows for an issue that was just created during import.
+    ///
+    /// The caller must only use this after a successful new issue insert. Update
+    /// and upsert paths must keep using the `sync_*_for_import` methods so stale
+    /// relation rows are removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any relation insert fails.
+    pub(crate) fn insert_new_issue_relations_for_import(&self, issue: &Issue) -> Result<()> {
+        self.insert_labels_for_import(&issue.id, &issue.labels)?;
+        self.insert_dependencies_for_import(&issue.id, &issue.dependencies)?;
+        self.insert_comments_for_import(&issue.id, &issue.comments)?;
+        Ok(())
+    }
+
+    fn insert_comments_for_import(
+        &self,
+        issue_id: &str,
+        comments: &[crate::model::Comment],
+    ) -> Result<()> {
+        validate_import_comments_for_issue(issue_id, comments)?;
+
+        self.insert_comment_rows_for_import(issue_id, comments)
+    }
+
+    fn insert_comment_rows_for_import(
+        &self,
+        issue_id: &str,
+        comments: &[crate::model::Comment],
+    ) -> Result<()> {
         if comments.is_empty() {
             return Ok(());
         }
 
         for comment in comments {
-            let created_at = comment.created_at.to_rfc3339();
-            let colliding_issue_id = if comment.id > 0 {
-                self.conn
-                    .query_with_params(
-                        "SELECT issue_id FROM comments WHERE id = ? LIMIT 1",
-                        &[SqliteValue::from(comment.id)],
-                    )?
-                    .into_iter()
-                    .next()
-                    .and_then(|row| {
-                        row.get(0)
-                            .and_then(SqliteValue::as_text)
-                            .map(str::to_string)
-                    })
-            } else {
-                None
-            };
-
-            // Route through AUTOINCREMENT whenever the JSONL-provided id is
-            // already taken — by *any* issue, including this one. The narrower
-            // "different issue" check missed self-collisions where an earlier
-            // comment in this same call had its id AUTO-reallocated into the
-            // range of a later comment's JSONL id (beads_rust-q0c).
-            if colliding_issue_id.is_some() || comment.id <= 0 {
-                self.conn.execute_with_params(
-                    "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
-                    &[
-                        SqliteValue::from(issue_id),
-                        SqliteValue::from(comment.author.as_str()),
-                        SqliteValue::from(comment.body.as_str()),
-                        SqliteValue::from(created_at.as_str()),
-                    ],
-                )?;
-            } else {
-                self.conn.execute_with_params(
-                    "INSERT INTO comments (id, issue_id, author, text, created_at) VALUES (?, ?, ?, ?, ?)",
-                    &[
-                        SqliteValue::from(comment.id),
-                        SqliteValue::from(issue_id),
-                        SqliteValue::from(comment.author.as_str()),
-                        SqliteValue::from(comment.body.as_str()),
-                        SqliteValue::from(created_at.as_str()),
-                    ],
-                )?;
-            }
+            self.insert_comment_for_import(issue_id, comment)?;
         }
 
         Ok(())
     }
+
+    fn insert_comment_for_import(&self, issue_id: &str, comment: &Comment) -> Result<()> {
+        let created_at = comment.created_at.to_rfc3339();
+        if comment.id <= 0 {
+            return self.insert_import_comment_without_id(issue_id, comment, &created_at);
+        }
+
+        match self.insert_import_comment_with_id(issue_id, comment, &created_at) {
+            Ok(()) => Ok(()),
+            Err(BeadsError::Database(error)) if is_import_comment_id_collision(&error) => {
+                match self.import_comment_id_owner(comment.id)? {
+                    // Route through AUTOINCREMENT whenever ANY row owns the id —
+                    // including this issue itself: an earlier comment in this same
+                    // import call may have had its id AUTO-reallocated into the
+                    // range of a later comment's JSONL id (beads_rust-q0c
+                    // self-collision; see LESSONS.md 2026-04-28).
+                    Some(_) => {
+                        self.insert_import_comment_without_id(issue_id, comment, &created_at)
+                    }
+                    None => Err(BeadsError::Database(error)),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn insert_import_comment_without_id(
+        &self,
+        issue_id: &str,
+        comment: &Comment,
+        created_at: &str,
+    ) -> Result<()> {
+        self.conn.execute_with_params(
+            "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                SqliteValue::from(issue_id),
+                SqliteValue::from(comment.author.as_str()),
+                SqliteValue::from(comment.body.as_str()),
+                SqliteValue::from(created_at),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn insert_import_comment_with_id(
+        &self,
+        issue_id: &str,
+        comment: &Comment,
+        created_at: &str,
+    ) -> Result<()> {
+        self.conn.execute_with_params(
+            "INSERT INTO comments (id, issue_id, author, text, created_at) VALUES (?, ?, ?, ?, ?)",
+            &[
+                SqliteValue::from(comment.id),
+                SqliteValue::from(issue_id),
+                SqliteValue::from(comment.author.as_str()),
+                SqliteValue::from(comment.body.as_str()),
+                SqliteValue::from(created_at),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn import_comment_id_owner(&self, comment_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_with_params(
+                "SELECT issue_id FROM comments WHERE id = ? LIMIT 1",
+                &[SqliteValue::from(comment_id)],
+            )?
+            .into_iter()
+            .next()
+            .and_then(|row| {
+                row.get(0)
+                    .and_then(SqliteValue::as_text)
+                    .map(str::to_string)
+            }))
+    }
+}
+
+fn is_import_comment_id_collision(error: &FrankenError) -> bool {
+    matches!(
+        error,
+        FrankenError::PrimaryKeyViolation | FrankenError::UniqueViolation { .. }
+    ) || matches!(
+        error,
+        FrankenError::Internal(message)
+            if message.contains("VDBE halted with code 19")
+                && (message.contains("PRIMARY KEY constraint failed")
+                    || message.contains("UNIQUE constraint failed"))
+    )
 }
 
 /// Implement the `DependencyStore` trait for `SqliteStorage`.
@@ -8327,6 +12951,14 @@ impl crate::validation::DependencyStore for SqliteStorage {
     ) -> std::result::Result<bool, crate::error::BeadsError> {
         Self::check_cycle(&self.conn, issue_id, depends_on_id, true)
     }
+
+    fn would_create_parent_child_cycle(
+        &self,
+        child_id: &str,
+        parent_id: &str,
+    ) -> std::result::Result<bool, crate::error::BeadsError> {
+        Self::check_parent_child_cycle(&self.conn, child_id, parent_id, true)
+    }
 }
 
 fn validate_new_comment(issue_id: &str, author: &str, text: &str) -> Result<()> {
@@ -8339,6 +12971,47 @@ fn validate_new_comment(issue_id: &str, author: &str, text: &str) -> Result<()> 
     };
 
     CommentValidator::validate(&comment).map_err(BeadsError::from_validation_errors)
+}
+
+fn validate_issue_comments_for_create(issue: &Issue) -> Result<()> {
+    for comment in &issue.comments {
+        validate_new_comment(&issue.id, &comment.author, &comment.body)?;
+    }
+
+    Ok(())
+}
+
+fn validate_import_comments_for_issue(issue_id: &str, comments: &[Comment]) -> Result<()> {
+    let mut seen_comment_ids = HashSet::new();
+    for comment in comments {
+        if comment.issue_id != issue_id {
+            return Err(BeadsError::validation(
+                "comment.issue_id",
+                format!(
+                    "comment issue_id '{}' does not match import issue '{}'",
+                    comment.issue_id, issue_id
+                ),
+            ));
+        }
+        let comment_for_validation = Comment {
+            id: 1,
+            issue_id: issue_id.to_string(),
+            author: comment.author.clone(),
+            body: comment.body.clone(),
+            created_at: comment.created_at,
+        };
+        CommentValidator::validate(&comment_for_validation)
+            .map_err(BeadsError::from_validation_errors)?;
+
+        if comment.id > 0 && !seen_comment_ids.insert(comment.id) {
+            return Err(BeadsError::validation(
+                "comment.id",
+                format!("duplicate import comment id {}", comment.id),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn insert_comment_row(conn: &Connection, issue_id: &str, author: &str, text: &str) -> Result<i64> {
@@ -8402,11 +13075,10 @@ fn comment_from_row(row: &fsqlite::Row) -> Result<Comment> {
         .and_then(SqliteValue::as_text)
         .ok_or_else(|| BeadsError::Config(format!("comments row missing body for {id}")))?
         .to_string();
-    let created_at_str = row
+    let created_at_value = row
         .get(4)
-        .and_then(SqliteValue::as_text)
         .ok_or_else(|| BeadsError::Config(format!("comments row missing created_at for {id}")))?;
-    let created_at = parse_datetime(created_at_str).map_err(|err| match err {
+    let created_at = parse_datetime_value(Some(created_at_value)).map_err(|err| match err {
         BeadsError::Config(msg) => {
             BeadsError::Config(format!("invalid comment timestamp for {id}: {msg}"))
         }
@@ -8433,13 +13105,62 @@ fn dedupe_preserving_order(values: &[String]) -> Vec<String> {
     deduped
 }
 
+fn validate_storage_label(label: &str) -> Result<()> {
+    LabelValidator::validate(label).map_err(|error| BeadsError::validation("label", error.message))
+}
+
+fn validate_storage_labels(labels: &[String]) -> Result<()> {
+    if labels.len() > ISSUE_LABEL_MAX_COUNT {
+        return Err(label_count_error());
+    }
+
+    for label in labels {
+        validate_storage_label(label)?;
+    }
+
+    Ok(())
+}
+
+fn validate_storage_label_refs(labels: &[&String]) -> Result<()> {
+    if labels.len() > ISSUE_LABEL_MAX_COUNT {
+        return Err(label_count_error());
+    }
+
+    for label in labels {
+        validate_storage_label(label.as_str())?;
+    }
+
+    Ok(())
+}
+
+fn label_count_error() -> BeadsError {
+    BeadsError::validation("labels", format!("exceeds {ISSUE_LABEL_MAX_COUNT} labels"))
+}
+
 impl Drop for SqliteStorage {
     fn drop(&mut self) {
-        // Do not checkpoint on drop. Read-only CLI commands were turning
-        // teardown into a write-like operation, which created spurious busy
-        // failures under parallel read traffic.
+        // Read-only commands leave `mutation_count` at zero, so they keep
+        // the original "no checkpoint on teardown" behaviour that prevents
+        // spurious busy failures under parallel read traffic. Mutating
+        // commands that committed since the last periodic checkpoint —
+        // including the abnormal-exit case where signal-induced shutdown
+        // (`crate::shutdown`) returns from main without re-entering
+        // `with_write_transaction` — get one final TRUNCATE here so WAL
+        // frames are not stranded on disk after the process ends (#270).
+        if self.mutation_count > 0
+            && let Err(e) = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        {
+            tracing::debug!(error = %e, "WAL checkpoint on drop failed (non-fatal)");
+        }
         // Explicitly close the connection to avoid fsqlite drop_close warnings.
         let _ = self.conn.close_in_place();
+        // Ephemeral temp databases (open_memory) are unlinked here, after the
+        // connection is closed, so the file and its WAL/SHM/journal sidecars are
+        // not left behind in TMPDIR (#299). Persistent databases have
+        // `temp_db_path == None` and are never touched.
+        if let Some(path) = self.temp_db_path.take() {
+            remove_temp_db_files(&path);
+        }
     }
 }
 
@@ -8460,7 +13181,9 @@ impl SqliteStorage {
 #[allow(clippy::similar_names)]
 mod tests {
     use super::*;
-    use crate::format::ReadyIssue;
+    use crate::format::{
+        BlockedIssueOutput, ReadyIssue, StaleIssue, TextFormatOptions, format_issue_line_with,
+    };
     use crate::model::{Issue, IssueType, Priority, Status};
     use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
     use std::fs;
@@ -8500,6 +13223,8 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -8518,10 +13243,271 @@ mod tests {
         }
     }
 
+    type ReadyTextFields = (
+        String,
+        String,
+        Status,
+        Priority,
+        IssueType,
+        DateTime<Utc>,
+        DateTime<Utc>,
+    );
+
+    fn ready_text_fields(issue: Issue) -> ReadyTextFields {
+        (
+            issue.id,
+            issue.title,
+            issue.status,
+            issue.priority,
+            issue.issue_type,
+            issue.created_at,
+            issue.updated_at,
+        )
+    }
+
+    fn issue_ids(issues: Vec<Issue>) -> Vec<String> {
+        issues.into_iter().map(|issue| issue.id).collect()
+    }
+
+    fn ready_summary_projection_fixture() -> SqliteStorage {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 3, 20, 12, 0, 0).unwrap();
+
+        let mut ready = make_issue(
+            "bd-ready-summary",
+            "Ready summary issue",
+            Status::Open,
+            1,
+            Some("alice"),
+            created_at,
+            None,
+        );
+        ready.description = Some("Description should stay cold".to_string());
+        ready.design = Some("Design should stay cold".repeat(128));
+        ready.acceptance_criteria = Some("AC should stay cold".repeat(128));
+        ready.notes = Some("Notes should stay cold".repeat(128));
+        ready.owner = Some("product".to_string());
+        ready.estimated_minutes = Some(45);
+        ready.created_by = Some("agent".to_string());
+        ready.updated_at = created_at + chrono::Duration::minutes(5);
+
+        let issues = [
+            ready,
+            make_issue(
+                "bd-ready-summary-other",
+                "Other ready summary issue",
+                Status::Open,
+                2,
+                None,
+                created_at + chrono::Duration::minutes(1),
+                None,
+            ),
+            make_issue(
+                "bd-ready-summary-blocker",
+                "Blocker",
+                Status::Open,
+                0,
+                None,
+                created_at + chrono::Duration::minutes(2),
+                None,
+            ),
+            make_issue(
+                "bd-ready-summary-blocked",
+                "Blocked",
+                Status::Open,
+                1,
+                None,
+                created_at + chrono::Duration::minutes(3),
+                None,
+            ),
+        ];
+        for issue in &issues {
+            storage.create_issue(issue, "tester").unwrap();
+        }
+        storage
+            .add_dependency(
+                "bd-ready-summary-blocked",
+                "bd-ready-summary-blocker",
+                "blocks",
+                "tester",
+            )
+            .unwrap();
+
+        storage
+    }
+
+    fn blocker_id_from_ref_for_test(blocker_ref: &str) -> String {
+        blocker_ref
+            .rsplit_once(':')
+            .map_or(blocker_ref, |(prefix, _)| prefix)
+            .to_string()
+    }
+
+    fn blocked_issue_output_for_test(
+        (issue, blockers): (Issue, Vec<String>),
+    ) -> BlockedIssueOutput {
+        BlockedIssueOutput {
+            blocked_by: blockers
+                .iter()
+                .map(|blocker_ref| blocker_id_from_ref_for_test(blocker_ref))
+                .collect(),
+            blocked_by_count: blockers.len(),
+            created_at: issue.created_at,
+            created_by: issue.created_by,
+            description: issue.description,
+            id: issue.id,
+            issue_type: issue.issue_type,
+            priority: issue.priority,
+            status: issue.status,
+            title: issue.title,
+            updated_at: issue.updated_at,
+        }
+    }
+
+    #[test]
+    fn test_dedupe_export_hash_batch_keeps_last_hash_in_first_position() {
+        let exports = vec![
+            ("bd-a".to_string(), "hash-a1".to_string()),
+            ("bd-b".to_string(), "hash-b".to_string()),
+            ("bd-a".to_string(), "hash-a2".to_string()),
+        ];
+
+        let deduped = SqliteStorage::dedupe_export_hash_batch(&exports);
+
+        assert_eq!(
+            deduped,
+            vec![
+                ("bd-a".to_string(), "hash-a2".to_string()),
+                ("bd-b".to_string(), "hash-b".to_string()),
+            ]
+        );
+    }
+
+    fn insert_external_parent_child_dependency(
+        storage: &SqliteStorage,
+        external_child: &str,
+        parent_id: &str,
+        created_at: DateTime<Utc>,
+    ) {
+        // Temporarily disable FK checks for the raw INSERT since external
+        // children do not exist in the local issues table.
+        storage.conn.execute("PRAGMA foreign_keys = OFF").unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES (?, ?, 'parent-child', ?, ?)",
+                &[
+                    SqliteValue::from(external_child),
+                    SqliteValue::from(parent_id),
+                    SqliteValue::from(created_at.to_rfc3339()),
+                    SqliteValue::from("tester"),
+                ],
+            )
+            .unwrap();
+        storage.conn.execute("PRAGMA foreign_keys = ON").unwrap();
+    }
+
+    fn insert_parent_child_dependency_for_test(
+        storage: &SqliteStorage,
+        child_id: &str,
+        parent_id: &str,
+        created_at: DateTime<Utc>,
+    ) {
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES (?, ?, 'parent-child', ?, ?)",
+                &[
+                    SqliteValue::from(child_id),
+                    SqliteValue::from(parent_id),
+                    SqliteValue::from(created_at.to_rfc3339()),
+                    SqliteValue::from("tester"),
+                ],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn test_open_memory() {
         let storage = SqliteStorage::open_memory();
         assert!(storage.is_ok(), "open_memory failed: {:?}", storage.err());
+    }
+
+    /// Regression for #299: `open_memory` is backed by a real temp file (because
+    /// FrankenSQLite cannot use `:memory:`), and that file plus any WAL/SHM/
+    /// journal sidecars must be unlinked when the storage is dropped — otherwise
+    /// `beads_mem_*` files accumulate in `TMPDIR`.
+    #[test]
+    fn open_memory_temp_files_removed_on_drop() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let db_path = storage
+            .temp_db_path
+            .clone()
+            .expect("open_memory must record its temp db path");
+
+        // Perform a mutation so SQLite actually materializes the WAL sidecar,
+        // exercising the sidecar-cleanup path and not just the base .db file.
+        let issue = make_issue(
+            "bd-1",
+            "tmp leak repro",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+
+        assert!(
+            db_path.exists(),
+            "temp db file should exist while storage is open: {}",
+            db_path.display()
+        );
+
+        drop(storage);
+
+        // The base file and every sidecar SQLite may have created must be gone.
+        let name = db_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("temp db name");
+        let leftovers: Vec<PathBuf> = std::iter::once(db_path.clone())
+            .chain(
+                ["-wal", "-shm", "-journal"]
+                    .iter()
+                    .map(|s| db_path.with_file_name(format!("{name}{s}"))),
+            )
+            .filter(|p| p.exists())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp db files left behind after drop: {leftovers:?}"
+        );
+    }
+
+    /// A failed `open_memory` (or its drop) must not leave files behind either:
+    /// `remove_temp_db_files` cleans up the base file and sidecars and tolerates
+    /// missing files.
+    #[test]
+    fn remove_temp_db_files_clears_all_sidecars() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("beads_mem_test_0.db");
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            fs::write(
+                dir.path().join(format!("beads_mem_test_0.db{suffix}")),
+                b"x",
+            )
+            .unwrap();
+        }
+        remove_temp_db_files(&base);
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let p = dir.path().join(format!("beads_mem_test_0.db{suffix}"));
+            assert!(!p.exists(), "should have been removed: {}", p.display());
+        }
+        // Idempotent / tolerant of already-missing files.
+        remove_temp_db_files(&base);
     }
 
     #[test]
@@ -8552,6 +13538,8 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -8875,6 +13863,54 @@ mod tests {
     }
 
     #[test]
+    fn test_external_blockers_return_sorted_blocker_refs() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 3, 3, 0, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-external-blocked",
+            "External blocked",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+
+        storage
+            .add_dependency(
+                "bd-external-blocked",
+                "external:zproj:zcap",
+                "blocks",
+                "tester",
+            )
+            .unwrap();
+        storage
+            .add_dependency(
+                "bd-external-blocked",
+                "external:aproj:acap",
+                "blocks",
+                "tester",
+            )
+            .unwrap();
+
+        let external_statuses = HashMap::from([
+            ("external:zproj:zcap".to_string(), false),
+            ("external:aproj:acap".to_string(), false),
+        ]);
+        let blockers = storage.external_blockers(&external_statuses).unwrap();
+        let expected = vec![
+            "external:aproj:acap:blocked".to_string(),
+            "external:zproj:zcap:blocked".to_string(),
+        ];
+        assert_eq!(
+            blockers.get("bd-external-blocked"),
+            Some(&expected),
+            "external blocker refs should not inherit dependency row order"
+        );
+    }
+
+    #[test]
     fn test_add_dependency_rejects_external_parent_child_target() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
@@ -8898,29 +13934,297 @@ mod tests {
     fn test_has_external_dependencies_detects_external_parent_child_children() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 3, 3, 0, 0, 0).unwrap();
-        let parent = make_issue("bd-p1", "Parent", Status::Open, 2, None, t1, None);
+        let mut parent = make_issue("bd-p1", "Parent", Status::Open, 2, None, t1, None);
+        parent.issue_type = IssueType::Epic;
         storage.create_issue(&parent, "tester").unwrap();
 
-        // Temporarily disable FK checks for the raw INSERT since
-        // external:extproj:child doesn't exist in the issues table.
-        storage.conn.execute("PRAGMA foreign_keys = OFF").unwrap();
-        storage
-            .conn
-            .execute_with_params(
-                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
-                 VALUES (?, ?, 'parent-child', ?, ?)",
-                &[
-                    SqliteValue::from("external:extproj:child"),
-                    SqliteValue::from("bd-p1"),
-                    SqliteValue::from(t1.to_rfc3339()),
-                    SqliteValue::from("tester"),
-                ],
-            )
-            .unwrap();
-        storage.conn.execute("PRAGMA foreign_keys = ON").unwrap();
+        insert_external_parent_child_dependency(&storage, "external:extproj:child", "bd-p1", t1);
 
         assert!(storage.has_external_dependencies(true).unwrap());
         assert!(storage.has_external_dependencies(false).unwrap());
+        assert!(storage.may_have_blocked_command_results().unwrap());
+    }
+
+    #[test]
+    fn test_missing_issue_references_allows_external_dependency_endpoints() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 3, 3, 0, 0, 0).unwrap();
+        let local = make_issue("bd-local", "Local issue", Status::Open, 2, None, t1, None);
+        let mut epic = make_issue("bd-epic", "Epic issue", Status::Open, 2, None, t1, None);
+        epic.issue_type = IssueType::Epic;
+
+        storage.create_issue(&local, "tester").unwrap();
+        storage.create_issue(&epic, "tester").unwrap();
+        storage
+            .add_dependency("bd-local", "external:target:cap", "blocks", "tester")
+            .unwrap();
+        insert_external_parent_child_dependency(&storage, "external:child:cap", "bd-epic", t1);
+
+        assert!(
+            !storage
+                .has_missing_issue_reference("dependencies", "depends_on_id")
+                .unwrap(),
+            "external dependency targets are valid cross-project blockers"
+        );
+        assert!(
+            !storage
+                .has_missing_issue_reference("dependencies", "issue_id")
+                .unwrap(),
+            "external parent-child children are valid cross-project endpoints"
+        );
+        assert_eq!(
+            storage.missing_issue_references().unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_external_parent_child_task_parent_is_not_blocked_candidate() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 3, 4, 0, 0, 0).unwrap();
+        let parent = make_issue(
+            "bd-task-parent",
+            "Task Parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&parent, "tester").unwrap();
+
+        insert_external_parent_child_dependency(
+            &storage,
+            "external:extproj:task-child",
+            "bd-task-parent",
+            t1,
+        );
+
+        assert!(!storage.has_external_dependencies(true).unwrap());
+        assert!(storage.has_external_dependencies(false).unwrap());
+        assert!(!storage.may_have_blocked_command_results().unwrap());
+    }
+
+    #[test]
+    fn test_blocking_only_external_resolution_skips_non_epic_external_children() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 3, 5, 0, 0, 0).unwrap();
+        let direct = make_issue(
+            "bd-direct",
+            "Direct blocker",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let task_parent = make_issue(
+            "bd-task-parent",
+            "Task Parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let mut epic_parent = make_issue(
+            "bd-epic-parent",
+            "Epic Parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        epic_parent.issue_type = IssueType::Epic;
+
+        for issue in [direct, task_parent, epic_parent] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage
+            .add_dependency(
+                "bd-direct",
+                "external:direct:capability",
+                "blocks",
+                "tester",
+            )
+            .unwrap();
+        insert_external_parent_child_dependency(
+            &storage,
+            "external:extproj:task-child",
+            "bd-task-parent",
+            t1,
+        );
+        insert_external_parent_child_dependency(
+            &storage,
+            "external:extproj:epic-child",
+            "bd-epic-parent",
+            t1,
+        );
+
+        let statuses = storage
+            .resolve_external_dependency_statuses(&HashMap::new(), true)
+            .unwrap();
+
+        assert_eq!(statuses.get("external:direct:capability"), Some(&false));
+        assert_eq!(statuses.get("external:extproj:epic-child"), Some(&false));
+        assert!(
+            !statuses.contains_key("external:extproj:task-child"),
+            "blocking-only resolution should not query external children of non-epic parents"
+        );
+    }
+
+    #[test]
+    fn test_external_parent_child_child_only_blocks_epic_parent() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 3, 6, 0, 0, 0).unwrap();
+        let task_parent = make_issue(
+            "bd-task-parent",
+            "Task Parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let mut epic_parent = make_issue(
+            "bd-epic-parent",
+            "Epic Parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        epic_parent.issue_type = IssueType::Epic;
+        storage.create_issue(&task_parent, "tester").unwrap();
+        storage.create_issue(&epic_parent, "tester").unwrap();
+
+        for (external_child, parent_id) in [
+            ("external:extproj:task-child", "bd-task-parent"),
+            ("external:extproj:epic-child", "bd-epic-parent"),
+        ] {
+            insert_external_parent_child_dependency(&storage, external_child, parent_id, t1);
+        }
+
+        let external_statuses = HashMap::from([
+            ("external:extproj:task-child".to_string(), false),
+            ("external:extproj:epic-child".to_string(), false),
+        ]);
+        let blockers = storage.external_blockers(&external_statuses).unwrap();
+
+        assert!(
+            !blockers.contains_key("bd-task-parent"),
+            "external children should not make non-epic parents blocked"
+        );
+        let epic_blockers = blockers
+            .get("bd-epic-parent")
+            .expect("external child should block epic parent");
+        assert_eq!(epic_blockers.len(), 1);
+        assert_eq!(
+            epic_blockers.first().map(String::as_str),
+            Some("external:extproj:epic-child:child-blocked")
+        );
+    }
+
+    #[test]
+    fn test_blocked_command_candidate_probe_empty_cache_and_no_external_deps_is_false() {
+        let storage = SqliteStorage::open_memory().unwrap();
+
+        assert!(!storage.may_have_blocked_command_results().unwrap());
+    }
+
+    #[test]
+    fn test_blocked_command_candidate_probe_detects_local_blocked_cache() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 3, 4, 0, 0, 0).unwrap();
+        let blocker = make_issue("bd-blocker", "Blocker", Status::Open, 2, None, t1, None);
+        let blocked = make_issue("bd-blocked", "Blocked", Status::Open, 2, None, t1, None);
+        storage.create_issue(&blocker, "tester").unwrap();
+        storage.create_issue(&blocked, "tester").unwrap();
+        storage
+            .add_dependency("bd-blocked", "bd-blocker", "blocks", "tester")
+            .unwrap();
+
+        assert!(storage.may_have_blocked_command_results().unwrap());
+    }
+
+    #[test]
+    fn test_blocked_command_candidate_probe_detects_external_blockers() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 3, 5, 0, 0, 0).unwrap();
+        let issue = make_issue("bd-p1", "Parent", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .add_dependency("bd-p1", "external:extproj:capability", "blocks", "tester")
+            .unwrap();
+
+        assert!(storage.may_have_blocked_command_results().unwrap());
+    }
+
+    /// Regression for beads_rust#285. The issue reported that `br close`
+    /// persisted to JSONL but not to the SQLite store and that the
+    /// dirty-tracker stayed empty — meaning the JSONL→DB→JSONL
+    /// reconciliation never fired for the row. Pins both halves of
+    /// the close-as-update contract: the SQLite row reports
+    /// `status='closed'` post-update, and `dirty_issues` contains the
+    /// id so the next flush exports the change. If anyone regresses
+    /// `update_issue`'s `ctx.mark_dirty(id)` call (sqlite.rs:2634 at
+    /// the time this test was added) this fails fast.
+    #[test]
+    fn test_close_path_marks_dirty_and_persists_to_db() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue("bd-close-285", "Close me", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue, "tester").unwrap();
+
+        // Sanity: dirty-tracker is empty after create. (`create_issue`
+        // marks dirty, so we clear it explicitly so the assertion below
+        // measures only the close path's contribution.)
+        storage.clear_all_dirty_issues().unwrap();
+        assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+
+        let close_update = IssueUpdate {
+            status: Some(Status::Closed),
+            closed_at: Some(Some(Utc.with_ymd_and_hms(2026, 5, 2, 0, 0, 0).unwrap())),
+            close_reason: Some(Some("done".to_string())),
+            skip_cache_rebuild: true,
+            ..IssueUpdate::default()
+        };
+        let updated = storage
+            .update_issue("bd-close-285", &close_update, "tester")
+            .expect("close path must succeed");
+
+        // Half 1: the in-memory return value reports Closed.
+        assert_eq!(updated.status, Status::Closed, "returned issue.status");
+
+        // Half 2: the SQLite store actually reflects Closed. Reading
+        // through `get_issue` exercises the same query path consumers
+        // use; a raw SELECT is unnecessary because the user-visible
+        // symptom is the wrong status surfacing through that API.
+        let reloaded = storage
+            .get_issue("bd-close-285")
+            .expect("get_issue")
+            .expect("issue must still exist after close");
+        assert_eq!(
+            reloaded.status,
+            Status::Closed,
+            "SQLite row must report closed; if this fails, br close persisted to JSONL but not DB (issue #285)"
+        );
+
+        // Half 3: dirty_issues queued the close so the next flush can
+        // export it. If this count is zero the JSONL→DB reconciliation
+        // path has nothing to act on and divergence accumulates over
+        // time (the 2.4% drift rate the issue reports).
+        assert_eq!(
+            storage.get_dirty_issue_count().unwrap(),
+            1,
+            "close path must enqueue dirty_issues; without this br sync --flush-only is a no-op after close (issue #285)"
+        );
+        let dirty: Vec<(String, String)> = storage.get_dirty_issue_metadata().unwrap();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].0, "bd-close-285");
     }
 
     #[test]
@@ -8946,6 +14250,58 @@ mod tests {
         assert_eq!(updated.priority, Priority::HIGH);
         assert_eq!(updated.assignee.as_deref(), Some("alice"));
         assert_eq!(updated.description.as_deref(), Some("New description"));
+    }
+
+    #[test]
+    fn test_update_issue_writes_source_repo_path() {
+        // Regression for #289: `br update --source-repo-path PATH` must
+        // round-trip through SQLite. Without writing to the column, the
+        // installed checkpoint would silently lose the value on every
+        // create-then-update cycle.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 5, 1, 0, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-srp",
+            "source_repo_path RT",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let updates = IssueUpdate {
+            source_repo: Some(Some("widget_engine".to_string())),
+            source_repo_path: Some(Some("/data/projects/widget_engine".to_string())),
+            ..IssueUpdate::default()
+        };
+        let updated = storage.update_issue("bd-srp", &updates, "tester").unwrap();
+        assert_eq!(updated.source_repo.as_deref(), Some("widget_engine"));
+        assert_eq!(
+            updated.source_repo_path.as_deref(),
+            Some("/data/projects/widget_engine")
+        );
+
+        // Read back through a fresh fetch to prove it persisted (not just
+        // returned from the in-memory `Issue` the update builder mutates).
+        let reread = storage.get_issue("bd-srp").unwrap().unwrap();
+        assert_eq!(reread.source_repo.as_deref(), Some("widget_engine"));
+        assert_eq!(
+            reread.source_repo_path.as_deref(),
+            Some("/data/projects/widget_engine")
+        );
+
+        // Clear path: passing an empty string through `optional_string_field`
+        // sets the inner Option to None, which should write SQL NULL.
+        let clear = IssueUpdate {
+            source_repo_path: Some(None),
+            ..IssueUpdate::default()
+        };
+        let cleared = storage.update_issue("bd-srp", &clear, "tester").unwrap();
+        assert!(cleared.source_repo_path.is_none());
+        let reread = storage.get_issue("bd-srp").unwrap().unwrap();
+        assert!(reread.source_repo_path.is_none());
     }
 
     #[test]
@@ -9169,6 +14525,97 @@ mod tests {
     }
 
     #[test]
+    fn test_reopen_clears_close_metadata() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-rmeta",
+            "Reopen metadata",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let close_update = IssueUpdate {
+            status: Some(Status::Closed),
+            close_reason: Some(Some("done".to_string())),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue("bd-rmeta", &close_update, "tester")
+            .unwrap();
+        storage
+            .record_close_metadata(
+                "bd-rmeta",
+                &crate::close_policy::AttributionValues::default(),
+                false,
+                None,
+                &[],
+            )
+            .unwrap();
+        assert!(storage.get_close_metadata("bd-rmeta").unwrap().is_some());
+
+        let reopen_update = IssueUpdate {
+            status: Some(Status::Open),
+            closed_at: Some(None),
+            close_reason: Some(None),
+            closed_by_session: Some(None),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue("bd-rmeta", &reopen_update, "tester")
+            .unwrap();
+
+        assert!(storage.get_close_metadata("bd-rmeta").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_delete_issue_clears_close_metadata() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-dmeta",
+            "Delete metadata",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let close_update = IssueUpdate {
+            status: Some(Status::Closed),
+            close_reason: Some(Some("done".to_string())),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue("bd-dmeta", &close_update, "tester")
+            .unwrap();
+        storage
+            .record_close_metadata(
+                "bd-dmeta",
+                &crate::close_policy::AttributionValues::default(),
+                false,
+                None,
+                &[],
+            )
+            .unwrap();
+        assert!(storage.get_close_metadata("bd-dmeta").unwrap().is_some());
+
+        storage
+            .delete_issue("bd-dmeta", "tester", "cleanup", None)
+            .unwrap();
+
+        assert!(storage.get_close_metadata("bd-dmeta").unwrap().is_none());
+    }
+
+    #[test]
     fn test_delete_issue_recomputes_content_hash_for_tombstone() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
@@ -9302,6 +14749,37 @@ mod tests {
     }
 
     #[test]
+    fn test_scheduler_evidence_helpers_handle_default_candidate_window() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 4, 1, 0, 0, 0).unwrap();
+        let ids = (0..512)
+            .map(|index| format!("bd-window-{index:03}"))
+            .collect::<Vec<_>>();
+
+        for id in &ids {
+            let issue = make_issue(id, id, Status::Open, 1, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+            storage.add_label(id, "scheduler", "tester").unwrap();
+        }
+        for issue_id in ids.iter().skip(1) {
+            storage
+                .add_dependency(issue_id, &ids[0], "blocks", "tester")
+                .unwrap();
+        }
+
+        let labels = storage.get_labels_for_issues(&ids).unwrap();
+        let (dependency_counts, dependent_counts) =
+            storage.count_relation_counts_for_issues(&ids).unwrap();
+
+        assert_eq!(labels.len(), ids.len());
+        assert!(ids.iter().all(|id| labels[id] == ["scheduler"]));
+        assert_eq!(*dependent_counts.get(&ids[0]).unwrap_or(&0), ids.len() - 1);
+        for issue_id in ids.iter().skip(1) {
+            assert_eq!(*dependency_counts.get(issue_id).unwrap_or(&0), 1);
+        }
+    }
+
+    #[test]
     fn test_all_list_relation_metadata_matches_separate_helpers() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 4, 1, 0, 0, 0).unwrap();
@@ -9415,6 +14893,332 @@ mod tests {
     }
 
     #[test]
+    fn test_add_label_rejects_invalid_storage_label() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-l-invalid",
+            "Invalid label",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let err = storage
+            .add_label("bd-l-invalid", "bad label", "tester")
+            .expect_err("invalid labels must be rejected at storage boundary");
+        assert!(err.to_string().contains("invalid characters"));
+        assert!(storage.get_labels("bd-l-invalid").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_remove_label_rejects_invalid_storage_label_without_mutating() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-l-remove-invalid",
+            "Invalid label removal",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .add_label("bd-l-remove-invalid", "backend", "tester")
+            .unwrap();
+
+        let err = storage
+            .remove_label("bd-l-remove-invalid", "bad label", "tester")
+            .expect_err("invalid removal label must be rejected at storage boundary");
+        assert!(err.to_string().contains("invalid characters"));
+        assert_eq!(
+            storage.get_labels("bd-l-remove-invalid").unwrap(),
+            vec!["backend".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_add_label_enforces_issue_label_limit() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue("bd-l-cap", "Label cap", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue, "tester").unwrap();
+
+        for index in 0..ISSUE_LABEL_MAX_COUNT {
+            let label = format!("label-{index:02}");
+            assert!(storage.add_label("bd-l-cap", &label, "tester").unwrap());
+        }
+
+        assert!(
+            !storage.add_label("bd-l-cap", "label-00", "tester").unwrap(),
+            "duplicate labels should remain an idempotent no-op at the cap"
+        );
+        let err = storage
+            .add_label("bd-l-cap", "label-extra", "tester")
+            .expect_err("new label beyond cap must fail");
+        assert!(err.to_string().contains("exceeds 64 labels"));
+        assert_eq!(
+            storage.get_labels("bd-l-cap").unwrap().len(),
+            ISSUE_LABEL_MAX_COUNT
+        );
+    }
+
+    #[test]
+    fn test_add_label_to_issues_bulk_marks_only_changed_ids() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        for id in ["bd-bulk-a", "bd-bulk-b", "bd-bulk-c"] {
+            let issue = make_issue(id, id, Status::Open, 2, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage
+            .add_label("bd-bulk-b", "bulk-added", "tester")
+            .unwrap();
+        storage.clear_all_dirty_issues().unwrap();
+
+        let ids = vec![
+            "bd-bulk-a".to_string(),
+            "bd-bulk-b".to_string(),
+            "bd-bulk-c".to_string(),
+            "bd-bulk-a".to_string(),
+        ];
+        let changed = storage
+            .add_label_to_issues_bulk(&ids, "bulk-added", "tester")
+            .unwrap();
+        let expected = ["bd-bulk-a", "bd-bulk-c"]
+            .into_iter()
+            .map(String::from)
+            .collect::<HashSet<_>>();
+        assert_eq!(changed, expected);
+
+        for id in ["bd-bulk-a", "bd-bulk-b", "bd-bulk-c"] {
+            assert!(
+                storage
+                    .get_labels(id)
+                    .unwrap()
+                    .contains(&"bulk-added".to_string()),
+                "{id} should have the bulk-added label"
+            );
+        }
+
+        let mut dirty = storage.get_dirty_issue_ids().unwrap();
+        dirty.sort();
+        assert_eq!(
+            dirty,
+            vec!["bd-bulk-a".to_string(), "bd-bulk-c".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_add_label_to_issues_bulk_handles_sqlite_var_limit_boundary() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+        let ids = (0..SQLITE_VAR_LIMIT)
+            .map(|index| format!("bd-bulk-boundary-{index:03}"))
+            .collect::<Vec<_>>();
+
+        for id in &ids {
+            let issue = make_issue(id, id, Status::Open, 2, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage.clear_all_dirty_issues().unwrap();
+
+        let changed = storage
+            .add_label_to_issues_bulk(&ids, "bulk-boundary", "tester")
+            .unwrap();
+        let expected = ids.iter().cloned().collect::<HashSet<_>>();
+        assert_eq!(changed, expected);
+
+        let mut dirty = storage.get_dirty_issue_ids().unwrap();
+        dirty.sort();
+        assert_eq!(dirty, ids);
+    }
+
+    #[test]
+    fn test_add_label_to_issues_bulk_rejects_cap_without_partial_mutation() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        for id in ["bd-bulk-cap-ok", "bd-bulk-cap-full"] {
+            let issue = make_issue(id, id, Status::Open, 2, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        for index in 0..ISSUE_LABEL_MAX_COUNT {
+            let label = format!("label-{index:02}");
+            storage
+                .add_label("bd-bulk-cap-full", &label, "tester")
+                .unwrap();
+        }
+        storage.clear_all_dirty_issues().unwrap();
+
+        let ids = vec!["bd-bulk-cap-ok".to_string(), "bd-bulk-cap-full".to_string()];
+        let err = storage
+            .add_label_to_issues_bulk(&ids, "label-extra", "tester")
+            .expect_err("bulk label add must reject a target at the label cap");
+        assert!(err.to_string().contains("exceeds 64 labels"));
+        assert!(
+            !storage
+                .get_labels("bd-bulk-cap-ok")
+                .unwrap()
+                .contains(&"label-extra".to_string()),
+            "bulk validation should avoid partially labeling earlier targets"
+        );
+        assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_add_label_to_issues_bulk_rejects_tombstone_without_partial_mutation() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        for id in ["bd-bulk-active", "bd-bulk-tomb"] {
+            let issue = make_issue(id, id, Status::Open, 2, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage
+            .delete_issue("bd-bulk-tomb", "tester", "delete target", None)
+            .unwrap();
+        storage.clear_all_dirty_issues().unwrap();
+
+        let ids = vec!["bd-bulk-active".to_string(), "bd-bulk-tomb".to_string()];
+        let err = storage
+            .add_label_to_issues_bulk(&ids, "bulk-added", "tester")
+            .expect_err("bulk label add must reject tombstones");
+        assert!(
+            err.to_string()
+                .contains("cannot add label to tombstone issue: bd-bulk-tomb")
+        );
+        assert!(storage.get_labels("bd-bulk-active").unwrap().is_empty());
+        assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_remove_label_from_issues_bulk_marks_only_changed_ids() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        for id in ["bd-bulk-remove-a", "bd-bulk-remove-b", "bd-bulk-remove-c"] {
+            let issue = make_issue(id, id, Status::Open, 2, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage
+            .add_label("bd-bulk-remove-a", "bulk-removed", "tester")
+            .unwrap();
+        storage
+            .add_label("bd-bulk-remove-c", "bulk-removed", "tester")
+            .unwrap();
+        storage.clear_all_dirty_issues().unwrap();
+
+        let ids = vec![
+            "bd-bulk-remove-a".to_string(),
+            "bd-bulk-remove-b".to_string(),
+            "bd-bulk-remove-c".to_string(),
+            "bd-bulk-remove-a".to_string(),
+        ];
+        let changed = storage
+            .remove_label_from_issues_bulk(&ids, "bulk-removed", "tester")
+            .unwrap();
+        let expected = ["bd-bulk-remove-a", "bd-bulk-remove-c"]
+            .into_iter()
+            .map(String::from)
+            .collect::<HashSet<_>>();
+        assert_eq!(changed, expected);
+
+        for id in ["bd-bulk-remove-a", "bd-bulk-remove-b", "bd-bulk-remove-c"] {
+            assert!(
+                !storage
+                    .get_labels(id)
+                    .unwrap()
+                    .contains(&"bulk-removed".to_string()),
+                "{id} should not have the bulk-removed label"
+            );
+        }
+
+        let mut dirty = storage.get_dirty_issue_ids().unwrap();
+        dirty.sort();
+        assert_eq!(
+            dirty,
+            vec![
+                "bd-bulk-remove-a".to_string(),
+                "bd-bulk-remove-c".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_remove_label_from_issues_bulk_handles_sqlite_var_limit_boundary() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+        let ids = (0..SQLITE_VAR_LIMIT)
+            .map(|index| format!("bd-bulk-remove-boundary-{index:03}"))
+            .collect::<Vec<_>>();
+
+        for id in &ids {
+            let issue = make_issue(id, id, Status::Open, 2, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        let added = storage
+            .add_label_to_issues_bulk(&ids, "bulk-remove-boundary", "tester")
+            .unwrap();
+        assert_eq!(added, ids.iter().cloned().collect::<HashSet<_>>());
+        storage.clear_all_dirty_issues().unwrap();
+
+        let changed = storage
+            .remove_label_from_issues_bulk(&ids, "bulk-remove-boundary", "tester")
+            .unwrap();
+        let expected = ids.iter().cloned().collect::<HashSet<_>>();
+        assert_eq!(changed, expected);
+
+        let mut dirty = storage.get_dirty_issue_ids().unwrap();
+        dirty.sort();
+        assert_eq!(dirty, ids);
+    }
+
+    #[test]
+    fn test_remove_label_from_issues_bulk_rejects_tombstone_without_partial_mutation() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        for id in ["bd-bulk-remove-active", "bd-bulk-remove-tomb"] {
+            let issue = make_issue(id, id, Status::Open, 2, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage
+            .add_label("bd-bulk-remove-active", "bulk-removed", "tester")
+            .unwrap();
+        storage
+            .delete_issue("bd-bulk-remove-tomb", "tester", "delete target", None)
+            .unwrap();
+        storage.clear_all_dirty_issues().unwrap();
+
+        let ids = vec![
+            "bd-bulk-remove-active".to_string(),
+            "bd-bulk-remove-tomb".to_string(),
+        ];
+        let err = storage
+            .remove_label_from_issues_bulk(&ids, "bulk-removed", "tester")
+            .expect_err("bulk label remove must reject tombstones");
+        assert!(
+            err.to_string()
+                .contains("cannot remove label from tombstone issue: bd-bulk-remove-tomb")
+        );
+        assert_eq!(
+            storage.get_labels("bd-bulk-remove-active").unwrap(),
+            vec!["bulk-removed".to_string()]
+        );
+        assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
+    }
+
+    #[test]
     fn test_set_labels_deduplicates_input() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
@@ -9436,6 +15240,231 @@ mod tests {
 
         let labels = storage.get_labels("bd-l2").unwrap();
         assert_eq!(labels, vec!["api".to_string(), "backend".to_string()]);
+    }
+
+    #[test]
+    fn test_set_labels_validates_before_replacing_existing_labels() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-l-set-invalid",
+            "Set labels",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .set_labels("bd-l-set-invalid", &["stable".to_string()], "tester")
+            .unwrap();
+
+        let err = storage
+            .set_labels("bd-l-set-invalid", &["bad label".to_string()], "tester")
+            .expect_err("invalid replacement label must fail before deleting old labels");
+        assert!(err.to_string().contains("invalid characters"));
+        assert_eq!(
+            storage.get_labels("bd-l-set-invalid").unwrap(),
+            vec!["stable".to_string()]
+        );
+
+        let too_many = (0..=ISSUE_LABEL_MAX_COUNT)
+            .map(|index| format!("label-{index:02}"))
+            .collect::<Vec<_>>();
+        let err = storage
+            .set_labels("bd-l-set-invalid", &too_many, "tester")
+            .expect_err("too many replacement labels must fail");
+        assert!(err.to_string().contains("exceeds 64 labels"));
+        assert_eq!(
+            storage.get_labels("bd-l-set-invalid").unwrap(),
+            vec!["stable".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_sync_labels_for_import_validates_before_replacing_existing_labels() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-l-import-invalid",
+            "Import labels",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .add_label("bd-l-import-invalid", "stable", "tester")
+            .unwrap();
+
+        let err = storage
+            .sync_labels_for_import("bd-l-import-invalid", &["bad label".to_string()])
+            .expect_err("invalid import labels must fail before deleting old labels");
+        assert!(err.to_string().contains("invalid characters"));
+        assert_eq!(
+            storage.get_labels("bd-l-import-invalid").unwrap(),
+            vec!["stable".to_string()]
+        );
+
+        let too_many = (0..=ISSUE_LABEL_MAX_COUNT)
+            .map(|index| format!("label-{index:02}"))
+            .collect::<Vec<_>>();
+        let err = storage
+            .sync_labels_for_import("bd-l-import-invalid", &too_many)
+            .expect_err("too many import labels must fail before deleting old labels");
+        assert!(err.to_string().contains("exceeds 64 labels"));
+        assert_eq!(
+            storage.get_labels("bd-l-import-invalid").unwrap(),
+            vec!["stable".to_string()]
+        );
+
+        storage
+            .sync_labels_for_import(
+                "bd-l-import-invalid",
+                &[
+                    "backend".to_string(),
+                    "backend".to_string(),
+                    "api".to_string(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            storage.get_labels("bd-l-import-invalid").unwrap(),
+            vec!["api".to_string(), "backend".to_string()]
+        );
+    }
+
+    fn setup_dependency_import_validation_storage() -> (SqliteStorage, Issue, Issue, DateTime<Utc>)
+    {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-d-import-invalid",
+            "Import dependencies",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let stable_parent = make_issue(
+            "bd-d-import-stable",
+            "Stable parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        storage.create_issue(&stable_parent, "tester").unwrap();
+        storage
+            .add_dependency(&issue.id, &stable_parent.id, "blocks", "tester")
+            .unwrap();
+
+        (storage, issue, stable_parent, t1)
+    }
+
+    fn assert_stable_dependency_unchanged(
+        storage: &SqliteStorage,
+        issue_id: &str,
+        stable_parent_id: &str,
+    ) {
+        let dependencies = storage.get_dependencies_full(issue_id).unwrap();
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].depends_on_id, stable_parent_id);
+        assert_eq!(
+            dependencies[0].dep_type,
+            crate::model::DependencyType::Blocks
+        );
+    }
+
+    #[test]
+    fn test_sync_dependencies_for_import_rejects_self_and_wrong_source_before_replacing() {
+        let (storage, issue, stable_parent, t1) = setup_dependency_import_validation_storage();
+
+        let self_dependency = crate::model::Dependency {
+            issue_id: issue.id.clone(),
+            depends_on_id: issue.id.clone(),
+            dep_type: crate::model::DependencyType::Blocks,
+            created_at: t1,
+            created_by: Some("import".to_string()),
+            metadata: None,
+            thread_id: None,
+        };
+        let err = storage
+            .sync_dependencies_for_import(&issue.id, &[self_dependency])
+            .expect_err("self-dependency must fail before deleting old dependencies");
+        assert!(matches!(err, BeadsError::SelfDependency { id } if id == issue.id));
+        assert_stable_dependency_unchanged(&storage, &issue.id, &stable_parent.id);
+
+        let wrong_source = crate::model::Dependency {
+            issue_id: "bd-d-import-other".to_string(),
+            depends_on_id: stable_parent.id.clone(),
+            dep_type: crate::model::DependencyType::Blocks,
+            created_at: t1,
+            created_by: Some("import".to_string()),
+            metadata: None,
+            thread_id: None,
+        };
+        let err = storage
+            .sync_dependencies_for_import(&issue.id, &[wrong_source])
+            .expect_err("wrong dependency issue_id must fail before deleting old dependencies");
+        assert!(
+            err.to_string().contains("dependency.issue_id"),
+            "unexpected dependency owner validation error: {err:?}"
+        );
+        assert_stable_dependency_unchanged(&storage, &issue.id, &stable_parent.id);
+    }
+
+    #[test]
+    fn test_sync_dependencies_for_import_rejects_metadata_and_parent_before_replacing() {
+        let (storage, issue, stable_parent, t1) = setup_dependency_import_validation_storage();
+
+        let invalid_metadata = crate::model::Dependency {
+            issue_id: issue.id.clone(),
+            depends_on_id: stable_parent.id.clone(),
+            dep_type: crate::model::DependencyType::Blocks,
+            created_at: t1,
+            created_by: Some("import".to_string()),
+            metadata: Some("{not-json".to_string()),
+            thread_id: None,
+        };
+        let err = storage
+            .sync_dependencies_for_import(&issue.id, &[invalid_metadata])
+            .expect_err("invalid dependency metadata must fail before deleting old dependencies");
+        assert!(
+            matches!(&err, BeadsError::Validation { field, .. } if field == "dependencies[0].metadata"),
+            "metadata validation error must name the offending dependency field: {err:?}"
+        );
+        // #323: the error must be actionable — naming the issue and target.
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&issue.id) && msg.contains(&stable_parent.id),
+            "metadata error must name issue and target: {msg}"
+        );
+        assert_stable_dependency_unchanged(&storage, &issue.id, &stable_parent.id);
+
+        let invalid_parent = crate::model::Dependency {
+            issue_id: issue.id.clone(),
+            depends_on_id: "external:parent".to_string(),
+            dep_type: crate::model::DependencyType::ParentChild,
+            created_at: t1,
+            created_by: Some("import".to_string()),
+            metadata: None,
+            thread_id: None,
+        };
+        let err = storage
+            .sync_dependencies_for_import(&issue.id, &[invalid_parent])
+            .expect_err("invalid import dependency must fail before deleting old dependencies");
+        assert!(err.to_string().contains("parent-child dependencies"));
+
+        assert_stable_dependency_unchanged(&storage, &issue.id, &stable_parent.id);
     }
 
     #[test]
@@ -9491,6 +15520,53 @@ mod tests {
     }
 
     #[test]
+    fn test_unique_label_counts_exclude_tombstone_issues() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        let active = make_issue(
+            "bd-l-active",
+            "Active label count target",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let tombstone = make_issue(
+            "bd-l-deleted",
+            "Deleted label count target",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&active, "tester").unwrap();
+        storage.create_issue(&tombstone, "tester").unwrap();
+        storage
+            .add_label("bd-l-active", "shared", "tester")
+            .unwrap();
+        storage
+            .add_label("bd-l-active", "active-only", "tester")
+            .unwrap();
+        storage
+            .add_label("bd-l-deleted", "shared", "tester")
+            .unwrap();
+        storage
+            .add_label("bd-l-deleted", "deleted-only", "tester")
+            .unwrap();
+        storage
+            .delete_issue("bd-l-deleted", "tester", "delete label count target", None)
+            .unwrap();
+
+        assert_eq!(
+            storage.get_unique_labels_with_counts().unwrap(),
+            vec![("active-only".to_string(), 1), ("shared".to_string(), 1),]
+        );
+    }
+
+    #[test]
     fn test_rename_label_same_name_is_noop() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
@@ -9513,6 +15589,49 @@ mod tests {
             storage.get_events("bd-l3", 100).unwrap().len(),
             event_count_before
         );
+    }
+
+    #[test]
+    fn test_rename_label_rejects_invalid_label_names_without_mutating() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-l-rename-invalid",
+            "Rename invalid label",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .add_label("bd-l-rename-invalid", "backend", "tester")
+            .unwrap();
+
+        let new_name_error = storage
+            .rename_label("backend", "bad label", "tester")
+            .expect_err("invalid replacement label must fail before mutation");
+        assert!(new_name_error.to_string().contains("invalid characters"));
+        assert_eq!(
+            storage.get_labels("bd-l-rename-invalid").unwrap(),
+            vec!["backend".to_string()]
+        );
+
+        let old_name_error = storage
+            .rename_label("bad label", "frontend", "tester")
+            .expect_err("invalid source label must fail before mutation");
+        assert!(old_name_error.to_string().contains("invalid characters"));
+        assert_eq!(
+            storage.get_labels("bd-l-rename-invalid").unwrap(),
+            vec!["backend".to_string()]
+        );
+
+        let same_name_error = storage
+            .rename_label("bad label", "bad label", "tester")
+            .expect_err("invalid same-name rename must not be treated as a no-op");
+        assert!(same_name_error.to_string().contains("invalid characters"));
     }
 
     #[test]
@@ -9595,6 +15714,396 @@ mod tests {
     }
 
     #[test]
+    fn test_bulk_dependency_import_inserts_acyclic_edges_once() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let issue_a = make_issue("bd-bulk-a", "A", Status::Open, 2, None, t1, None);
+        let issue_b = make_issue("bd-bulk-b", "B", Status::Open, 2, None, t1, None);
+        let issue_c = make_issue("bd-bulk-c", "C", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage.create_issue(&issue_b, "tester").unwrap();
+        storage.create_issue(&issue_c, "tester").unwrap();
+
+        let inserted = storage
+            .add_dependencies_bulk_for_import(
+                &[
+                    BulkDependencyInsert {
+                        issue_id: "bd-bulk-a".to_string(),
+                        depends_on_id: "bd-bulk-b".to_string(),
+                        dep_type: "blocks".to_string(),
+                    },
+                    BulkDependencyInsert {
+                        issue_id: "bd-bulk-b".to_string(),
+                        depends_on_id: "bd-bulk-c".to_string(),
+                        dep_type: "blocks".to_string(),
+                    },
+                    BulkDependencyInsert {
+                        issue_id: "bd-bulk-a".to_string(),
+                        depends_on_id: "bd-bulk-b".to_string(),
+                        dep_type: "blocks".to_string(),
+                    },
+                ],
+                "tester",
+            )
+            .unwrap();
+
+        assert_eq!(inserted, 2);
+        assert_eq!(
+            storage.get_dependencies("bd-bulk-a").unwrap(),
+            vec!["bd-bulk-b".to_string()]
+        );
+        assert_eq!(
+            storage.get_dependencies("bd-bulk-b").unwrap(),
+            vec!["bd-bulk-c".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_bulk_dependency_import_rejects_cycle_before_partial_insert() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let issue_a = make_issue("bd-bulk-cycle-a", "A", Status::Open, 2, None, t1, None);
+        let issue_b = make_issue("bd-bulk-cycle-b", "B", Status::Open, 2, None, t1, None);
+        let issue_c = make_issue("bd-bulk-cycle-c", "C", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage.create_issue(&issue_b, "tester").unwrap();
+        storage.create_issue(&issue_c, "tester").unwrap();
+        storage
+            .add_dependency("bd-bulk-cycle-a", "bd-bulk-cycle-b", "blocks", "tester")
+            .unwrap();
+
+        let error = storage
+            .add_dependencies_bulk_for_import(
+                &[
+                    BulkDependencyInsert {
+                        issue_id: "bd-bulk-cycle-b".to_string(),
+                        depends_on_id: "bd-bulk-cycle-c".to_string(),
+                        dep_type: "blocks".to_string(),
+                    },
+                    BulkDependencyInsert {
+                        issue_id: "bd-bulk-cycle-c".to_string(),
+                        depends_on_id: "bd-bulk-cycle-a".to_string(),
+                        dep_type: "blocks".to_string(),
+                    },
+                ],
+                "tester",
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(error, BeadsError::DependencyCycle { .. }),
+            "unexpected bulk cycle error: {error:?}"
+        );
+        assert!(
+            storage
+                .get_dependencies("bd-bulk-cycle-b")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            storage
+                .get_dependencies("bd-bulk-cycle-c")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_add_dependency_existing_pair_skips_cycle_check() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let issue_a = make_issue("bd-existing-a", "A", Status::Open, 2, None, t1, None);
+        let issue_b = make_issue("bd-existing-b", "B", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage.create_issue(&issue_b, "tester").unwrap();
+
+        storage
+            .add_dependency("bd-existing-a", "bd-existing-b", "related", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-existing-b", "bd-existing-a", "blocks", "tester")
+            .unwrap();
+
+        let added = storage
+            .add_dependency("bd-existing-a", "bd-existing-b", "blocks", "tester")
+            .expect("existing pair should return unchanged instead of false cycle");
+
+        assert!(!added);
+        let dep_types: Vec<String> = storage
+            .get_dependencies_full("bd-existing-a")
+            .unwrap()
+            .into_iter()
+            .map(|dep| dep.dep_type.as_str().to_string())
+            .collect();
+        assert_eq!(dep_types, vec!["related".to_string()]);
+    }
+
+    #[test]
+    fn test_bulk_dependency_import_ignores_existing_pairs_before_cycle_check() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let issue_a = make_issue("bd-bulk-existing-a", "A", Status::Open, 2, None, t1, None);
+        let issue_b = make_issue("bd-bulk-existing-b", "B", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage.create_issue(&issue_b, "tester").unwrap();
+        storage
+            .add_dependency(
+                "bd-bulk-existing-a",
+                "bd-bulk-existing-b",
+                "related",
+                "tester",
+            )
+            .unwrap();
+
+        let inserted = storage
+            .add_dependencies_bulk_for_import(
+                &[
+                    BulkDependencyInsert {
+                        issue_id: "bd-bulk-existing-a".to_string(),
+                        depends_on_id: "bd-bulk-existing-b".to_string(),
+                        dep_type: "blocks".to_string(),
+                    },
+                    BulkDependencyInsert {
+                        issue_id: "bd-bulk-existing-b".to_string(),
+                        depends_on_id: "bd-bulk-existing-a".to_string(),
+                        dep_type: "blocks".to_string(),
+                    },
+                ],
+                "tester",
+            )
+            .expect("ignored duplicate pair should not create a false proposed cycle");
+
+        assert_eq!(inserted, 1);
+        let dep_types_a: Vec<String> = storage
+            .get_dependencies_full("bd-bulk-existing-a")
+            .unwrap()
+            .into_iter()
+            .map(|dep| dep.dep_type.as_str().to_string())
+            .collect();
+        assert_eq!(dep_types_a, vec!["related".to_string()]);
+        assert_eq!(
+            storage.get_dependencies("bd-bulk-existing-b").unwrap(),
+            vec!["bd-bulk-existing-a".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_parent_child_cycle_check_allows_existing_parent_to_child_blocker_edge() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let parent = make_issue(
+            "bd-pc-cycle-parent",
+            "Parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let child = make_issue(
+            "bd-pc-cycle-child",
+            "Child",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&parent, "tester").unwrap();
+        storage.create_issue(&child, "tester").unwrap();
+
+        storage
+            .add_dependency(
+                "bd-pc-cycle-parent",
+                "bd-pc-cycle-child",
+                "blocks",
+                "tester",
+            )
+            .unwrap();
+
+        assert!(
+            storage
+                .would_create_cycle("bd-pc-cycle-child", "bd-pc-cycle-parent", true)
+                .unwrap(),
+            "standard edge semantics would see the existing parent -> child blocker path"
+        );
+        assert!(
+            !storage
+                .would_create_parent_child_cycle("bd-pc-cycle-child", "bd-pc-cycle-parent", true)
+                .unwrap(),
+            "parent-child semantics must check the prospective parent -> child graph edge"
+        );
+        assert!(
+            storage
+                .add_dependency(
+                    "bd-pc-cycle-child",
+                    "bd-pc-cycle-parent",
+                    "parent-child",
+                    "tester",
+                )
+                .unwrap()
+        );
+        assert!(
+            storage.detect_blocking_cycles().unwrap().is_empty(),
+            "duplicate parent -> child graph edges are acyclic"
+        );
+    }
+
+    #[test]
+    fn test_parent_child_cycle_check_rejects_reversed_hierarchy_cycle() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let parent = make_issue(
+            "bd-pc-cycle-existing-parent",
+            "Existing parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let child = make_issue(
+            "bd-pc-cycle-existing-child",
+            "Existing child",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&parent, "tester").unwrap();
+        storage.create_issue(&child, "tester").unwrap();
+        storage
+            .add_dependency(
+                "bd-pc-cycle-existing-child",
+                "bd-pc-cycle-existing-parent",
+                "parent-child",
+                "tester",
+            )
+            .unwrap();
+
+        assert!(
+            storage
+                .would_create_parent_child_cycle(
+                    "bd-pc-cycle-existing-parent",
+                    "bd-pc-cycle-existing-child",
+                    true,
+                )
+                .unwrap(),
+            "making the existing parent a child of its child must be rejected"
+        );
+        let error = storage
+            .add_dependency(
+                "bd-pc-cycle-existing-parent",
+                "bd-pc-cycle-existing-child",
+                "parent-child",
+                "tester",
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, BeadsError::DependencyCycle { .. }),
+            "unexpected reversed hierarchy error: {error:?}"
+        );
+        assert_eq!(
+            storage
+                .get_parent_id("bd-pc-cycle-existing-parent")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_add_dependency_rejects_second_parent_child_parent() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let child = make_issue(
+            "bd-single-parent-child",
+            "Child",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let parent_a = make_issue(
+            "bd-single-parent-a",
+            "Parent A",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let parent_b = make_issue(
+            "bd-single-parent-b",
+            "Parent B",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+
+        storage.create_issue(&child, "tester").unwrap();
+        storage.create_issue(&parent_a, "tester").unwrap();
+        storage.create_issue(&parent_b, "tester").unwrap();
+
+        assert!(
+            storage
+                .add_dependency(
+                    "bd-single-parent-child",
+                    "bd-single-parent-a",
+                    "Parent-Child",
+                    "tester",
+                )
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .add_dependency(
+                    "bd-single-parent-child",
+                    "bd-single-parent-a",
+                    "parent-child",
+                    "tester",
+                )
+                .unwrap(),
+            "adding the same parent-child row should remain idempotent"
+        );
+
+        let error = storage
+            .add_dependency(
+                "bd-single-parent-child",
+                "bd-single-parent-b",
+                "parent-child",
+                "tester",
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                BeadsError::Validation { field, reason }
+                    if field == "depends_on_id"
+                        && reason.contains("already has parent bd-single-parent-a")
+            ),
+            "unexpected second-parent error: {error:?}"
+        );
+        assert_eq!(
+            storage
+                .get_parent_id("bd-single-parent-child")
+                .unwrap()
+                .as_deref(),
+            Some("bd-single-parent-a")
+        );
+    }
+
+    #[test]
     fn test_dependency_mutations_reject_tombstone_issue() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
@@ -9658,6 +16167,19 @@ mod tests {
             "unexpected clear parent error: {clear_parent_error:?}"
         );
 
+        let remove_parent_error = storage.remove_parent("bd-dep-child", "tester").unwrap_err();
+        assert!(
+            matches!(
+                &remove_parent_error,
+                BeadsError::Validation { field, reason }
+                    if field == "issue_id"
+                        && reason.contains(
+                            "cannot clear parent from tombstone issue: bd-dep-child"
+                        )
+            ),
+            "unexpected remove_parent error: {remove_parent_error:?}"
+        );
+
         let set_parent_error = storage
             .set_parent("bd-dep-child", Some("bd-dep-new-parent"), "tester")
             .unwrap_err();
@@ -9673,6 +16195,300 @@ mod tests {
 
         let deps = storage.get_dependencies("bd-dep-child").unwrap();
         assert_eq!(deps, vec!["bd-dep-old-parent".to_string()]);
+    }
+
+    #[test]
+    fn test_set_parent_same_parent_is_noop() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 3, 0, 0, 0).unwrap();
+
+        let child = make_issue(
+            "bd-parent-noop-child",
+            "Child",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let parent = make_issue(
+            "bd-parent-noop-parent",
+            "Parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&child, "tester").unwrap();
+        storage.create_issue(&parent, "tester").unwrap();
+        storage
+            .set_parent(
+                "bd-parent-noop-child",
+                Some("bd-parent-noop-parent"),
+                "tester",
+            )
+            .unwrap();
+        storage.clear_all_dirty_issues().unwrap();
+
+        let before = storage
+            .get_issue("bd-parent-noop-child")
+            .unwrap()
+            .expect("child exists");
+        let event_count_before = storage
+            .get_events("bd-parent-noop-child", 100)
+            .unwrap()
+            .len();
+
+        storage
+            .set_parent(
+                "bd-parent-noop-child",
+                Some("bd-parent-noop-parent"),
+                "tester",
+            )
+            .unwrap();
+
+        let after = storage
+            .get_issue("bd-parent-noop-child")
+            .unwrap()
+            .expect("child exists");
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(
+            storage
+                .get_parent_id("bd-parent-noop-child")
+                .unwrap()
+                .as_deref(),
+            Some("bd-parent-noop-parent")
+        );
+        assert_eq!(
+            storage
+                .get_events("bd-parent-noop-child", 100)
+                .unwrap()
+                .len(),
+            event_count_before
+        );
+        assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_set_parent_same_requested_parent_cleans_extra_parent_rows() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 5, 0, 0, 0).unwrap();
+
+        let child = make_issue(
+            "bd-parent-cleanup-child",
+            "Child",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let parent = make_issue(
+            "bd-parent-cleanup-parent",
+            "Parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let extra_parent = make_issue(
+            "bd-parent-cleanup-extra-parent",
+            "Extra parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&child, "tester").unwrap();
+        storage.create_issue(&parent, "tester").unwrap();
+        storage.create_issue(&extra_parent, "tester").unwrap();
+        insert_parent_child_dependency_for_test(
+            &storage,
+            "bd-parent-cleanup-child",
+            "bd-parent-cleanup-parent",
+            t1,
+        );
+        insert_parent_child_dependency_for_test(
+            &storage,
+            "bd-parent-cleanup-child",
+            "bd-parent-cleanup-extra-parent",
+            t1,
+        );
+        assert_eq!(
+            storage
+                .get_parent_id("bd-parent-cleanup-child")
+                .unwrap()
+                .as_deref(),
+            Some("bd-parent-cleanup-extra-parent")
+        );
+        storage.clear_all_dirty_issues().unwrap();
+
+        storage
+            .set_parent(
+                "bd-parent-cleanup-child",
+                Some("bd-parent-cleanup-parent"),
+                "tester",
+            )
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .get_parent_id("bd-parent-cleanup-child")
+                .unwrap()
+                .as_deref(),
+            Some("bd-parent-cleanup-parent")
+        );
+        let parent_rows = storage
+            .conn
+            .query_with_params(
+                "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type = 'parent-child' ORDER BY depends_on_id",
+                &[SqliteValue::from("bd-parent-cleanup-child")],
+            )
+            .unwrap();
+        let parent_ids = parent_rows
+            .iter()
+            .filter_map(|row| {
+                row.get(0)
+                    .and_then(SqliteValue::as_text)
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parent_ids,
+            vec!["bd-parent-cleanup-parent".to_string()],
+            "set_parent must canonicalize duplicate parent-child rows"
+        );
+        assert_eq!(
+            storage.get_dirty_issue_ids().unwrap(),
+            vec!["bd-parent-cleanup-child".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_remove_parent_invalidates_all_duplicate_parent_rows() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 6, 0, 0, 0).unwrap();
+
+        let child = make_issue(
+            "bd-remove-parent-child",
+            "Child",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let mut parent_a = make_issue(
+            "bd-remove-parent-a",
+            "Parent A",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        parent_a.issue_type = IssueType::Epic;
+        let mut parent_b = make_issue(
+            "bd-remove-parent-b",
+            "Parent B",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        parent_b.issue_type = IssueType::Epic;
+
+        storage.create_issue(&child, "tester").unwrap();
+        storage.create_issue(&parent_a, "tester").unwrap();
+        storage.create_issue(&parent_b, "tester").unwrap();
+        insert_parent_child_dependency_for_test(
+            &storage,
+            "bd-remove-parent-child",
+            "bd-remove-parent-a",
+            t1,
+        );
+        insert_parent_child_dependency_for_test(
+            &storage,
+            "bd-remove-parent-child",
+            "bd-remove-parent-b",
+            t1,
+        );
+        storage.rebuild_blocked_cache(true).unwrap();
+        assert!(storage.is_blocked("bd-remove-parent-a").unwrap());
+        assert!(storage.is_blocked("bd-remove-parent-b").unwrap());
+
+        assert!(
+            storage
+                .remove_parent("bd-remove-parent-child", "tester")
+                .unwrap()
+        );
+
+        assert!(
+            !storage.blocked_cache_marked_stale().unwrap(),
+            "remove_parent should eagerly refresh the affected cache entries"
+        );
+        assert!(
+            !storage.is_blocked("bd-remove-parent-a").unwrap(),
+            "first old parent must not keep a stale child-open cache row"
+        );
+        assert!(
+            !storage.is_blocked("bd-remove-parent-b").unwrap(),
+            "second old parent must not keep a stale child-open cache row"
+        );
+        assert_eq!(
+            storage.get_parent_id("bd-remove-parent-child").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_set_parent_clear_absent_parent_is_noop() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-parent-clear-noop",
+            "Already root",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        storage.clear_all_dirty_issues().unwrap();
+
+        let before = storage
+            .get_issue("bd-parent-clear-noop")
+            .unwrap()
+            .expect("issue exists");
+        let event_count_before = storage
+            .get_events("bd-parent-clear-noop", 100)
+            .unwrap()
+            .len();
+
+        storage
+            .set_parent("bd-parent-clear-noop", None, "tester")
+            .unwrap();
+
+        let after = storage
+            .get_issue("bd-parent-clear-noop")
+            .unwrap()
+            .expect("issue exists");
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(storage.get_parent_id("bd-parent-clear-noop").unwrap(), None);
+        assert_eq!(
+            storage
+                .get_events("bd-parent-clear-noop", 100)
+                .unwrap()
+                .len(),
+            event_count_before
+        );
+        assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
     }
 
     #[test]
@@ -9716,6 +16532,84 @@ mod tests {
             deps[0].metadata.as_deref(),
             Some(r#"{"source":"cli","reason":"gate"}"#)
         );
+    }
+
+    #[test]
+    fn test_import_dependency_with_legacy_empty_metadata_rebuilds() {
+        // Regression for issue #323: legacy JSONL with `"metadata":""` (an
+        // empty string that is not valid JSON) must rebuild cleanly through the
+        // JSONL deserialize -> SQLite import path, materializing as the empty
+        // JSON object `"{}"` with no data loss.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let issue_a = make_issue("bd-a1", "A", Status::Open, 2, None, t1, None);
+        let issue_b = make_issue("bd-b1", "B", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage.create_issue(&issue_b, "tester").unwrap();
+
+        // Deserialize exactly as a JSONL rebuild would (not constructing the
+        // Dependency directly) so the empty-string coercion is exercised.
+        let dep_json = r#"{
+            "issue_id": "bd-a1",
+            "depends_on_id": "bd-b1",
+            "type": "blocks",
+            "created_at": "2026-01-01T00:00:00Z",
+            "created_by": "import",
+            "metadata": "",
+            "thread_id": ""
+        }"#;
+        let dep: crate::model::Dependency =
+            serde_json::from_str(dep_json).expect("legacy empty metadata must deserialize");
+        assert_eq!(dep.metadata, None, "empty metadata must coerce to None");
+
+        storage
+            .sync_dependencies_for_import("bd-a1", &[dep])
+            .expect("rebuild with legacy empty metadata must succeed");
+
+        let deps = storage.get_dependencies_full("bd-a1").unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].depends_on_id, "bd-b1");
+        // None is materialized as "{}" on insert.
+        assert_eq!(deps[0].metadata.as_deref(), Some("{}"));
+    }
+
+    #[test]
+    fn test_get_dependencies_full_preserves_numeric_created_at() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let issue_a = make_issue("bd-a1", "A", Status::Open, 2, None, t1, None);
+        let issue_b = make_issue("bd-b1", "B", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage.create_issue(&issue_b, "tester").unwrap();
+        storage
+            .add_dependency("bd-a1", "bd-b1", "blocks", "tester")
+            .unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "UPDATE dependencies SET created_at = ? WHERE issue_id = ? AND depends_on_id = ?",
+                &[
+                    SqliteValue::Integer(1_776_651_488_000_000),
+                    SqliteValue::from("bd-a1"),
+                    SqliteValue::from("bd-b1"),
+                ],
+            )
+            .unwrap();
+
+        let deps = storage.get_dependencies_full("bd-a1").unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].created_at.year(), 2026);
+        assert_eq!(deps[0].created_at.month(), 4);
+        assert_eq!(deps[0].created_at.day(), 20);
+        assert_eq!(deps[0].created_at.hour(), 2);
+        assert_eq!(deps[0].created_at.minute(), 18);
+
+        let by_issue = storage
+            .get_dependencies_full_for_issues(&["bd-a1".to_string()])
+            .unwrap();
+        assert_eq!(by_issue["bd-a1"][0].created_at, deps[0].created_at);
     }
 
     #[test]
@@ -9774,6 +16668,38 @@ mod tests {
         assert_eq!(deps[0].status, Status::Blocked);
         assert_eq!(deps[0].priority, Priority::MEDIUM);
         assert_eq!(deps[0].dep_type, "blocks");
+    }
+
+    #[test]
+    fn test_get_dependencies_with_metadata_sorts_external_placeholder_as_medium_priority() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let issue_a = make_issue("bd-a1", "A", Status::Open, 2, None, t1, None);
+        let critical = make_issue("bd-critical", "Critical", Status::Open, 0, None, t1, None);
+        let low = make_issue("bd-low", "Low", Status::Open, 3, None, t1, None);
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage.create_issue(&critical, "tester").unwrap();
+        storage.create_issue(&low, "tester").unwrap();
+
+        storage
+            .add_dependency("bd-a1", "external:proj:capability", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-a1", "bd-low", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-a1", "bd-critical", "blocks", "tester")
+            .unwrap();
+
+        let deps = storage.get_dependencies_with_metadata("bd-a1").unwrap();
+        let ids: Vec<_> = deps.iter().map(|dep| dep.id.as_str()).collect();
+
+        assert_eq!(
+            ids,
+            vec!["bd-critical", "external:proj:capability", "bd-low"]
+        );
+        assert_eq!(deps[1].priority, Priority::MEDIUM);
     }
 
     #[test]
@@ -9856,6 +16782,27 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_blocking_cycles_ignores_related_edges() -> Result<()> {
+        let mut storage = SqliteStorage::open_memory()?;
+        let t1 = Utc
+            .with_ymd_and_hms(2025, 7, 3, 0, 0, 0)
+            .single()
+            .ok_or_else(|| BeadsError::internal("invalid test timestamp"))?;
+
+        let issue_a = make_issue("bd-rel-cy1", "A", Status::Open, 2, None, t1, None);
+        let issue_b = make_issue("bd-rel-cy2", "B", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue_a, "tester")?;
+        storage.create_issue(&issue_b, "tester")?;
+
+        storage.add_dependency("bd-rel-cy1", "bd-rel-cy2", "related", "tester")?;
+        storage.add_dependency("bd-rel-cy2", "bd-rel-cy1", "related", "tester")?;
+
+        assert!(!storage.detect_all_cycles()?.is_empty());
+        assert!(storage.detect_blocking_cycles()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn test_get_comments_orders_by_created_at() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
@@ -9885,6 +16832,8 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -9964,6 +16913,8 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -10008,6 +16959,138 @@ mod tests {
     }
 
     #[test]
+    fn test_get_comments_preserves_numeric_created_at() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+
+        let issue = Issue {
+            id: "bd-c-numeric-time".to_string(),
+            content_hash: None,
+            title: "Comment issue".to_string(),
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            notes: None,
+            status: Status::Open,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            assignee: None,
+            owner: None,
+            estimated_minutes: None,
+            created_at: t1,
+            created_by: None,
+            updated_at: t1,
+            closed_at: None,
+            close_reason: None,
+            closed_by_session: None,
+            defer_until: None,
+            due_at: None,
+            external_ref: None,
+            source_system: None,
+            source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
+            deleted_at: None,
+            deleted_by: None,
+            delete_reason: None,
+            original_type: None,
+            compaction_level: None,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: None,
+            sender: None,
+            ephemeral: false,
+            pinned: false,
+            is_template: false,
+            labels: vec![],
+            dependencies: vec![],
+            comments: vec![],
+        };
+        storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
+                &[
+                    SqliteValue::from("bd-c-numeric-time"),
+                    SqliteValue::from("alice"),
+                    SqliteValue::from("fractional"),
+                    SqliteValue::Float(1_776_651_488.25),
+                ],
+            )
+            .unwrap();
+
+        let comments = storage.get_comments("bd-c-numeric-time").unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].created_at.year(), 2026);
+        assert_eq!(comments[0].created_at.timestamp(), 1_776_651_488);
+        assert_eq!(comments[0].created_at.timestamp_subsec_nanos(), 250_000_000);
+
+        let by_issue = storage
+            .get_comments_for_issues(&["bd-c-numeric-time".to_string()])
+            .unwrap();
+        assert_eq!(
+            by_issue["bd-c-numeric-time"][0].created_at,
+            comments[0].created_at
+        );
+    }
+
+    #[test]
+    fn test_get_latest_comments_for_issues_bounds_each_issue() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+        let issue_a = make_issue("bd-c-latest-a", "A", Status::Open, 2, None, t1, None);
+        let issue_b = make_issue("bd-c-latest-b", "B", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage.create_issue(&issue_b, "tester").unwrap();
+
+        for (issue_id, body, created_at) in [
+            ("bd-c-latest-a", "a-old", "2025-07-01T00:00:00Z"),
+            ("bd-c-latest-a", "a-middle", "2025-07-02T00:00:00Z"),
+            ("bd-c-latest-a", "a-new", "2025-07-03T00:00:00Z"),
+            ("bd-c-latest-b", "b-old", "2025-07-01T00:00:00Z"),
+            ("bd-c-latest-b", "b-new", "2025-07-02T00:00:00Z"),
+        ] {
+            storage
+                .conn
+                .execute_with_params(
+                    "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
+                    &[
+                        SqliteValue::from(issue_id),
+                        SqliteValue::from("tester"),
+                        SqliteValue::from(body),
+                        SqliteValue::from(created_at),
+                    ],
+                )
+                .unwrap();
+        }
+
+        let by_issue = storage
+            .get_latest_comments_for_issues(
+                &["bd-c-latest-a".to_string(), "bd-c-latest-b".to_string()],
+                2,
+            )
+            .unwrap();
+
+        let issue_a_bodies = by_issue["bd-c-latest-a"]
+            .iter()
+            .map(|comment| comment.body.as_str())
+            .collect::<Vec<_>>();
+        let issue_b_bodies = by_issue["bd-c-latest-b"]
+            .iter()
+            .map(|comment| comment.body.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(issue_a_bodies, ["a-middle", "a-new"]);
+        assert_eq!(issue_b_bodies, ["b-old", "b-new"]);
+
+        let empty = storage
+            .get_latest_comments_for_issues(&["bd-c-latest-a".to_string()], 0)
+            .unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
     fn test_add_comment_round_trip() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
@@ -10037,6 +17120,8 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -10083,18 +17168,13 @@ mod tests {
         );
         storage.create_issue(&issue, "tester").unwrap();
 
-        let long_text = "x".repeat(51_201);
-        let body_error = storage
+        // Long-content comments are explicitly permitted — spec write-ups,
+        // session transcripts, etc. routinely exceed 50KB. The prior cap
+        // rejected legitimate pre-existing JSONL records on rebuild.
+        let long_text = "x".repeat(600_000);
+        storage
             .add_comment("bd-c-invalid-input", "alice", &long_text)
-            .unwrap_err();
-        assert!(
-            matches!(
-                &body_error,
-                BeadsError::Validation { field, reason }
-                    if field == "content" && reason.contains("exceeds 50KB")
-            ),
-            "unexpected long comment error: {body_error:?}"
-        );
+            .expect("long comment bodies must be accepted");
 
         let author_error = storage
             .add_comment("bd-c-invalid-input", "", "Valid comment body")
@@ -10109,9 +17189,54 @@ mod tests {
         );
 
         let comments = storage.get_comments("bd-c-invalid-input").unwrap();
+        assert_eq!(
+            comments.len(),
+            1,
+            "the long-body insert above must persist; only the empty-author insert is rejected: {comments:?}"
+        );
+        assert_eq!(
+            comments[0].body.len(),
+            600_000,
+            "long comment body preserved verbatim"
+        );
+    }
+
+    #[test]
+    fn test_create_issue_rejects_invalid_embedded_comment_without_inserting_issue() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+        let mut issue = make_issue(
+            "bd-c-create-invalid",
+            "Create comment validation target",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        issue.comments.push(Comment {
+            id: 1,
+            issue_id: "bd-c-create-invalid".to_string(),
+            author: "alice".to_string(),
+            body: "   ".to_string(),
+            created_at: t1,
+        });
+
+        let err = storage.create_issue(&issue, "tester").unwrap_err();
         assert!(
-            comments.is_empty(),
-            "invalid comments must not be inserted: {comments:?}"
+            matches!(
+                &err,
+                BeadsError::Validation { field, reason }
+                    if field == "content" && reason.contains("cannot be empty")
+            ),
+            "unexpected embedded comment validation error: {err:?}"
+        );
+        assert!(storage.get_issue("bd-c-create-invalid").unwrap().is_none());
+        assert!(
+            storage
+                .get_comments("bd-c-create-invalid")
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -10322,6 +17447,194 @@ mod tests {
         assert_ne!(
             comments_b[0].id, colliding_id,
             "second comment must have been re-allocated to avoid PK collision"
+    fn test_sync_comments_for_import_rejects_duplicate_comment_ids_for_same_issue() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-c-import-dup",
+            "Duplicate import comments",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        let existing_comment = storage
+            .add_comment(&issue.id, "bob", "existing local comment")
+            .unwrap();
+
+        let first = crate::model::Comment {
+            id: 42,
+            issue_id: issue.id.clone(),
+            author: "alice".to_string(),
+            body: "first imported comment".to_string(),
+            created_at: t1,
+        };
+        let second = crate::model::Comment {
+            id: 42,
+            issue_id: issue.id.clone(),
+            author: "alice".to_string(),
+            body: "duplicate imported comment".to_string(),
+            created_at: t1 + chrono::Duration::minutes(1),
+        };
+
+        let error = storage
+            .sync_comments_for_import(&issue.id, &[first, second])
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("duplicate import comment id 42"),
+            "duplicate same-issue import comment IDs must remain invalid: {error:?}"
+        );
+        assert_eq!(
+            storage.get_comments(&issue.id).unwrap(),
+            vec![existing_comment.clone()]
+        );
+
+        let wrong_issue_comment = crate::model::Comment {
+            id: 44,
+            issue_id: "bd-c-import-other".to_string(),
+            author: "alice".to_string(),
+            body: "valid text, wrong owner".to_string(),
+            created_at: t1,
+        };
+        let error = storage
+            .sync_comments_for_import(&issue.id, &[wrong_issue_comment])
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("comment.issue_id"),
+            "wrong comment owner must fail validation: {error:?}"
+        );
+        assert_eq!(
+            storage.get_comments(&issue.id).unwrap(),
+            vec![existing_comment]
+        );
+    }
+
+    #[test]
+    fn test_sync_comments_for_import_validates_before_replacing_existing_comments() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-c-import-invalid",
+            "Invalid import comments",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        let existing_comment = storage
+            .add_comment(&issue.id, "bob", "existing local comment")
+            .unwrap();
+
+        let invalid_comment = crate::model::Comment {
+            id: 43,
+            issue_id: issue.id.clone(),
+            author: "alice".to_string(),
+            body: "   ".to_string(),
+            created_at: t1,
+        };
+
+        let error = storage
+            .sync_comments_for_import(&issue.id, &[invalid_comment])
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("cannot be empty"),
+            "invalid import comment body must fail validation: {error:?}"
+        );
+        assert_eq!(
+            storage.get_comments(&issue.id).unwrap(),
+            vec![existing_comment]
+        );
+    }
+
+    #[test]
+    fn test_insert_new_issue_relations_for_import_skips_relation_deletes() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+
+        let parent = make_issue("bd-parent", "Parent", Status::Open, 2, None, t1, None);
+        let other = make_issue("bd-other", "Other", Status::Open, 2, None, t1, None);
+        let mut imported = make_issue("bd-new", "New import", Status::Open, 2, None, t1, None);
+        storage.create_issue(&parent, "tester").unwrap();
+        storage.create_issue(&other, "tester").unwrap();
+        storage.insert_new_issue_for_import(&imported).unwrap();
+
+        let existing_comment = storage
+            .add_comment("bd-other", "bob", "Existing owner")
+            .unwrap();
+        imported.labels = vec!["sync".to_string(), "perf".to_string(), "sync".to_string()];
+        imported.dependencies = vec![crate::model::Dependency {
+            issue_id: imported.id.clone(),
+            depends_on_id: parent.id.clone(),
+            dep_type: crate::model::DependencyType::Blocks,
+            created_at: t1,
+            created_by: Some("import".to_string()),
+            metadata: None,
+            thread_id: None,
+        }];
+        imported.comments = vec![crate::model::Comment {
+            id: existing_comment.id,
+            issue_id: imported.id.clone(),
+            author: "alice".to_string(),
+            body: "Imported comment".to_string(),
+            created_at: t1 + chrono::Duration::minutes(5),
+        }];
+
+        storage
+            .insert_new_issue_relations_for_import(&imported)
+            .unwrap();
+
+        assert_eq!(
+            storage.get_labels(&imported.id).unwrap(),
+            vec!["perf", "sync"]
+        );
+        let dependency_count = storage
+            .execute_raw_query("SELECT COUNT(*) FROM dependencies WHERE issue_id = 'bd-new'")
+            .unwrap()
+            .first()
+            .and_then(|row| row.first())
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(-1);
+        assert_eq!(dependency_count, 1);
+
+        let imported_comments = storage.get_comments(&imported.id).unwrap();
+        assert_eq!(imported_comments.len(), 1);
+        assert_eq!(imported_comments[0].body, "Imported comment");
+        assert_ne!(imported_comments[0].id, existing_comment.id);
+
+        assert_eq!(
+            storage.get_comments(&other.id).unwrap(),
+            vec![existing_comment]
+        );
+    }
+
+    #[test]
+    fn test_has_owned_relation_rows_for_import_detects_orphan_rows() {
+        let storage = SqliteStorage::open_memory().unwrap();
+
+        assert!(
+            !storage
+                .has_owned_relation_rows_for_import("bd-stale")
+                .unwrap()
+        );
+
+        storage
+            .conn
+            .execute(
+                "PRAGMA foreign_keys = OFF;
+                 INSERT INTO labels (issue_id, label) VALUES ('bd-stale', 'old-label');",
+            )
+            .unwrap();
+
+        assert!(
+            storage
+                .has_owned_relation_rows_for_import("bd-stale")
+                .unwrap()
         );
     }
 
@@ -10379,6 +17692,27 @@ mod tests {
     }
 
     #[test]
+    fn test_external_project_capability_probe_does_not_create_missing_database() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("missing-external.db");
+        let capabilities = HashSet::from(["capability".to_string()]);
+
+        let error = query_external_project_capabilities(&db_path, &capabilities)
+            .expect_err("missing external database should be an unsatisfied dependency");
+
+        assert!(
+            error
+                .to_string()
+                .contains("external project database not found"),
+            "{error}"
+        );
+        assert!(
+            !db_path.exists(),
+            "read-only external dependency probe must not create missing DB files"
+        );
+    }
+
+    #[test]
     fn test_add_comment_marks_dirty() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
@@ -10408,6 +17742,8 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -10809,6 +18145,196 @@ mod tests {
     }
 
     #[test]
+    fn test_get_start_blockers_ignores_child_open_but_keeps_real_blockers() {
+        // #315: an epic that is "blocked" only by its own still-open children
+        // must remain claimable / startable (the child-open rollup is a
+        // close-ordering constraint, not a real dependency). A genuine `blocks`
+        // edge must still prevent starting, and the child-open marker must be
+        // filtered out of the reported start-blockers.
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let now = Utc::now();
+
+        let mut epic = make_issue("bd-epic", "Epic", Status::Open, 2, None, now, None);
+        epic.issue_type = IssueType::Epic;
+        let mut blocked_epic = make_issue(
+            "bd-epic-blocked",
+            "Blocked epic",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        blocked_epic.issue_type = IssueType::Epic;
+        for issue in [
+            epic,
+            make_issue("bd-epic.1", "Child", Status::Open, 2, None, now, None),
+            blocked_epic,
+            make_issue(
+                "bd-epic-blocked.1",
+                "Child of blocked epic",
+                Status::Open,
+                2,
+                None,
+                now,
+                None,
+            ),
+            make_issue(
+                "bd-real-blocker",
+                "Real blocker",
+                Status::Open,
+                2,
+                None,
+                now,
+                None,
+            ),
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        storage
+            .add_dependency("bd-epic.1", "bd-epic", "parent-child", "tester")
+            .unwrap();
+        storage
+            .add_dependency(
+                "bd-epic-blocked.1",
+                "bd-epic-blocked",
+                "parent-child",
+                "tester",
+            )
+            .unwrap();
+        storage
+            .add_dependency("bd-epic-blocked", "bd-real-blocker", "blocks", "tester")
+            .unwrap();
+
+        // Both epics are "blocked" in the close-ordering sense (open children).
+        assert!(storage.is_blocked("bd-epic").unwrap());
+        assert!(storage.is_blocked("bd-epic-blocked").unwrap());
+
+        // An epic blocked ONLY by open children has no start-blockers: claimable.
+        assert!(
+            storage.get_start_blockers("bd-epic").unwrap().is_empty(),
+            "epic with only open children must be startable (#315)"
+        );
+        // The close-ordering view (get_blockers) is unchanged — still rolls up.
+        assert_eq!(
+            storage.get_blockers("bd-epic").unwrap(),
+            vec!["bd-epic.1".to_string()]
+        );
+
+        // An epic with a real `blocks` dependency is still start-blocked, and
+        // the child-open marker is filtered out of the reported blockers.
+        assert_eq!(
+            storage.get_start_blockers("bd-epic-blocked").unwrap(),
+            vec!["bd-real-blocker".to_string()],
+            "real blocks edge must still block starting; child-open filtered (#315)"
+        );
+    }
+
+    #[test]
+    fn test_get_start_blockers_ignores_inherited_parent_blocked_marker() {
+        // #357 (start-path counterpart of #355): a child whose ONLY blocker is
+        // the inherited `<parent>:parent-blocked` rollup — i.e. its parent epic
+        // is itself blocked, but the child has no real prerequisite of its own —
+        // must be claimable / startable. `parent-child` is hierarchy, not a
+        // prerequisite edge from the parent to the child, and the actionable
+        // children of a blocked epic are frequently exactly the work that
+        // unblocks the epic. A child with a DIRECT real blocker must still
+        // reject, so this strips only the propagated marker, not real edges.
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let now = Utc::now();
+
+        let mut parent = make_issue("bd-parent", "Parent epic", Status::Open, 2, None, now, None);
+        parent.issue_type = IssueType::Epic;
+        for issue in [
+            parent,
+            make_issue("bd-child", "Child task", Status::Open, 2, None, now, None),
+            make_issue(
+                "bd-child-direct",
+                "Child with its own blocker",
+                Status::Open,
+                2,
+                None,
+                now,
+                None,
+            ),
+            make_issue(
+                "bd-blocker",
+                "External blocker",
+                Status::Open,
+                2,
+                None,
+                now,
+                None,
+            ),
+            make_issue(
+                "bd-direct-blocker",
+                "Direct blocker of bd-child-direct",
+                Status::Open,
+                2,
+                None,
+                now,
+                None,
+            ),
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        // The parent epic is genuinely blocked by an open prerequisite.
+        storage
+            .add_dependency("bd-parent", "bd-blocker", "blocks", "tester")
+            .unwrap();
+        // Both children belong to the parent via hierarchy (parent-child).
+        storage
+            .add_dependency("bd-child", "bd-parent", "parent-child", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-child-direct", "bd-parent", "parent-child", "tester")
+            .unwrap();
+        // bd-child-direct ALSO has a real prerequisite of its own.
+        storage
+            .add_dependency("bd-child-direct", "bd-direct-blocker", "blocks", "tester")
+            .unwrap();
+
+        // The blocked parent propagates a `:parent-blocked` marker onto its
+        // children — confirm the child carries it as its only (non-direct)
+        // blocker before asserting the start gate ignores it.
+        let child_blockers = storage.get_blockers("bd-child").unwrap();
+        assert!(
+            child_blockers
+                .iter()
+                .any(|b| b == "bd-parent" || b == "bd-parent:parent-blocked"),
+            "child of a blocked epic should inherit the parent-blocked rollup: {child_blockers:?}"
+        );
+
+        // #357: a child whose only blocker is the inherited parent-blocked
+        // marker has no real start-blockers — it must be claimable / startable.
+        assert!(
+            storage.get_start_blockers("bd-child").unwrap().is_empty(),
+            "child blocked only by inherited :parent-blocked must be startable (#357)"
+        );
+
+        // A child with a DIRECT real `blocks` edge is still start-blocked; only
+        // the inherited parent-blocked marker is filtered, never the real edge.
+        assert_eq!(
+            storage.get_start_blockers("bd-child-direct").unwrap(),
+            vec!["bd-direct-blocker".to_string()],
+            "a real direct blocker must still prevent starting (#357 strips only the rollup)"
+        );
+
+        // The close path (already fixed by #355) remains correct: the child
+        // with only the inherited marker is closable too.
+        assert!(
+            storage.get_close_blockers("bd-child").unwrap().is_empty(),
+            "child blocked only by inherited :parent-blocked must be closable (#355)"
+        );
+    }
+
+    #[test]
     fn test_rebuild_blocked_cache_impl_recreates_table_and_repopulates_entries() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("beads.db");
@@ -10990,6 +18516,833 @@ mod tests {
             .map(ReadyIssue::from)
             .collect();
 
+        assert_eq!(projected, full);
+    }
+
+    #[test]
+    fn test_get_ready_summary_issues_for_command_output_matches_full_text_fields() {
+        let storage = ready_summary_projection_fixture();
+
+        let filters = ReadyFilters::default();
+        let full = storage
+            .get_ready_issues(&filters, ReadySortPolicy::Priority)
+            .unwrap()
+            .into_iter()
+            .map(ready_text_fields)
+            .collect::<Vec<_>>();
+        let projected_raw = storage
+            .get_ready_summary_issues_for_command_output(&filters, ReadySortPolicy::Priority)
+            .unwrap();
+        let projected_issue = projected_raw
+            .iter()
+            .find(|issue| issue.id == "bd-ready-summary")
+            .unwrap();
+        assert!(projected_issue.description.is_none());
+        assert!(projected_issue.design.is_none());
+        assert!(projected_issue.acceptance_criteria.is_none());
+        assert!(projected_issue.notes.is_none());
+        assert!(projected_issue.assignee.is_none());
+        assert!(projected_issue.owner.is_none());
+        assert!(projected_issue.estimated_minutes.is_none());
+        assert!(projected_issue.created_by.is_none());
+
+        let projected = projected_raw
+            .into_iter()
+            .map(ready_text_fields)
+            .collect::<Vec<_>>();
+
+        assert_eq!(projected, full);
+    }
+
+    #[test]
+    fn test_limited_ready_hybrid_hydrates_command_projection_after_summary_window() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 3, 20, 12, 0, 0).unwrap();
+
+        let mut first = make_issue(
+            "bd-ready-window-first",
+            "First visible ready issue",
+            Status::Open,
+            1,
+            Some("alice"),
+            created_at,
+            None,
+        );
+        first.description = Some("Visible description".to_string());
+        first.acceptance_criteria = Some("Visible acceptance criteria".to_string());
+        first.notes = Some("Visible notes".to_string());
+        first.owner = Some("product".to_string());
+        first.estimated_minutes = Some(30);
+        first.created_by = Some("agent".to_string());
+        first.updated_at = created_at + chrono::Duration::minutes(5);
+
+        let second = make_issue(
+            "bd-ready-window-second",
+            "Second ready issue",
+            Status::Open,
+            1,
+            None,
+            created_at + chrono::Duration::minutes(1),
+            None,
+        );
+
+        storage.create_issue(&first, "tester").unwrap();
+        storage.create_issue(&second, "tester").unwrap();
+
+        let filters = ReadyFilters {
+            limit: Some(1),
+            ..ReadyFilters::default()
+        };
+        let command = storage
+            .get_ready_issues_for_command_output(&filters, ReadySortPolicy::Hybrid)
+            .unwrap();
+
+        assert_eq!(command.len(), 1);
+        assert_eq!(command[0].id, "bd-ready-window-first");
+        assert_eq!(
+            command[0].description.as_deref(),
+            Some("Visible description")
+        );
+        assert_eq!(
+            command[0].acceptance_criteria.as_deref(),
+            Some("Visible acceptance criteria")
+        );
+        assert_eq!(command[0].notes.as_deref(), Some("Visible notes"));
+        assert_eq!(command[0].assignee.as_deref(), Some("alice"));
+        assert_eq!(command[0].owner.as_deref(), Some("product"));
+        assert_eq!(command[0].estimated_minutes, Some(30));
+        assert_eq!(command[0].created_by.as_deref(), Some("agent"));
+
+        let summary = storage
+            .get_ready_summary_issues_for_command_output(&filters, ReadySortPolicy::Hybrid)
+            .unwrap();
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].id, "bd-ready-window-first");
+        assert!(summary[0].description.is_none());
+        assert!(summary[0].acceptance_criteria.is_none());
+        assert!(summary[0].notes.is_none());
+        assert!(summary[0].assignee.is_none());
+    }
+
+    #[test]
+    fn test_limited_ready_hybrid_summary_window_skips_blocked_candidates() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 3, 20, 12, 0, 0).unwrap();
+
+        let blocker = make_issue(
+            "bd-ready-window-blocker",
+            "Window blocker",
+            Status::Open,
+            0,
+            None,
+            created_at,
+            None,
+        );
+        let blocked_first = make_issue(
+            "bd-ready-window-blocked-first",
+            "Blocked first ready candidate",
+            Status::Open,
+            0,
+            None,
+            created_at + chrono::Duration::seconds(1),
+            None,
+        );
+        let unblocked_second = make_issue(
+            "bd-ready-window-unblocked-second",
+            "Unblocked second ready candidate",
+            Status::Open,
+            0,
+            None,
+            created_at + chrono::Duration::seconds(2),
+            None,
+        );
+
+        storage.create_issue(&blocker, "tester").unwrap();
+        storage.create_issue(&blocked_first, "tester").unwrap();
+        storage.create_issue(&unblocked_second, "tester").unwrap();
+        storage
+            .add_dependency(
+                "bd-ready-window-blocked-first",
+                "bd-ready-window-blocker",
+                "blocks",
+                "tester",
+            )
+            .unwrap();
+
+        let filters = ReadyFilters {
+            limit: Some(1),
+            ..ReadyFilters::default()
+        };
+        let issues = storage
+            .get_ready_summary_issues_for_command_output(&filters, ReadySortPolicy::Hybrid)
+            .unwrap();
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].id, "bd-ready-window-blocker");
+    }
+
+    #[test]
+    fn test_limited_ready_hybrid_falls_back_when_high_bucket_is_short() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 3, 20, 12, 0, 0).unwrap();
+
+        let high = make_issue(
+            "bd-ready-window-high",
+            "High priority ready issue",
+            Status::Open,
+            1,
+            None,
+            created_at,
+            None,
+        );
+        let medium = make_issue(
+            "bd-ready-window-medium",
+            "Medium priority fallback issue",
+            Status::Open,
+            2,
+            None,
+            created_at + chrono::Duration::minutes(1),
+            None,
+        );
+
+        storage.create_issue(&high, "tester").unwrap();
+        storage.create_issue(&medium, "tester").unwrap();
+
+        let filters = ReadyFilters {
+            limit: Some(2),
+            ..ReadyFilters::default()
+        };
+        let issues = storage
+            .get_ready_issues_for_command_output(&filters, ReadySortPolicy::Hybrid)
+            .unwrap();
+
+        let ids = issues
+            .iter()
+            .map(|issue| issue.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["bd-ready-window-high", "bd-ready-window-medium"]);
+    }
+
+    #[test]
+    fn test_get_blocked_issues_for_command_output_matches_full_blocked_output() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 4, 1, 9, 0, 0).unwrap();
+
+        let blocker = make_issue(
+            "bd-blocker-detailed",
+            "Blocker",
+            Status::Open,
+            0,
+            None,
+            created_at,
+            None,
+        );
+        let mut blocked = make_issue(
+            "bd-blocked-detailed",
+            "Blocked detailed issue",
+            Status::Open,
+            2,
+            None,
+            created_at + chrono::Duration::minutes(1),
+            None,
+        );
+        let large_unused = "unused overflow payload ".repeat(256);
+        blocked.description = Some("Visible blocked description".to_string());
+        blocked.design = Some(large_unused.clone());
+        blocked.acceptance_criteria = Some(large_unused.clone());
+        blocked.notes = Some(large_unused);
+        blocked.created_by = Some("agent".to_string());
+        blocked.updated_at = created_at + chrono::Duration::minutes(5);
+        blocked.source_repo = Some("repo".to_string());
+        blocked.sender = Some("cli".to_string());
+
+        storage.create_issue(&blocker, "tester").unwrap();
+        storage.create_issue(&blocked, "tester").unwrap();
+        storage
+            .add_dependency(
+                "bd-blocked-detailed",
+                "bd-blocker-detailed",
+                "blocks",
+                "tester",
+            )
+            .unwrap();
+
+        let full: Vec<_> = storage
+            .get_blocked_issues()
+            .unwrap()
+            .into_iter()
+            .map(blocked_issue_output_for_test)
+            .collect();
+        let projected_raw = storage.get_blocked_issues_for_command_output().unwrap();
+        let projected_issue = &projected_raw
+            .iter()
+            .find(|(issue, _)| issue.id == "bd-blocked-detailed")
+            .unwrap()
+            .0;
+        assert!(projected_issue.design.is_none());
+        assert!(projected_issue.acceptance_criteria.is_none());
+        assert!(projected_issue.notes.is_none());
+        assert!(projected_issue.source_repo.is_none());
+        assert!(projected_issue.sender.is_none());
+
+        let projected: Vec<_> = projected_raw
+            .into_iter()
+            .map(blocked_issue_output_for_test)
+            .collect();
+
+        assert_eq!(
+            serde_json::to_value(projected).unwrap(),
+            serde_json::to_value(full).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_get_blocked_issues_for_command_output_falls_back_when_cache_table_missing() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 4, 1, 10, 0, 0).unwrap();
+        let blocker = make_issue("bd-b1", "Blocker", Status::Open, 1, None, created_at, None);
+        let mut blocked = make_issue(
+            "bd-c1",
+            "Blocked issue",
+            Status::Open,
+            2,
+            None,
+            created_at + chrono::Duration::minutes(1),
+            None,
+        );
+        blocked.description = Some("Visible description".to_string());
+        blocked.design = Some("unused design".repeat(512));
+        let ready = make_issue(
+            "bd-r1",
+            "Ready issue",
+            Status::Open,
+            3,
+            None,
+            created_at + chrono::Duration::minutes(2),
+            None,
+        );
+        storage.create_issue(&blocker, "tester").unwrap();
+        storage.create_issue(&blocked, "tester").unwrap();
+        storage.create_issue(&ready, "tester").unwrap();
+        storage
+            .add_dependency("bd-c1", "bd-b1", "blocks", "tester")
+            .unwrap();
+
+        storage
+            .conn
+            .execute("DROP TABLE blocked_issues_cache")
+            .unwrap();
+
+        let full: Vec<_> = storage
+            .get_blocked_issues()
+            .unwrap()
+            .into_iter()
+            .map(blocked_issue_output_for_test)
+            .collect();
+        let projected_raw = storage.get_blocked_issues_for_command_output().unwrap();
+        let projected_issue = &projected_raw
+            .iter()
+            .find(|(issue, _)| issue.id == "bd-c1")
+            .unwrap()
+            .0;
+        assert!(projected_issue.design.is_none());
+
+        let projected: Vec<_> = projected_raw
+            .into_iter()
+            .map(blocked_issue_output_for_test)
+            .collect();
+
+        assert_eq!(
+            serde_json::to_value(projected).unwrap(),
+            serde_json::to_value(full).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_list_stale_issues_for_command_output_matches_full_stale_output() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 4, 10, 12, 0, 0).unwrap();
+        let old_at = now - chrono::Duration::days(45);
+        let fresh_at = now - chrono::Duration::days(1);
+
+        let mut stale_issue = make_issue(
+            "bd-stale-detailed",
+            "Detailed stale issue",
+            Status::Open,
+            1,
+            Some("alice"),
+            old_at,
+            None,
+        );
+        stale_issue.description = Some("Should not be loaded".to_string());
+        stale_issue.design = Some("unused design".repeat(512));
+        stale_issue.acceptance_criteria = Some("unused ac".repeat(512));
+        stale_issue.notes = Some("unused notes".repeat(512));
+        stale_issue.owner = Some("owner".to_string());
+        stale_issue.created_by = Some("creator".to_string());
+        stale_issue.source_repo = Some("repo".to_string());
+        stale_issue.sender = Some("cli".to_string());
+
+        let fresh_issue = make_issue(
+            "bd-fresh",
+            "Fresh issue",
+            Status::Open,
+            2,
+            Some("bob"),
+            fresh_at,
+            None,
+        );
+
+        storage.create_issue(&stale_issue, "tester").unwrap();
+        storage.create_issue(&fresh_issue, "tester").unwrap();
+
+        let filters = ListFilters {
+            include_deferred: true,
+            updated_before: Some(now - chrono::Duration::days(30)),
+            sort: Some("updated_at".to_string()),
+            reverse: true,
+            ..ListFilters::default()
+        };
+
+        let full: Vec<_> = storage
+            .list_issues(&filters)
+            .unwrap()
+            .into_iter()
+            .map(StaleIssue::from)
+            .collect();
+        let projected_raw = storage
+            .list_stale_issues_for_command_output(&filters)
+            .unwrap();
+        let projected_issue = projected_raw
+            .iter()
+            .find(|issue| issue.id == "bd-stale-detailed")
+            .unwrap();
+        assert!(projected_issue.description.is_none());
+        assert!(projected_issue.design.is_none());
+        assert!(projected_issue.acceptance_criteria.is_none());
+        assert!(projected_issue.notes.is_none());
+        assert!(projected_issue.source_repo.is_none());
+        assert!(projected_issue.sender.is_none());
+
+        let projected: Vec<_> = projected_raw.into_iter().map(StaleIssue::from).collect();
+
+        assert_eq!(
+            serde_json::to_value(projected).unwrap(),
+            serde_json::to_value(full).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_list_orphan_candidate_issues_for_command_output_matches_full_candidate_fields() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 4, 11, 12, 0, 0).unwrap();
+
+        let mut open_issue = make_issue(
+            "bd-orphan-open",
+            "Open orphan candidate",
+            Status::Open,
+            1,
+            None,
+            now,
+            None,
+        );
+        open_issue.description = Some("Should not be loaded".to_string());
+        open_issue.design = Some("unused design".repeat(512));
+        open_issue.acceptance_criteria = Some("unused ac".repeat(512));
+        open_issue.notes = Some("unused notes".repeat(512));
+        open_issue.owner = Some("owner".to_string());
+        open_issue.sender = Some("cli".to_string());
+
+        let in_progress_issue = make_issue(
+            "bd-orphan-progress",
+            "In-progress orphan candidate",
+            Status::InProgress,
+            2,
+            None,
+            now - chrono::Duration::minutes(1),
+            None,
+        );
+        let mut closed_issue = make_issue(
+            "bd-orphan-closed",
+            "Closed non-candidate",
+            Status::Closed,
+            3,
+            None,
+            now - chrono::Duration::minutes(2),
+            None,
+        );
+        closed_issue.closed_at = Some(now);
+
+        storage.create_issue(&open_issue, "tester").unwrap();
+        storage.create_issue(&in_progress_issue, "tester").unwrap();
+        storage.create_issue(&closed_issue, "tester").unwrap();
+
+        let filters = ListFilters {
+            statuses: Some(vec![Status::Open, Status::InProgress]),
+            ..ListFilters::default()
+        };
+        let full = storage
+            .list_issues(&filters)
+            .unwrap()
+            .into_iter()
+            .map(|issue| (issue.id, issue.title, issue.status, issue.priority))
+            .collect::<Vec<_>>();
+        let projected_raw = storage
+            .list_orphan_candidate_issues_for_command_output(&filters)
+            .unwrap();
+        let projected_issue = projected_raw
+            .iter()
+            .find(|issue| issue.id == "bd-orphan-open")
+            .unwrap();
+        assert!(projected_issue.description.is_none());
+        assert!(projected_issue.design.is_none());
+        assert!(projected_issue.acceptance_criteria.is_none());
+        assert!(projected_issue.notes.is_none());
+        assert!(projected_issue.owner.is_none());
+        assert!(projected_issue.sender.is_none());
+
+        let projected = projected_raw
+            .into_iter()
+            .map(|issue| (issue.id, issue.title, issue.status, issue.priority))
+            .collect::<Vec<_>>();
+
+        assert_eq!(projected, full);
+    }
+
+    #[test]
+    fn test_list_graph_issues_for_command_output_matches_full_graph_fields() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 4, 12, 12, 0, 0).unwrap();
+
+        let mut open_issue = make_issue(
+            "bd-graph-open",
+            "Open graph node",
+            Status::Open,
+            1,
+            None,
+            now,
+            None,
+        );
+        open_issue.description = Some("Should not be loaded".to_string());
+        open_issue.design = Some("unused design".repeat(512));
+        open_issue.acceptance_criteria = Some("unused ac".repeat(512));
+        open_issue.notes = Some("unused notes".repeat(512));
+        open_issue.owner = Some("owner".to_string());
+        open_issue.sender = Some("cli".to_string());
+
+        let deferred_issue = make_issue(
+            "bd-graph-deferred",
+            "Deferred graph node",
+            Status::Deferred,
+            2,
+            None,
+            now - chrono::Duration::minutes(1),
+            None,
+        );
+        let mut closed_issue = make_issue(
+            "bd-graph-closed",
+            "Closed non-node",
+            Status::Closed,
+            3,
+            None,
+            now - chrono::Duration::minutes(2),
+            None,
+        );
+        closed_issue.closed_at = Some(now);
+
+        storage.create_issue(&open_issue, "tester").unwrap();
+        storage.create_issue(&deferred_issue, "tester").unwrap();
+        storage.create_issue(&closed_issue, "tester").unwrap();
+
+        let filters = ListFilters {
+            include_deferred: true,
+            ..ListFilters::default()
+        };
+        let full = storage
+            .list_issues(&filters)
+            .unwrap()
+            .into_iter()
+            .map(|issue| (issue.id, issue.title, issue.status, issue.priority))
+            .collect::<Vec<_>>();
+        let projected_raw = storage
+            .list_graph_issues_for_command_output(&filters)
+            .unwrap();
+        let projected_issue = projected_raw
+            .iter()
+            .find(|issue| issue.id == "bd-graph-open")
+            .unwrap();
+        assert!(projected_issue.description.is_none());
+        assert!(projected_issue.design.is_none());
+        assert!(projected_issue.acceptance_criteria.is_none());
+        assert!(projected_issue.notes.is_none());
+        assert!(projected_issue.owner.is_none());
+        assert!(projected_issue.sender.is_none());
+
+        let projected = projected_raw
+            .into_iter()
+            .map(|issue| (issue.id, issue.title, issue.status, issue.priority))
+            .collect::<Vec<_>>();
+
+        assert_eq!(projected, full);
+    }
+
+    #[test]
+    fn test_list_issues_default_visible_limited_page_matches_sql_order() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let day_1 = Utc.with_ymd_and_hms(2026, 4, 13, 12, 0, 0).unwrap();
+        let day_2 = Utc.with_ymd_and_hms(2026, 4, 14, 12, 0, 0).unwrap();
+        let day_3 = Utc.with_ymd_and_hms(2026, 4, 15, 12, 0, 0).unwrap();
+
+        for issue in [
+            make_issue("bd-p1-old", "P1 old", Status::Open, 1, None, day_1, None),
+            make_issue("bd-p0-old", "P0 old", Status::Open, 0, None, day_1, None),
+            make_issue("bd-p0-a", "P0 tie A", Status::Open, 0, None, day_2, None),
+            make_issue("bd-p0-b", "P0 tie B", Status::Open, 0, None, day_2, None),
+            make_issue(
+                "bd-deferred-new",
+                "Deferred new",
+                Status::Deferred,
+                0,
+                None,
+                day_3,
+                None,
+            ),
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        let mut closed = make_issue("bd-closed", "Closed", Status::Closed, 0, None, day_3, None);
+        closed.closed_at = Some(day_3);
+        storage.create_issue(&closed, "tester").unwrap();
+
+        let mut template = make_issue(
+            "bd-template",
+            "Template",
+            Status::Open,
+            0,
+            None,
+            day_3,
+            None,
+        );
+        template.is_template = true;
+        storage.create_issue(&template, "tester").unwrap();
+
+        let fast = storage
+            .list_issues(&ListFilters {
+                include_deferred: true,
+                limit: Some(5),
+                offset: Some(0),
+                ..ListFilters::default()
+            })
+            .unwrap();
+        let baseline = storage
+            .list_issues(&ListFilters {
+                include_deferred: true,
+                limit: Some(5),
+                offset: Some(0),
+                sort: Some("priority".to_string()),
+                ..ListFilters::default()
+            })
+            .unwrap();
+
+        let fast_ids = fast
+            .iter()
+            .map(|issue| issue.id.as_str())
+            .collect::<Vec<_>>();
+        let baseline_ids = baseline
+            .iter()
+            .map(|issue| issue.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(fast_ids, baseline_ids);
+        assert_eq!(
+            fast_ids,
+            vec![
+                "bd-deferred-new",
+                "bd-p0-a",
+                "bd-p0-b",
+                "bd-p0-old",
+                "bd-p1-old"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_list_text_issues_for_command_output_matches_full_summary_fields() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 4, 13, 12, 0, 0).unwrap();
+
+        let mut open_issue = make_issue(
+            "bd-list-open",
+            "Open text row",
+            Status::Open,
+            1,
+            None,
+            now,
+            None,
+        );
+        open_issue.description = Some("Should not be loaded".to_string());
+        open_issue.design = Some("unused design".repeat(512));
+        open_issue.acceptance_criteria = Some("unused ac".repeat(512));
+        open_issue.notes = Some("unused notes".repeat(512));
+        open_issue.owner = Some("owner".to_string());
+        open_issue.sender = Some("cli".to_string());
+
+        let deferred_issue = make_issue(
+            "bd-list-deferred",
+            "Deferred text row",
+            Status::Deferred,
+            2,
+            None,
+            now - chrono::Duration::minutes(1),
+            None,
+        );
+        let mut closed_issue = make_issue(
+            "bd-list-closed",
+            "Closed non-row",
+            Status::Closed,
+            3,
+            None,
+            now - chrono::Duration::minutes(2),
+            None,
+        );
+        closed_issue.closed_at = Some(now);
+
+        storage.create_issue(&open_issue, "tester").unwrap();
+        storage.create_issue(&deferred_issue, "tester").unwrap();
+        storage.create_issue(&closed_issue, "tester").unwrap();
+
+        let filters = ListFilters {
+            include_deferred: true,
+            limit: Some(0),
+            offset: Some(0),
+            ..ListFilters::default()
+        };
+        let full = storage
+            .list_issues(&filters)
+            .unwrap()
+            .into_iter()
+            .map(|issue| {
+                (
+                    issue.id,
+                    issue.title,
+                    issue.status,
+                    issue.priority,
+                    issue.issue_type,
+                )
+            })
+            .collect::<Vec<_>>();
+        let projected_raw = storage
+            .list_text_issues_for_command_output(&filters)
+            .unwrap();
+        let projected_issue = projected_raw
+            .iter()
+            .find(|issue| issue.id == "bd-list-open")
+            .unwrap();
+        assert!(projected_issue.description.is_none());
+        assert!(projected_issue.design.is_none());
+        assert!(projected_issue.acceptance_criteria.is_none());
+        assert!(projected_issue.notes.is_none());
+        assert!(projected_issue.owner.is_none());
+        assert!(projected_issue.sender.is_none());
+
+        let projected = projected_raw
+            .into_iter()
+            .map(|issue| {
+                (
+                    issue.id,
+                    issue.title,
+                    issue.status,
+                    issue.priority,
+                    issue.issue_type,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(projected, full);
+    }
+
+    #[test]
+    fn test_list_text_issues_for_command_output_supports_limit_offset() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 4, 13, 12, 0, 0).unwrap();
+
+        let mut oldest_high = make_issue(
+            "bd-list-high-old",
+            "High old",
+            Status::Open,
+            1,
+            None,
+            now - chrono::Duration::minutes(2),
+            None,
+        );
+        oldest_high.description = Some("Should not be loaded".repeat(256));
+        let newest_high = make_issue(
+            "bd-list-high-new",
+            "High new",
+            Status::Open,
+            1,
+            None,
+            now,
+            None,
+        );
+        let normal = make_issue(
+            "bd-list-normal",
+            "Normal",
+            Status::Open,
+            2,
+            None,
+            now - chrono::Duration::minutes(1),
+            None,
+        );
+
+        storage.create_issue(&oldest_high, "tester").unwrap();
+        storage.create_issue(&newest_high, "tester").unwrap();
+        storage.create_issue(&normal, "tester").unwrap();
+
+        let filters = ListFilters {
+            include_deferred: true,
+            limit: Some(2),
+            offset: Some(1),
+            ..ListFilters::default()
+        };
+        let full = storage
+            .list_issues(&filters)
+            .unwrap()
+            .into_iter()
+            .map(|issue| (issue.id, issue.title, issue.status, issue.priority))
+            .collect::<Vec<_>>();
+        let projected_raw = storage
+            .list_text_issues_for_command_output(&filters)
+            .unwrap();
+        let projected_issue = projected_raw
+            .iter()
+            .find(|issue| issue.id == "bd-list-high-old")
+            .unwrap();
+        assert!(projected_issue.description.is_none());
+
+        let projected = projected_raw
+            .into_iter()
+            .map(|issue| (issue.id, issue.title, issue.status, issue.priority))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            projected,
+            vec![
+                (
+                    "bd-list-high-old".to_string(),
+                    "High old".to_string(),
+                    Status::Open,
+                    Priority(1),
+                ),
+                (
+                    "bd-list-normal".to_string(),
+                    "Normal".to_string(),
+                    Status::Open,
+                    Priority(2),
+                ),
+            ]
+        );
         assert_eq!(projected, full);
     }
 
@@ -11261,7 +19614,7 @@ mod tests {
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
         conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
             .unwrap();
-        drop(conn);
+        conn.close().unwrap();
 
         let reopened = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
         assert_eq!(
@@ -11480,6 +19833,74 @@ mod tests {
         assert!(
             index_names.contains("idx_issues_external_ref_unique"),
             "reopen should recreate missing canonical indexes, got: {index_names:?}"
+        );
+    }
+
+    #[test]
+    fn test_open_repairs_current_version_nullable_blocked_cache_table() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp
+            .path()
+            .join("current_version_nullable_blocked_cache.db");
+
+        {
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            storage
+                .conn
+                .execute("DROP TABLE blocked_issues_cache")
+                .unwrap();
+            storage
+                .conn
+                .execute(
+                    "CREATE TABLE blocked_issues_cache (
+                        issue_id TEXT PRIMARY KEY,
+                        blocked_by TEXT,
+                        blocked_at DATETIME
+                    )",
+                )
+                .unwrap();
+            storage
+                .conn
+                .execute(
+                    "INSERT INTO blocked_issues_cache (issue_id, blocked_by, blocked_at)
+                     VALUES ('bd-null-cache', NULL, CURRENT_TIMESTAMP)",
+                )
+                .unwrap();
+            storage
+                .conn
+                .execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
+                .unwrap();
+        }
+
+        let reopened = SqliteStorage::open(&db_path).unwrap();
+        let column_rows = reopened
+            .conn
+            .query("PRAGMA table_info(blocked_issues_cache)")
+            .unwrap();
+        let mut blocked_by_not_null = false;
+        for row in &column_rows {
+            if row.get(1).and_then(SqliteValue::as_text) == Some("blocked_by") {
+                blocked_by_not_null = row
+                    .get(3)
+                    .and_then(SqliteValue::as_integer)
+                    .is_some_and(|value| value != 0);
+            }
+        }
+        assert!(
+            blocked_by_not_null,
+            "current-version open should repair nullable blocked_by cache columns"
+        );
+
+        let null_rows = reopened
+            .conn
+            .query_row("SELECT COUNT(*) FROM blocked_issues_cache WHERE blocked_by IS NULL")
+            .unwrap()
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(-1);
+        assert_eq!(
+            null_rows, 0,
+            "current-version open should discard malformed derived cache rows"
         );
     }
 
@@ -11923,6 +20344,51 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_export_hashes_after_clear_skips_stale_rows() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
+        for issue_id in ["bd-hash-1", "bd-hash-2"] {
+            let issue = make_issue(issue_id, "Hash target", Status::Open, 2, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage
+            .set_export_hashes(&[
+                ("bd-hash-1".to_string(), "stale-a".to_string()),
+                ("bd-hash-2".to_string(), "stale-b".to_string()),
+            ])
+            .unwrap();
+
+        let inserted = storage
+            .with_write_transaction(|storage| {
+                storage.clear_all_export_hashes_in_tx()?;
+                storage.insert_export_hashes_after_clear_in_tx(&[
+                    ("bd-hash-1".to_string(), "fresh-a".to_string()),
+                    ("bd-hash-1".to_string(), "fresh-a-final".to_string()),
+                    ("bd-hash-2".to_string(), "fresh-b".to_string()),
+                ])
+            })
+            .unwrap();
+
+        assert_eq!(inserted, 2);
+        assert_eq!(
+            storage.get_export_hash("bd-hash-1").unwrap().unwrap().0,
+            "fresh-a-final"
+        );
+        assert_eq!(
+            storage.get_export_hash("bd-hash-2").unwrap().unwrap().0,
+            "fresh-b"
+        );
+        let row_count = storage
+            .execute_raw_query("SELECT COUNT(*) FROM export_hashes")
+            .unwrap()
+            .first()
+            .and_then(|row| row.first())
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(-1);
+        assert_eq!(row_count, 2);
+    }
+
+    #[test]
     fn test_set_changed_export_hashes_skips_unchanged_rows() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
@@ -12306,6 +20772,16 @@ mod tests {
             "CREATE INDEX IF NOT EXISTS idx_issues_due_at ON issues(due_at) WHERE due_at IS NOT NULL",
             "CREATE INDEX IF NOT EXISTS idx_issues_defer_until ON issues(defer_until) WHERE defer_until IS NOT NULL",
             "CREATE INDEX IF NOT EXISTS idx_issues_ready ON issues(status, priority, created_at) WHERE status = 'open' AND ephemeral = 0 AND pinned = 0 AND (is_template = 0 OR is_template IS NULL)",
+            // Issue #354: `br ready` can be configured (workflow.status_groups.ready)
+            // to surface statuses beyond `open` (e.g. `rework`). The partial
+            // `idx_issues_ready` above only covers `status = 'open'`, so a widened
+            // ready group would fall back to a scan on the status leg. The partial
+            // predicate is a static migration string and cannot be widened to a
+            // per-repo dynamic group, so we add a non-partial `(status, priority,
+            // created_at)` index to keep the widened `status IN (...) ORDER BY
+            // priority, created_at` ready query index-covered. The tighter partial
+            // index still wins for the common default `[open]` group.
+            "CREATE INDEX IF NOT EXISTS idx_issues_status_priority_created ON issues(status, priority, created_at)",
         ];
         for (i, sql) in indexes.iter().enumerate() {
             match conn.execute(sql) {
@@ -12703,6 +21179,116 @@ mod tests {
     }
 
     #[test]
+    fn test_list_issues_custom_sort_limit_uses_id_tiebreaker() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2025, 8, 4, 0, 0, 0).unwrap();
+
+        for issue in [
+            make_issue(
+                "bd-list-b",
+                "Tie B",
+                Status::Open,
+                1,
+                None,
+                created_at,
+                None,
+            ),
+            make_issue(
+                "bd-list-a",
+                "Tie A",
+                Status::Open,
+                1,
+                None,
+                created_at,
+                None,
+            ),
+            make_issue(
+                "bd-list-c",
+                "Later",
+                Status::Open,
+                2,
+                None,
+                created_at - chrono::Duration::days(1),
+                None,
+            ),
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        let issues = storage
+            .list_issues(&ListFilters {
+                sort: Some("created".to_string()),
+                limit: Some(2),
+                ..ListFilters::default()
+            })
+            .unwrap();
+        let ids: Vec<_> = issues.iter().map(|issue| issue.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["bd-list-a", "bd-list-b"]);
+    }
+
+    #[test]
+    fn test_list_changelog_issues_matches_closed_list_projection() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 8, 1, 0, 0, 0).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2025, 8, 2, 0, 0, 0).unwrap();
+        let t3 = Utc.with_ymd_and_hms(2025, 8, 3, 0, 0, 0).unwrap();
+
+        let mut closed_low = make_issue("bd-low", "Low", Status::Closed, 2, None, t1, None);
+        closed_low.closed_at = Some(t3);
+        let mut closed_high_new =
+            make_issue("bd-high-new", "High New", Status::Closed, 1, None, t3, None);
+        closed_high_new.closed_at = Some(t3);
+        let mut closed_high_old =
+            make_issue("bd-high-old", "High Old", Status::Closed, 1, None, t2, None);
+        closed_high_old.closed_at = Some(t2);
+        let open_issue = make_issue("bd-open", "Open", Status::Open, 0, None, t3, None);
+        let mut template = make_issue("bd-template", "Template", Status::Closed, 0, None, t3, None);
+        template.closed_at = Some(t3);
+        template.is_template = true;
+
+        for issue in [
+            closed_low,
+            closed_high_new,
+            closed_high_old,
+            open_issue,
+            template,
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        let filters = ListFilters {
+            statuses: Some(vec![Status::Closed]),
+            include_closed: true,
+            ..ListFilters::default()
+        };
+        let expected: Vec<_> = storage
+            .list_issues(&filters)
+            .unwrap()
+            .into_iter()
+            .map(|issue| ChangelogIssueRow {
+                id: issue.id,
+                title: issue.title,
+                priority: issue.priority,
+                issue_type: issue.issue_type,
+                created_at: issue.created_at,
+                closed_at: issue.closed_at,
+            })
+            .collect();
+
+        let actual = storage.list_changelog_issues().unwrap();
+
+        assert_eq!(
+            actual
+                .iter()
+                .map(|issue| issue.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bd-high-new", "bd-high-old", "bd-low"]
+        );
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn test_search_issues_full_text() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 9, 1, 0, 0, 0).unwrap();
@@ -12789,6 +21375,306 @@ mod tests {
         let case_results = storage.search_issues("authentication", &filters).unwrap();
         let case_ids: Vec<_> = case_results.iter().map(|issue| issue.id.as_str()).collect();
         assert_eq!(case_ids, vec!["bd-s-description"]);
+    }
+
+    #[test]
+    fn test_search_issues_materialized_label_candidates_preserve_semantics() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 9, 1, 0, 0, 0).unwrap();
+
+        let mut export_swarm = make_issue(
+            "bd-s-label-a",
+            "needle export swarm",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        export_swarm.labels = vec!["export".to_string(), "swarm".to_string()];
+        let mut export_only = make_issue(
+            "bd-s-label-b",
+            "needle export only",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        export_only.labels = vec!["export".to_string()];
+        let mut swarm_only = make_issue(
+            "bd-s-label-c",
+            "needle swarm only",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        swarm_only.labels = vec!["swarm".to_string()];
+        let mut unrelated = make_issue(
+            "bd-s-label-d",
+            "needle unrelated",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        unrelated.labels = vec!["other".to_string()];
+
+        for issue in [export_swarm, export_only, swarm_only, unrelated] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        let ids_for = |filters: ListFilters| {
+            storage
+                .search_issues("needle", &filters)
+                .unwrap()
+                .into_iter()
+                .map(|issue| issue.id)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            ids_for(ListFilters {
+                labels: Some(vec!["export".to_string(), "swarm".to_string()]),
+                ..ListFilters::default()
+            }),
+            vec!["bd-s-label-a"]
+        );
+        assert_eq!(
+            ids_for(ListFilters {
+                labels_or: Some(vec!["export".to_string(), "swarm".to_string()]),
+                ..ListFilters::default()
+            }),
+            vec!["bd-s-label-a", "bd-s-label-b", "bd-s-label-c"]
+        );
+        assert_eq!(
+            ids_for(ListFilters {
+                labels: Some(vec!["export".to_string()]),
+                labels_or: Some(vec!["swarm".to_string()]),
+                ..ListFilters::default()
+            }),
+            vec!["bd-s-label-a"]
+        );
+        assert!(
+            ids_for(ListFilters {
+                labels: Some(vec!["missing".to_string()]),
+                ..ListFilters::default()
+            })
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_redundant_single_label_fast_path_preserves_list_and_search_results() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 9, 1, 0, 0, 0).unwrap();
+
+        let mut visible_a = make_issue(
+            "bd-s-cover-a",
+            "needle global alpha",
+            Status::Open,
+            1,
+            None,
+            t1,
+            None,
+        );
+        visible_a.labels = vec!["global".to_string()];
+        let mut visible_b = make_issue(
+            "bd-s-cover-b",
+            "needle global beta",
+            Status::Open,
+            2,
+            None,
+            t1 + chrono::Duration::minutes(1),
+            None,
+        );
+        visible_b.labels = vec!["global".to_string()];
+        let deferred_unlabeled = make_issue(
+            "bd-s-cover-c",
+            "needle deferred",
+            Status::Deferred,
+            0,
+            None,
+            t1 + chrono::Duration::minutes(2),
+            None,
+        );
+
+        for issue in [visible_a, visible_b, deferred_unlabeled] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        assert!(
+            storage
+                .single_label_covers_default_visible_issues(false, "global")
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .single_label_covers_default_visible_issues(true, "global")
+                .unwrap()
+        );
+
+        let no_label_filters = ListFilters::default();
+        let global_label_filters = ListFilters {
+            labels: Some(vec!["global".to_string()]),
+            ..ListFilters::default()
+        };
+
+        let broad_candidate_ids =
+            vec!["bd-s-cover-a".to_string(); REDUNDANT_LABEL_COVERAGE_MIN_CANDIDATES];
+        assert!(
+            storage
+                .redundant_default_visible_single_label_filter(
+                    &global_label_filters,
+                    Some(&broad_candidate_ids),
+                )
+                .unwrap()
+        );
+        let narrow_candidate_ids =
+            vec!["bd-s-cover-a".to_string(); REDUNDANT_LABEL_COVERAGE_MIN_CANDIDATES - 1];
+        assert!(
+            !storage
+                .redundant_default_visible_single_label_filter(
+                    &global_label_filters,
+                    Some(&narrow_candidate_ids),
+                )
+                .unwrap()
+        );
+
+        let no_label_list_ids = issue_ids(storage.list_issues(&no_label_filters).unwrap());
+        let global_label_list_ids = issue_ids(storage.list_issues(&global_label_filters).unwrap());
+        assert_eq!(global_label_list_ids, no_label_list_ids);
+
+        let no_label_search_ids =
+            issue_ids(storage.search_issues("needle", &no_label_filters).unwrap());
+        let global_label_search_ids = issue_ids(
+            storage
+                .search_issues("needle", &global_label_filters)
+                .unwrap(),
+        );
+        assert_eq!(global_label_search_ids, no_label_search_ids);
+
+        let include_deferred_global_label_ids = issue_ids(
+            storage
+                .search_issues(
+                    "needle",
+                    &ListFilters {
+                        include_deferred: true,
+                        labels: Some(vec!["global".to_string()]),
+                        ..ListFilters::default()
+                    },
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            include_deferred_global_label_ids,
+            vec!["bd-s-cover-a", "bd-s-cover-b"]
+        );
+    }
+
+    #[test]
+    fn test_search_issues_for_command_output_matches_text_fields() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 9, 1, 0, 0, 0).unwrap();
+
+        let mut description_match = make_issue(
+            "bd-search-proj-a",
+            "Command projection alpha",
+            Status::Open,
+            1,
+            Some("agent-a"),
+            t1,
+            None,
+        );
+        description_match.description =
+            Some("description carries projection needle context".to_string());
+        description_match.design = Some("unused design".repeat(512));
+        description_match.acceptance_criteria = Some("unused ac".repeat(512));
+        description_match.notes = Some("unused notes".repeat(512));
+        description_match.owner = Some("owner".to_string());
+        description_match.sender = Some("cli".to_string());
+
+        let title_match = make_issue(
+            "bd-search-proj-b",
+            "Projection needle title",
+            Status::Open,
+            2,
+            Some("agent-b"),
+            t1 + chrono::Duration::minutes(1),
+            None,
+        );
+
+        storage.create_issue(&description_match, "tester").unwrap();
+        storage.create_issue(&title_match, "tester").unwrap();
+
+        let filters = ListFilters {
+            limit: Some(0),
+            ..ListFilters::default()
+        };
+        let full = storage
+            .search_issues("projection needle", &filters)
+            .unwrap();
+        let projected = storage
+            .search_issues_for_command_output("projection needle", &filters)
+            .unwrap();
+
+        let full_summary = full
+            .iter()
+            .map(|issue| {
+                (
+                    issue.id.as_str(),
+                    issue.title.as_str(),
+                    issue.description.as_deref(),
+                    issue.status.clone(),
+                    issue.priority,
+                    issue.issue_type.clone(),
+                    issue.assignee.as_deref(),
+                    issue.created_at,
+                    issue.updated_at,
+                )
+            })
+            .collect::<Vec<_>>();
+        let projected_summary = projected
+            .iter()
+            .map(|issue| {
+                (
+                    issue.id.as_str(),
+                    issue.title.as_str(),
+                    issue.description.as_deref(),
+                    issue.status.clone(),
+                    issue.priority,
+                    issue.issue_type.clone(),
+                    issue.assignee.as_deref(),
+                    issue.created_at,
+                    issue.updated_at,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(projected_summary, full_summary);
+
+        let full_lines = full
+            .iter()
+            .map(|issue| format_issue_line_with(issue, TextFormatOptions::plain()))
+            .collect::<Vec<_>>();
+        let projected_lines = projected
+            .iter()
+            .map(|issue| format_issue_line_with(issue, TextFormatOptions::plain()))
+            .collect::<Vec<_>>();
+        assert_eq!(projected_lines, full_lines);
+
+        let projected_description_match = projected
+            .iter()
+            .find(|issue| issue.id == "bd-search-proj-a")
+            .unwrap();
+        assert!(projected_description_match.description.is_some());
+        assert!(projected_description_match.design.is_none());
+        assert!(projected_description_match.acceptance_criteria.is_none());
+        assert!(projected_description_match.notes.is_none());
+        assert!(projected_description_match.owner.is_none());
+        assert!(projected_description_match.sender.is_none());
     }
 
     #[test]
@@ -12929,6 +21815,163 @@ mod tests {
             .map(|issue| issue.id.as_str())
             .collect();
         assert_eq!(ids, vec!["bd-s-page-c"]);
+    }
+
+    #[test]
+    fn test_search_issues_limit_uses_id_tiebreaker() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2025, 9, 4, 0, 0, 0).unwrap();
+
+        for issue in [
+            make_issue(
+                "bd-search-b",
+                "authentication tie b",
+                Status::Open,
+                1,
+                None,
+                created_at,
+                None,
+            ),
+            make_issue(
+                "bd-search-a",
+                "authentication tie a",
+                Status::Open,
+                1,
+                None,
+                created_at,
+                None,
+            ),
+            make_issue(
+                "bd-search-c",
+                "authentication later",
+                Status::Open,
+                2,
+                None,
+                created_at - chrono::Duration::days(1),
+                None,
+            ),
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        let results = storage
+            .search_issues(
+                "authentication",
+                &ListFilters {
+                    limit: Some(2),
+                    ..ListFilters::default()
+                },
+            )
+            .unwrap();
+        let ids: Vec<_> = results.iter().map(|issue| issue.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["bd-search-a", "bd-search-b"]);
+    }
+
+    #[test]
+    fn test_search_issues_default_visible_limited_page_matches_generic_order() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let base = Utc.with_ymd_and_hms(2025, 9, 4, 0, 0, 0).unwrap();
+
+        let mut closed = make_issue(
+            "bd-search-closed",
+            "needle closed",
+            Status::Closed,
+            0,
+            None,
+            base + chrono::Duration::minutes(10),
+            None,
+        );
+        closed.closed_at = Some(base + chrono::Duration::minutes(11));
+        let mut template = make_issue(
+            "bd-search-template",
+            "needle template",
+            Status::Open,
+            0,
+            None,
+            base + chrono::Duration::minutes(9),
+            None,
+        );
+        template.is_template = true;
+
+        for issue in [
+            make_issue(
+                "bd-search-p1",
+                "needle p1",
+                Status::Open,
+                1,
+                None,
+                base + chrono::Duration::minutes(4),
+                None,
+            ),
+            make_issue(
+                "bd-search-p0-old",
+                "needle p0 old",
+                Status::Open,
+                0,
+                None,
+                base + chrono::Duration::minutes(1),
+                None,
+            ),
+            make_issue(
+                "bd-search-deferred",
+                "needle deferred",
+                Status::Deferred,
+                0,
+                None,
+                base + chrono::Duration::minutes(3),
+                None,
+            ),
+            make_issue(
+                "bd-search-p0-new",
+                "needle p0 new",
+                Status::Open,
+                0,
+                None,
+                base + chrono::Duration::minutes(2),
+                None,
+            ),
+            make_issue(
+                "bd-search-nomatch",
+                "other",
+                Status::Open,
+                0,
+                None,
+                base + chrono::Duration::minutes(5),
+                None,
+            ),
+            closed,
+            template,
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        let fast_filters = ListFilters {
+            include_deferred: true,
+            limit: Some(3),
+            ..ListFilters::default()
+        };
+        let generic_filters = ListFilters {
+            include_deferred: true,
+            limit: Some(3),
+            sort: Some("priority".to_string()),
+            ..ListFilters::default()
+        };
+
+        let fast_ids = issue_ids(storage.search_issues("needle", &fast_filters).unwrap());
+        let generic_ids = issue_ids(storage.search_issues("needle", &generic_filters).unwrap());
+
+        assert_eq!(fast_ids, generic_ids);
+        assert_eq!(
+            fast_ids,
+            vec!["bd-search-deferred", "bd-search-p0-new", "bd-search-p0-old",]
+        );
+
+        let fast_no_match = storage.search_issues("absent", &fast_filters).unwrap();
+        let generic_no_match = storage.search_issues("absent", &generic_filters).unwrap();
+
+        assert_eq!(fast_no_match, generic_no_match);
+        assert!(fast_no_match.is_empty());
     }
 
     #[test]
@@ -13105,6 +22148,25 @@ mod tests {
         let issues = storage.list_issues(&filters).unwrap();
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].id, "bd-l4");
+
+        let duplicate_filters = ListFilters {
+            labels: Some(vec![
+                "core".to_string(),
+                "frontend".to_string(),
+                "frontend".to_string(),
+            ]),
+            ..Default::default()
+        };
+
+        let duplicate_issues = storage.list_issues(&duplicate_filters).unwrap();
+        assert_eq!(duplicate_issues.len(), 1);
+        assert_eq!(duplicate_issues[0].id, "bd-l4");
+        assert_eq!(
+            storage
+                .count_issues_with_filters(&duplicate_filters)
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -13132,6 +22194,62 @@ mod tests {
         let issues = storage.list_issues(&filters).unwrap();
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].id, "bd-l5");
+        assert_eq!(storage.count_issues_with_filters(&filters).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_list_issues_materialized_label_candidates_match_filtered_fallback() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc::now();
+
+        for id in ["bd-lj1", "bd-lj2", "bd-lj3", "bd-lj4"] {
+            let issue = make_issue(id, id, Status::Open, 2, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        for (issue_id, labels) in [
+            ("bd-lj1", ["export", "lane-00", "swarm"].as_slice()),
+            ("bd-lj2", ["export", "lane-01"].as_slice()),
+            ("bd-lj3", ["lane-00", "swarm"].as_slice()),
+            ("bd-lj4", ["export", "swarm"].as_slice()),
+        ] {
+            for label in labels {
+                storage.add_label(issue_id, label, "tester").unwrap();
+            }
+        }
+
+        let fast_filters = ListFilters {
+            labels: Some(vec!["export".to_string()]),
+            limit: Some(2),
+            ..Default::default()
+        };
+        let fallback_filters = ListFilters {
+            types: Some(vec![IssueType::Task]),
+            ..fast_filters.clone()
+        };
+
+        let fast_ids: Vec<_> = storage
+            .list_issues(&fast_filters)
+            .unwrap()
+            .into_iter()
+            .map(|issue| issue.id)
+            .collect();
+        let fallback_ids: Vec<_> = storage
+            .list_issues(&fallback_filters)
+            .unwrap()
+            .into_iter()
+            .map(|issue| issue.id)
+            .collect();
+
+        assert_eq!(fast_ids, vec!["bd-lj1", "bd-lj2"]);
+        assert_eq!(fast_ids, fallback_ids);
+        assert_eq!(
+            storage.count_issues_with_filters(&fast_filters).unwrap(),
+            storage
+                .count_issues_with_filters(&fallback_filters)
+                .unwrap()
+        );
+        assert_eq!(storage.count_issues_with_filters(&fast_filters).unwrap(), 3);
     }
 
     #[test]
@@ -13215,6 +22333,198 @@ mod tests {
             .get_ready_issues(&filters_or_backend, ReadySortPolicy::Oldest)
             .unwrap();
         assert_eq!(res.len(), 2);
+    }
+
+    #[test]
+    fn test_ready_default_group_is_open_only() {
+        // #354: with no ready_statuses configured, the query behaves exactly as
+        // before — only `open` issues surface, `rework`/`in_progress` do not.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc::now();
+
+        storage
+            .create_issue(
+                &make_issue("bd-open", "Open", Status::Open, 2, None, t1, None),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .create_issue(
+                &make_issue(
+                    "bd-rework",
+                    "Rework",
+                    Status::Custom("rework".to_string()),
+                    2,
+                    None,
+                    t1,
+                    None,
+                ),
+                "tester",
+            )
+            .unwrap();
+
+        let filters = ReadyFilters::default();
+        let res = storage
+            .get_ready_issues(&filters, ReadySortPolicy::Oldest)
+            .unwrap();
+        let ids: Vec<&str> = res.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["bd-open"], "default group must be [open] only");
+    }
+
+    #[test]
+    fn test_ready_configured_group_surfaces_rework() {
+        // #354: a configured ready group [open, rework] surfaces rework items
+        // while preserving each issue's actual status.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc::now();
+
+        storage
+            .create_issue(
+                &make_issue("bd-open", "Open", Status::Open, 2, None, t1, None),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .create_issue(
+                &make_issue(
+                    "bd-rework",
+                    "Rework",
+                    Status::Custom("rework".to_string()),
+                    2,
+                    None,
+                    t1,
+                    None,
+                ),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .create_issue(
+                &make_issue(
+                    "bd-inprog",
+                    "InProgress",
+                    Status::InProgress,
+                    2,
+                    None,
+                    t1,
+                    None,
+                ),
+                "tester",
+            )
+            .unwrap();
+
+        let filters = ReadyFilters {
+            ready_statuses: vec!["open".to_string(), "rework".to_string()],
+            ..Default::default()
+        };
+        let res = storage
+            .get_ready_issues(&filters, ReadySortPolicy::Oldest)
+            .unwrap();
+        let mut ids: Vec<&str> = res.iter().map(|i| i.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["bd-open", "bd-rework"]);
+        // in_progress stays out; statuses are preserved.
+        let rework = res.iter().find(|i| i.id == "bd-rework").unwrap();
+        assert_eq!(rework.status.as_str(), "rework");
+    }
+
+    #[test]
+    fn test_ready_configured_group_still_gates_defer_until() {
+        // #354: a non-deferred configured member with a future defer_until is
+        // still time-gated out unless --include-deferred is set.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc::now();
+        let future = t1 + chrono::Duration::days(7);
+
+        storage
+            .create_issue(
+                &make_issue(
+                    "bd-rework-deferred",
+                    "ReworkDeferred",
+                    Status::Custom("rework".to_string()),
+                    2,
+                    None,
+                    t1,
+                    Some(future),
+                ),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .create_issue(
+                &make_issue("bd-open", "Open", Status::Open, 2, None, t1, None),
+                "tester",
+            )
+            .unwrap();
+
+        let filters = ReadyFilters {
+            ready_statuses: vec!["open".to_string(), "rework".to_string()],
+            ..Default::default()
+        };
+        let res = storage
+            .get_ready_issues(&filters, ReadySortPolicy::Oldest)
+            .unwrap();
+        let ids: Vec<&str> = res.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["bd-open"],
+            "future defer_until must gate the rework member out"
+        );
+
+        // With --include-deferred, the gate drops and the rework member returns.
+        let filters_deferred = ReadyFilters {
+            ready_statuses: vec!["open".to_string(), "rework".to_string()],
+            include_deferred: true,
+            ..Default::default()
+        };
+        let res = storage
+            .get_ready_issues(&filters_deferred, ReadySortPolicy::Oldest)
+            .unwrap();
+        let mut ids: Vec<&str> = res.iter().map(|i| i.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["bd-open", "bd-rework-deferred"]);
+    }
+
+    #[test]
+    fn test_ready_include_deferred_no_double_count_when_group_lists_deferred() {
+        // #354: --include-deferred folds in `deferred`, but must not double-count
+        // it (or error) when the configured group already lists `deferred`.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc::now();
+
+        storage
+            .create_issue(
+                &make_issue(
+                    "bd-deferred",
+                    "Deferred",
+                    Status::Deferred,
+                    2,
+                    None,
+                    t1,
+                    None,
+                ),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .create_issue(
+                &make_issue("bd-open", "Open", Status::Open, 2, None, t1, None),
+                "tester",
+            )
+            .unwrap();
+
+        let filters = ReadyFilters {
+            ready_statuses: vec!["open".to_string(), "deferred".to_string()],
+            include_deferred: true,
+            ..Default::default()
+        };
+        let res = storage
+            .get_ready_issues(&filters, ReadySortPolicy::Oldest)
+            .unwrap();
+        let mut ids: Vec<&str> = res.iter().map(|i| i.id.as_str()).collect();
+        ids.sort_unstable();
+        // Exactly one row per id — no duplicate `bd-deferred`.
+        assert_eq!(ids, vec!["bd-deferred", "bd-open"]);
     }
 
     #[test]
@@ -13320,6 +22630,154 @@ mod tests {
         assert_eq!(res.len(), 0, "Non-existent parent should return empty");
     }
 
+    /// Regression: `--parent` combined with `--label` must return their
+    /// intersection, not an empty set (#307). Also covers `--parent --recursive
+    /// --label` (#308 / #307 interaction).
+    #[test]
+    fn test_get_ready_issues_parent_combined_with_label() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc::now();
+
+        let mut parent = make_issue("bd-epic", "Parent Epic", Status::Open, 1, None, t1, None);
+        parent.issue_type = IssueType::Epic;
+        storage.create_issue(&parent, "tester").unwrap();
+
+        // Two labelled direct children + one unlabelled direct child.
+        let child1 = make_issue("bd-epic.1", "Child 1", Status::Open, 2, None, t1, None);
+        let child2 = make_issue("bd-epic.2", "Child 2", Status::Open, 2, None, t1, None);
+        let child3 = make_issue("bd-epic.3", "Child 3", Status::Open, 2, None, t1, None);
+        storage.create_issue(&child1, "tester").unwrap();
+        storage.create_issue(&child2, "tester").unwrap();
+        storage.create_issue(&child3, "tester").unwrap();
+        for id in ["bd-epic.1", "bd-epic.2", "bd-epic.3"] {
+            storage
+                .add_dependency(id, "bd-epic", "parent-child", "tester")
+                .unwrap();
+        }
+        storage
+            .add_label("bd-epic.1", "mini-safe", "tester")
+            .unwrap();
+        storage
+            .add_label("bd-epic.2", "mini-safe", "tester")
+            .unwrap();
+
+        // A labelled descendant under bd-epic.1 (for the recursive case).
+        let grandchild = make_issue("bd-epic.1.1", "Grandchild", Status::Open, 2, None, t1, None);
+        storage.create_issue(&grandchild, "tester").unwrap();
+        storage
+            .add_dependency("bd-epic.1.1", "bd-epic.1", "parent-child", "tester")
+            .unwrap();
+        storage
+            .add_label("bd-epic.1.1", "mini-safe", "tester")
+            .unwrap();
+
+        // --parent alone: all three direct children are ready (non-epic parents
+        // do not inherit a child-open blocker).
+        let parent_only = ReadyFilters {
+            parent: Some("bd-epic".to_string()),
+            ..Default::default()
+        };
+        let res = storage
+            .get_ready_issues(&parent_only, ReadySortPolicy::Oldest)
+            .unwrap();
+        assert_eq!(
+            res.len(),
+            3,
+            "parent-only should return three direct children"
+        );
+
+        // --parent + --label: intersection = the two labelled direct children.
+        let parent_label = ReadyFilters {
+            parent: Some("bd-epic".to_string()),
+            labels_and: vec!["mini-safe".to_string()],
+            ..Default::default()
+        };
+        let res = storage
+            .get_ready_issues(&parent_label, ReadySortPolicy::Oldest)
+            .unwrap();
+        let ids: Vec<&str> = res.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            res.len(),
+            2,
+            "parent+label must return the AND-intersection, got {ids:?}"
+        );
+        assert!(ids.contains(&"bd-epic.1"));
+        assert!(ids.contains(&"bd-epic.2"));
+        assert!(!ids.contains(&"bd-epic.3"), "unlabelled child excluded");
+
+        // --parent + --recursive + --label: includes the labelled grandchild.
+        let parent_recursive_label = ReadyFilters {
+            parent: Some("bd-epic".to_string()),
+            recursive: true,
+            labels_and: vec!["mini-safe".to_string()],
+            ..Default::default()
+        };
+        let res = storage
+            .get_ready_issues(&parent_recursive_label, ReadySortPolicy::Oldest)
+            .unwrap();
+        let ids: Vec<&str> = res.iter().map(|i| i.id.as_str()).collect();
+        assert!(
+            ids.contains(&"bd-epic.1.1"),
+            "recursive+label must reach labelled grandchild, got {ids:?}"
+        );
+        assert!(ids.contains(&"bd-epic.2"));
+    }
+
+    /// Regression: `--parent --recursive` terminates even when the parent-child
+    /// graph contains a cycle, instead of hanging on an unbounded walk (#308).
+    #[test]
+    fn test_get_ready_issues_recursive_parent_cycle_terminates() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc::now();
+
+        for id in ["cyc-a", "cyc-b", "cyc-c"] {
+            let issue = make_issue(id, id, Status::Open, 2, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        // a -> b -> c -> a (cycle through parent-child edges).
+        storage
+            .add_dependency("cyc-b", "cyc-a", "parent-child", "tester")
+            .unwrap();
+        storage
+            .add_dependency("cyc-c", "cyc-b", "parent-child", "tester")
+            .unwrap();
+        // The edge that closes the a -> b -> c -> a cycle. `add_dependency` now
+        // correctly REFUSES to create a parent-child cycle, so a genuine cycle
+        // can only enter the store via import/legacy data. Insert the closing
+        // row straight into the table (bypassing the guard) to exercise the
+        // recursive-BFS termination path against real cyclic data.
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by) \
+                 VALUES (?, ?, ?, ?, ?)",
+                &[
+                    SqliteValue::from("cyc-a"),
+                    SqliteValue::from("cyc-c"),
+                    SqliteValue::from("parent-child"),
+                    SqliteValue::from(Utc::now().to_rfc3339()),
+                    SqliteValue::from("tester"),
+                ],
+            )
+            .unwrap();
+
+        let filters = ReadyFilters {
+            parent: Some("cyc-a".to_string()),
+            recursive: true,
+            ..Default::default()
+        };
+        // The visited-set BFS must terminate; the exact membership is whatever
+        // the readiness rules allow, but the call must return without hanging.
+        let res = storage
+            .get_ready_issues(&filters, ReadySortPolicy::Oldest)
+            .unwrap();
+        let ids: Vec<&str> = res.iter().map(|i| i.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"cyc-a"),
+            "parent itself must not appear, got {ids:?}"
+        );
+    }
+
     #[test]
     fn test_get_ready_issues_treats_null_legacy_flags_as_false() {
         let conn = Connection::open(":memory:").unwrap();
@@ -13362,7 +22820,9 @@ mod tests {
                 sender TEXT,
                 ephemeral INTEGER,
                 pinned INTEGER,
-                is_template INTEGER
+                is_template INTEGER,
+                source_repo_path TEXT,
+                agent_context TEXT
             );
             CREATE TABLE blocked_issues_cache (
                 issue_id TEXT PRIMARY KEY,
@@ -13380,6 +22840,8 @@ mod tests {
         let storage = SqliteStorage {
             conn,
             mutation_count: 0,
+            temp_db_path: None,
+            pending_event_attribution: None,
         };
         let timestamp = Utc.with_ymd_and_hms(2026, 3, 11, 0, 0, 0).unwrap();
         let stamp = timestamp.to_rfc3339();
@@ -13411,6 +22873,34 @@ mod tests {
 
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].id, "bd-legacy-ready");
+    }
+
+    #[test]
+    fn test_get_ready_issues_skips_stale_cache_work_when_no_candidate_status() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 3, 12, 0, 0, 0).unwrap();
+        let mut closed = make_issue(
+            "bd-closed",
+            "Closed issue",
+            Status::Closed,
+            2,
+            None,
+            now,
+            None,
+        );
+        closed.closed_at = Some(now);
+        storage.create_issue(&closed, "tester").unwrap();
+        storage.mark_blocked_cache_stale().unwrap();
+
+        let ready = storage
+            .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Priority)
+            .unwrap();
+
+        assert!(ready.is_empty());
+        assert!(
+            storage.blocked_cache_marked_stale().unwrap(),
+            "read-only ready query must not refresh or clear stale blocked-cache metadata"
+        );
     }
 
     #[test]
@@ -13475,6 +22965,76 @@ mod tests {
             .map(|issue| issue.id)
             .collect();
         assert_eq!(limited_ids, ["bd-high-old", "bd-critical-new"]);
+
+        let fallback_limited_ids: Vec<String> = storage
+            .get_ready_issues(
+                &ReadyFilters {
+                    limit: Some(3),
+                    ..ReadyFilters::default()
+                },
+                ReadySortPolicy::Hybrid,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|issue| issue.id)
+            .collect();
+        assert_eq!(
+            fallback_limited_ids,
+            ["bd-high-old", "bd-critical-new", "bd-low-old"]
+        );
+    }
+
+    #[test]
+    fn test_get_ready_issues_limited_sql_sort_uses_id_tiebreaker() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 3, 13, 0, 0, 0).unwrap();
+
+        for issue in [
+            make_issue(
+                "bd-tie-b",
+                "Tie inserted first",
+                Status::Open,
+                1,
+                None,
+                created_at,
+                None,
+            ),
+            make_issue(
+                "bd-tie-a",
+                "Tie inserted second",
+                Status::Open,
+                1,
+                None,
+                created_at,
+                None,
+            ),
+            make_issue(
+                "bd-low",
+                "Low priority",
+                Status::Open,
+                3,
+                None,
+                created_at + chrono::Duration::seconds(1),
+                None,
+            ),
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        let ids: Vec<String> = storage
+            .get_ready_issues(
+                &ReadyFilters {
+                    limit: Some(2),
+                    ..ReadyFilters::default()
+                },
+                ReadySortPolicy::Hybrid,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|issue| issue.id)
+            .collect();
+
+        assert_eq!(ids, ["bd-tie-a", "bd-tie-b"]);
     }
 
     #[test]
@@ -13648,6 +23208,22 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_canonical_utc_datetime_matches_rfc3339_parser() {
+        let raw = "2026-01-16T07:21:09.280348123+00:00";
+        let fast = parse_canonical_utc_datetime(raw).expect("canonical UTC timestamp");
+        let general = DateTime::parse_from_rfc3339(raw)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(fast, general);
+        assert_eq!(fast.timestamp_subsec_nanos(), 280_348_123);
+    }
+
+    #[test]
+    fn test_parse_canonical_utc_datetime_leaves_non_utc_offsets_to_fallback() {
+        assert!(parse_canonical_utc_datetime("2026-01-16T07:21:09.280348123+01:00").is_none());
+    }
+
+    #[test]
     fn test_parse_datetime_rfc3339_with_offset() {
         let result = parse_datetime("2026-02-26T19:54:42+00:00").unwrap();
         assert_eq!(result.year(), 2026);
@@ -13704,6 +23280,33 @@ mod tests {
         let v = SqliteValue::Integer(1_776_651_488_000_000_000);
         let dt = parse_datetime_value(Some(&v)).unwrap();
         assert_eq!(dt.year(), 2026);
+    }
+
+    #[test]
+    fn test_datetime_from_epoch_auto_keeps_exact_unit_boundaries() {
+        let seconds = datetime_from_epoch_auto(10_000_000_000).unwrap();
+        assert_eq!(seconds.timestamp(), 10_000_000_000);
+        assert_eq!(seconds.timestamp_subsec_nanos(), 0);
+
+        let milliseconds = datetime_from_epoch_auto(10_000_000_000_000).unwrap();
+        assert_eq!(milliseconds.timestamp(), 10_000_000_000);
+        assert_eq!(milliseconds.timestamp_subsec_nanos(), 0);
+
+        let microseconds = datetime_from_epoch_auto(10_000_000_000_000_000).unwrap();
+        assert_eq!(microseconds.timestamp(), 10_000_000_000);
+        assert_eq!(microseconds.timestamp_subsec_nanos(), 0);
+
+        let negative_seconds = datetime_from_epoch_auto(-10_000_000_000).unwrap();
+        assert_eq!(negative_seconds.timestamp(), -10_000_000_000);
+        assert_eq!(negative_seconds.timestamp_subsec_nanos(), 0);
+
+        let negative_milliseconds = datetime_from_epoch_auto(-10_000_000_000_000).unwrap();
+        assert_eq!(negative_milliseconds.timestamp(), -10_000_000_000);
+        assert_eq!(negative_milliseconds.timestamp_subsec_nanos(), 0);
+
+        let negative_microseconds = datetime_from_epoch_auto(-10_000_000_000_000_000).unwrap();
+        assert_eq!(negative_microseconds.timestamp(), -10_000_000_000);
+        assert_eq!(negative_microseconds.timestamp_subsec_nanos(), 0);
     }
 
     #[test]
@@ -13766,6 +23369,17 @@ mod tests {
     }
 
     #[test]
+    fn test_datetime_from_epoch_seconds_f64_carries_rounded_nanoseconds() {
+        let dt = datetime_from_epoch_seconds_f64(1.999_999_999_6).unwrap();
+        assert_eq!(dt.timestamp(), 2);
+        assert_eq!(dt.timestamp_subsec_nanos(), 0);
+
+        let dt = datetime_from_epoch_seconds_f64(-0.000_000_000_4).unwrap();
+        assert_eq!(dt.timestamp(), 0);
+        assert_eq!(dt.timestamp_subsec_nanos(), 0);
+    }
+
+    #[test]
     fn test_parse_datetime_value_integer_negative_is_pre_epoch() {
         // -3600 s = 1969-12-31T23:00:00Z. Confirms negatives route through
         // the seconds branch correctly (not mis-classified as a larger
@@ -13775,9 +23389,8 @@ mod tests {
         assert_eq!(dt.timestamp(), -3600);
         assert_eq!(dt.timestamp_subsec_nanos(), 0);
 
-        // Negative microseconds pick up div_euclid/rem_euclid's floor
-        // semantics: -1_500_000 µs = -1.5 s → (secs=-2, nanos=5e8). Must
-        // match datetime_from_epoch_seconds_f64(-1.5).
+        // Negative microsecond-range values pick up div_euclid/rem_euclid's
+        // floor semantics instead of truncating toward zero.
         let v = SqliteValue::Integer(-1_500_000_000_000_000); // µs-range magnitude
         let dt = parse_datetime_value(Some(&v)).unwrap();
         assert_eq!(dt.timestamp(), -1_500_000_000);
@@ -13879,6 +23492,60 @@ mod tests {
     }
 
     #[test]
+    fn test_metadata_default_insert_rechecks_existing_key() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("metadata-default-race.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        storage
+            .conn
+            .execute_with_params(
+                "DELETE FROM metadata WHERE key = ?",
+                &[SqliteValue::from(METADATA_JSONL_SIZE)],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(METADATA_JSONL_SIZE),
+                    SqliteValue::from("racing-writer"),
+                ],
+            )
+            .unwrap();
+
+        SqliteStorage::insert_metadata_default_if_missing(
+            &storage.conn,
+            METADATA_JSONL_SIZE,
+            METADATA_EMPTY_VALUE,
+        )
+        .unwrap();
+
+        let rows = storage
+            .conn
+            .query_with_params(
+                "SELECT value FROM metadata WHERE key = ? ORDER BY rowid ASC",
+                &[SqliteValue::from(METADATA_JSONL_SIZE)],
+            )
+            .unwrap();
+        let values: Vec<String> = rows
+            .iter()
+            .filter_map(|row| {
+                row.get(0)
+                    .and_then(SqliteValue::as_text)
+                    .map(str::to_string)
+            })
+            .collect();
+
+        assert_eq!(
+            values,
+            vec!["racing-writer".to_string()],
+            "default seeding must not duplicate or overwrite a key inserted by a racing opener"
+        );
+    }
+
+    #[test]
     fn test_metadata_state_updates_keep_single_seeded_row() {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("metadata-state.db");
@@ -13918,6 +23585,172 @@ mod tests {
             Some("false".to_string())
         );
         assert_eq!(storage.get_metadata(BLOCKED_CACHE_STATE_KEY).unwrap(), None);
+    }
+
+    #[test]
+    fn test_metadata_duplicate_rows_read_latest_and_harmonize_on_write() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("metadata-duplicates.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(METADATA_JSONL_CONTENT_HASH),
+                    SqliteValue::from("stale-hash"),
+                ],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(METADATA_JSONL_CONTENT_HASH),
+                    SqliteValue::from("latest-hash"),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            storage.get_metadata(METADATA_JSONL_CONTENT_HASH).unwrap(),
+            Some("latest-hash".to_string()),
+            "metadata reads must use the latest duplicate row"
+        );
+
+        storage
+            .set_metadata(METADATA_JSONL_CONTENT_HASH, "rewritten-hash")
+            .unwrap();
+
+        let rows = storage
+            .conn
+            .query_with_params(
+                "SELECT value FROM metadata WHERE key = ? ORDER BY rowid ASC",
+                &[SqliteValue::from(METADATA_JSONL_CONTENT_HASH)],
+            )
+            .unwrap();
+        let values: Vec<String> = rows
+            .iter()
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from))
+            .collect();
+
+        assert_eq!(
+            values,
+            vec![
+                "rewritten-hash".to_string(),
+                "rewritten-hash".to_string(),
+                "rewritten-hash".to_string(),
+            ],
+            "metadata writes must harmonize every duplicate row for the key"
+        );
+    }
+
+    #[test]
+    fn test_ready_readiness_probe_uses_latest_blocked_cache_state_duplicate() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("ready-stale-duplicate.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+
+        storage
+            .create_issue(
+                &make_issue("bd-ready", "Ready issue", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(BLOCKED_CACHE_STATE_KEY),
+                    SqliteValue::from(BLOCKED_CACHE_STATE_STALE),
+                ],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(BLOCKED_CACHE_STATE_KEY),
+                    SqliteValue::from(METADATA_EMPTY_VALUE),
+                ],
+            )
+            .unwrap();
+
+        let readiness = storage.ready_readiness_probe(false).unwrap();
+
+        assert!(readiness.has_candidate_status);
+        assert!(
+            !readiness.blocked_cache_stale,
+            "an older duplicate stale marker must not force the ready path to bypass the cache"
+        );
+    }
+
+    /// Regression: the Drop checkpoint heuristic from #270 fires only
+    /// when the handle accumulated mutations since the last periodic
+    /// `wal_checkpoint(PASSIVE)`. The read-only path keeps the
+    /// original "no checkpoint on teardown" behaviour described in
+    /// the Drop impl's comment so it doesn't re-introduce the
+    /// spurious busy failures the previous design avoided.
+    ///
+    /// We assert the gate (`mutation_count > 0`) rather than the
+    /// post-Drop WAL file size because the actual on-disk effect of
+    /// `PRAGMA wal_checkpoint(TRUNCATE)` is fsqlite's responsibility
+    /// — its checkpoint executor decides whether the file is
+    /// truncated to zero or retained as a zero-frame header — and
+    /// keeping that detail out of beads_rust's regression suite
+    /// avoids a false alarm whenever fsqlite revises its WAL
+    /// teardown.
+    #[test]
+    fn test_drop_checkpoint_gate_tracks_mutation_count() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("drop-checkpoint.db");
+
+        // Mutating handle: create_issue must drive `mutation_count`
+        // above zero so the Drop impl's gate selects the checkpoint
+        // branch. This assertion is the single point of contract
+        // between the heuristic in `Drop` and the underlying
+        // `with_write_transaction` accounting.
+        {
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            let now = Utc::now();
+            let issue = make_issue(
+                "bd-drop-1",
+                "drop-checkpoint",
+                Status::Open,
+                2,
+                None,
+                now,
+                None,
+            );
+            storage.create_issue(&issue, "tester").unwrap();
+            assert!(
+                storage.mutation_count > 0,
+                "create_issue must increment mutation_count so the Drop heuristic checkpoints WAL"
+            );
+            // Drop runs at end of scope and exercises the checkpoint
+            // path. Any panic from inside Drop would surface as a
+            // test failure regardless of whether we observe the
+            // sidecar afterward.
+        }
+
+        // Re-opening must succeed and see the row, proving the
+        // committed data survived the Drop teardown intact (whether
+        // it lives in the main DB file post-checkpoint or in a
+        // replayed WAL is fsqlite's call).
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(
+            storage.mutation_count, 0,
+            "fresh open must not pre-increment mutation_count"
+        );
+        assert!(
+            storage.get_issue("bd-drop-1").unwrap().is_some(),
+            "row written before drop must be visible after re-open"
+        );
     }
 
     /// Regression test for beads_rust-ok70: verify that status-change updates
@@ -14417,5 +24250,219 @@ mod tests {
             err_msg.contains("conn test error"),
             "should propagate body error, got: {err_msg}"
         );
+    }
+
+    // ========================================================================
+    // Issue #312, Layer 3 — attribution capture-only tests
+    // ========================================================================
+
+    #[test]
+    fn pending_attribution_is_stamped_onto_create_event() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 7, 12, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-attr-1",
+            "Attributed create",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+
+        storage.set_pending_event_attribution(EventAttribution::new(
+            Some("agent-7"),
+            Some("codex-cli"),
+            Some("opus-4"),
+        ));
+        storage.create_issue(&issue, "tester").expect("create");
+
+        let events = storage.get_events("bd-attr-1", 0).expect("events");
+        let created = events
+            .iter()
+            .find(|e| e.event_type == EventType::Created)
+            .expect("created event present");
+        assert_eq!(created.agent_name.as_deref(), Some("agent-7"));
+        assert_eq!(created.harness.as_deref(), Some("codex-cli"));
+        assert_eq!(created.model.as_deref(), Some("opus-4"));
+    }
+
+    #[test]
+    fn pending_attribution_is_stamped_onto_update_status_change_without_blocking() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 7, 12, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-attr-2",
+            "Attributed update",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&issue, "tester").expect("create");
+
+        storage.set_pending_event_attribution(EventAttribution::new(
+            Some("agent-9"),
+            None,
+            Some("opus-4"),
+        ));
+        let update = IssueUpdate {
+            status: Some(Status::InProgress),
+            ..Default::default()
+        };
+        // The transition must NOT be gated/rejected by the attribution; it is a
+        // recorded audit trail only.
+        let updated = storage
+            .update_issue("bd-attr-2", &update, "tester")
+            .expect("status change should not be blocked by attribution");
+        assert_eq!(updated.status, Status::InProgress);
+
+        let events = storage.get_events("bd-attr-2", 0).expect("events");
+        let status_event = events
+            .iter()
+            .find(|e| e.event_type == EventType::StatusChanged)
+            .expect("status_changed event present");
+        assert_eq!(status_event.agent_name.as_deref(), Some("agent-9"));
+        assert!(status_event.harness.is_none());
+        assert_eq!(status_event.model.as_deref(), Some("opus-4"));
+    }
+
+    #[test]
+    fn absent_attribution_records_no_values_and_does_not_leak() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 7, 12, 0, 0).unwrap();
+
+        // First create stages attribution...
+        storage.set_pending_event_attribution(EventAttribution::new(Some("agent-x"), None, None));
+        let first = make_issue("bd-attr-3", "First", Status::Open, 2, None, now, None);
+        storage
+            .create_issue(&first, "tester")
+            .expect("create first");
+
+        // ...the second create stages NONE, so it must record no attribution
+        // (the prior staging must not leak into this unrelated mutation).
+        let second = make_issue("bd-attr-4", "Second", Status::Open, 2, None, now, None);
+        storage
+            .create_issue(&second, "tester")
+            .expect("create second");
+
+        let second_events = storage.get_events("bd-attr-4", 0).expect("events");
+        let created = second_events
+            .iter()
+            .find(|e| e.event_type == EventType::Created)
+            .expect("created event present");
+        assert!(created.agent_name.is_none());
+        assert!(created.harness.is_none());
+        assert!(created.model.is_none());
+    }
+
+    #[test]
+    fn event_attribution_normalizes_blank_inputs_to_none() {
+        let attribution = EventAttribution::new(Some("  "), Some(""), Some("opus-4"));
+        assert!(attribution.agent_name.is_none());
+        assert!(attribution.harness.is_none());
+        assert_eq!(attribution.model.as_deref(), Some("opus-4"));
+        assert!(!attribution.is_empty());
+        assert!(EventAttribution::new(None, None, None).is_empty());
+    }
+
+    // ---- #312 hardening (F1): attribution survives a non-committing mutation
+    // and is consumed only after a successful commit -----------------------
+
+    #[test]
+    fn pending_attribution_survives_failed_mutation_and_stamps_on_retry() {
+        // Models the JSONL-recovery retry path: the first `mutate()` does NOT
+        // commit (its closure errors → rollback), so the staged attribution must
+        // remain available for the *next* `mutate()` to stamp. Previously the
+        // start-of-`mutate()` `.take()` consumed it on the failed attempt,
+        // dropping attribution from the recovered write (F1).
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        storage.set_pending_event_attribution(EventAttribution::new(
+            Some("agent-retry"),
+            None,
+            Some("opus-4"),
+        ));
+
+        // A mutation whose closure fails with a non-transient error: it rolls
+        // back and never commits. The staged slot must be left intact.
+        let failed: Result<()> = storage.mutate("noop_fail", "tester", |_conn, _ctx| {
+            Err(BeadsError::Config("simulated mutation failure".into()))
+        });
+        assert!(failed.is_err(), "mutation closure error should propagate");
+        assert!(
+            storage.pending_event_attribution.is_some(),
+            "attribution must survive a non-committing mutation so the recovery \
+             retry can still stamp it",
+        );
+
+        // The retry: a committing mutation must now record the (still-staged)
+        // attribution onto its events.
+        let now = Utc.with_ymd_and_hms(2026, 6, 7, 12, 0, 0).unwrap();
+        let issue = make_issue("bd-attr-retry", "Retried", Status::Open, 2, None, now, None);
+        storage.create_issue(&issue, "tester").expect("create");
+
+        let events = storage.get_events("bd-attr-retry", 0).expect("events");
+        let created = events
+            .iter()
+            .find(|e| e.event_type == EventType::Created)
+            .expect("created event present");
+        assert_eq!(created.agent_name.as_deref(), Some("agent-retry"));
+        assert_eq!(created.model.as_deref(), Some("opus-4"));
+
+        // And after the committing mutation, the slot is cleared (consumed once).
+        assert!(
+            storage.pending_event_attribution.is_none(),
+            "attribution must be consumed by exactly one committing mutation",
+        );
+    }
+
+    // ---- #312 hardening (F2): no-op update clears the staged slot ----------
+
+    #[test]
+    fn empty_update_clears_pending_attribution_so_it_does_not_leak() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 7, 12, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-attr-noop",
+            "No-op target",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&issue, "tester").expect("create");
+
+        // Stage attribution, then call update_issue with EMPTY updates: this
+        // early-returns without calling `mutate()`, but must still drain the
+        // staged slot so it cannot leak onto the next, unrelated mutation (F2).
+        storage.set_pending_event_attribution(EventAttribution::new(
+            Some("agent-leak"),
+            None,
+            None,
+        ));
+        let empty = IssueUpdate::default();
+        storage
+            .update_issue("bd-attr-noop", &empty, "tester")
+            .expect("empty update is a no-op read");
+        assert!(
+            storage.pending_event_attribution.is_none(),
+            "empty-update no-op must clear the staged attribution",
+        );
+
+        // Confirm no leak: a subsequent create (which stages nothing) records
+        // no attribution.
+        let next = make_issue("bd-attr-next", "Next", Status::Open, 2, None, now, None);
+        storage.create_issue(&next, "tester").expect("create next");
+        let events = storage.get_events("bd-attr-next", 0).expect("events");
+        let created = events
+            .iter()
+            .find(|e| e.event_type == EventType::Created)
+            .expect("created event present");
+        assert!(created.agent_name.is_none());
+        assert!(created.harness.is_none());
+        assert!(created.model.is_none());
     }
 }

@@ -1,15 +1,24 @@
 # Build artifacts (all target directories)
 target/
 target*/
+.rch-target/
 
-# Cargo.lock
-# Intentionally ignored: scripts/dev-local-frankensqlite.toml (copied to
-# .cargo/config.toml) patches fsqlite* deps at sibling paths, which rewrites
-# registry sources / checksums in Cargo.lock on every local `cargo` invocation.
-# Committing that dev-local lockfile would break `cargo install beads_rust`
-# for end users (paths point at /data/projects/frankensqlite on the author's
-# workstation). Keep Cargo.lock untracked — crates.io publishes regenerate
-# the lockfile from Cargo.toml on install.
+# Cargo.lock IS tracked — beads_rust is a binary CLI, so a committed
+# lockfile gives reproducible builds for `nix build`, `cargo install --git`,
+# and the flake input path used by Home Manager / NixOS configs.
+#
+# Dev-local workflow (sibling-path patching via
+# scripts/dev-local-frankensqlite.toml) rewrites Cargo.lock on every cargo
+# invocation by stripping registry source/checksum lines from patched
+# crates. To avoid accidentally committing that dev-local pollution, run
+# `scripts/activate-dev-local-patch.sh` (sets git skip-worktree on
+# Cargo.lock) before applying the patch and
+# `scripts/deactivate-dev-local-patch.sh` afterwards.
+
+# Fuzz harness lockfile — the fuzz/ workspace is opt-in tooling, not
+# part of the published binary. Keep it untracked so libfuzzer/cargo-fuzz
+# version churn doesn't show up in `git status`.
+fuzz/Cargo.lock
 
 # IDE
 .idea/
@@ -178,6 +187,21 @@ report.json
 # without the global entry).
 .ntm/logs/*.log
 
+# NTM agent coordination state (human inbox spool, per-pane rate-limit
+# snapshots, spawn-state cache, robot snapshot summaries) — regenerated
+# on every orchestrator tick.
+.ntm/human_inbox/
+.ntm/rate_limits.json
+.ntm/spawn-state.json
+.ntm/summaries/
+
+# Skill workspaces — per-pass scratch trees written by /harmonize-skills-*,
+# /rust-unsafe-code-exorcist, and the rust-undefined-behavior-exorcist
+# skill. Each is regenerated on the next run.
+.harmonize_workspace/
+.ub-exorcism/
+.unsafe-audit/
+
 # Skill-loop / refactor-pass run artifacts that should NOT be tracked.
 # Each pass's directory under refactor/artifacts/ legitimately contains
 # small markdown ledgers, scoring files, and golden replay JSON which
@@ -205,11 +229,7 @@ tests/artifacts/perf/**/perf.data
 tests/artifacts/perf/**/*.beads/
 *.perf.data
 
-# LaTeX build artifacts (from m2p PDF generation)
-*.aux
-*.log
-*.out
-*-pages/
-
-# Guard: nested docs/ (created by running pdflatex from wrong cwd)
-docs/docs/
+# Beads compliance audit dir (managed by /beads-compliance-and-completion-verification skill)
+/beads_compliance_audit/
+# br doctor per-run artifacts
+.doctor/

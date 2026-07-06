@@ -333,7 +333,7 @@ fn e2e_lint_filter_by_type_bug() {
 #[test]
 fn e2e_lint_filter_by_status_all() {
     let _log = common::test_log("e2e_lint_filter_by_status_all");
-    // --status all should include closed issues
+    // --status all should include non-default issue states.
     let workspace = BrWorkspace::new();
     init_workspace(&workspace);
 
@@ -341,21 +341,37 @@ fn e2e_lint_filter_by_status_all() {
     let bug_id = create_issue_with_description(&workspace, "Closed bug", "bug", Some("Closed"));
     let close = run_br(&workspace, ["close", &bug_id], "close_bug");
     assert!(close.status.success(), "close failed: {}", close.stderr);
+    let deferred_bug =
+        create_issue_with_description(&workspace, "Deferred bug", "bug", Some("Deferred"));
+    let defer = run_br(
+        &workspace,
+        [
+            "update",
+            &deferred_bug,
+            "--status",
+            "deferred",
+            "--defer",
+            "2100-01-01T00:00:00Z",
+        ],
+        "defer_bug_for_status_all",
+    );
+    assert!(defer.status.success(), "defer failed: {}", defer.stderr);
 
-    // Default lint should not include closed
+    // Default lint should not include closed or deferred.
     let lint_default = run_br(&workspace, ["lint", "--json"], "lint_status_default");
     let json_str = extract_json_payload(&lint_default.stdout);
     let json: Value = serde_json::from_str(&json_str).expect("valid JSON");
+    let default_results = json["results"].as_array().unwrap();
     assert!(
-        !json["results"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|r| r["id"] == bug_id),
+        !default_results.iter().any(|r| r["id"] == bug_id),
         "closed issue should not appear in default lint"
     );
+    assert!(
+        !default_results.iter().any(|r| r["id"] == deferred_bug),
+        "deferred issue should not appear in default lint"
+    );
 
-    // --status all should include closed
+    // --status all should include closed and deferred.
     let lint_all = run_br(
         &workspace,
         ["lint", "--status", "all", "--json"],
@@ -369,13 +385,14 @@ fn e2e_lint_filter_by_status_all() {
 
     let json_str = extract_json_payload(&lint_all.stdout);
     let json: Value = serde_json::from_str(&json_str).expect("valid JSON");
+    let all_results = json["results"].as_array().unwrap();
     assert!(
-        json["results"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|r| r["id"] == bug_id),
+        all_results.iter().any(|r| r["id"] == bug_id),
         "closed issue should appear with --status all"
+    );
+    assert!(
+        all_results.iter().any(|r| r["id"] == deferred_bug),
+        "deferred issue should appear with --status all"
     );
 }
 

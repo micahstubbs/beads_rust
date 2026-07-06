@@ -15,7 +15,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, parse_list_issues, run_br};
+use common::cli::{BrWorkspace, parse_list_issues, parse_list_page, run_br};
 
 fn parse_created_id(stdout: &str) -> String {
     let line = stdout.lines().next().unwrap_or("");
@@ -106,9 +106,11 @@ fn setup_diverse_workspace() -> (BrWorkspace, Vec<String>) {
     );
     assert!(issue4.status.success());
     let id4 = parse_created_id(&issue4.stdout);
+    // beads_rust#301: terminal-state transitions go through `br close` so
+    // close-policy fires uniformly. `br update --status closed` is rejected.
     run_br(
         &workspace,
-        ["update", &id4, "--status", "closed"],
+        ["close", &id4, "--reason", "fixture: closed in setup"],
         "close_task2",
     );
     ids.push(id4);
@@ -825,6 +827,28 @@ fn e2e_list_limit_zero_unlimited() {
     // Should have all 5 non-closed issues (limit=0 means unlimited)
     // Default list excludes closed but includes deferred
     assert_eq!(issues.len(), 5);
+}
+
+#[test]
+fn e2e_list_limit_zero_with_offset_reports_unpaginated_total() {
+    let _log = common::test_log("e2e_list_limit_zero_with_offset_reports_unpaginated_total");
+    let (workspace, _ids) = setup_diverse_workspace();
+
+    let list = run_br(
+        &workspace,
+        ["list", "--limit", "0", "--offset", "2", "--json"],
+        "list_limit_zero_offset",
+    );
+    assert!(list.status.success(), "list failed: {}", list.stderr);
+
+    let page = parse_list_page(&list.stdout);
+    let issues = page["issues"].as_array().expect("issues array");
+
+    assert_eq!(issues.len(), 3);
+    assert_eq!(page["total"].as_u64(), Some(5));
+    assert_eq!(page["limit"].as_u64(), Some(0));
+    assert_eq!(page["offset"].as_u64(), Some(2));
+    assert_eq!(page["has_more"].as_bool(), Some(false));
 }
 
 // =============================================================================

@@ -113,14 +113,21 @@ fn e2e_queries_ready_stale_count_search() {
         defer_issue.stderr
     );
 
+    // beads_rust#301: `br update --status closed` is rejected; use the
+    // dedicated `br close` command so close-policy is enforced uniformly.
     let close_issue = run_br(
         &workspace,
-        ["update", &closed_id, "--status", "closed"],
+        [
+            "close",
+            &closed_id,
+            "--reason",
+            "fixture: ready-after-close",
+        ],
         "close_issue",
     );
     assert!(
         close_issue.status.success(),
-        "close update failed: {}",
+        "close failed: {}",
         close_issue.stderr
     );
 
@@ -852,6 +859,14 @@ fn e2e_saved_queries_lifecycle() {
         list_json.stderr
     );
     let list_payload = extract_json_payload(&list_json.stdout);
+    assert!(
+        list_payload.starts_with("{\"queries\":["),
+        "query list JSON should preserve queries-first object shape: {list_payload}"
+    );
+    assert!(
+        list_payload.ends_with(",\"count\":2}"),
+        "query list JSON should preserve count trailer: {list_payload}"
+    );
     let list_parsed: Value = serde_json::from_str(&list_payload).expect("list json");
     assert_eq!(list_parsed["count"], 2);
     let queries = list_parsed["queries"].as_array().expect("queries array");
@@ -959,6 +974,80 @@ fn e2e_saved_queries_lifecycle() {
         list_empty.stdout.contains("No saved queries"),
         "expected no saved queries after deletion"
     );
+}
+
+/// Regression: `query run` must not replace saved pagination when the operator
+/// did not pass run-time pagination flags.
+#[test]
+fn e2e_query_run_preserves_saved_limit_without_override() {
+    let _log = common::test_log("e2e_query_run_preserves_saved_limit_without_override");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "query_limit_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    for title in ["Limit issue A", "Limit issue B", "Limit issue C"] {
+        let created = run_br(&workspace, ["create", title], title);
+        assert!(
+            created.status.success(),
+            "create failed: {}",
+            created.stderr
+        );
+    }
+
+    let save = run_br(
+        &workspace,
+        [
+            "query", "save", "one-open", "--status", "open", "--limit", "1", "--offset", "1",
+            "--sort", "title",
+        ],
+        "query_limit_save",
+    );
+    assert!(save.status.success(), "query save failed: {}", save.stderr);
+
+    let saved_run = run_br(
+        &workspace,
+        ["query", "run", "one-open", "--json"],
+        "query_limit_run_saved",
+    );
+    assert!(
+        saved_run.status.success(),
+        "query run failed: {}",
+        saved_run.stderr
+    );
+    let saved_payload = extract_json_payload(&saved_run.stdout);
+    let saved_json: Value = serde_json::from_str(&saved_payload).expect("saved run json");
+    assert_eq!(saved_json["limit"], 1);
+    assert_eq!(saved_json["offset"], 1);
+    assert_eq!(
+        saved_json["issues"].as_array().expect("issues array").len(),
+        1
+    );
+    assert_eq!(saved_json["issues"][0]["title"], "Limit issue B");
+
+    let override_run = run_br(
+        &workspace,
+        ["query", "run", "one-open", "--limit", "2", "--json"],
+        "query_limit_run_override",
+    );
+    assert!(
+        override_run.status.success(),
+        "query run override failed: {}",
+        override_run.stderr
+    );
+    let override_payload = extract_json_payload(&override_run.stdout);
+    let override_json: Value = serde_json::from_str(&override_payload).expect("override run json");
+    assert_eq!(override_json["limit"], 2);
+    assert_eq!(override_json["offset"], 1);
+    assert_eq!(
+        override_json["issues"]
+            .as_array()
+            .expect("issues array")
+            .len(),
+        2
+    );
+    assert_eq!(override_json["issues"][0]["title"], "Limit issue B");
+    assert_eq!(override_json["issues"][1]["title"], "Limit issue C");
 }
 
 /// E2E tests for saved query error cases.
