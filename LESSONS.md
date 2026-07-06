@@ -189,3 +189,13 @@ conn.query_with_params(
 - **Loops mutate the conflict surface they iterate over**: When a function loops over inputs and writes to a table that future iterations read, the function's own intermediate writes are part of the conflict surface. "Owner != me" checks must include "owner == me from earlier in this same call."
 - **Inlined vs parameterized SQL = different code paths**: A SQL bug that doesn't reproduce against a library's tests may be hiding behind the calling shape. Inlined string literals and bind parameters go through different planner phases, even when the resulting query is logically identical. Always test both shapes for SQL bugs.
 - **Check `main`, not just the published version**: Before fixing an upstream library bug, build against the upstream `main` branch — not just the latest published version. A library can have the same `version =` field on crates.io and in its repo while the code differs significantly. The fix you're about to write may already be one merged-but-unreleased commit away.
+
+## 2026-07-06T16:30 - Raw File-Header Reads Bypass the WAL
+
+**Problem**: With two agent sessions working the same repo, `br show`/`br close <id>` intermittently returned "Issue not found" for rows `br list` displayed, and `br update <id>` echoed the title of an unrelated issue while writing the correct row. `br doctor --repair` cleared it, so it looked like random DB corruption.
+
+**Root Cause**: `open_with_timeout` decided "is this schema current?" by reading `user_version` from the raw SQLite file header (byte 60). Header bytes don't see WAL-resident values; with a concurrent session leaving an uncheckpointed WAL, a fresh `br` process misread the version as stale and re-applied schema — including issues-table rebuilds via DDL canonicalization — against a live, current database. fsqlite 0.1.7 makes this worse: it no longer checkpoints `user_version` into the header on close, so the misread happens on *every* open, not just unlucky ones.
+
+**Lesson**: Any fast-path that peeks at storage bytes underneath an MVCC/WAL engine must be treated as a hint, never as a decision input for mutations. If a connection is already open (it was, three lines above), ask the engine (`PRAGMA user_version`) — it reads through the WAL for free. Header peeks are only safe as "is this even a SQLite file" pre-filters.
+
+**Fix**: 2405632 — `connection_user_version()` via the open connection in `open_with_timeout`; `open_current_read_only` keeps the header peek only as a file-validity pre-filter and confirms the version through its read-only connection. Verified with 225+135 point-lookups under concurrent update+sync churn (0 misses) and the rewritten WAL-visibility test.
