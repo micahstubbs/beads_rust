@@ -682,8 +682,19 @@ fn canonicalize_issues_table_create_sql(conn: &Connection) -> Result<bool> {
     let updated = conn.execute(
         "UPDATE sqlite_master SET sql = replace(sql, 'CREATE TABLE IF NOT EXISTS issues', 'CREATE TABLE issues') WHERE type='table' AND name='issues'",
     );
+    // A writable_schema text edit must be paired with a schema-version bump,
+    // or other connections keep their stale parsed schema (and multi-process
+    // CLI flows misread config/policy tables).
+    let bump = conn
+        .query_row("PRAGMA schema_version")
+        .ok()
+        .and_then(|row| row.get(0).and_then(SqliteValue::as_integer))
+        .map(|version| conn.execute(&format!("PRAGMA schema_version = {}", version + 1)));
     let reset = conn.execute("PRAGMA writable_schema=OFF");
     updated.map_err(BeadsError::Database)?;
+    if let Some(result) = bump {
+        result.map_err(BeadsError::Database)?;
+    }
     reset.map_err(BeadsError::Database)?;
     if issues_table_create_sql_preserves_if_not_exists(conn) {
         // Text rewrite unsupported by the engine — fall back to the rebuild.
