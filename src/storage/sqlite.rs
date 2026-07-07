@@ -1042,7 +1042,12 @@ impl SqliteStorage {
         // header bytes miss WAL-resident values, and a stale read here caused
         // spurious schema re-application against live databases under
         // concurrent sessions (treasury-jqms).
+        // Fall back to the raw header if the PRAGMA itself errors (e.g. a
+        // corrupted database): treating a failed read as "stale schema" would
+        // trigger schema re-application, silently healing corruption that
+        // doctor must be able to detect (sqlite_page_malformed fixture).
         let schema_current = connection_user_version(&conn)
+            .or_else(|| database_header_user_version(path))
             .is_some_and(|version| version >= u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0));
         let runtime_compatible = runtime_schema_compatible(&conn);
 
