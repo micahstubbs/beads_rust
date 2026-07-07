@@ -1038,7 +1038,16 @@ impl SqliteStorage {
             conn.execute(&format!("PRAGMA busy_timeout={timeout_ms}"))?;
         }
 
-        let schema_current = database_header_user_version(path)
+        // Read the version through the connection, not the raw file header:
+        // header bytes miss WAL-resident values, and a stale read here caused
+        // spurious schema re-application against live databases under
+        // concurrent sessions.
+        // Fall back to the raw header if the PRAGMA itself errors (e.g. a
+        // corrupted database): treating a failed read as "stale schema" would
+        // trigger schema re-application, silently healing corruption that
+        // doctor must be able to detect.
+        let schema_current = connection_user_version(&conn)
+            .or_else(|| database_header_user_version(path))
             .is_some_and(|version| version >= u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0));
         let runtime_compatible = runtime_schema_compatible(&conn);
 
@@ -1060,8 +1069,10 @@ impl SqliteStorage {
 
     pub(crate) fn open_current_read_only(path: &Path) -> Result<Option<Self>> {
         let current_schema_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
-        if database_header_user_version(path).is_none_or(|version| version < current_schema_version)
-        {
+        // Cheap pre-filter only: the raw header can lag the true value when
+        // user_version lives in an uncheckpointed WAL, so a low header value
+        // must not disqualify the database. Only a missing/invalid file does.
+        if database_header_user_version(path).is_none() {
             return Ok(None);
         }
 
@@ -1069,6 +1080,15 @@ impl SqliteStorage {
             path.to_string_lossy().as_ref(),
             OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
+        // Same fallback as open_with_timeout: a corrupted database can fail
+        // the PRAGMA read entirely; the header peek keeps doctor able to open
+        // read-only and actually run its integrity checks.
+        if connection_user_version(&conn)
+            .or_else(|| database_header_user_version(path))
+            .is_none_or(|version| version < current_schema_version)
+        {
+            return Ok(None);
+        }
         Ok(Some(Self {
             conn,
             mutation_count: 0,
@@ -10932,6 +10952,18 @@ fn remove_temp_db_files(path: &Path) {
     }
 }
 
+/// Read PRAGMA user_version through an open connection. Unlike the raw
+/// file-header peek below, this sees WAL-resident values, so it stays correct
+/// while other sessions have written but not yet checkpointed. Trusting the
+/// raw header for schema decisions caused spurious schema re-application
+/// (including issues table rebuilds) against live databases under concurrent
+/// sessions, corrupting point-query state.
+fn connection_user_version(conn: &Connection) -> Option<u32> {
+    let row = conn.query_row("PRAGMA user_version").ok()?;
+    let value = row.get(0).and_then(SqliteValue::as_integer)?;
+    u32::try_from(value).ok()
+}
+
 fn database_header_user_version(path: &Path) -> Option<u32> {
     if path == Path::new(":memory:") || !path.is_file() {
         return None;
@@ -19466,6 +19498,32 @@ mod tests {
             database_header_user_version(&db_path),
             Some(u32::try_from(CURRENT_SCHEMA_VERSION).unwrap())
         );
+    }
+
+    #[test]
+    fn test_connection_user_version_sees_wal_resident_value() {
+        // user_version set through one connection must be visible to a fresh
+        // connection via PRAGMA even when it only lives in the WAL (the engine
+        // does not checkpoint on close). The raw header peek is allowed to
+        // lag; trusting it for schema decisions caused spurious schema
+        // re-application against live databases.
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("wal_user_version.db");
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
+            .unwrap();
+        conn.close().unwrap();
+
+        let reopened = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(
+            connection_user_version(&reopened),
+            Some(u32::try_from(CURRENT_SCHEMA_VERSION).unwrap())
+        );
+
+        // The header peek stays a cheap pre-filter: it must identify a valid
+        // SQLite file (Some), but its value may lag the WAL.
+        assert!(database_header_user_version(&db_path).is_some());
     }
 
     #[test]
