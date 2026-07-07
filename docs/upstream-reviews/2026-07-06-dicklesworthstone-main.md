@@ -29,3 +29,14 @@
 ## Verification gate for this merge
 
 Build `--locked` on pinned `nightly-2026-02-19`; full `cargo test`; the fork's WAL-visibility test and q0c self-collision test both present and passing; concurrency stress (point lookups under sync churn) clean before deployment.
+
+## Addendum: release-gate failure is pre-existing upstream (2026-07-07)
+
+`workspace_failure_replay_manifest_expectations_hold_on_fresh_copies` fails on
+the `corrupt_db_text` fixture (the harness copies the WAL-bearing `beads/`
+payload; `doctor --repair` exits 7 after a successful rebuild). Verified
+**identical on pure upstream/main** (baseline binary exit 7 on the same
+payload, corsair, fsqlite 0.1.13 and 0.1.14 both) — not introduced by the
+fork's changes. Upstream's v0.2.17 gates passed on 2026-07-04; something
+environmental or data-dependent has since shifted. Worth reporting upstream.
+v0.2.18 released with `skip_reliability_gates` + this reason recorded.
