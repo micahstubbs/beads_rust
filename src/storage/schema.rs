@@ -1191,6 +1191,8 @@ fn parse_not_null_default_literal(col_def: &str) -> Option<String> {
     }
 
     None
+}
+
 /// Backfill storage-class NULL values in NOT NULL DEFAULT columns.
 ///
 /// SQLite's `ALTER TABLE ADD COLUMN ... NOT NULL DEFAULT ...` enforces the

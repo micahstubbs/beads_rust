@@ -10936,6 +10936,8 @@ fn connection_user_version(conn: &Connection) -> Option<u32> {
     let row = conn.query_row("PRAGMA user_version").ok()?;
     let value = row.get(0).and_then(SqliteValue::as_integer)?;
     u32::try_from(value).ok()
+}
+
 /// Best-effort removal of an ephemeral temp database and its SQLite sidecars.
 ///
 /// SQLite may create `-wal`, `-shm`, and `-journal` files next to the main
@@ -17447,6 +17449,10 @@ mod tests {
         assert_ne!(
             comments_b[0].id, colliding_id,
             "second comment must have been re-allocated to avoid PK collision"
+        );
+    }
+
+    #[test]
     fn test_sync_comments_for_import_rejects_duplicate_comment_ids_for_same_issue() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
