@@ -672,8 +672,24 @@ fn canonicalize_issues_table_create_sql(conn: &Connection) -> Result<bool> {
         return Ok(false);
     }
 
-    rebuild_issues_table(conn)?;
-    execute_batch(conn, SCHEMA_SQL)?;
+    // Only the stored DDL *text* needs fixing (bd re-parses sqlite_master and
+    // chokes on IF NOT EXISTS). Rewrite the text in place instead of doing a
+    // full table rebuild: a rebuild at init churns the page layout (temp-table
+    // copy + drop leaves freelist pages), which broke the sqlite_page_malformed
+    // doctor fixture and costs every fresh init a pointless rebuild.
+    conn.execute("PRAGMA writable_schema=ON")
+        .map_err(BeadsError::Database)?;
+    let updated = conn.execute(
+        "UPDATE sqlite_master SET sql = replace(sql, 'CREATE TABLE IF NOT EXISTS issues', 'CREATE TABLE issues') WHERE type='table' AND name='issues'",
+    );
+    let reset = conn.execute("PRAGMA writable_schema=OFF");
+    updated.map_err(BeadsError::Database)?;
+    reset.map_err(BeadsError::Database)?;
+    if issues_table_create_sql_preserves_if_not_exists(conn) {
+        // Text rewrite unsupported by the engine — fall back to the rebuild.
+        rebuild_issues_table(conn)?;
+        execute_batch(conn, SCHEMA_SQL)?;
+    }
     Ok(true)
 }
 
