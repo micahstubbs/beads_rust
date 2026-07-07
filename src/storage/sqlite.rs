@@ -1087,7 +1087,11 @@ impl SqliteStorage {
             path.to_string_lossy().as_ref(),
             OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
+        // Same fallback as open_with_timeout: a corrupted database can fail
+        // the PRAGMA read entirely; the header peek keeps doctor able to open
+        // read-only and actually run its integrity checks.
         if connection_user_version(&conn)
+            .or_else(|| database_header_user_version(path))
             .is_none_or(|version| version < current_schema_version)
         {
             return Ok(None);
