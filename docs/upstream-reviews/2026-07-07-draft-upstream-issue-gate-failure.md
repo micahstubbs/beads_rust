@@ -1,8 +1,18 @@
 # DRAFT upstream issue — Dicklesworthstone/beads_rust
 
-Status: DRAFT, not yet filed. Companion to the two PR branches
+Status: SUPERSEDED — already filed upstream by the concurrent session before
+this draft could be submitted (discovered 2026-07-07, treasury-n626):
+
+- Issue #375 (this report): https://github.com/Dicklesworthstone/beads_rust/issues/375
+- PR #373 (user_version): https://github.com/Dicklesworthstone/beads_rust/pull/373
+- PR #374 (self-collision): https://github.com/Dicklesworthstone/beads_rust/pull/374
+
+This session's duplicate branches remain on the fork as
 `pr-upstream/wal-aware-user-version` and `pr-upstream/import-self-collision`
-(treasury-n626).
+(equivalent content; the wal branch also ports the read-only-path fallback,
+and the collision branch carries a second, cross-issue regression test not in
+#374). Delete once #373/#374 merge:
+`git push origin --delete pr-upstream/wal-aware-user-version pr-upstream/import-self-collision`
 
 ---
 
